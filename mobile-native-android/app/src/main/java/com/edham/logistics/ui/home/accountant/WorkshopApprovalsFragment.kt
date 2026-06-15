@@ -18,6 +18,7 @@ class WorkshopApprovalsFragment : Fragment() {
 
     private val viewModel: AccountantViewModel by viewModels()
     private lateinit var adapter: WorkshopRequestAdapter
+    private lateinit var swipeRefresh: androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -32,6 +33,9 @@ class WorkshopApprovalsFragment : Fragment() {
         
         // Update toolbar title if needed (since we re-use layout)
         view.findViewById<androidx.appcompat.widget.Toolbar>(R.id.toolbar)?.title = "بوابة اعتمادات الورشة"
+
+        swipeRefresh = view.findViewById(R.id.swipeRefresh)
+        swipeRefresh.setOnRefreshListener { viewModel.loadWorkshopRequests() }
 
         setupRecyclerView(view)
         observeViewModel()
@@ -57,6 +61,10 @@ class WorkshopApprovalsFragment : Fragment() {
     private fun observeViewModel() {
         viewModel.workshopRequests.observe(viewLifecycleOwner) { requests ->
             adapter.updateData(requests)
+        }
+
+        viewModel.isLoading.observe(viewLifecycleOwner) { loading ->
+            swipeRefresh.isRefreshing = loading
         }
 
         viewModel.error.observe(viewLifecycleOwner) { error ->

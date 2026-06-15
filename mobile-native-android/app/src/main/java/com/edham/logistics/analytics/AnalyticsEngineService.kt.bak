@@ -1,0 +1,1098 @@
+package com.edham.logistics.analytics
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.AnalyticsApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Analytics Engine Service - Core analytics processing and aggregation
+ * 
+ * Features:
+ * - Real-time KPI calculations
+ * - Fleet analytics aggregation
+ * - Shipment analytics processing
+ * - Driver performance metrics
+ * - Fuel consumption analytics
+ * - Revenue analytics calculations
+ * - Temperature monitoring analytics
+ * - Delay and incident analytics
+ * - Performance monitoring
+ * - Data aggregation services
+ */
+@Singleton
+class AnalyticsEngineService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val analyticsApi: AnalyticsApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _analyticsState = MutableStateFlow<AnalyticsState>(AnalyticsState.Idle)
+    val analyticsState: StateFlow<AnalyticsState> = _analyticsState.asStateFlow()
+    
+    private val _realTimeKPIs = MutableStateFlow<RealTimeKPIs>(RealTimeKPIs())
+    val realTimeKPIs: StateFlow<RealTimeKPIs> = _realTimeKPIs.asStateFlow()
+    
+    private val _analyticsData = MutableStateFlow<AnalyticsData>(AnalyticsData())
+    val analyticsData: StateFlow<AnalyticsData> = _analyticsData.asStateFlow()
+    
+    private var isInitialized = false
+    private var aggregationTimer: Timer? = null
+    
+    companion object {
+        private const val TAG = "AnalyticsEngineService"
+        private const val AGGREGATION_INTERVAL_MS = 30000L // 30 seconds
+        private const val KPI_UPDATE_INTERVAL_MS = 5000L // 5 seconds
+        private const val DATA_RETENTION_DAYS = 90
+    }
+    
+    /**
+     * Initialize analytics engine
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Initializing
+                
+                // Load cached analytics data
+                loadCachedAnalyticsData()
+                
+                // Initialize real-time KPIs
+                initializeRealTimeKPIs()
+                
+                // Start aggregation timer
+                startAggregationTimer()
+                
+                // Start KPI update timer
+                startKPIUpdateTimer()
+                
+                isInitialized = true
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to initialize analytics engine: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Calculate real-time KPIs
+     */
+    suspend fun calculateRealTimeKPIs(): Result<RealTimeKPIs> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Analytics engine not initialized")
+                }
+                
+                _analyticsState.value = AnalyticsState.Calculating
+                
+                // Get current data
+                val activeShipments = database.shipmentDao().getActiveShipmentsCount()
+                val totalVehicles = database.vehicleDao().getTotalVehiclesCount()
+                val activeDrivers = database.driverDao().getActiveDriversCount()
+                val todayRevenue = database.invoiceDao().getTodayRevenue()
+                val todayExpenses = database.expenseDao().getTodayExpenses()
+                val averageTemperature = database.temperatureLogDao().getTodayAverageTemperature()
+                val activeAlerts = database.alertDao().getActiveAlertsCount()
+                val onTimeDeliveryRate = calculateOnTimeDeliveryRate()
+                val fuelEfficiency = calculateAverageFuelEfficiency()
+                
+                val kpis = RealTimeKPIs(
+                    activeShipments = activeShipments,
+                    totalVehicles = totalVehicles,
+                    activeDrivers = activeDrivers,
+                    todayRevenue = todayRevenue,
+                    todayExpenses = todayExpenses,
+                    netProfit = todayRevenue - todayExpenses,
+                    averageTemperature = averageTemperature,
+                    activeAlerts = activeAlerts,
+                    onTimeDeliveryRate = onTimeDeliveryRate,
+                    fuelEfficiency = fuelEfficiency,
+                    lastUpdated = Date()
+                )
+                
+                _realTimeKPIs.value = kpis
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(kpis)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to calculate real-time KPIs: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fleet analytics
+     */
+    suspend fun getFleetAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<FleetAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Processing
+                
+                // Get fleet data
+                val fleetUtilization = calculateFleetUtilization(dateRange)
+                val vehiclePerformance = calculateVehiclePerformance(dateRange)
+                val maintenanceAnalytics = calculateMaintenanceAnalytics(dateRange)
+                val fuelAnalytics = calculateFleetFuelAnalytics(dateRange)
+                
+                val fleetAnalytics = FleetAnalytics(
+                    period = dateRange,
+                    totalVehicles = database.vehicleDao().getTotalVehiclesCount(),
+                    activeVehicles = database.vehicleDao().getActiveVehiclesCount(),
+                    fleetUtilization = fleetUtilization,
+                    vehiclePerformance = vehiclePerformance,
+                    maintenanceAnalytics = maintenanceAnalytics,
+                    fuelAnalytics = fuelAnalytics,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(fleetAnalytics)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to get fleet analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get shipment analytics
+     */
+    suspend fun getShipmentAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<ShipmentAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Processing
+                
+                // Get shipment data
+                val totalShipments = database.shipmentDao().getShipmentsCount(dateRange.startDate, dateRange.endDate)
+                val completedShipments = database.shipmentDao().getCompletedShipmentsCount(dateRange.startDate, dateRange.endDate)
+                val delayedShipments = database.shipmentDao().getDelayedShipmentsCount(dateRange.startDate, dateRange.endDate)
+                val shipmentByStatus = database.shipmentDao().getShipmentsByStatus(dateRange.startDate, dateRange.endDate)
+                val shipmentByType = database.shipmentDao().getShipmentsByType(dateRange.startDate, dateRange.endDate)
+                val deliveryTimes = calculateDeliveryTimeAnalytics(dateRange)
+                val revenueByShipment = calculateRevenueByShipment(dateRange)
+                
+                val shipmentAnalytics = ShipmentAnalytics(
+                    period = dateRange,
+                    totalShipments = totalShipments,
+                    completedShipments = completedShipments,
+                    delayedShipments = delayedShipments,
+                    completionRate = if (totalShipments > 0) (completedShipments.toFloat() / totalShipments) * 100f else 0f,
+                    onTimeDeliveryRate = if (completedShipments > 0) ((completedShipments - delayedShipments).toFloat() / completedShipments) * 100f else 0f,
+                    shipmentByStatus = shipmentByStatus,
+                    shipmentByType = shipmentByType,
+                    deliveryTimes = deliveryTimes,
+                    revenueByShipment = revenueByShipment,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(shipmentAnalytics)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to get shipment analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get driver performance analytics
+     */
+    suspend fun getDriverPerformanceAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<DriverPerformanceAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Processing
+                
+                // Get driver performance data
+                val totalDrivers = database.driverDao().getTotalDriversCount()
+                val activeDrivers = database.driverDao().getActiveDriversCount()
+                val driverPerformance = calculateIndividualDriverPerformance(dateRange)
+                val topPerformers = getTopPerformingDrivers(dateRange, 10)
+                val performanceByRegion = calculatePerformanceByRegion(dateRange)
+                val averagePerformance = calculateAverageDriverPerformance(dateRange)
+                
+                val driverAnalytics = DriverPerformanceAnalytics(
+                    period = dateRange,
+                    totalDrivers = totalDrivers,
+                    activeDrivers = activeDrivers,
+                    averagePerformance = averagePerformance,
+                    driverPerformance = driverPerformance,
+                    topPerformers = topPerformers,
+                    performanceByRegion = performanceByRegion,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(driverAnalytics)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to get driver performance analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fuel analytics
+     */
+    suspend fun getFuelAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<FuelAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Processing
+                
+                // Get fuel data
+                val totalFuelConsumption = database.fuelExpenseDao().getTotalFuelConsumption(dateRange.startDate, dateRange.endDate)
+                val totalFuelCost = database.fuelExpenseDao().getTotalFuelCost(dateRange.startDate, dateRange.endDate)
+                val averageFuelPrice = database.fuelExpenseDao().getAverageFuelPrice(dateRange.startDate, dateRange.endDate)
+                val fuelByVehicle = database.fuelExpenseDao().getFuelConsumptionByVehicle(dateRange.startDate, dateRange.endDate)
+                val fuelEfficiency = calculateFuelEfficiencyByVehicle(dateRange)
+                val fuelPriceTrends = calculateFuelPriceTrends(dateRange)
+                val fuelingStations = getTopFuelingStations(dateRange, 10)
+                
+                val fuelAnalytics = FuelAnalytics(
+                    period = dateRange,
+                    totalFuelConsumption = totalFuelConsumption,
+                    totalFuelCost = totalFuelCost,
+                    averageFuelPrice = averageFuelPrice,
+                    fuelByVehicle = fuelByVehicle,
+                    fuelEfficiency = fuelEfficiency,
+                    fuelPriceTrends = fuelPriceTrends,
+                    topFuelingStations = fuelingStations,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(fuelAnalytics)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to get fuel analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get revenue analytics
+     */
+    suspend fun getRevenueAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<RevenueAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Processing
+                
+                // Get revenue data
+                val totalRevenue = database.invoiceDao().getTotalRevenue(dateRange.startDate, dateRange.endDate)
+                val revenueByMonth = database.invoiceDao().getRevenueByMonth(dateRange.startDate, dateRange.endDate)
+                val revenueByService = database.invoiceDao().getRevenueByService(dateRange.startDate, dateRange.endDate)
+                val revenueByCustomer = database.invoiceDao().getRevenueByCustomer(dateRange.startDate, dateRange.endDate)
+                val revenueByRegion = database.invoiceDao().getRevenueByRegion(dateRange.startDate, dateRange.endDate)
+                val revenueGrowth = calculateRevenueGrowth(dateRange)
+                val averageRevenuePerShipment = calculateAverageRevenuePerShipment(dateRange)
+                
+                val revenueAnalytics = RevenueAnalytics(
+                    period = dateRange,
+                    totalRevenue = totalRevenue,
+                    revenueByMonth = revenueByMonth,
+                    revenueByService = revenueByService,
+                    revenueByCustomer = revenueByCustomer,
+                    revenueByRegion = revenueByRegion,
+                    revenueGrowth = revenueGrowth,
+                    averageRevenuePerShipment = averageRevenuePerShipment,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(revenueAnalytics)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to get revenue analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get temperature analytics
+     */
+    suspend fun getTemperatureAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<TemperatureAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Processing
+                
+                // Get temperature data
+                val averageTemperature = database.temperatureLogDao().getAverageTemperature(dateRange.startDate, dateRange.endDate)
+                val temperatureByVehicle = database.temperatureLogDao().getAverageTemperatureByVehicle(dateRange.startDate, dateRange.endDate)
+                val temperatureAlerts = database.temperatureLogDao().getTemperatureAlerts(dateRange.startDate, dateRange.endDate)
+                val temperatureCompliance = calculateTemperatureCompliance(dateRange)
+                val temperatureTrends = calculateTemperatureTrends(dateRange)
+                val coldChainEfficiency = calculateColdChainEfficiency(dateRange)
+                
+                val temperatureAnalytics = TemperatureAnalytics(
+                    period = dateRange,
+                    averageTemperature = averageTemperature,
+                    temperatureByVehicle = temperatureByVehicle,
+                    temperatureAlerts = temperatureAlerts,
+                    temperatureCompliance = temperatureCompliance,
+                    temperatureTrends = temperatureTrends,
+                    coldChainEfficiency = coldChainEfficiency,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(temperatureAnalytics)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to get temperature analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get delay analytics
+     */
+    suspend fun getDelayAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<DelayAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Processing
+                
+                // Get delay data
+                val totalDelays = database.shipmentDao().getDelayedShipmentsCount(dateRange.startDate, dateRange.endDate)
+                val delayByReason = database.shipmentDao().getDelaysByReason(dateRange.startDate, dateRange.endDate)
+                val delayByRegion = database.shipmentDao().getDelaysByRegion(dateRange.startDate, dateRange.endDate)
+                val averageDelayTime = calculateAverageDelayTime(dateRange)
+                val delayTrends = calculateDelayTrends(dateRange)
+                val delayCost = calculateDelayCost(dateRange)
+                
+                val delayAnalytics = DelayAnalytics(
+                    period = dateRange,
+                    totalDelays = totalDelays,
+                    delayByReason = delayByReason,
+                    delayByRegion = delayByRegion,
+                    averageDelayTime = averageDelayTime,
+                    delayTrends = delayTrends,
+                    delayCost = delayCost,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(delayAnalytics)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to get delay analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get incident analytics
+     */
+    suspend fun getIncidentAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<IncidentAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Processing
+                
+                // Get incident data
+                val totalIncidents = database.incidentDao().getIncidentsCount(dateRange.startDate, dateRange.endDate)
+                val incidentsByType = database.incidentDao().getIncidentsByType(dateRange.startDate, dateRange.endDate)
+                val incidentsBySeverity = database.incidentDao().getIncidentsBySeverity(dateRange.startDate, dateRange.endDate)
+                val incidentsByRegion = database.incidentDao().getIncidentsByRegion(dateRange.startDate, dateRange.endDate)
+                val incidentResolutionTime = calculateAverageIncidentResolutionTime(dateRange)
+                val incidentTrends = calculateIncidentTrends(dateRange)
+                val safetyMetrics = calculateSafetyMetrics(dateRange)
+                
+                val incidentAnalytics = IncidentAnalytics(
+                    period = dateRange,
+                    totalIncidents = totalIncidents,
+                    incidentsByType = incidentsByType,
+                    incidentsBySeverity = incidentsBySeverity,
+                    incidentsByRegion = incidentsByRegion,
+                    averageResolutionTime = incidentResolutionTime,
+                    incidentTrends = incidentTrends,
+                    safetyMetrics = safetyMetrics,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Ready
+                Result.success(incidentAnalytics)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to get incident analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadCachedAnalyticsData() {
+        try {
+            // Load cached analytics data from local storage
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun initializeRealTimeKPIs() {
+        calculateRealTimeKPIs()
+    }
+    
+    private fun startAggregationTimer() {
+        aggregationTimer = Timer()
+        aggregationTimer?.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                // Perform data aggregation
+                performDataAggregation()
+            }
+        }, 0, AGGREGATION_INTERVAL_MS)
+    }
+    
+    private fun startKPIUpdateTimer() {
+        Timer().scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                // Update real-time KPIs
+                calculateRealTimeKPIs()
+            }
+        }, 0, KPI_UPDATE_INTERVAL_MS)
+    }
+    
+    private suspend fun performDataAggregation() {
+        try {
+            // Aggregate data for analytics
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun calculateOnTimeDeliveryRate(): Float {
+        val completedShipments = database.shipmentDao().getCompletedShipmentsCount(
+            Date().apply { add(Calendar.DAY_OF_MONTH, -30) },
+            Date()
+        )
+        val delayedShipments = database.shipmentDao().getDelayedShipmentsCount(
+            Date().apply { add(Calendar.DAY_OF_MONTH, -30) },
+            Date()
+        )
+        
+        return if (completedShipments > 0) {
+            ((completedShipments - delayedShipments).toFloat() / completedShipments) * 100f
+        } else {
+            0f
+        }
+    }
+    
+    private suspend fun calculateAverageFuelEfficiency(): Float {
+        return database.fuelExpenseDao().getAverageFuelEfficiency(
+            Date().apply { add(Calendar.DAY_OF_MONTH, -30) },
+            Date()
+        )
+    }
+    
+    private suspend fun calculateFleetUtilization(dateRange: DateRange): FleetUtilization {
+        val totalVehicles = database.vehicleDao().getTotalVehiclesCount()
+        val activeVehicles = database.vehicleDao().getActiveVehiclesCount()
+        val utilizationRate = if (totalVehicles > 0) (activeVehicles.toFloat() / totalVehicles) * 100f else 0f
+        
+        return FleetUtilization(
+            totalVehicles = totalVehicles,
+            activeVehicles = activeVehicles,
+            utilizationRate = utilizationRate,
+            averageHoursPerVehicle = calculateAverageHoursPerVehicle(dateRange)
+        )
+    }
+    
+    private suspend fun calculateVehiclePerformance(dateRange: DateRange): List<VehiclePerformance> {
+        return database.vehicleDao().getAllVehicles().map { vehicle ->
+            val trips = database.shipmentDao().getVehicleTrips(vehicle.id, dateRange.startDate, dateRange.endDate)
+            val totalDistance = trips.sumOf { it.distance ?: 0.0 }
+            val fuelConsumption = database.fuelExpenseDao().getVehicleFuelConsumption(vehicle.id, dateRange.startDate, dateRange.endDate)
+            val efficiency = if (fuelConsumption > 0) totalDistance / fuelConsumption else 0.0
+            
+            VehiclePerformance(
+                vehicleId = vehicle.id,
+                vehicleNumber = vehicle.vehicleNumber,
+                totalDistance = totalDistance,
+                totalTrips = trips.size,
+                fuelConsumption = fuelConsumption,
+                efficiency = efficiency,
+                utilization = calculateVehicleUtilization(vehicle.id, dateRange)
+            )
+        }
+    }
+    
+    private suspend fun calculateMaintenanceAnalytics(dateRange: DateRange): MaintenanceAnalytics {
+        val totalMaintenance = database.maintenanceExpenseDao().getTotalMaintenanceCost(dateRange.startDate, dateRange.endDate)
+        val maintenanceByType = database.maintenanceExpenseDao().getMaintenanceCostByType(dateRange.startDate, dateRange.endDate)
+        val averageDowntime = database.maintenanceExpenseDao().getAverageDowntime(dateRange.startDate, dateRange.endDate)
+        
+        return MaintenanceAnalytics(
+            totalCost = totalMaintenance,
+            costByType = maintenanceByType,
+            averageDowntime = averageDowntime,
+            preventiveMaintenanceRate = calculatePreventiveMaintenanceRate(dateRange)
+        )
+    }
+    
+    private suspend fun calculateFleetFuelAnalytics(dateRange: DateRange): FleetFuelAnalytics {
+        val totalConsumption = database.fuelExpenseDao().getTotalFuelConsumption(dateRange.startDate, dateRange.endDate)
+        val totalCost = database.fuelExpenseDao().getTotalFuelCost(dateRange.startDate, dateRange.endDate)
+        val averagePrice = if (totalConsumption > 0) totalCost / totalConsumption else 0.0
+        
+        return FleetFuelAnalytics(
+            totalConsumption = totalConsumption,
+            totalCost = totalCost,
+            averagePrice = averagePrice,
+            consumptionTrend = calculateFuelConsumptionTrend(dateRange),
+            priceTrend = calculateFuelPriceTrend(dateRange)
+        )
+    }
+    
+    private suspend fun calculateIndividualDriverPerformance(dateRange: DateRange): List<DriverPerformance> {
+        return database.driverDao().getAllDrivers().map { driver ->
+            val trips = database.shipmentDao().getDriverTrips(driver.id, dateRange.startDate, dateRange.endDate)
+            val completedTrips = trips.count { it.status == ShipmentStatus.COMPLETED }
+            val delayedTrips = trips.count { it.isDelayed }
+            val totalDistance = trips.sumOf { it.distance ?: 0.0 }
+            val totalRevenue = trips.sumOf { it.revenue ?: 0.0 }
+            
+            DriverPerformance(
+                driverId = driver.id,
+                driverName = driver.name,
+                totalTrips = trips.size,
+                completedTrips = completedTrips,
+                delayedTrips = delayedTrips,
+                completionRate = if (trips.isNotEmpty()) (completedTrips.toFloat() / trips.size) * 100f else 0f,
+                onTimeDeliveryRate = if (completedTrips > 0) ((completedTrips - delayedTrips).toFloat() / completedTrips) * 100f else 0f,
+                totalDistance = totalDistance,
+                totalRevenue = totalRevenue,
+                averageRating = calculateDriverAverageRating(driver.id, dateRange)
+            )
+        }
+    }
+    
+    private suspend fun getTopPerformingDrivers(dateRange: DateRange, limit: Int): List<DriverPerformance> {
+        return calculateIndividualDriverPerformance(dateRange)
+            .sortedByDescending { it.completionRate * it.onTimeDeliveryRate }
+            .take(limit)
+    }
+    
+    private suspend fun calculatePerformanceByRegion(dateRange: DateRange): Map<String, RegionalPerformance> {
+        // Implementation for calculating performance by region
+        return emptyMap()
+    }
+    
+    private suspend fun calculateAverageDriverPerformance(dateRange: DateRange): Float {
+        val performances = calculateIndividualDriverPerformance(dateRange)
+        return if (performances.isNotEmpty()) {
+            performances.map { it.completionRate }.average().toFloat()
+        } else {
+            0f
+        }
+    }
+    
+    private suspend fun calculateDeliveryTimeAnalytics(dateRange: DateRange): DeliveryTimeAnalytics {
+        val deliveryTimes = database.shipmentDao().getDeliveryTimes(dateRange.startDate, dateRange.endDate)
+        val averageTime = if (deliveryTimes.isNotEmpty()) deliveryTimes.average() else 0.0
+        val minTime = deliveryTimes.minOrNull() ?: 0.0
+        val maxTime = deliveryTimes.maxOrNull() ?: 0.0
+        
+        return DeliveryTimeAnalytics(
+            averageDeliveryTime = averageTime,
+            minDeliveryTime = minTime,
+            maxDeliveryTime = maxTime,
+            deliveryTimeDistribution = calculateDeliveryTimeDistribution(deliveryTimes)
+        )
+    }
+    
+    private suspend fun calculateRevenueByShipment(dateRange: DateRange): Map<String, Double> {
+        return database.invoiceDao().getRevenueByShipment(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateFuelEfficiencyByVehicle(dateRange: DateRange): Map<String, Float> {
+        return database.fuelExpenseDao().getFuelEfficiencyByVehicle(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateFuelPriceTrends(dateRange: DateRange): List<PriceTrend> {
+        return database.fuelExpenseDao().getFuelPriceTrends(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun getTopFuelingStations(dateRange: DateRange, limit: Int): List<FuelingStation> {
+        return database.fuelExpenseDao().getTopFuelingStations(dateRange.startDate, dateRange.endDate, limit)
+    }
+    
+    private suspend fun calculateRevenueGrowth(dateRange: DateRange): RevenueGrowth {
+        val currentPeriodRevenue = database.invoiceDao().getTotalRevenue(dateRange.startDate, dateRange.endDate)
+        val previousPeriodRevenue = database.invoiceDao().getTotalRevenue(
+            Date().apply { time = dateRange.startDate.time - (dateRange.endDate.time - dateRange.startDate.time) },
+            dateRange.startDate
+        )
+        
+        val growthRate = if (previousPeriodRevenue > 0) {
+            ((currentPeriodRevenue - previousPeriodRevenue) / previousPeriodRevenue) * 100f
+        } else {
+            0f
+        }
+        
+        return RevenueGrowth(
+            currentPeriodRevenue = currentPeriodRevenue,
+            previousPeriodRevenue = previousPeriodRevenue,
+            growthRate = growthRate
+        )
+    }
+    
+    private suspend fun calculateAverageRevenuePerShipment(dateRange: DateRange): Double {
+        val totalRevenue = database.invoiceDao().getTotalRevenue(dateRange.startDate, dateRange.endDate)
+        val totalShipments = database.shipmentDao().getShipmentsCount(dateRange.startDate, dateRange.endDate)
+        
+        return if (totalShipments > 0) totalRevenue / totalShipments else 0.0
+    }
+    
+    private suspend fun calculateTemperatureCompliance(dateRange: DateRange): TemperatureCompliance {
+        val totalReadings = database.temperatureLogDao().getTotalReadings(dateRange.startDate, dateRange.endDate)
+        val compliantReadings = database.temperatureLogDao().getCompliantReadings(dateRange.startDate, dateRange.endDate)
+        
+        return TemperatureCompliance(
+            totalReadings = totalReadings,
+            compliantReadings = compliantReadings,
+            complianceRate = if (totalReadings > 0) (compliantReadings.toFloat() / totalReadings) * 100f else 100f
+        )
+    }
+    
+    private suspend fun calculateTemperatureTrends(dateRange: DateRange): List<TemperatureTrend> {
+        return database.temperatureLogDao().getTemperatureTrends(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateColdChainEfficiency(dateRange: DateRange): Float {
+        val totalShipments = database.shipmentDao().getShipmentsCount(dateRange.startDate, dateRange.endDate)
+        val successfulColdChainShipments = database.shipmentDao().getSuccessfulColdChainShipments(dateRange.startDate, dateRange.endDate)
+        
+        return if (totalShipments > 0) (successfulColdChainShipments.toFloat() / totalShipments) * 100f else 100f
+    }
+    
+    private suspend fun calculateAverageDelayTime(dateRange: DateRange): Double {
+        return database.shipmentDao().getAverageDelayTime(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateDelayTrends(dateRange: DateRange): List<DelayTrend> {
+        return database.shipmentDao().getDelayTrends(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateDelayCost(dateRange: DateRange): Double {
+        return database.shipmentDao().getDelayCost(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateAverageIncidentResolutionTime(dateRange: DateRange): Double {
+        return database.incidentDao().getAverageResolutionTime(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateIncidentTrends(dateRange: DateRange): List<IncidentTrend> {
+        return database.incidentDao().getIncidentTrends(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateSafetyMetrics(dateRange: DateRange): SafetyMetrics {
+        val totalIncidents = database.incidentDao().getIncidentsCount(dateRange.startDate, dateRange.endDate)
+        val totalDistance = database.shipmentDao().getTotalDistance(dateRange.startDate, dateRange.endDate)
+        val accidentRate = if (totalDistance > 0) (totalIncidents.toFloat() / (totalDistance / 1000f)) else 0f // incidents per 1000 km
+        
+        return SafetyMetrics(
+            totalIncidents = totalIncidents,
+            accidentRate = accidentRate,
+            daysSinceLastIncident = calculateDaysSinceLastIncident(),
+            safetyScore = calculateSafetyScore(dateRange)
+        )
+    }
+    
+    private suspend fun calculateAverageHoursPerVehicle(dateRange: DateRange): Float {
+        return database.vehicleDao().getAverageHoursPerVehicle(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateVehicleUtilization(vehicleId: String, dateRange: DateRange): Float {
+        val totalHours = database.vehicleDao().getVehicleOperatingHours(vehicleId, dateRange.startDate, dateRange.endDate)
+        val periodHours = (dateRange.endDate.time - dateRange.startDate.time) / (1000 * 60 * 60)
+        
+        return if (periodHours > 0) (totalHours / periodHours) * 100f else 0f
+    }
+    
+    private suspend fun calculatePreventiveMaintenanceRate(dateRange: DateRange): Float {
+        val totalMaintenance = database.maintenanceExpenseDao().getTotalMaintenanceCount(dateRange.startDate, dateRange.endDate)
+        val preventiveMaintenance = database.maintenanceExpenseDao().getPreventiveMaintenanceCount(dateRange.startDate, dateRange.endDate)
+        
+        return if (totalMaintenance > 0) (preventiveMaintenance.toFloat() / totalMaintenance) * 100f else 0f
+    }
+    
+    private suspend fun calculateFuelConsumptionTrend(dateRange: DateRange): List<ConsumptionTrend> {
+        return database.fuelExpenseDao().getFuelConsumptionTrends(dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateDriverAverageRating(driverId: String, dateRange: DateRange): Float {
+        return database.driverDao().getDriverAverageRating(driverId, dateRange.startDate, dateRange.endDate)
+    }
+    
+    private suspend fun calculateDeliveryTimeDistribution(deliveryTimes: List<Double>): Map<String, Int> {
+        return distributionOf(deliveryTimes) { time ->
+            when {
+                time < 2 -> "Under 2 hours"
+                time < 4 -> "2-4 hours"
+                time < 8 -> "4-8 hours"
+                time < 24 -> "8-24 hours"
+                else -> "Over 24 hours"
+            }
+        }
+    }
+    
+    private fun <T> distributionOf(items: List<T>, classifier: (T) -> String): Map<String, Int> {
+        return items.groupingBy { classifier(it) }.eachCount()
+    }
+    
+    private suspend fun calculateDaysSinceLastIncident(): Long {
+        val lastIncident = database.incidentDao().getLastIncident()
+        return if (lastIncident != null) {
+            (Date().time - lastIncident.date.time) / (1000 * 60 * 60 * 24)
+        } else {
+            Long.MAX_VALUE
+        }
+    }
+    
+    private suspend fun calculateSafetyScore(dateRange: DateRange): Float {
+        val incidents = database.incidentDao().getIncidentsCount(dateRange.startDate, dateRange.endDate)
+        val distance = database.shipmentDao().getTotalDistance(dateRange.startDate, dateRange.endDate)
+        
+        // Safety score calculation (100 - incidents per 1000km * 10)
+        val incidentRate = if (distance > 0) (incidents.toFloat() / (distance / 1000f)) else 0f
+        return maxOf(0f, 100f - (incidentRate * 10f))
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        aggregationTimer?.cancel()
+        aggregationTimer = null
+    }
+}
+
+/**
+ * Data classes for analytics
+ */
+data class RealTimeKPIs(
+    val activeShipments: Int = 0,
+    val totalVehicles: Int = 0,
+    val activeDrivers: Int = 0,
+    val todayRevenue: Double = 0.0,
+    val todayExpenses: Double = 0.0,
+    val netProfit: Double = 0.0,
+    val averageTemperature: Float = 0f,
+    val activeAlerts: Int = 0,
+    val onTimeDeliveryRate: Float = 0f,
+    val fuelEfficiency: Float = 0f,
+    val lastUpdated: Date = Date()
+)
+
+data class AnalyticsData(
+    val fleetAnalytics: FleetAnalytics? = null,
+    val shipmentAnalytics: ShipmentAnalytics? = null,
+    val driverAnalytics: DriverPerformanceAnalytics? = null,
+    val fuelAnalytics: FuelAnalytics? = null,
+    val revenueAnalytics: RevenueAnalytics? = null,
+    val temperatureAnalytics: TemperatureAnalytics? = null,
+    val delayAnalytics: DelayAnalytics? = null,
+    val incidentAnalytics: IncidentAnalytics? = null,
+    val lastUpdated: Date = Date()
+)
+
+data class FleetAnalytics(
+    val period: DateRange,
+    val totalVehicles: Int,
+    val activeVehicles: Int,
+    val fleetUtilization: FleetUtilization,
+    val vehiclePerformance: List<VehiclePerformance>,
+    val maintenanceAnalytics: MaintenanceAnalytics,
+    val fuelAnalytics: FleetFuelAnalytics,
+    val generatedAt: Date
+)
+
+data class ShipmentAnalytics(
+    val period: DateRange,
+    val totalShipments: Int,
+    val completedShipments: Int,
+    val delayedShipments: Int,
+    val completionRate: Float,
+    val onTimeDeliveryRate: Float,
+    val shipmentByStatus: Map<String, Int>,
+    val shipmentByType: Map<String, Int>,
+    val deliveryTimes: DeliveryTimeAnalytics,
+    val revenueByShipment: Map<String, Double>,
+    val generatedAt: Date
+)
+
+data class DriverPerformanceAnalytics(
+    val period: DateRange,
+    val totalDrivers: Int,
+    val activeDrivers: Int,
+    val averagePerformance: Float,
+    val driverPerformance: List<DriverPerformance>,
+    val topPerformers: List<DriverPerformance>,
+    val performanceByRegion: Map<String, RegionalPerformance>,
+    val generatedAt: Date
+)
+
+data class FuelAnalytics(
+    val period: DateRange,
+    val totalFuelConsumption: Double,
+    val totalFuelCost: Double,
+    val averageFuelPrice: Double,
+    val fuelByVehicle: Map<String, Double>,
+    val fuelEfficiency: Map<String, Float>,
+    val fuelPriceTrends: List<PriceTrend>,
+    val topFuelingStations: List<FuelingStation>,
+    val generatedAt: Date
+)
+
+data class RevenueAnalytics(
+    val period: DateRange,
+    val totalRevenue: Double,
+    val revenueByMonth: Map<String, Double>,
+    val revenueByService: Map<String, Double>,
+    val revenueByCustomer: Map<String, Double>,
+    val revenueByRegion: Map<String, Double>,
+    val revenueGrowth: RevenueGrowth,
+    val averageRevenuePerShipment: Double,
+    val generatedAt: Date
+)
+
+data class TemperatureAnalytics(
+    val period: DateRange,
+    val averageTemperature: Float,
+    val temperatureByVehicle: Map<String, Float>,
+    val temperatureAlerts: Int,
+    val temperatureCompliance: TemperatureCompliance,
+    val temperatureTrends: List<TemperatureTrend>,
+    val coldChainEfficiency: Float,
+    val generatedAt: Date
+)
+
+data class DelayAnalytics(
+    val period: DateRange,
+    val totalDelays: Int,
+    val delayByReason: Map<String, Int>,
+    val delayByRegion: Map<String, Int>,
+    val averageDelayTime: Double,
+    val delayTrends: List<DelayTrend>,
+    val delayCost: Double,
+    val generatedAt: Date
+)
+
+data class IncidentAnalytics(
+    val period: DateRange,
+    val totalIncidents: Int,
+    val incidentsByType: Map<String, Int>,
+    val incidentsBySeverity: Map<String, Int>,
+    val incidentsByRegion: Map<String, Int>,
+    val averageResolutionTime: Double,
+    val incidentTrends: List<IncidentTrend>,
+    val safetyMetrics: SafetyMetrics,
+    val generatedAt: Date
+)
+
+// Supporting data classes
+data class FleetUtilization(
+    val totalVehicles: Int,
+    val activeVehicles: Int,
+    val utilizationRate: Float,
+    val averageHoursPerVehicle: Float
+)
+
+data class VehiclePerformance(
+    val vehicleId: String,
+    val vehicleNumber: String,
+    val totalDistance: Double,
+    val totalTrips: Int,
+    val fuelConsumption: Double,
+    val efficiency: Double,
+    val utilization: Float
+)
+
+data class MaintenanceAnalytics(
+    val totalCost: Double,
+    val costByType: Map<String, Double>,
+    val averageDowntime: Double,
+    val preventiveMaintenanceRate: Float
+)
+
+data class FleetFuelAnalytics(
+    val totalConsumption: Double,
+    val totalCost: Double,
+    val averagePrice: Double,
+    val consumptionTrend: List<ConsumptionTrend>,
+    val priceTrend: List<PriceTrend>
+)
+
+data class DriverPerformance(
+    val driverId: String,
+    val driverName: String,
+    val totalTrips: Int,
+    val completedTrips: Int,
+    val delayedTrips: Int,
+    val completionRate: Float,
+    val onTimeDeliveryRate: Float,
+    val totalDistance: Double,
+    val totalRevenue: Double,
+    val averageRating: Float
+)
+
+data class RegionalPerformance(
+    val region: String,
+    val averageCompletionRate: Float,
+    val averageOnTimeDeliveryRate: Float,
+    val totalRevenue: Double
+)
+
+data class DeliveryTimeAnalytics(
+    val averageDeliveryTime: Double,
+    val minDeliveryTime: Double,
+    val maxDeliveryTime: Double,
+    val deliveryTimeDistribution: Map<String, Int>
+)
+
+data class RevenueGrowth(
+    val currentPeriodRevenue: Double,
+    val previousPeriodRevenue: Double,
+    val growthRate: Float
+)
+
+data class TemperatureCompliance(
+    val totalReadings: Int,
+    val compliantReadings: Int,
+    val complianceRate: Float
+)
+
+data class TemperatureTrend(
+    val date: Date,
+    val averageTemperature: Float,
+    val minTemperature: Float,
+    val maxTemperature: Float
+)
+
+data class PriceTrend(
+    val date: Date,
+    val price: Double
+)
+
+data class ConsumptionTrend(
+    val date: Date,
+    val consumption: Double
+)
+
+data class FuelingStation(
+    val name: String,
+    val totalFuel: Double,
+    val totalCost: Double,
+    val visitCount: Int
+)
+
+data class DelayTrend(
+    val date: Date,
+    val delayCount: Int,
+    val averageDelayTime: Double
+)
+
+data class IncidentTrend(
+    val date: Date,
+    val incidentCount: Int,
+    val averageSeverity: Float
+)
+
+data class SafetyMetrics(
+    val totalIncidents: Int,
+    val accidentRate: Float,
+    val daysSinceLastIncident: Long,
+    val safetyScore: Float
+)
+
+data class DateRange(
+    val startDate: Date,
+    val endDate: Date
+) {
+    companion object {
+        fun last30Days(): DateRange {
+            val calendar = Calendar.getInstance()
+            val endDate = calendar.time
+            calendar.add(Calendar.DAY_OF_MONTH, -30)
+            val startDate = calendar.time
+            return DateRange(startDate, endDate)
+        }
+        
+        fun last7Days(): DateRange {
+            val calendar = Calendar.getInstance()
+            val endDate = calendar.time
+            calendar.add(Calendar.DAY_OF_MONTH, -7)
+            val startDate = calendar.time
+            return DateRange(startDate, endDate)
+        }
+        
+        fun today(): DateRange {
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.HOUR_OF_DAY, 0)
+            calendar.set(Calendar.MINUTE, 0)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            val startDate = calendar.time
+            
+            calendar.add(Calendar.DAY_OF_MONTH, 1)
+            val endDate = calendar.time
+            
+            return DateRange(startDate, endDate)
+        }
+    }
+}
+
+/**
+ * Enums
+ */
+enum class AnalyticsState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Calculating,
+    Error
+}

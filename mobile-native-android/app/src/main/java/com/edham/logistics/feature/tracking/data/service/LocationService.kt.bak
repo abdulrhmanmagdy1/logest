@@ -1,0 +1,308 @@
+package com.edham.logistics.feature.tracking.data.service
+
+import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.os.Build
+import android.os.IBinder
+import android.os.Looper
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.edham.logistics.R
+import com.edham.logistics.core.utils.TokenManager
+import com.edham.logistics.feature.tracking.domain.model.UpdateLocationRequest
+import com.edham.logistics.feature.tracking.domain.usecase.UpdateLocationUseCase
+import com.google.android.gms.location.*
+import com.google.android.gms.maps.model.LatLng
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class LocationService : Service() {
+
+    @Inject
+    lateinit var updateLocationUseCase: UpdateLocationUseCase
+    
+    @Inject
+    lateinit var tokenManager: TokenManager
+
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private lateinit var locationCallback: LocationCallback
+    
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    private var currentShipmentId: String? = null
+    private var currentDriverId: String? = null
+    private var currentVehicleId: String? = null
+    
+    private var isTracking = false
+    private var lastLocation: Location? = null
+    private var lastUpdateTime: Long = 0
+    
+    private val _locationUpdates = MutableStateFlow<LatLng?>(null)
+    val locationUpdates: StateFlow<LatLng?> = _locationUpdates.asStateFlow()
+    
+    private val _trackingStatus = MutableStateFlow(false)
+    val trackingStatus: StateFlow<Boolean> = _trackingStatus.asStateFlow()
+    
+    companion object {
+        private const val TAG = "LocationService"
+        private const val NOTIFICATION_ID = 1001
+        private const val NOTIFICATION_CHANNEL_ID = "location_service_channel"
+        private const val UPDATE_INTERVAL = 30000L // 30 seconds
+        private const val FASTEST_UPDATE_INTERVAL = 15000L // 15 seconds
+        private const val MIN_DISTANCE_BETWEEN_UPDATES = 50f // 50 meters
+        private const val ACCURACY_THRESHOLD = 100f // 100 meters
+        
+        fun startTracking(
+            context: Context,
+            shipmentId: String,
+            driverId: String,
+            vehicleId: String
+        ) {
+            val intent = Intent(context, LocationService::class.java).apply {
+                putExtra("shipment_id", shipmentId)
+                putExtra("driver_id", driverId)
+                putExtra("vehicle_id", vehicleId)
+            }
+            ContextCompat.startForegroundService(context, intent)
+        }
+        
+        fun stopTracking(context: Context) {
+            val intent = Intent(context, LocationService::class.java)
+            context.stopService(intent)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        createNotificationChannel()
+        setupLocationCallback()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        intent?.let {
+            currentShipmentId = it.getStringExtra("shipment_id")
+            currentDriverId = it.getStringExtra("driver_id")
+            currentVehicleId = it.getStringExtra("vehicle_id")
+        }
+        
+        if (currentShipmentId != null && currentDriverId != null && currentVehicleId != null) {
+            startLocationTracking()
+        }
+        
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startLocationTracking() {
+        if (isTracking) return
+        
+        if (!hasLocationPermission()) {
+            Log.e(TAG, "Location permission not granted")
+            stopSelf()
+            return
+        }
+        
+        startForeground(NOTIFICATION_ID, createNotification())
+        requestLocationUpdates()
+        isTracking = true
+        _trackingStatus.value = true
+        
+        // Start periodic location upload
+        serviceScope.launch {
+            while (isActive && isTracking) {
+                uploadLocationUpdates()
+                delay(UPDATE_INTERVAL)
+            }
+        }
+        
+        Log.d(TAG, "Location tracking started")
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestLocationUpdates() {
+        val locationRequest = LocationRequest.create().apply {
+            priority = LocationRequest.PRIORITY_HIGH_ACCURACY
+            interval = UPDATE_INTERVAL
+            fastestInterval = FASTEST_UPDATE_INTERVAL
+            smallestDisplacement = MIN_DISTANCE_BETWEEN_UPDATES
+        }
+        
+        fusedLocationClient.requestLocationUpdates(
+            locationRequest,
+            locationCallback,
+            Looper.getMainLooper()
+        )
+    }
+
+    private fun stopLocationTracking() {
+        if (!isTracking) return
+        
+        fusedLocationClient.removeLocationUpdates(locationCallback)
+        isTracking = false
+        _trackingStatus.value = false
+        
+        Log.d(TAG, "Location tracking stopped")
+    }
+
+    private fun setupLocationCallback() {
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                result.lastLocation?.let { location ->
+                    if (isLocationValid(location)) {
+                        handleLocationUpdate(location)
+                    }
+                }
+            }
+            
+            override fun onLocationAvailability(availability: LocationAvailability) {
+                if (!availability.isLocationAvailable) {
+                    Log.w(TAG, "Location not available")
+                }
+            }
+        }
+    }
+
+    private fun isLocationValid(location: Location): Boolean {
+        // Check accuracy
+        if (location.accuracy > ACCURACY_THRESHOLD) {
+            Log.w(TAG, "Location accuracy too low: ${location.accuracy}m")
+            return false
+        }
+        
+        // Check if location is significantly different from last one
+        lastLocation?.let { last ->
+            val distance = last.distanceTo(location)
+            if (distance < MIN_DISTANCE_BETWEEN_UPDATES) {
+                Log.d(TAG, "Location too close to last one: ${distance}m")
+                return false
+            }
+        }
+        
+        return true
+    }
+
+    private fun handleLocationUpdate(location: Location) {
+        lastLocation = location
+        lastUpdateTime = System.currentTimeMillis()
+        
+        val latLng = LatLng(location.latitude, location.longitude)
+        _locationUpdates.value = latLng
+        
+        Log.d(TAG, "Location updated: ${location.latitude}, ${location.longitude}")
+    }
+
+    private suspend fun uploadLocationUpdates() {
+        lastLocation?.let { location ->
+            currentShipmentId?.let { shipmentId ->
+                currentDriverId?.let { driverId ->
+                    currentVehicleId?.let { vehicleId ->
+                        
+                        val request = UpdateLocationRequest(
+                            shipmentId = shipmentId,
+                            driverId = driverId,
+                            vehicleId = vehicleId,
+                            location = LatLng(location.latitude, location.longitude),
+                            accuracy = location.accuracy,
+                            speed = location.speed,
+                            heading = if (location.hasBearing()) location.bearing else 0f,
+                            batteryLevel = getBatteryLevel(),
+                            isMoving = location.speed > 0.5f // 0.5 m/s threshold
+                        )
+                        
+                        try {
+                            when (val result = updateLocationUseCase(request)) {
+                                is com.edham.logistics.core.utils.Result.Success -> {
+                                    Log.d(TAG, "Location uploaded successfully")
+                                }
+                                is com.edham.logistics.core.utils.Result.Error -> {
+                                    Log.e(TAG, "Failed to upload location: ${result.exception.message}")
+                                }
+                                is com.edham.logistics.core.utils.Result.Loading -> {
+                                    // Handle loading state if needed
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error uploading location", e)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED &&
+        ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun getBatteryLevel(): Float? {
+        return try {
+            val batteryManager = getSystemService(Context.BATTERY_SERVICE) as android.os.BatteryManager
+            batteryManager.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY).toFloat()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting battery level", e)
+            null
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "Location Tracking Service",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Tracks vehicle location for shipment tracking"
+                setShowBadge(false)
+                enableVibration(false)
+                setSound(null, null)
+            }
+            
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun createNotification(): Notification {
+        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("تتبع الموقع نشط")
+            .setContentText("جاري تتبع موقع المركبة للشحنة")
+            .setSmallIcon(R.drawable.ic_location_tracking)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .setSilent(true)
+            .build()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        stopLocationTracking()
+        serviceScope.cancel()
+    }
+}

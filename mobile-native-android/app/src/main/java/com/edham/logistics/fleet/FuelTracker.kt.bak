@@ -1,0 +1,826 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.FuelTransactionEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Fuel Tracker - Comprehensive fuel tracking and management system
+ * 
+ * Features:
+ * - Fuel transaction tracking
+ * - Fuel consumption monitoring
+ * - Fuel level monitoring
+ * - Fuel cost tracking
+ * - Fuel efficiency analysis
+ * - Fuel theft detection
+ * - Refueling alerts
+ * - Fuel budget management
+ */
+@Singleton
+class FuelTracker @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _trackingState = MutableStateFlow<FuelTrackingState>(FuelTrackingState.Idle)
+    val trackingState: StateFlow<FuelTrackingState> = _trackingState.asStateFlow()
+    
+    private val _fuelTransactions = MutableStateFlow<List<FuelTransactionEntity>>(emptyList())
+    val fuelTransactions: StateFlow<List<FuelTransactionEntity>> = _fuelTransactions.asStateFlow()
+    
+    private val _fuelAnalytics = MutableStateFlow<FuelAnalytics?>(null)
+    val fuelAnalytics: StateFlow<FuelAnalytics?> = _fuelAnalytics.asStateFlow()
+    
+    private val _fuelAlerts = MutableStateFlow<List<FuelAlert>>(emptyList())
+    val fuelAlerts: StateFlow<List<FuelAlert>> = _fuelAlerts.asStateFlow()
+    
+    private val _vehicleFuelLevels = MutableStateFlow<Map<Long, Float>>(emptyMap())
+    val vehicleFuelLevels: StateFlow<Map<Long, Float>> = _vehicleFuelLevels.asStateFlow()
+    
+    private var isTracking = false
+    private val trackedVehicles = mutableSetOf<Long>()
+    private val fuelListeners = mutableListOf<FuelTrackingListener>()
+    
+    companion object {
+        private const val TAG = "FuelTracker"
+        private const val MONITORING_INTERVAL = 60000L // 1 minute
+        private const val LOW_FUEL_THRESHOLD = 20f
+        private const val CRITICAL_FUEL_THRESHOLD = 10f
+        private const val THEFT_DETECTION_THRESHOLD = 15f // 15% drop in 30 minutes
+        private const val MAX_TRANSACTIONS_PER_VEHICLE = 1000
+    }
+    
+    /**
+     * Start fuel tracking
+     */
+    suspend fun startTracking(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _trackingState.value = FuelTrackingState.Starting
+                
+                // Load active vehicles
+                val activeVehicles = database.vehicleDao().getVehiclesByStatus(VehicleStatus.IN_USE)
+                
+                // Start tracking each vehicle
+                activeVehicles.forEach { vehicle ->
+                    startVehicleFuelTracking(vehicle.id)
+                }
+                
+                // Start periodic monitoring
+                startPeriodicMonitoring()
+                
+                // Load existing transactions
+                loadFuelTransactions()
+                
+                isTracking = true
+                _trackingState.value = FuelTrackingState.Tracking
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _trackingState.value = FuelTrackingState.Error("Failed to start tracking: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Stop fuel tracking
+     */
+    suspend fun stopTracking(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                isTracking = false
+                
+                // Stop tracking all vehicles
+                trackedVehicles.forEach { vehicleId ->
+                    stopVehicleFuelTracking(vehicleId)
+                }
+                
+                // Stop periodic monitoring
+                stopPeriodicMonitoring()
+                
+                _trackingState.value = FuelTrackingState.Stopped
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _trackingState.value = FuelTrackingState.Error("Failed to stop tracking: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Record fuel transaction
+     */
+    suspend fun recordFuelTransaction(request: FuelTransactionRequest): Result<FuelTransactionEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _trackingState.value = FuelTrackingState.RecordingTransaction
+                
+                // Validate request
+                validateFuelTransactionRequest(request)
+                
+                // Get vehicle
+                val vehicle = database.vehicleDao().getVehicleById(request.vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Create transaction
+                val transaction = FuelTransactionEntity(
+                    id = 0,
+                    vehicleId = request.vehicleId,
+                    transactionType = request.transactionType,
+                    fuelType = request.fuelType,
+                    quantity = request.quantity,
+                    unitPrice = request.unitPrice,
+                    totalPrice = request.quantity * request.unitPrice,
+                    fuelLevelBefore = request.fuelLevelBefore,
+                    fuelLevelAfter = request.fuelLevelAfter,
+                    mileage = request.mileage,
+                    location = request.location,
+                    stationName = request.stationName,
+                    receiptNumber = request.receiptNumber,
+                    paymentMethod = request.paymentMethod,
+                    driverId = request.driverId,
+                    timestamp = request.timestamp ?: Date(),
+                    notes = request.notes,
+                    createdAt = Date()
+                )
+                
+                // Save transaction
+                val transactionId = database.fuelTransactionDao().insertTransaction(transaction)
+                val savedTransaction = transaction.copy(id = transactionId)
+                
+                // Update vehicle fuel level
+                val updatedVehicle = vehicle.copy(
+                    fuelLevel = request.fuelLevelAfter,
+                    updatedAt = Date()
+                )
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Update fuel levels
+                updateVehicleFuelLevels()
+                
+                // Update transactions list
+                updateFuelTransactions()
+                
+                // Check for alerts
+                checkFuelAlerts(request.vehicleId, request.fuelLevelAfter)
+                
+                // Notify listeners
+                notifyFuelTransaction(savedTransaction)
+                
+                _trackingState.value = FuelTrackingState.TransactionRecorded
+                Result.success(savedTransaction)
+                
+            } catch (e: Exception) {
+                _trackingState.value = FuelTrackingState.Error("Failed to record transaction: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update vehicle fuel level
+     */
+    suspend fun updateVehicleFuelLevel(
+        vehicleId: Long,
+        fuelLevel: Float,
+        mileage: Float? = null,
+        timestamp: Date = Date()
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val previousLevel = vehicle.fuelLevel
+                
+                // Update vehicle
+                val updatedVehicle = vehicle.copy(
+                    fuelLevel = fuelLevel,
+                    mileage = mileage ?: vehicle.mileage,
+                    updatedAt = timestamp
+                )
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Update fuel levels
+                updateVehicleFuelLevels()
+                
+                // Check for fuel theft
+                checkFuelTheft(vehicleId, previousLevel, fuelLevel, timestamp)
+                
+                // Check for alerts
+                checkFuelAlerts(vehicleId, fuelLevel)
+                
+                // Notify listeners
+                notifyFuelLevelUpdate(vehicleId, fuelLevel, previousLevel)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fuel transactions for vehicle
+     */
+    suspend fun getVehicleFuelTransactions(vehicleId: Long, limit: Int = 100): List<FuelTransactionEntity> {
+        return withContext(Dispatchers.IO) {
+            database.fuelTransactionDao().getTransactionsByVehicle(vehicleId, limit)
+        }
+    }
+    
+    /**
+     * Get fuel analytics
+     */
+    suspend fun getFuelAnalytics(dateRange: DateRange = DateRange.last30Days()): FuelAnalytics {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = database.fuelTransactionDao().getTransactionsByDateRange(dateRange.startDate, dateRange.endDate)
+                val allVehicles = database.vehicleDao().getAllVehicles()
+                
+                val totalTransactions = transactions.size
+                val totalFuelConsumed = transactions.filter { it.transactionType == FuelTransactionType.REFUELING }
+                    .sumOf { it.quantity.toDouble() }
+                val totalCost = transactions.sumOf { it.totalPrice.toDouble() }
+                
+                val averageFuelPrice = if (transactions.isNotEmpty()) {
+                    transactions.map { it.unitPrice }.average()
+                } else 0.0
+                
+                val fuelByType = transactions.groupBy { it.fuelType }
+                    .mapValues { it.value.sumOf { it.quantity.toDouble() } }
+                
+                val fuelByVehicle = transactions.groupBy { it.vehicleId }
+                    .mapValues { it.value.sumOf { it.quantity.toDouble() } }
+                
+                val consumptionByMonth = calculateConsumptionByMonth(transactions)
+                val costByMonth = calculateCostByMonth(transactions)
+                val efficiencyMetrics = calculateEfficiencyMetrics(transactions, allVehicles)
+                val theftIncidents = calculateTheftIncidents(transactions)
+                
+                FuelAnalytics(
+                    totalTransactions = totalTransactions,
+                    totalFuelConsumed = totalFuelConsumed.toFloat(),
+                    totalCost = totalCost.toFloat(),
+                    averageFuelPrice = averageFuelPrice.toFloat(),
+                    fuelByType = fuelByType,
+                    fuelByVehicle = fuelByVehicle,
+                    consumptionByMonth = consumptionByMonth,
+                    costByMonth = costByMonth,
+                    efficiencyMetrics = efficiencyMetrics,
+                    theftIncidents = theftIncidents,
+                    dateRange = dateRange
+                )
+                
+            } catch (e: Exception) {
+                FuelAnalytics()
+            }
+        }
+    }
+    
+    /**
+     * Get fuel efficiency for vehicle
+     */
+    suspend fun getVehicleFuelEfficiency(vehicleId: Long, dateRange: DateRange = DateRange.last30Days()): FuelEfficiency {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = database.fuelTransactionDao().getTransactionsByVehicleAndDateRange(vehicleId, dateRange.startDate, dateRange.endDate)
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val refuelingTransactions = transactions.filter { it.transactionType == FuelTransactionType.REFUELING }
+                
+                if (refuelingTransactions.isEmpty()) {
+                    return@withContext FuelEfficiency(
+                        vehicleId = vehicleId,
+                        vehicleIdString = vehicle.vehicleId,
+                        kmPerLiter = 0f,
+                        litersPer100km = 0f,
+                        costPerKm = 0f,
+                        totalDistance = 0f,
+                        totalFuel = 0f,
+                        totalCost = 0f,
+                        efficiency = 0f
+                    )
+                }
+                
+                val totalFuel = refuelingTransactions.sumOf { it.quantity.toDouble() }.toFloat()
+                val totalCost = refuelingTransactions.sumOf { it.totalPrice.toDouble() }.toFloat()
+                
+                // Calculate distance between refueling points
+                val totalDistance = calculateTotalDistance(refuelingTransactions)
+                
+                val kmPerLiter = if (totalFuel > 0) totalDistance / totalFuel else 0f
+                val litersPer100km = if (totalDistance > 0) (totalFuel / totalDistance) * 100f else 0f
+                val costPerKm = if (totalDistance > 0) totalCost / totalDistance else 0f
+                
+                val efficiency = when {
+                    kmPerLiter >= 15 -> FuelEfficiencyLevel.EXCELLENT
+                    kmPerLiter >= 12 -> FuelEfficiencyLevel.GOOD
+                    kmPerLiter >= 8 -> FuelEfficiencyLevel.AVERAGE
+                    kmPerLiter >= 5 -> FuelEfficiencyLevel.POOR
+                    else -> FuelEfficiencyLevel.VERY_POOR
+                }
+                
+                FuelEfficiency(
+                    vehicleId = vehicleId,
+                    vehicleIdString = vehicle.vehicleId,
+                    kmPerLiter = kmPerLiter,
+                    litersPer100km = litersPer100km,
+                    costPerKm = costPerKm,
+                    totalDistance = totalDistance,
+                    totalFuel = totalFuel,
+                    totalCost = totalCost,
+                    efficiency = efficiency
+                )
+                
+            } catch (e: Exception) {
+                throw Exception("Failed to calculate fuel efficiency: ${e.message}")
+            }
+        }
+    }
+    
+    /**
+     * Get fuel budget analysis
+     */
+    suspend fun getFuelBudgetAnalysis(dateRange: DateRange = DateRange.last30Days()): FuelBudgetAnalysis {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = database.fuelTransactionDao().getTransactionsByDateRange(dateRange.startDate, dateRange.endDate)
+                val totalCost = transactions.sumOf { it.totalPrice.toDouble() }.toFloat()
+                
+                // Budget would be set based on company policy
+                val monthlyBudget = 50000f // Placeholder
+                val dailyBudget = monthlyBudget / 30f
+                val actualDailySpend = totalCost / dateRange.days
+                val budgetUtilization = (totalCost / monthlyBudget) * 100f
+                
+                val projectedMonthlySpend = actualDailySpend * 30f
+                val variance = projectedMonthlySpend - monthlyBudget
+                
+                val costTrend = calculateCostTrend(transactions)
+                val recommendations = generateBudgetRecommendations(totalCost, monthlyBudget, costTrend)
+                
+                FuelBudgetAnalysis(
+                    totalCost = totalCost,
+                    monthlyBudget = monthlyBudget,
+                    dailyBudget = dailyBudget,
+                    actualDailySpend = actualDailySpend,
+                    budgetUtilization = budgetUtilization,
+                    projectedMonthlySpend = projectedMonthlySpend,
+                    variance = variance,
+                    costTrend = costTrend,
+                    recommendations = recommendations
+                )
+                
+            } catch (e: Exception) {
+                FuelBudgetAnalysis()
+            }
+        }
+    }
+    
+    /**
+     * Add fuel tracking listener
+     */
+    fun addFuelTrackingListener(listener: FuelTrackingListener) {
+        fuelListeners.add(listener)
+    }
+    
+    /**
+     * Remove fuel tracking listener
+     */
+    fun removeFuelTrackingListener(listener: FuelTrackingListener) {
+        fuelListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun startVehicleFuelTracking(vehicleId: Long) {
+        trackedVehicles.add(vehicleId)
+        // Implementation would start vehicle-specific fuel monitoring
+    }
+    
+    private suspend fun stopVehicleFuelTracking(vehicleId: Long) {
+        trackedVehicles.remove(vehicleId)
+        // Implementation would stop vehicle-specific fuel monitoring
+    }
+    
+    private fun startPeriodicMonitoring() {
+        // Implementation would start periodic fuel level monitoring
+    }
+    
+    private fun stopPeriodicMonitoring() {
+        // Implementation would stop periodic monitoring
+    }
+    
+    private suspend fun loadFuelTransactions() {
+        val transactions = database.fuelTransactionDao().getAllTransactions()
+        _fuelTransactions.value = transactions
+    }
+    
+    private suspend fun updateVehicleFuelLevels() {
+        val vehicles = database.vehicleDao().getAllVehicles()
+        val fuelLevels = vehicles.associate { it.id to it.fuelLevel }
+        _vehicleFuelLevels.value = fuelLevels
+    }
+    
+    private fun validateFuelTransactionRequest(request: FuelTransactionRequest) {
+        if (request.vehicleId <= 0) throw Exception("Valid vehicle ID is required")
+        if (request.quantity <= 0) throw Exception("Fuel quantity must be positive")
+        if (request.unitPrice <= 0) throw Exception("Unit price must be positive")
+        if (request.fuelLevelBefore < 0 || request.fuelLevelBefore > 100) {
+            throw Exception("Invalid fuel level before")
+        }
+        if (request.fuelLevelAfter < 0 || request.fuelLevelAfter > 100) {
+            throw Exception("Invalid fuel level after")
+        }
+    }
+    
+    private suspend fun checkFuelAlerts(vehicleId: Long, fuelLevel: Float) {
+        val alerts = mutableListOf<FuelAlert>()
+        
+        when {
+            fuelLevel <= CRITICAL_FUEL_THRESHOLD -> {
+                alerts.add(FuelAlert(
+                    id = 0,
+                    vehicleId = vehicleId,
+                    type = FuelAlertType.CRITICAL_FUEL,
+                    message = "Critical fuel level: ${fuelLevel}%",
+                    severity = AlertSeverity.CRITICAL,
+                    timestamp = Date(),
+                    resolved = false
+                ))
+            }
+            fuelLevel <= LOW_FUEL_THRESHOLD -> {
+                alerts.add(FuelAlert(
+                    id = 0,
+                    vehicleId = vehicleId,
+                    type = FuelAlertType.LOW_FUEL,
+                    message = "Low fuel level: ${fuelLevel}%",
+                    severity = AlertSeverity.HIGH,
+                    timestamp = Date(),
+                    resolved = false
+                ))
+            }
+        }
+        
+        if (alerts.isNotEmpty()) {
+            val currentAlerts = _fuelAlerts.value.toMutableList()
+            currentAlerts.addAll(alerts)
+            _fuelAlerts.value = currentAlerts
+            
+            alerts.forEach { alert ->
+                notifyFuelAlert(alert)
+            }
+        }
+    }
+    
+    private suspend fun checkFuelTheft(vehicleId: Long, previousLevel: Float, currentLevel: Float, timestamp: Date) {
+        val levelDrop = previousLevel - currentLevel
+        
+        // Check for significant fuel drop
+        if (levelDrop >= THEFT_DETECTION_THRESHOLD) {
+            // Check if this happened during expected operation
+            val thirtyMinutesAgo = Date(timestamp.time - 30 * 60 * 1000)
+            val recentTransactions = database.fuelTransactionDao()
+                .getTransactionsByVehicleAndAfterDate(vehicleId, thirtyMinutesAgo)
+            
+            // If no recent refueling, this might be theft
+            if (recentTransactions.isEmpty()) {
+                val theftAlert = FuelAlert(
+                    id = 0,
+                    vehicleId = vehicleId,
+                    type = FuelAlertType.FUEL_THEFT,
+                    message = "Potential fuel theft detected: ${levelDrop}% drop in 30 minutes",
+                    severity = AlertSeverity.CRITICAL,
+                    timestamp = timestamp,
+                    resolved = false
+                )
+                
+                val currentAlerts = _fuelAlerts.value.toMutableList()
+                currentAlerts.add(theftAlert)
+                _fuelAlerts.value = currentAlerts
+                
+                notifyFuelAlert(theftAlert)
+            }
+        }
+    }
+    
+    private suspend fun updateFuelTransactions() {
+        val transactions = database.fuelTransactionDao().getAllTransactions()
+        _fuelTransactions.value = transactions
+    }
+    
+    private fun calculateConsumptionByMonth(transactions: List<FuelTransactionEntity>): Map<String, Double> {
+        return transactions.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.timestamp
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { it.value.sumOf { transaction -> transaction.quantity.toDouble() } }
+    }
+    
+    private fun calculateCostByMonth(transactions: List<FuelTransactionEntity>): Map<String, Double> {
+        return transactions.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.timestamp
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { it.value.sumOf { transaction -> transaction.totalPrice.toDouble() } }
+    }
+    
+    private fun calculateEfficiencyMetrics(
+        transactions: List<FuelTransactionEntity>,
+        vehicles: List<VehicleEntity>
+    ): Map<String, Float> {
+        val metrics = mutableMapOf<String, Float>()
+        
+        vehicles.forEach { vehicle ->
+            val vehicleTransactions = transactions.filter { it.vehicleId == vehicle.id }
+            val refuelingTransactions = vehicleTransactions.filter { it.transactionType == FuelTransactionType.REFUELING }
+            
+            if (refuelingTransactions.isNotEmpty()) {
+                val totalFuel = refuelingTransactions.sumOf { it.quantity.toDouble() }.toFloat()
+                val totalDistance = calculateTotalDistance(refuelingTransactions)
+                val efficiency = if (totalFuel > 0) totalDistance / totalFuel else 0f
+                
+                metrics[vehicle.vehicleId] = efficiency
+            }
+        }
+        
+        return metrics
+    }
+    
+    private fun calculateTheftIncidents(transactions: List<FuelTransactionEntity>): Int {
+        // Implementation would analyze transactions for theft patterns
+        return 0 // Placeholder
+    }
+    
+    private fun calculateTotalDistance(transactions: List<FuelTransactionEntity>): Float {
+        // Implementation would calculate distance between refueling points
+        return 0f // Placeholder
+    }
+    
+    private fun calculateCostTrend(transactions: List<FuelTransactionEntity>): CostTrend {
+        if (transactions.size < 2) return CostTrend.STABLE
+        
+        val recentTransactions = transactions.takeLast(10)
+        val olderTransactions = transactions.dropLast(10).takeLast(10)
+        
+        if (olderTransactions.isEmpty()) return CostTrend.STABLE
+        
+        val recentAvg = recentTransactions.map { it.unitPrice }.average()
+        val olderAvg = olderTransactions.map { it.unitPrice }.average()
+        
+        val change = (recentAvg - olderAvg) / olderAvg * 100
+        
+        return when {
+            change > 5 -> CostTrend.INCREASING
+            change < -5 -> CostTrend.DECREASING
+            else -> CostTrend.STABLE
+        }
+    }
+    
+    private fun generateBudgetRecommendations(
+        totalCost: Float,
+        monthlyBudget: Float,
+        costTrend: CostTrend
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (totalCost > monthlyBudget * 0.8) {
+            recommendations.add("Fuel spending is approaching budget limit")
+        }
+        
+        if (costTrend == CostTrend.INCREASING) {
+            recommendations.add("Fuel costs are trending upward - consider optimization strategies")
+        }
+        
+        if (costTrend == CostTrend.DECREASING) {
+            recommendations.add("Good cost control - maintain current practices")
+        }
+        
+        return recommendations
+    }
+    
+    private fun notifyFuelTransaction(transaction: FuelTransactionEntity) {
+        fuelListeners.forEach { listener ->
+            listener.onFuelTransaction(transaction)
+        }
+    }
+    
+    private fun notifyFuelLevelUpdate(vehicleId: Long, newLevel: Float, previousLevel: Float) {
+        fuelListeners.forEach { listener ->
+            listener.onFuelLevelUpdate(vehicleId, newLevel, previousLevel)
+        }
+    }
+    
+    private fun notifyFuelAlert(alert: FuelAlert) {
+        fuelListeners.forEach { listener ->
+            listener.onFuelAlert(alert)
+        }
+    }
+    
+    /**
+     * Get tracking status
+     */
+    fun isTracking(): Boolean = isTracking
+    
+    /**
+     * Get tracked vehicles count
+     */
+    fun getTrackedVehiclesCount(): Int = trackedVehicles.size
+}
+
+/**
+ * Data classes
+ */
+data class FuelTransactionRequest(
+    val vehicleId: Long,
+    val transactionType: FuelTransactionType,
+    val fuelType: FuelType,
+    val quantity: Float,
+    val unitPrice: Float,
+    val fuelLevelBefore: Float,
+    val fuelLevelAfter: Float,
+    val mileage: Float,
+    val location: String,
+    val stationName: String?,
+    val receiptNumber: String?,
+    val paymentMethod: PaymentMethod,
+    val driverId: String?,
+    val timestamp: Date?,
+    val notes: String?
+)
+
+data class FuelAnalytics(
+    val totalTransactions: Int = 0,
+    val totalFuelConsumed: Float = 0f,
+    val totalCost: Float = 0f,
+    val averageFuelPrice: Float = 0f,
+    val fuelByType: Map<String, Double> = emptyMap(),
+    val fuelByVehicle: Map<Long, Double> = emptyMap(),
+    val consumptionByMonth: Map<String, Double> = emptyMap(),
+    val costByMonth: Map<String, Double> = emptyMap(),
+    val efficiencyMetrics: Map<String, Float> = emptyMap(),
+    val theftIncidents: Int = 0,
+    val dateRange: DateRange = DateRange()
+)
+
+data class FuelEfficiency(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val kmPerLiter: Float,
+    val litersPer100km: Float,
+    val costPerKm: Float,
+    val totalDistance: Float,
+    val totalFuel: Float,
+    val totalCost: Float,
+    val efficiency: FuelEfficiencyLevel
+)
+
+data class FuelBudgetAnalysis(
+    val totalCost: Float = 0f,
+    val monthlyBudget: Float = 0f,
+    val dailyBudget: Float = 0f,
+    val actualDailySpend: Float = 0f,
+    val budgetUtilization: Float = 0f,
+    val projectedMonthlySpend: Float = 0f,
+    val variance: Float = 0f,
+    val costTrend: CostTrend = CostTrend.STABLE,
+    val recommendations: List<String> = emptyList()
+)
+
+data class FuelAlert(
+    val id: Long,
+    val vehicleId: Long,
+    val type: FuelAlertType,
+    val message: String,
+    val severity: AlertSeverity,
+    val timestamp: Date,
+    val resolved: Boolean
+)
+
+data class DateRange(
+    val startDate: Date,
+    val endDate: Date
+) {
+    val days: Int get() = ((endDate.time - startDate.time) / (24 * 60 * 60 * 1000)).toInt() + 1
+    
+    companion object {
+        fun last30Days(): DateRange {
+            val endDate = Date()
+            val startDate = Date(endDate.time - 30L * 24 * 60 * 60 * 1000)
+            return DateRange(startDate, endDate)
+        }
+        
+        fun last7Days(): DateRange {
+            val endDate = Date()
+            val startDate = Date(endDate.time - 7L * 24 * 60 * 60 * 1000)
+            return DateRange(startDate, endDate)
+        }
+        
+        fun thisMonth(): DateRange {
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.DAY_OF_MONTH, 1)
+            val startDate = calendar.time
+            
+            calendar.add(Calendar.MONTH, 1)
+            calendar.add(Calendar.DAY_OF_MONTH, -1)
+            val endDate = calendar.time
+            
+            return DateRange(startDate, endDate)
+        }
+    }
+}
+
+/**
+ * Interfaces
+ */
+interface FuelTrackingListener {
+    fun onFuelTransaction(transaction: FuelTransactionEntity)
+    fun onFuelLevelUpdate(vehicleId: Long, newLevel: Float, previousLevel: Float)
+    fun onFuelAlert(alert: FuelAlert)
+}
+
+/**
+ * Enums
+ */
+enum class FuelTrackingState {
+    Idle,
+    Starting,
+    Tracking,
+    RecordingTransaction,
+    TransactionRecorded,
+    Stopping,
+    Stopped,
+    Error
+}
+
+enum class FuelTransactionType {
+    REFUELING,
+    FUEL_THEFT,
+    CORRECTION,
+    TRANSFER
+}
+
+enum class FuelType {
+    GASOLINE,
+    DIESEL,
+    ELECTRIC,
+    HYBRID,
+    NATURAL_GAS,
+    PROPANE
+}
+
+enum class PaymentMethod {
+    CASH,
+    CREDIT_CARD,
+    DEBIT_CARD,
+    FUEL_CARD,
+    COMPANY_ACCOUNT,
+    OTHER
+}
+
+enum class FuelAlertType {
+    LOW_FUEL,
+    CRITICAL_FUEL,
+    FUEL_THEFT,
+    ABNORMAL_CONSUMPTION,
+    REFUELING_REQUIRED,
+    COST_ANOMALY
+}
+
+enum class FuelEfficiencyLevel {
+    EXCELLENT,
+    GOOD,
+    AVERAGE,
+    POOR,
+    VERY_POOR
+}
+
+enum class CostTrend {
+    INCREASING,
+    DECREASING,
+    STABLE
+}

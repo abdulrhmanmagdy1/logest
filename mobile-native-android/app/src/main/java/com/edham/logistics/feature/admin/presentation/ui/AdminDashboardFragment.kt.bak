@@ -1,0 +1,247 @@
+package com.edham.logistics.feature.admin.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.databinding.FragmentAdminDashboardBinding
+import com.edham.logistics.feature.admin.presentation.ui.AdminDashboardViewModel
+import com.edham.logistics.feature.admin.presentation.adapter.RecentUsersAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class AdminDashboardFragment : Fragment() {
+
+    private var _binding: FragmentAdminDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: AdminDashboardViewModel by viewModels()
+    
+    @Inject
+    lateinit var recentUsersAdapter: RecentUsersAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentAdminDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerView()
+        observeViewModel()
+        setupClickListeners()
+    }
+
+    private fun setupRecyclerView() {
+        binding.recyclerViewRecentUsers.apply {
+            adapter = recentUsersAdapter
+            layoutManager = LinearLayoutManager(requireContext())
+        }
+        
+        recentUsersAdapter.setOnItemClickListener { user ->
+            // Navigate to user details
+            navigateToUserDetails(user.id)
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.cardShipments.setOnClickListener {
+            viewModel.navigateToShipments()
+        }
+        
+        binding.cardDrivers.setOnClickListener {
+            viewModel.navigateToUsers()
+        }
+        
+        binding.cardVehicles.setOnClickListener {
+            viewModel.navigateToVehicles()
+        }
+        
+        binding.cardRevenue.setOnClickListener {
+            viewModel.navigateToReports()
+        }
+        
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refreshDashboard()
+        }
+        
+        binding.swipeRefreshLayout.setOnRefreshListener {
+            viewModel.refreshDashboard()
+        }
+    }
+
+    private fun updateUI(uiState: AdminDashboardViewModel.AdminDashboardUiState) {
+        // Handle navigation events
+        if (uiState.navigateToUsers) {
+            navigateToUsers()
+            viewModel.onNavigationHandled()
+        }
+        
+        if (uiState.navigateToShipments) {
+            navigateToShipments()
+            viewModel.onNavigationHandled()
+        }
+        
+        if (uiState.navigateToVehicles) {
+            navigateToVehicles()
+            viewModel.onNavigationHandled()
+        }
+        
+        if (uiState.navigateToReports) {
+            navigateToReports()
+            viewModel.onNavigationHandled()
+        }
+        
+        // Update loading state
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.gone()
+        binding.layoutError.gone()
+        binding.swipeRefreshLayout.isRefreshing = false
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.gone()
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.swipeRefreshLayout.isRefreshing = false
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refreshDashboard()
+        }
+    }
+
+    private fun showContent(uiState: AdminDashboardViewModel.AdminDashboardUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        binding.swipeRefreshLayout.isRefreshing = false
+        
+        uiState.dashboardStats?.let { stats ->
+            updateDashboardCards(stats)
+            updateSystemHealth(stats.systemHealth)
+        }
+        
+        // Update recent users
+        recentUsersAdapter.submitList(uiState.recentUsers)
+    }
+
+    private fun updateDashboardCards(stats: com.edham.logistics.feature.admin.domain.model.DashboardStats) {
+        binding.textTotalShipments.text = stats.totalShipments.toString()
+        binding.textActiveShipments.text = stats.activeShipments.toString()
+        binding.textCompletedShipments.text = stats.completedShipments.toString()
+        binding.textTotalDrivers.text = stats.totalDrivers.toString()
+        binding.textActiveDrivers.text = stats.activeDrivers.toString()
+        binding.textTotalVehicles.text = stats.totalVehicles.toString()
+        binding.textAvailableVehicles.text = stats.availableVehicles.toString()
+        binding.textTotalRevenue.text = formatCurrency(stats.totalRevenue)
+        binding.textMonthlyRevenue.text = formatCurrency(stats.monthlyRevenue)
+        binding.textTotalCustomers.text = stats.totalCustomers.toString()
+        binding.textNewCustomers.text = stats.newCustomersThisMonth.toString()
+        binding.textPendingTasks.text = stats.pendingTasks.toString()
+        binding.textOverdueTasks.text = stats.overdueTasks.toString()
+    }
+
+    private fun updateSystemHealth(systemHealth: com.edham.logistics.feature.admin.domain.model.SystemHealth) {
+        binding.textSystemHealth.text = when (systemHealth.overallHealth) {
+            "healthy" -> "سليم"
+            "warning" -> "تحذير"
+            "critical" -> "حرج"
+            else -> "غير معروف"
+        }
+        
+        binding.textApiStatus.text = when (systemHealth.apiStatus) {
+            "online" -> "متصل"
+            "offline" -> "غير متصل"
+            else -> systemHealth.apiStatus
+        }
+        
+        binding.textDatabaseStatus.text = when (systemHealth.databaseStatus) {
+            "online" -> "متصل"
+            "offline" -> "غير متصل"
+            else -> systemHealth.databaseStatus
+        }
+        
+        binding.textLastBackup.text = systemHealth.lastBackupTime
+        binding.textStorageUsage.text = "${systemHealth.storageUsage}%"
+        binding.textMemoryUsage.text = "${systemHealth.memoryUsage}%"
+        binding.textCpuUsage.text = "${systemHealth.cpuUsage}%"
+        
+        // Update health indicator color
+        binding.indicatorSystemHealth.setBackgroundColor(
+            when (systemHealth.overallHealth) {
+                "healthy" -> android.graphics.Color.GREEN
+                "warning" -> android.graphics.Color.YELLOW
+                "critical" -> android.graphics.Color.RED
+                else -> android.graphics.Color.GRAY
+            }
+        )
+    }
+
+    private fun formatCurrency(amount: Double): String {
+        return String.format("%,.2f ريال", amount)
+    }
+
+    private fun navigateToUsers() {
+        findNavController().navigate(R.id.action_adminDashboardFragment_to_usersFragment)
+    }
+
+    private fun navigateToShipments() {
+        findNavController().navigate(R.id.action_adminDashboardFragment_to_shipmentsFragment)
+    }
+
+    private fun navigateToVehicles() {
+        findNavController().navigate(R.id.action_adminDashboardFragment_to_vehiclesFragment)
+    }
+
+    private fun navigateToReports() {
+        findNavController().navigate(R.id.action_adminDashboardFragment_to_reportsFragment)
+    }
+
+    private fun navigateToUserDetails(userId: String) {
+        val action = AdminDashboardFragmentDirections
+            .actionAdminDashboardFragmentToUserDetailsFragment(userId)
+        findNavController().navigate(action)
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

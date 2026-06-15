@@ -1,0 +1,804 @@
+package com.edham.logistics.finance.audit
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.FinancialAuditApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Financial Audit Log Service - Comprehensive financial audit logging and monitoring
+ * 
+ * Features:
+ * - Complete audit trail for all financial operations
+ * - Real-time audit monitoring
+ * - Compliance checking and reporting
+ * - Anomaly detection and alerts
+ * - Audit log retention and archiving
+ * - Role-based audit access
+ * - Audit report generation
+ */
+@Singleton
+class FinancialAuditLogService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val financialAuditApi: FinancialAuditApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _auditLogState = MutableStateFlow<AuditLogState>(AuditLogState.Idle)
+    val auditLogState: StateFlow<AuditLogState> = _auditLogState.asStateFlow()
+    
+    private val _auditLogs = MutableStateFlow<List<FinancialAuditLog>>(emptyList())
+    val auditLogs: StateFlow<List<FinancialAuditLog>> = _auditLogs.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "FinancialAuditLogService"
+        private const val AUDIT_LOG_CACHE_SIZE = 1000
+        private const val AUDIT_LOG_RETENTION_DAYS = 365 // 1 year
+        private const val ANOMALY_THRESHOLD = 3 // Standard deviations
+        private const val BATCH_SIZE = 100
+    }
+    
+    /**
+     * Initialize financial audit log service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _auditLogState.value = AuditLogState.Initializing
+                
+                // Load recent audit logs
+                loadRecentAuditLogs()
+                
+                // Initialize anomaly detection
+                initializeAnomalyDetection()
+                
+                // Start audit log cleanup
+                scheduleAuditLogCleanup()
+                
+                isInitialized = true
+                _auditLogState.value = AuditLogState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _auditLogState.value = AuditLogState.Error("Failed to initialize audit log service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Log financial operation
+     */
+    suspend fun logFinancialOperation(
+        operationType: FinancialOperationType,
+        entityType: FinancialEntityType,
+        entityId: String,
+        userId: String,
+        details: Map<String, Any>,
+        oldValue: Any? = null,
+        newValue: Any? = null,
+        metadata: Map<String, String> = emptyMap()
+    ): Result<FinancialAuditLog> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Audit log service not initialized")
+                }
+                
+                _auditLogState.value = AuditLogState.Logging
+                
+                // Create audit log entry
+                val auditLog = FinancialAuditLog(
+                    id = UUID.randomUUID().toString(),
+                    operationType = operationType,
+                    entityType = entityType,
+                    entityId = entityId,
+                    userId = userId,
+                    timestamp = Date(),
+                    details = details,
+                    oldValue = oldValue?.toString(),
+                    newValue = newValue?.toString(),
+                    ipAddress = getIPAddress(),
+                    userAgent = getUserAgent(),
+                    sessionId = getCurrentSessionId(),
+                    riskScore = calculateRiskScore(operationType, details),
+                    complianceStatus = checkCompliance(operationType, details),
+                    metadata = metadata
+                )
+                
+                // Check for anomalies
+                val anomalyCheck = checkForAnomalies(auditLog)
+                if (anomalyCheck.isAnomaly) {
+                    auditLog.copy(
+                        isAnomalous = true,
+                        anomalyReason = anomalyCheck.reason,
+                        anomalySeverity = anomalyCheck.severity
+                    )
+                }
+                
+                // Save to database
+                val savedLog = database.financialAuditLogDao().insertAuditLog(auditLog.toEntity())
+                    .let { id -> auditLog.copy(id = id.toString()) }
+                
+                // Add to cache
+                addToAuditLogs(savedLog)
+                
+                // Check for real-time alerts
+                checkForRealTimeAlerts(savedLog)
+                
+                _auditLogState.value = AuditLogState.Ready
+                Result.success(savedLog)
+                
+            } catch (e: Exception) {
+                _auditLogState.value = AuditLogState.Error("Failed to log financial operation: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get audit logs with filtering
+     */
+    suspend fun getAuditLogs(
+        operationType: FinancialOperationType? = null,
+        entityType: FinancialEntityType? = null,
+        userId: String? = null,
+        dateRange: DateRange? = null,
+        riskLevel: RiskLevel? = null,
+        complianceStatus: ComplianceStatus? = null,
+        page: Int = 0,
+        pageSize: Int = 50
+    ): Result<AuditLogResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val logs = database.financialAuditLogDao().getAuditLogs(
+                    operationType = operationType,
+                    entityType = entityType,
+                    userId = userId,
+                    startDate = dateRange?.startDate,
+                    endDate = dateRange?.endDate,
+                    riskLevel = riskLevel,
+                    complianceStatus = complianceStatus,
+                    limit = pageSize,
+                    offset = page * pageSize
+                ).map { it.toDomainModel() }
+                
+                val totalCount = database.financialAuditLogDao().getAuditLogsCount(
+                    operationType = operationType,
+                    entityType = entityType,
+                    userId = userId,
+                    startDate = dateRange?.startDate,
+                    endDate = dateRange?.endDate,
+                    riskLevel = riskLevel,
+                    complianceStatus = complianceStatus
+                )
+                
+                Result.success(
+                    AuditLogResult(
+                        logs = logs,
+                        totalCount = totalCount,
+                        page = page,
+                        pageSize = pageSize,
+                        totalPages = (totalCount + pageSize - 1) / pageSize
+                    )
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get audit log by ID
+     */
+    suspend fun getAuditLog(auditLogId: String): FinancialAuditLog? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _auditLogs.value.find { it.id == auditLogId }
+                    ?: database.financialAuditLogDao().getAuditLogById(auditLogId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Generate compliance report
+     */
+    suspend fun generateComplianceReport(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<ComplianceReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _auditLogState.value = AuditLogState.GeneratingReport
+                
+                val logs = getAuditLogs(dateRange = dateRange).getOrThrow().logs
+                
+                // Analyze compliance
+                val totalOperations = logs.size
+                val compliantOperations = logs.count { it.complianceStatus == ComplianceStatus.COMPLIANT }
+                val nonCompliantOperations = logs.count { it.complianceStatus == ComplianceStatus.NON_COMPLIANT }
+                val highRiskOperations = logs.count { it.riskLevel == RiskLevel.HIGH }
+                val anomalousOperations = logs.count { it.isAnomalous }
+                
+                // Group by operation type
+                val operationsByType = logs.groupBy { it.operationType }
+                    .mapValues { it.value.size }
+                
+                // Group by user
+                val operationsByUser = logs.groupBy { it.userId }
+                    .mapValues { it.value.size }
+                
+                val report = ComplianceReport(
+                    period = dateRange,
+                    totalOperations = totalOperations,
+                    compliantOperations = compliantOperations,
+                    nonCompliantOperations = nonCompliantOperations,
+                    complianceRate = if (totalOperations > 0) (compliantOperations.toFloat() / totalOperations) * 100f else 100f,
+                    highRiskOperations = highRiskOperations,
+                    anomalousOperations = anomalousOperations,
+                    operationsByType = operationsByType,
+                    operationsByUser = operationsByUser,
+                    generatedAt = Date(),
+                    recommendations = generateComplianceRecommendations(logs)
+                )
+                
+                _auditLogState.value = AuditLogState.Ready
+                Result.success(report)
+                
+            } catch (e: Exception) {
+                _auditLogState.value = AuditLogState.Error("Failed to generate compliance report: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate anomaly report
+     */
+    suspend fun generateAnomalyReport(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<AnomalyReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _auditLogState.value = AuditLogState.GeneratingReport
+                
+                val logs = getAuditLogs(dateRange = dateRange).getOrThrow().logs
+                val anomalousLogs = logs.filter { it.isAnomalous }
+                
+                // Analyze anomalies
+                val anomaliesByType = anomalousLogs.groupBy { it.anomalyReason }
+                    .mapValues { it.value.size }
+                
+                val anomaliesBySeverity = anomalousLogs.groupBy { it.anomalySeverity }
+                    .mapValues { it.value.size }
+                
+                val anomaliesByUser = anomalousLogs.groupBy { it.userId }
+                    .mapValues { it.value.size }
+                
+                val report = AnomalyReport(
+                    period = dateRange,
+                    totalOperations = logs.size,
+                    anomalousOperations = anomalousLogs.size,
+                    anomalyRate = if (logs.isNotEmpty()) (anomalousLogs.size.toFloat() / logs.size) * 100f else 0f,
+                    anomaliesByType = anomaliesByType,
+                    anomaliesBySeverity = anomaliesBySeverity,
+                    anomaliesByUser = anomaliesByUser,
+                    topAnomalies = anomalousLogs.sortedByDescending { it.riskScore }.take(10),
+                    generatedAt = Date(),
+                    recommendations = generateAnomalyRecommendations(anomalousLogs)
+                )
+                
+                _auditLogState.value = AuditLogState.Ready
+                Result.success(report)
+                
+            } catch (e: Exception) {
+                _auditLogState.value = AuditLogState.Error("Failed to generate anomaly report: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Export audit logs
+     */
+    suspend fun exportAuditLogs(
+        format: ExportFormat,
+        filters: AuditLogFilters = AuditLogFilters(),
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _auditLogState.value = AuditLogState.Exporting
+                
+                val logs = getAuditLogs(
+                    operationType = filters.operationType,
+                    entityType = filters.entityType,
+                    userId = filters.userId,
+                    dateRange = dateRange,
+                    riskLevel = filters.riskLevel,
+                    complianceStatus = filters.complianceStatus
+                ).getOrThrow().logs
+                
+                val exportPath = when (format) {
+                    ExportFormat.CSV -> exportToCSV(logs)
+                    ExportFormat.JSON -> exportToJSON(logs)
+                    ExportFormat.PDF -> exportToPDF(logs)
+                    ExportFormat.EXCEL -> exportToExcel(logs)
+                }
+                
+                _auditLogState.value = AuditLogState.Ready
+                Result.success(exportPath)
+                
+            } catch (e: Exception) {
+                _auditLogState.value = AuditLogState.Error("Failed to export audit logs: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Archive old audit logs
+     */
+    suspend fun archiveAuditLogs(
+        olderThanDays: Int = AUDIT_LOG_RETENTION_DAYS
+    ): Result<Int> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _auditLogState.value = AuditLogState.Archiving
+                
+                val cutoffDate = Calendar.getInstance().apply {
+                    add(Calendar.DAY_OF_MONTH, -olderThanDays)
+                }.time
+                
+                val archivedCount = database.financialAuditLogDao().archiveAuditLogs(cutoffDate)
+                
+                _auditLogState.value = AuditLogState.Ready
+                Result.success(archivedCount)
+                
+            } catch (e: Exception) {
+                _auditLogState.value = AuditLogState.Error("Failed to archive audit logs: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadRecentAuditLogs() {
+        try {
+            val logs = database.financialAuditLogDao().getRecentAuditLogs(AUDIT_LOG_CACHE_SIZE)
+                .map { it.toDomainModel() }
+            
+            _auditLogs.value = logs
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun initializeAnomalyDetection() {
+        // Initialize anomaly detection models and thresholds
+    }
+    
+    private suspend fun scheduleAuditLogCleanup() {
+        // Schedule periodic cleanup of old audit logs
+    }
+    
+    private fun calculateRiskScore(
+        operationType: FinancialOperationType,
+        details: Map<String, Any>
+    ): Float {
+        var riskScore = 0f
+        
+        // Base risk by operation type
+        riskScore += when (operationType) {
+            FinancialOperationType.DELETE -> 0.8f
+            FinancialOperationType.UPDATE -> 0.4f
+            FinancialOperationType.CREATE -> 0.2f
+            FinancialOperationType.READ -> 0.1f
+            FinancialOperationType.EXPORT -> 0.6f
+            FinancialOperationType.IMPORT -> 0.7f
+        }
+        
+        // Risk by amount (if applicable)
+        val amount = details["amount"] as? Double ?: 0.0
+        if (amount > 10000) riskScore += 0.3f
+        if (amount > 50000) riskScore += 0.4f
+        if (amount > 100000) riskScore += 0.3f
+        
+        return riskScore.coerceIn(0f, 1f)
+    }
+    
+    private fun checkCompliance(
+        operationType: FinancialOperationType,
+        details: Map<String, Any>
+    ): ComplianceStatus {
+        // Check compliance based on operation type and details
+        return when {
+            operationType == FinancialOperationType.DELETE && 
+            details["requiresApproval"] == true -> ComplianceStatus.NON_COMPLIANT
+            operationType == FinancialOperationType.UPDATE && 
+            details["amount"] != null && 
+            (details["amount"] as Double) > 100000 -> ComplianceStatus.REQUIRES_REVIEW
+            else -> ComplianceStatus.COMPLIANT
+        }
+    }
+    
+    private suspend fun checkForAnomalies(auditLog: FinancialAuditLog): AnomalyCheck {
+        // Check for various anomalies
+        val recentLogs = _auditLogs.value.takeLast(100)
+        
+        // Check for unusual frequency
+        val userRecentLogs = recentLogs.filter { it.userId == auditLog.userId }
+        if (userRecentLogs.size > 10) {
+            return AnomalyCheck(
+                isAnomaly = true,
+                reason = "High frequency operations",
+                severity = AnomalySeverity.MEDIUM
+            )
+        }
+        
+        // Check for unusual amounts
+        val amount = auditLog.details["amount"] as? Double ?: 0.0
+        if (amount > 100000) {
+            return AnomalyCheck(
+                isAnomaly = true,
+                reason = "Unusually high amount",
+                severity = AnomalySeverity.HIGH
+            )
+        }
+        
+        // Check for unusual time patterns
+        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        if (hour < 6 || hour > 22) {
+            return AnomalyCheck(
+                isAnomaly = true,
+                reason = "Unusual operation time",
+                severity = AnomalySeverity.LOW
+            )
+        }
+        
+        return AnomalyCheck(isAnomaly = false)
+    }
+    
+    private suspend fun checkForRealTimeAlerts(auditLog: FinancialAuditLog) {
+        if (auditLog.riskScore > 0.8f) {
+            // Send high-risk alert
+            sendAlert(
+                type = AlertType.HIGH_RISK_OPERATION,
+                message = "High-risk financial operation detected",
+                auditLog = auditLog
+            )
+        }
+        
+        if (auditLog.isAnomalous && auditLog.anomalySeverity == AnomalySeverity.HIGH) {
+            // Send anomaly alert
+            sendAlert(
+                type = AlertType.ANOMALY_DETECTED,
+                message = "Anomalous financial operation detected: ${auditLog.anomalyReason}",
+                auditLog = auditLog
+            )
+        }
+    }
+    
+    private suspend fun sendAlert(
+        type: AlertType,
+        message: String,
+        auditLog: FinancialAuditLog
+    ) {
+        // Send real-time alert to monitoring system
+    }
+    
+    private fun getIPAddress(): String {
+        // Get client IP address
+        return "192.168.1.100" // Placeholder
+    }
+    
+    private fun getUserAgent(): String {
+        // Get user agent string
+        return "EdhamLogistics/1.0 (Android)"
+    }
+    
+    private fun getCurrentSessionId(): String {
+        // Get current session ID
+        return UUID.randomUUID().toString()
+    }
+    
+    private fun generateComplianceRecommendations(logs: List<FinancialAuditLog>): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        val nonCompliantLogs = logs.filter { it.complianceStatus != ComplianceStatus.COMPLIANT }
+        if (nonCompliantLogs.isNotEmpty()) {
+            recommendations.add("Review ${nonCompliantLogs.size} non-compliant operations")
+        }
+        
+        val highRiskLogs = logs.filter { it.riskLevel == RiskLevel.HIGH }
+        if (highRiskLogs.size > 5) {
+            recommendations.add("Implement additional controls for high-risk operations")
+        }
+        
+        return recommendations
+    }
+    
+    private fun generateAnomalyRecommendations(anomalousLogs: List<FinancialAuditLog>): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        val anomaliesByUser = anomalousLogs.groupBy { it.userId }
+        anomaliesByUser.forEach { (userId, logs) ->
+            if (logs.size > 3) {
+                recommendations.add("Review user $userId for suspicious activity")
+            }
+        }
+        
+        return recommendations
+    }
+    
+    private suspend fun exportToCSV(logs: List<FinancialAuditLog>): String {
+        // Export to CSV format
+        val csvContent = StringBuilder()
+        csvContent.appendLine("ID,Operation Type,Entity Type,Entity ID,User ID,Timestamp,Risk Score,Compliance Status")
+        
+        logs.forEach { log ->
+            csvContent.appendLine("${log.id},${log.operationType},${log.entityType},${log.entityId},${log.userId},${log.timestamp},${log.riskScore},${log.complianceStatus}")
+        }
+        
+        val fileName = "audit_logs_${Date().time}.csv"
+        val filePath = "${context.getExternalFilesDir(null)}/$fileName"
+        
+        // Write to file
+        context.openFileOutput(fileName, Context.MODE_PRIVATE).use { output ->
+            output.write(csvContent.toString().toByteArray())
+        }
+        
+        return filePath
+    }
+    
+    private suspend fun exportToJSON(logs: List<FinancialAuditLog>): String {
+        // Export to JSON format
+        val jsonContent = securityUtils.toJson(logs)
+        
+        val fileName = "audit_logs_${Date().time}.json"
+        val filePath = "${context.getExternalFilesDir(null)}/$fileName"
+        
+        // Write to file
+        context.openFileOutput(fileName, Context.MODE_PRIVATE).use { output ->
+            output.write(jsonContent.toByteArray())
+        }
+        
+        return filePath
+    }
+    
+    private suspend fun exportToPDF(logs: List<FinancialAuditLog>): String {
+        // Export to PDF format
+        val fileName = "audit_logs_${Date().time}.pdf"
+        val filePath = "${context.getExternalFilesDir(null)}/$fileName"
+        
+        // Generate PDF using external library
+        return filePath
+    }
+    
+    private suspend fun exportToExcel(logs: List<FinancialAuditLog>): String {
+        // Export to Excel format
+        val fileName = "audit_logs_${Date().time}.xlsx"
+        val filePath = "${context.getExternalFilesDir(null)}/$fileName"
+        
+        // Generate Excel using external library
+        return filePath
+    }
+    
+    private fun addToAuditLogs(auditLog: FinancialAuditLog) {
+        val currentLogs = _auditLogs.value.toMutableList()
+        currentLogs.add(0, auditLog) // Add to beginning
+        
+        // Keep only last AUDIT_LOG_CACHE_SIZE logs in cache
+        if (currentLogs.size > AUDIT_LOG_CACHE_SIZE) {
+            currentLogs.removeAt(currentLogs.size - 1)
+        }
+        
+        _auditLogs.value = currentLogs
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class FinancialAuditLog(
+    val id: String = "",
+    val operationType: FinancialOperationType,
+    val entityType: FinancialEntityType,
+    val entityId: String,
+    val userId: String,
+    val timestamp: Date,
+    val details: Map<String, Any>,
+    val oldValue: String? = null,
+    val newValue: String? = null,
+    val ipAddress: String,
+    val userAgent: String,
+    val sessionId: String,
+    val riskScore: Float,
+    val riskLevel: RiskLevel = RiskLevel.LOW,
+    val complianceStatus: ComplianceStatus,
+    val isAnomalous: Boolean = false,
+    val anomalyReason: String? = null,
+    val anomalySeverity: AnomalySeverity? = null,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class AuditLogResult(
+    val logs: List<FinancialAuditLog>,
+    val totalCount: Int,
+    val page: Int,
+    val pageSize: Int,
+    val totalPages: Int
+)
+
+data class ComplianceReport(
+    val period: DateRange,
+    val totalOperations: Int,
+    val compliantOperations: Int,
+    val nonCompliantOperations: Int,
+    val complianceRate: Float,
+    val highRiskOperations: Int,
+    val anomalousOperations: Int,
+    val operationsByType: Map<FinancialOperationType, Int>,
+    val operationsByUser: Map<String, Int>,
+    val generatedAt: Date,
+    val recommendations: List<String>
+)
+
+data class AnomalyReport(
+    val period: DateRange,
+    val totalOperations: Int,
+    val anomalousOperations: Int,
+    val anomalyRate: Float,
+    val anomaliesByType: Map<String, Int>,
+    val anomaliesBySeverity: Map<AnomalySeverity, Int>,
+    val anomaliesByUser: Map<String, Int>,
+    val topAnomalies: List<FinancialAuditLog>,
+    val generatedAt: Date,
+    val recommendations: List<String>
+)
+
+data class AuditLogFilters(
+    val operationType: FinancialOperationType? = null,
+    val entityType: FinancialEntityType? = null,
+    val userId: String? = null,
+    val riskLevel: RiskLevel? = null,
+    val complianceStatus: ComplianceStatus? = null
+)
+
+data class AnomalyCheck(
+    val isAnomaly: Boolean,
+    val reason: String? = null,
+    val severity: AnomalySeverity? = null
+)
+
+data class DateRange(
+    val startDate: Date,
+    val endDate: Date
+) {
+    companion object {
+        fun last30Days(): DateRange {
+            val calendar = Calendar.getInstance()
+            val endDate = calendar.time
+            calendar.add(Calendar.DAY_OF_MONTH, -30)
+            val startDate = calendar.time
+            return DateRange(startDate, endDate)
+        }
+        
+        fun last7Days(): DateRange {
+            val calendar = Calendar.getInstance()
+            val endDate = calendar.time
+            calendar.add(Calendar.DAY_OF_MONTH, -7)
+            val startDate = calendar.time
+            return DateRange(startDate, endDate)
+        }
+        
+        fun today(): DateRange {
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.HOUR_OF_DAY, 0)
+            calendar.set(Calendar.MINUTE, 0)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            val startDate = calendar.time
+            
+            calendar.add(Calendar.DAY_OF_MONTH, 1)
+            val endDate = calendar.time
+            
+            return DateRange(startDate, endDate)
+        }
+    }
+}
+
+/**
+ * Enums
+ */
+enum class AuditLogState {
+    Idle,
+    Initializing,
+    Ready,
+    Logging,
+    GeneratingReport,
+    Exporting,
+    Archiving,
+    Error
+}
+
+enum class FinancialOperationType {
+    CREATE,
+    READ,
+    UPDATE,
+    DELETE,
+    EXPORT,
+    IMPORT,
+    APPROVE,
+    REJECT
+}
+
+enum class FinancialEntityType {
+    INVOICE,
+    PAYMENT,
+    EXPENSE,
+    REFUND,
+    WALLET,
+    TRANSACTION,
+    REPORT,
+    USER
+}
+
+enum class RiskLevel {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class ComplianceStatus {
+    COMPLIANT,
+    NON_COMPLIANT,
+    REQUIRES_REVIEW,
+    PENDING
+}
+
+enum class AnomalySeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class ExportFormat {
+    CSV,
+    JSON,
+    PDF,
+    EXCEL
+}
+
+enum class AlertType {
+    HIGH_RISK_OPERATION,
+    ANOMALY_DETECTED,
+    COMPLIANCE_VIOLATION,
+    SYSTEM_ERROR
+}

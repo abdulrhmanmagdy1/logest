@@ -21,11 +21,12 @@ class SyncWorker @AssistedInject constructor(
     private val driverRepo: DriverRepository
 ) : CoroutineWorker(appContext, workerParams) {
 
-    override fun doWork(): Result {
+    override suspend fun doWork(): Result {
         return try {
-            // Logic to fetch PENDING from db.syncOperationDao()
-            // and call respective repository methods
-            Timber.i("Syncing pending operations...")
+            val pending = db.syncOperationDao().getPendingOperations()
+            pending.forEach { op ->
+                // Sync logic per type
+            }
             Result.success()
         } catch (e: Exception) {
             Result.retry()

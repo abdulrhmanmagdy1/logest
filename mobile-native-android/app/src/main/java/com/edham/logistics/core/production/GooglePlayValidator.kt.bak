@@ -1,0 +1,665 @@
+package com.edham.logistics.core.production
+
+import android.content.Context
+import android.content.pm.PackageManager
+import android.content.pm.PermissionInfo
+import android.os.Build
+import android.util.Log
+import com.edham.logistics.BuildConfig
+import dagger.hilt.android.qualifiers.ApplicationContext
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Google Play Store Validator
+ * Validates app compliance with Google Play requirements
+ */
+@Singleton
+class GooglePlayValidator @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val productionConfig: ProductionConfig
+) {
+    
+    companion object {
+        private const val TAG = "GooglePlayValidator"
+        
+        // Target API levels
+        const val TARGET_API_LEVEL = 34 // Android 14
+        const val MIN_API_LEVEL = 24 // Android 7.0
+        
+        // Google Play requirements
+        const val MAX_APK_SIZE_MB = 150
+        const val MAX_EXPANSION_FILE_SIZE_MB = 2048
+        const val MIN_TARGET_API_LEVEL = 33 // Android 13
+        
+        // Required permissions categories
+        val REQUIRED_PERMISSIONS = listOf(
+            "INTERNET",
+            "ACCESS_NETWORK_STATE"
+        )
+        
+        // Sensitive permissions that require justification
+        val SENSITIVE_PERMISSIONS = listOf(
+            "ACCESS_FINE_LOCATION",
+            "ACCESS_COARSE_LOCATION",
+            "CAMERA",
+            "RECORD_AUDIO",
+            "READ_CONTACTS",
+            "WRITE_CONTACTS",
+            "READ_EXTERNAL_STORAGE",
+            "WRITE_EXTERNAL_STORAGE"
+        )
+        
+        // Dangerous permissions
+        val DANGEROUS_PERMISSIONS = listOf(
+            "ACCESS_FINE_LOCATION",
+            "ACCESS_COARSE_LOCATION",
+            "CAMERA",
+            "RECORD_AUDIO",
+            "READ_CONTACTS",
+            "WRITE_CONTACTS",
+            "READ_CALENDAR",
+            "WRITE_CALENDAR",
+            "READ_SMS",
+            "SEND_SMS",
+            "RECEIVE_SMS",
+            "READ_PHONE_STATE",
+            "CALL_PHONE",
+            "READ_CALL_LOG",
+            "WRITE_CALL_LOG",
+            "ADD_VOICEMAIL",
+            "USE_SIP",
+            "PROCESS_OUTGOING_CALLS",
+            "READ_EXTERNAL_STORAGE",
+            "WRITE_EXTERNAL_STORAGE"
+        )
+        
+        // Google Play policy requirements
+        val POLICY_REQUIREMENTS = listOf(
+            "privacy_policy",
+            "target_api_level",
+            "app_content_rating",
+            "app_category",
+            "app_description",
+            "screenshots",
+            "icon_requirements",
+            "no_malicious_behavior",
+            "no_deceptive_ads",
+            "proper_permissions_usage"
+        )
+    }
+    
+    /**
+     * Initialize Google Play validation
+     */
+    fun initializeGooglePlayValidation() {
+        if (productionConfig.isProductionMode()) {
+            validateGooglePlayRequirements()
+            checkAppContent()
+            validatePermissions()
+            checkTechnicalRequirements()
+            Log.i(TAG, "Google Play validation initialized")
+        } else {
+            Log.d(TAG, "Google Play validation skipped in debug mode")
+        }
+    }
+    
+    /**
+     * Validate Google Play requirements
+     */
+    private fun validateGooglePlayRequirements() {
+        val issues = mutableListOf<String>()
+        
+        // Check target API level
+        if (Build.VERSION.SDK_INT < MIN_TARGET_API_LEVEL) {
+            issues.add("Target API level must be at least $MIN_TARGET_API_LEVEL")
+        }
+        
+        // Check app content rating
+        val ratingIssues = validateContentRating()
+        issues.addAll(ratingIssues)
+        
+        // Check app category
+        val categoryIssues = validateAppCategory()
+        issues.addAll(categoryIssues)
+        
+        // Check privacy policy
+        val privacyIssues = validatePrivacyPolicy()
+        issues.addAll(privacyIssues)
+        
+        // Check app description
+        val descriptionIssues = validateAppDescription()
+        issues.addAll(descriptionIssues)
+        
+        if (issues.isNotEmpty()) {
+            Log.e(TAG, "Google Play requirements validation failed: ${issues.joinToString(", ")}")
+            throw RuntimeException("Google Play requirements validation failed: ${issues.joinToString(", ")}")
+        } else {
+            Log.i(TAG, "Google Play requirements validation passed")
+        }
+    }
+    
+    /**
+     * Check app content
+     */
+    private fun checkAppContent() {
+        val issues = mutableListOf<String>()
+        
+        // Check for malicious behavior
+        if (containsMaliciousBehavior()) {
+            issues.add("App contains potentially malicious behavior")
+        }
+        
+        // Check for deceptive ads
+        if (containsDeceptiveAds()) {
+            issues.add("App contains deceptive advertising practices")
+        }
+        
+        // Check for prohibited content
+        val prohibitedIssues = checkProhibitedContent()
+        issues.addAll(prohibitedIssues)
+        
+        if (issues.isNotEmpty()) {
+            Log.e(TAG, "App content validation failed: ${issues.joinToString(", ")}")
+        } else {
+            Log.i(TAG, "App content validation passed")
+        }
+    }
+    
+    /**
+     * Validate permissions
+     */
+    private fun validatePermissions() {
+        val issues = mutableListOf<String>()
+        
+        try {
+            val packageInfo = context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.GET_PERMISSIONS
+            )
+            
+            val permissions = packageInfo.requestedPermissions?.toList() ?: emptyList()
+            
+            // Check required permissions
+            REQUIRED_PERMISSIONS.forEach { requiredPermission ->
+                if (!permissions.contains(requiredPermission)) {
+                    issues.add("Missing required permission: $requiredPermission")
+                }
+            }
+            
+            // Check sensitive permissions
+            SENSITIVE_PERMISSIONS.forEach { sensitivePermission ->
+                if (permissions.contains(sensitivePermission)) {
+                    issues.add("Sensitive permission requires justification: $sensitivePermission")
+                }
+            }
+            
+            // Check dangerous permissions
+            val dangerousPermissions = permissions.filter { permission ->
+                DANGEROUS_PERMISSIONS.contains(permission)
+            }
+            
+            if (dangerousPermissions.size > 10) {
+                issues.add("Too many dangerous permissions: ${dangerousPermissions.size}")
+            }
+            
+            // Validate permission usage
+            dangerousPermissions.forEach { permission ->
+                val usageIssues = validatePermissionUsage(permission)
+                issues.addAll(usageIssues)
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to validate permissions", e)
+            issues.add("Failed to validate permissions: ${e.message}")
+        }
+        
+        if (issues.isNotEmpty()) {
+            Log.e(TAG, "Permission validation failed: ${issues.joinToString(", ")}")
+        } else {
+            Log.i(TAG, "Permission validation passed")
+        }
+    }
+    
+    /**
+     * Check technical requirements
+     */
+    private fun checkTechnicalRequirements() {
+        val issues = mutableListOf<String>()
+        
+        // Check APK size
+        val sizeIssues = validateApkSize()
+        issues.addAll(sizeIssues)
+        
+        // Check target SDK version
+        if (Build.VERSION.SDK_INT < TARGET_API_LEVEL) {
+            issues.add("Target SDK version should be $TARGET_API_LEVEL or higher")
+        }
+        
+        // Check 64-bit support
+        val bitnessIssues = validateBitnessSupport()
+        issues.addAll(bitnessIssues)
+        
+        // Check app signing
+        val signingIssues = validateAppSigningForPlay()
+        issues.addAll(signingIssues)
+        
+        if (issues.isNotEmpty()) {
+            Log.e(TAG, "Technical requirements validation failed: ${issues.joinToString(", ")}")
+        } else {
+            Log.i(TAG, "Technical requirements validation passed")
+        }
+    }
+    
+    /**
+     * Validate content rating
+     */
+    private fun validateContentRating(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // This would check if app has appropriate content rating
+        // For now, assume it's properly rated
+        
+        return issues
+    }
+    
+    /**
+     * Validate app category
+     */
+    private fun validateAppCategory(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // This would check if app has appropriate category
+        // For logistics app, should be "Business" or "Productivity"
+        
+        return issues
+    }
+    
+    /**
+     * Validate privacy policy
+     */
+    private fun validatePrivacyPolicy(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // This would check if privacy policy is accessible and complete
+        // Should include data collection, usage, and sharing practices
+        
+        return issues
+    }
+    
+    /**
+     * Validate app description
+     */
+    private fun validateAppDescription(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // This would check if app description is adequate
+        // Should be clear, accurate, and not misleading
+        
+        return issues
+    }
+    
+    /**
+     * Check for malicious behavior
+     */
+    private fun containsMaliciousBehavior(): Boolean {
+        // This would scan for malicious patterns
+        // For now, assume app is clean
+        return false
+    }
+    
+    /**
+     * Check for deceptive ads
+     */
+    private fun containsDeceptiveAds(): Boolean {
+        // This would check for deceptive advertising practices
+        // For now, assume app follows ad policies
+        return false
+    }
+    
+    /**
+     * Check prohibited content
+     */
+    private fun checkProhibitedContent(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // This would check for prohibited content
+        // Including hate speech, violence, illegal content, etc.
+        
+        return issues
+    }
+    
+    /**
+     * Validate permission usage
+     */
+    private fun validatePermissionUsage(permission: String): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // Check if permission is properly justified
+        // Check if permission is used appropriately
+        // Check if permission is requested at appropriate time
+        
+        return issues
+    }
+    
+    /**
+     * Validate APK size
+     */
+    private fun validateApkSize(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        try {
+            val packageInfo = context.packageManager.getPackageInfo(
+                context.packageName,
+                0
+            )
+            val apkPath = packageInfo.applicationInfo.sourceDir
+            val apkFile = java.io.File(apkPath)
+            val apkSizeMB = apkFile.length() / (1024.0 * 1024.0)
+            
+            if (apkSizeMB > MAX_APK_SIZE_MB) {
+                issues.add("APK size exceeds Google Play limit: ${String.format("%.2f", apkSizeMB)}MB > ${MAX_APK_SIZE_MB}MB")
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to validate APK size", e)
+            issues.add("Failed to validate APK size: ${e.message}")
+        }
+        
+        return issues
+    }
+    
+    /**
+     * Validate bitness support
+     */
+    private fun validateBitnessSupport(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // Check if app supports 64-bit architecture
+        // 64-bit support is required for new apps
+        
+        val supportedAbis = Build.SUPPORTED_ABIS
+        val has64BitSupport = supportedAbis.any { it.contains("64") }
+        
+        if (!has64BitSupport) {
+            issues.add("App must support 64-bit architecture")
+        }
+        
+        return issues
+    }
+    
+    /**
+     * Validate app signing for Play Store
+     */
+    private fun validateAppSigningForPlay(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // Check if app is properly signed for Play Store
+        // Should use release signing keys
+        
+        if (BuildConfig.DEBUG) {
+            issues.add("App must be signed with release keys for Play Store")
+        }
+        
+        return issues
+    }
+    
+    /**
+     * Get Google Play compliance report
+     */
+    fun getGooglePlayComplianceReport(): Map<String, Any> {
+        val issues = mutableListOf<String>()
+        
+        // Collect all validation results
+        val requirementsIssues = validateAllRequirements()
+        issues.addAll(requirementsIssues)
+        
+        val contentIssues = validateAllContent()
+        issues.addAll(contentIssues)
+        
+        val permissionIssues = validateAllPermissions()
+        issues.addAll(permissionIssues)
+        
+        val technicalIssues = validateAllTechnical()
+        issues.addAll(technicalIssues)
+        
+        val isCompliant = issues.isEmpty()
+        val score = calculateComplianceScore(issues)
+        
+        return mapOf(
+            "isCompliant" to isCompliant,
+            "score" to score,
+            "issues" to issues,
+            "requirements" to getRequirementsStatus(),
+            "content" to getContentStatus(),
+            "permissions" to getPermissionStatus(),
+            "technical" to getTechnicalStatus(),
+            "recommendations" to getComplianceRecommendations(issues),
+            "policyRequirements" to POLICY_REQUIREMENTS,
+            "isProduction" to productionConfig.isProductionMode()
+        )
+    }
+    
+    /**
+     * Validate all requirements
+     */
+    private fun validateAllRequirements(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        if (Build.VERSION.SDK_INT < MIN_TARGET_API_LEVEL) {
+            issues.add("Target API level must be at least $MIN_TARGET_API_LEVEL")
+        }
+        
+        return issues
+    }
+    
+    /**
+     * Validate all content
+     */
+    private fun validateAllContent(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        if (containsMaliciousBehavior()) {
+            issues.add("App contains potentially malicious behavior")
+        }
+        
+        if (containsDeceptiveAds()) {
+            issues.add("App contains deceptive advertising practices")
+        }
+        
+        issues.addAll(checkProhibitedContent())
+        
+        return issues
+    }
+    
+    /**
+     * Validate all permissions
+     */
+    private fun validateAllPermissions(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        try {
+            val packageInfo = context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.GET_PERMISSIONS
+            )
+            
+            val permissions = packageInfo.requestedPermissions?.toList() ?: emptyList()
+            
+            REQUIRED_PERMISSIONS.forEach { requiredPermission ->
+                if (!permissions.contains(requiredPermission)) {
+                    issues.add("Missing required permission: $requiredPermission")
+                }
+            }
+            
+        } catch (e: Exception) {
+            issues.add("Failed to validate permissions: ${e.message}")
+        }
+        
+        return issues
+    }
+    
+    /**
+     * Validate all technical requirements
+     */
+    private fun validateAllTechnical(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        issues.addAll(validateApkSize())
+        issues.addAll(validateBitnessSupport())
+        issues.addAll(validateAppSigningForPlay())
+        
+        return issues
+    }
+    
+    /**
+     * Calculate compliance score
+     */
+    private fun calculateComplianceScore(issues: List<String>): Int {
+        val totalChecks = 20 // Approximate number of checks
+        val failedChecks = issues.size
+        return maxOf(0, 100 - (failedChecks * 5))
+    }
+    
+    /**
+     * Get requirements status
+     */
+    private fun getRequirementsStatus(): Map<String, Any> {
+        return mapOf(
+            "targetApiLevel" to Build.VERSION.SDK_INT,
+            "minRequiredApiLevel" to MIN_TARGET_API_LEVEL,
+            "meetsTargetApi" to (Build.VERSION.SDK_INT >= MIN_TARGET_API_LEVEL)
+        )
+    }
+    
+    /**
+     * Get content status
+     */
+    private fun getContentStatus(): Map<String, Any> {
+        return mapOf(
+            "hasMaliciousBehavior" to containsMaliciousBehavior(),
+            "hasDeceptiveAds" to containsDeceptiveAds(),
+            "prohibitedContentIssues" to checkProhibitedContent()
+        )
+    }
+    
+    /**
+     * Get permission status
+     */
+    private fun getPermissionStatus(): Map<String, Any> {
+        try {
+            val packageInfo = context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.GET_PERMISSIONS
+            )
+            
+            val permissions = packageInfo.requestedPermissions?.toList() ?: emptyList()
+            val dangerousPermissions = permissions.filter { DANGEROUS_PERMISSIONS.contains(it) }
+            
+            return mapOf(
+                "totalPermissions" to permissions.size,
+                "dangerousPermissions" to dangerousPermissions.size,
+                "sensitivePermissions" to permissions.filter { SENSITIVE_PERMISSIONS.contains(it) }.size,
+                "requiredPermissions" to REQUIRED_PERMISSIONS.filter { permissions.contains(it) }.size
+            )
+        } catch (e: Exception) {
+            return mapOf("error" to "Failed to get permission status")
+        }
+    }
+    
+    /**
+     * Get technical status
+     */
+    private fun getTechnicalStatus(): Map<String, Any> {
+        return mapOf(
+            "apkSizeMB" to getApkSizeMB(),
+            "apkSizeValid" to (getApkSizeMB() <= MAX_APK_SIZE_MB),
+            "supports64Bit" to Build.SUPPORTED_ABIS.any { it.contains("64") },
+            "isDebug" to BuildConfig.DEBUG
+        )
+    }
+    
+    /**
+     * Get APK size in MB
+     */
+    private fun getApkSizeMB(): Double {
+        return try {
+            val packageInfo = context.packageManager.getPackageInfo(
+                context.packageName,
+                0
+            )
+            val apkPath = packageInfo.applicationInfo.sourceDir
+            val apkFile = java.io.File(apkPath)
+            apkFile.length() / (1024.0 * 1024.0)
+        } catch (e: Exception) {
+            0.0
+        }
+    }
+    
+    /**
+     * Get compliance recommendations
+     */
+    private fun getComplianceRecommendations(issues: List<String>): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (issues.any { it.contains("API level") }) {
+            recommendations.add("Update target API level to meet Google Play requirements")
+        }
+        
+        if (issues.any { it.contains("APK size") }) {
+            recommendations.add("Reduce APK size using optimization techniques")
+        }
+        
+        if (issues.any { it.contains("64-bit") }) {
+            recommendations.add("Add 64-bit architecture support")
+        }
+        
+        if (issues.any { it.contains("permission") }) {
+            recommendations.add("Review and justify all requested permissions")
+        }
+        
+        if (issues.any { it.contains("signing") }) {
+            recommendations.add("Use proper release signing keys")
+        }
+        
+        if (issues.any { it.contains("malicious") }) {
+            recommendations.add("Remove any potentially malicious code or behavior")
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Check if app is ready for Google Play
+     */
+    fun isReadyForGooglePlay(): Boolean {
+        if (!productionConfig.isProductionMode()) {
+            return false // Only production builds should go to Play Store
+        }
+        
+        val report = getGooglePlayComplianceReport()
+        return report["isCompliant"] as Boolean
+    }
+    
+    /**
+     * Generate Google Play readiness summary
+     */
+    fun generateGooglePlayReadinessSummary(): Map<String, Any> {
+        val report = getGooglePlayComplianceReport()
+        
+        return mapOf(
+            "isReady" to report["isCompliant"],
+            "score" to report["score"],
+            "summary" to when {
+                report["score"] as Int >= 90 -> "Excellent - Ready for Google Play Store"
+                report["score"] as Int >= 80 -> "Good - Minor issues to address"
+                report["score"] as Int >= 70 -> "Fair - Several issues to address"
+                report["score"] as Int >= 60 -> "Poor - Major issues to address"
+                else -> "Not Ready - Significant issues to address"
+            },
+            "issuesCount" to (report["issues"] as List<*>).size,
+            "recommendationsCount" to (report["recommendations"] as List<*>).size,
+            "productionMode" to productionConfig.isProductionMode()
+        )
+    }
+}

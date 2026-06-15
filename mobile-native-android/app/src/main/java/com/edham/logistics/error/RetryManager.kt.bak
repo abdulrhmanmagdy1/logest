@@ -1,0 +1,324 @@
+package com.edham.logistics.error
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.retry
+import kotlinx.coroutines.flow.retryWhen
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * Retry Manager
+ * Advanced retry mechanism for failed requests with exponential backoff
+ */
+class RetryManager {
+    
+    companion object {
+        private const val DEFAULT_MAX_RETRIES = 3
+        private const val INITIAL_DELAY_MS = 1000L
+        private const val MAX_DELAY_MS = 30000L
+        private const val BACKOFF_MULTIPLIER = 2.0
+    }
+    
+    private val activeRequests = ConcurrentHashMap<String, AtomicInteger>()
+    private val requestHistory = ConcurrentHashMap<String, RequestHistory>()
+    
+    /**
+     * Execute operation with retry logic
+     */
+    suspend fun <T> executeWithRetry(
+        requestId: String,
+        operation: suspend () -> T,
+        maxRetries: Int = DEFAULT_MAX_RETRIES,
+        delayMs: Long = INITIAL_DELAY_MS,
+        shouldRetry: (Throwable, Int) -> Boolean = { error, attempt ->
+            error.isRetryable() && attempt < maxRetries
+        }
+    ): Result<T> {
+        val attemptCount = AtomicInteger(0)
+        activeRequests[requestId] = attemptCount
+        
+        return try {
+            val result = operation()
+            recordSuccess(requestId)
+            Result.success(result)
+        } catch (e: Exception) {
+            handleRetry(requestId, e, operation, maxRetries, delayMs, shouldRetry)
+        } finally {
+            activeRequests.remove(requestId)
+        }
+    }
+    
+    /**
+     * Execute Flow with retry logic
+     */
+    fun <T> executeFlowWithRetry(
+        requestId: String,
+        flowOperation: () -> Flow<T>,
+        maxRetries: Int = DEFAULT_MAX_RETRIES,
+        delayMs: Long = INITIAL_DELAY_MS,
+        shouldRetry: (Throwable, Int) -> Boolean = { error, attempt ->
+            error.isRetryable() && attempt < maxRetries
+        }
+    ): Flow<Result<T>> = flow {
+        try {
+            flowOperation().collect { result ->
+                emit(Result.success(result))
+            }
+        } catch (e: Exception) {
+            val retryResult = handleRetry(
+                requestId, e, { 
+                    // For flows, we need to re-execute the flow operation
+                    throw e 
+                }, maxRetries, delayMs, shouldRetry
+            )
+            emit(retryResult)
+        }
+    }.retryWhen { cause, attempt ->
+        val shouldRetry = shouldRetry(cause, attempt)
+        if (shouldRetry) {
+            val delay = calculateExponentialBackoff(attempt, delayMs)
+            delay(delay)
+        }
+        shouldRetry
+    }
+    
+    /**
+     * Handle retry logic
+     */
+    private suspend fun <T> handleRetry(
+        requestId: String,
+        error: Throwable,
+        operation: suspend () -> T,
+        maxRetries: Int,
+        initialDelay: Long,
+        shouldRetry: (Throwable, Int) -> Boolean
+    ): Result<T> {
+        var attempt = 0
+        
+        while (attempt < maxRetries && shouldRetry(error, attempt)) {
+            attempt++
+            recordAttempt(requestId, attempt, error)
+            
+            try {
+                val delay = calculateExponentialBackoff(attempt - 1, initialDelay)
+                delay(delay)
+                
+                val result = operation()
+                recordSuccess(requestId)
+                return Result.success(result)
+                
+            } catch (e: Exception) {
+                error = e
+                if (!shouldRetry(e, attempt)) {
+                    break
+                }
+            }
+        }
+        
+        recordFailure(requestId, error)
+        return Result.failure(error)
+    }
+    
+    /**
+     * Calculate exponential backoff delay
+     */
+    private fun calculateExponentialBackoff(attempt: Int, initialDelay: Long): Long {
+        val delay = (initialDelay * Math.pow(BACKOFF_MULTIPLIER, attempt.toDouble())).toLong()
+        return minOf(delay, MAX_DELAY_MS)
+    }
+    
+    /**
+     * Check if error is retryable
+     */
+    private fun Throwable.isRetryable(): Boolean {
+        return when (this) {
+            is java.net.SocketTimeoutException -> true
+            is java.net.UnknownHostException -> true
+            is java.io.IOException -> true
+            is retrofit2.HttpException -> {
+                val code = this.code()
+                code in 500..599 || code == 408 || code == 429
+            }
+            else -> false
+        }
+    }
+    
+    /**
+     * Record attempt
+     */
+    private fun recordAttempt(requestId: String, attempt: Int, error: Throwable) {
+        val history = requestHistory.getOrPut(requestId) { RequestHistory() }
+        history.addAttempt(error)
+    }
+    
+    /**
+     * Record success
+     */
+    private fun recordSuccess(requestId: String) {
+        val history = requestHistory.getOrPut(requestId) { RequestHistory() }
+        history.markSuccess()
+    }
+    
+    /**
+     * Record failure
+     */
+    private fun recordFailure(requestId: String, error: Throwable) {
+        val history = requestHistory.getOrPut(requestId) { RequestHistory() }
+        history.markFailure(error)
+    }
+    
+    /**
+     * Get request history
+     */
+    fun getRequestHistory(requestId: String): RequestHistory? {
+        return requestHistory[requestId]
+    }
+    
+    /**
+     * Check if request is currently active
+     */
+    fun isRequestActive(requestId: String): Boolean {
+        return activeRequests.containsKey(requestId)
+    }
+    
+    /**
+     * Cancel request
+     */
+    fun cancelRequest(requestId: String) {
+        activeRequests.remove(requestId)
+    }
+    
+    /**
+     * Clear all request history
+     */
+    fun clearHistory() {
+        requestHistory.clear()
+        activeRequests.clear()
+    }
+    
+    /**
+     * Get retry statistics
+     */
+    fun getRetryStatistics(): RetryStatistics {
+        val totalRequests = requestHistory.size
+        val successfulRequests = requestHistory.values.count { it.isSuccessful }
+        val failedRequests = totalRequests - successfulRequests
+        val totalAttempts = requestHistory.values.sumOf { it.totalAttempts }
+        
+        return RetryStatistics(
+            totalRequests = totalRequests,
+            successfulRequests = successfulRequests,
+            failedRequests = failedRequests,
+            totalAttempts = totalAttempts,
+            averageAttemptsPerRequest = if (totalRequests > 0) totalAttempts.toDouble() / totalRequests else 0.0
+        )
+    }
+}
+
+/**
+ * Request History
+ */
+class RequestHistory {
+    private val attempts = mutableListOf<AttemptRecord>()
+    private var successTime: Long? = null
+    private var failureTime: Long? = null
+    private var finalError: Throwable? = null
+    
+    fun addAttempt(error: Throwable) {
+        attempts.add(AttemptRecord(System.currentTimeMillis(), error))
+    }
+    
+    fun markSuccess() {
+        successTime = System.currentTimeMillis()
+    }
+    
+    fun markFailure(error: Throwable) {
+        failureTime = System.currentTimeMillis()
+        finalError = error
+    }
+    
+    val totalAttempts: Int get() = attempts.size
+    val isSuccessful: Boolean get() = successTime != null
+    val finalError: Throwable? get() = finalError
+    val attempts: List<AttemptRecord> get() = attempts.toList()
+    
+    fun getDuration(): Long? {
+        val start = attempts.firstOrNull()?.timestamp
+        val end = successTime ?: failureTime
+        return if (start != null && end != null) end - start else null
+    }
+}
+
+/**
+ * Attempt Record
+ */
+data class AttemptRecord(
+    val timestamp: Long,
+    val error: Throwable
+)
+
+/**
+ * Retry Statistics
+ */
+data class RetryStatistics(
+    val totalRequests: Int,
+    val successfulRequests: Int,
+    val failedRequests: Int,
+    val totalAttempts: Int,
+    val averageAttemptsPerRequest: Double
+) {
+    val successRate: Double get() = if (totalRequests > 0) successfulRequests.toDouble() / totalRequests else 0.0
+    val failureRate: Double get() = if (totalRequests > 0) failedRequests.toDouble() / totalRequests else 0.0
+}
+
+/**
+ * Retry Configuration
+ */
+data class RetryConfig(
+    val maxRetries: Int = 3,
+    val initialDelayMs: Long = 1000L,
+    val maxDelayMs: Long = 30000L,
+    val backoffMultiplier: Double = 2.0,
+    val shouldRetry: (Throwable, Int) -> Boolean = { error, attempt ->
+        error.isRetryable() && attempt < 3
+    }
+) {
+    companion object {
+        fun forNetworkRequests() = RetryConfig(
+            maxRetries = 3,
+            initialDelayMs = 1000L,
+            maxDelayMs = 10000L
+        )
+        
+        fun forCriticalRequests() = RetryConfig(
+            maxRetries = 5,
+            initialDelayMs = 500L,
+            maxDelayMs = 15000L
+        )
+        
+        fun forBackgroundSync() = RetryConfig(
+            maxRetries = 10,
+            initialDelayMs = 2000L,
+            maxDelayMs = 60000L
+        )
+    }
+}
+
+/**
+ * Extension function to check if throwable is retryable
+ */
+private fun Throwable.isRetryable(): Boolean {
+    return when (this) {
+        is java.net.SocketTimeoutException -> true
+        is java.net.UnknownHostException -> true
+        is java.io.IOException -> true
+        is retrofit2.HttpException -> {
+            val code = this.code()
+            code in 500..599 || code == 408 || code == 429
+        }
+        else -> false
+    }
+}

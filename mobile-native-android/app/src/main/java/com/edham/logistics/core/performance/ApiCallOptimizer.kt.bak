@@ -1,0 +1,375 @@
+package com.edham.logistics.core.performance
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicInteger
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * API Call Optimizer - Reduces API calls through intelligent batching, caching, and request optimization
+ */
+@Singleton
+class ApiCallOptimizer @Inject constructor() {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var config: ApiConfig = ApiConfig()
+    
+    // Request batching
+    private val requestQueue = Channel<BatchableRequest>(capacity = Channel.UNLIMITED)
+    private val batchProcessor = BatchProcessor()
+    
+    // Request deduplication
+    private val ongoingRequests = ConcurrentHashMap<String, Deferred<*>>()
+    
+    // Request throttling
+    private val throttleLimiter = Semaphore(10) // Max 10 concurrent requests
+    
+    // Request retry mechanism
+    private val retryPolicy = RetryPolicy()
+    
+    // Metrics
+    private val totalRequests = AtomicInteger(0)
+    private val batchedRequests = AtomicInteger(0)
+    private val cachedRequests = AtomicInteger(0)
+    private val failedRequests = AtomicInteger(0)
+
+    /**
+     * Configure the API call optimizer
+     */
+    fun configure(config: ApiConfig) {
+        this.config = config
+        batchProcessor.configure(config)
+        retryPolicy.configure(config)
+        
+        if (config.enableBatching) {
+            startBatchProcessor()
+        }
+    }
+
+    /**
+     * Execute API call with optimization
+     */
+    suspend fun <T> executeWithOptimization(
+        call: suspend () -> T,
+        priority: CallPriority = CallPriority.NORMAL
+    ): T {
+        totalRequests.incrementAndGet()
+        
+        return try {
+            when {
+                config.enableBatching && isBatchable(call) -> {
+                    executeBatched(call, priority)
+                }
+                else -> {
+                    executeDirect(call, priority)
+                }
+            }
+        } catch (e: Exception) {
+            failedRequests.incrementAndGet()
+            throw e
+        }
+    }
+
+    /**
+     * Execute multiple API calls in batch
+     */
+    suspend fun <T> batchExecute(
+        operations: List<suspend () -> T>,
+        batchSize: Int,
+        delayBetweenBatches: Long = 100
+    ): List<Result<T>> {
+        if (!config.enableBatching || operations.size <= 1) {
+            return operations.map { operation ->
+                try {
+                    Result.success(operation())
+                } catch (e: Exception) {
+                    Result.failure(e)
+                }
+            }
+        }
+
+        val results = mutableListOf<Result<T>>()
+        val batches = operations.chunked(batchSize)
+
+        batches.forEachIndexed { index, batch ->
+            if (index > 0 && delayBetweenBatches > 0) {
+                delay(delayBetweenBatches)
+            }
+
+            val batchResults = try {
+                executeBatch(batch)
+            } catch (e: Exception) {
+                batch.map { Result.failure<T>(e) }
+            }
+
+            results.addAll(batchResults)
+            batchedRequests.addAndGet(batch.size)
+        }
+
+        return results
+    }
+
+    /**
+     * Execute API call with caching
+     */
+    suspend fun <T> executeWithCache(
+        call: suspend () -> T,
+        cacheKey: String,
+        cachePolicy: CachePolicy = CachePolicy.DEFAULT
+    ): T {
+        // Check if request is already in progress
+        val ongoingRequest = ongoingRequests[cacheKey] as? Deferred<T>
+        if (ongoingRequest != null) {
+            return ongoingRequest.await()
+        }
+
+        // Create new deferred request
+        val deferred = async {
+            try {
+                val result = call()
+                cachedRequests.incrementAndGet()
+                result
+            } catch (e: Exception) {
+                ongoingRequests.remove(cacheKey)
+                throw e
+            }
+        }
+
+        ongoingRequests[cacheKey] = deferred
+        val result = deferred.await()
+        ongoingRequests.remove(cacheKey)
+        
+        return result
+    }
+
+    /**
+     * Execute API call with retry mechanism
+     */
+    suspend fun <T> executeWithRetry(
+        call: suspend () -> T,
+        maxRetries: Int = config.retryAttempts
+    ): T {
+        var lastException: Exception? = null
+        
+        repeat(maxRetries + 1) { attempt ->
+            try {
+                return call()
+            } catch (e: Exception) {
+                lastException = e
+                
+                if (attempt < maxRetries) {
+                    val delay = retryPolicy.calculateDelay(attempt, e)
+                    delay(delay)
+                } else {
+                    throw e
+                }
+            }
+        }
+        
+        throw lastException!!
+    }
+
+    /**
+     * Get optimization metrics
+     */
+    fun getMetrics(): ApiMetrics {
+        return ApiMetrics(
+            totalRequests = totalRequests.get(),
+            batchedRequests = batchedRequests.get(),
+            cachedRequests = cachedRequests.get(),
+            failedRequests = failedRequests.get(),
+            batchEfficiency = if (totalRequests.get() > 0) {
+                batchedRequests.get().toFloat() / totalRequests.get()
+            } else 0f,
+            cacheHitRate = if (totalRequests.get() > 0) {
+                cachedRequests.get().toFloat() / totalRequests.get()
+            } else 0f
+        )
+    }
+
+    /**
+     * Clear all ongoing requests and reset metrics
+     */
+    fun reset() {
+        ongoingRequests.clear()
+        totalRequests.set(0)
+        batchedRequests.set(0)
+        cachedRequests.set(0)
+        failedRequests.set(0)
+    }
+
+    /**
+     * Execute direct API call with throttling
+     */
+    private suspend fun <T> executeDirect(
+        call: suspend () -> T,
+        priority: CallPriority
+    ): T {
+        return throttleLimiter.withPermit {
+            executeWithRetry(call)
+        }
+    }
+
+    /**
+     * Execute batched API call
+     */
+    private suspend fun <T> executeBatched(
+        call: suspend () -> T,
+        priority: CallPriority
+    ): T {
+        val request = BatchableRequest(
+            call = call,
+            priority = priority,
+            timestamp = System.currentTimeMillis()
+        )
+        
+        requestQueue.send(request)
+        return batchProcessor.processRequest(request) as T
+    }
+
+    /**
+     * Execute a batch of operations
+     */
+    private suspend fun <T> executeBatch(operations: List<suspend () -> T>): List<T> {
+        return coroutineScope {
+            operations.map { operation ->
+                async {
+                    executeWithRetry(operation)
+                }
+            }.awaitAll()
+        }
+    }
+
+    /**
+     * Check if a call is batchable
+     */
+    private fun <T> isBatchable(call: suspend () -> T): Boolean {
+        // In a real implementation, this would analyze the call to determine if it can be batched
+        // For now, we'll assume all calls are batchable for demonstration
+        return true
+    }
+
+    /**
+     * Start the batch processor
+     */
+    private fun startBatchProcessor() {
+        coroutineScope.launch {
+            batchProcessor.start(requestQueue)
+        }
+    }
+
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+        requestQueue.close()
+        reset()
+    }
+}
+
+/**
+ * Batch processor for handling batched requests
+ */
+class BatchProcessor {
+    private var config: ApiConfig = ApiConfig()
+    private val batchWindow = 100L // 100ms window for batching
+    private val maxBatchSize = 20
+
+    fun configure(config: ApiConfig) {
+        this.config = config
+    }
+
+    suspend fun start(requestQueue: Channel<BatchableRequest>) {
+        while (true) {
+            try {
+                val batch = collectBatch(requestQueue)
+                if (batch.isNotEmpty()) {
+                    processBatch(batch)
+                }
+                delay(batchWindow)
+            } catch (e: Exception) {
+                // Log error and continue
+            }
+        }
+    }
+
+    suspend fun <T> processRequest(request: BatchableRequest): T {
+        // For single requests, execute directly
+        return request.call() as T
+    }
+
+    private suspend fun collectBatch(requestQueue: Channel<BatchableRequest>): List<BatchableRequest> {
+        val batch = mutableListOf<BatchableRequest>()
+        val deadline = System.currentTimeMillis() + batchWindow
+        
+        // Collect requests within the batch window
+        while (batch.size < maxBatchSize && System.currentTimeMillis() < deadline) {
+            val request = requestQueue.tryReceive().getOrNull() ?: break
+            batch.add(request)
+        }
+        
+        return batch
+    }
+
+    private suspend fun processBatch(batch: List<BatchableRequest>) {
+        if (batch.isEmpty()) return
+        
+        // Group requests by priority
+        val groupedByPriority = batch.groupBy { it.priority }
+        
+        // Process high priority requests first
+        listOf(CallPriority.CRITICAL, CallPriority.HIGH, CallPriority.NORMAL, CallPriority.LOW)
+            .forEach { priority ->
+                groupedByPriority[priority]?.let { requests ->
+                    requests.forEach { request ->
+                        try {
+                            request.call()
+                        } catch (e: Exception) {
+                            // Handle error
+                        }
+                    }
+                }
+            }
+    }
+}
+
+/**
+ * Retry policy for API calls
+ */
+class RetryPolicy {
+    private var maxRetries = 3
+    private var baseDelay = 1000L
+    private var maxDelay = 10000L
+    private var backoffMultiplier = 2.0
+
+    fun configure(config: ApiConfig) {
+        this.maxRetries = config.retryAttempts
+    }
+
+    fun calculateDelay(attempt: Int, exception: Exception): Long {
+        val delay = (baseDelay * Math.pow(backoffMultiplier, attempt.toDouble())).toLong()
+        return minOf(delay, maxDelay)
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class BatchableRequest(
+    val call: suspend () -> Any,
+    val priority: CallPriority,
+    val timestamp: Long
+)
+
+data class ApiMetrics(
+    val totalRequests: Int,
+    val batchedRequests: Int,
+    val cachedRequests: Int,
+    val failedRequests: Int,
+    val batchEfficiency: Float,
+    val cacheHitRate: Float
+)

@@ -1,0 +1,1097 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.DriverLicenseEntity
+import com.edham.logistics.data.local.entity.VehicleRegistrationEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * License Tracker - Comprehensive license and registration tracking system
+ * 
+ * Features:
+ * - Driver license management
+ * - Vehicle registration tracking
+ * - License renewal monitoring
+ * - Compliance checking
+ * - Expiry alerts
+ * - Document management
+ * - Regulatory compliance
+ * - Cost tracking
+ */
+@Singleton
+class LicenseTracker @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _licenseState = MutableStateFlow<LicenseState>(LicenseState.Idle)
+    val licenseState: StateFlow<LicenseState> = _licenseState.asStateFlow()
+    
+    private val _driverLicenses = MutableStateFlow<List<DriverLicenseEntity>>(emptyList())
+    val driverLicenses: StateFlow<List<DriverLicenseEntity>> = _driverLicenses.asStateFlow()
+    
+    private val _vehicleRegistrations = MutableStateFlow<List<VehicleRegistrationEntity>>(emptyList())
+    val vehicleRegistrations: StateFlow<List<VehicleRegistrationEntity>> = _vehicleRegistrations.asStateFlow()
+    
+    private val _licenseAnalytics = MutableStateFlow<LicenseAnalytics?>(null)
+    val licenseAnalytics: StateFlow<LicenseAnalytics?> = _licenseAnalytics.asStateFlow()
+    
+    private val _licenseAlerts = MutableStateFlow<List<LicenseAlert>>(emptyList())
+    val licenseAlerts: StateFlow<List<LicenseAlert>> = _licenseAlerts.asStateFlow()
+    
+    private val _renewalSchedule = MutableStateFlow<List<LicenseRenewal>>(emptyList())
+    val renewalSchedule: StateFlow<List<LicenseRenewal>> = _renewalSchedule.asStateFlow()
+    
+    private var isMonitoring = false
+    private val licenseListeners = mutableListOf<LicenseManagementListener>()
+    
+    companion object {
+        private const val TAG = "LicenseTracker"
+        private const val MONITORING_INTERVAL = 86400000L // 24 hours
+        private const val RENEWAL_WARNING_DAYS = 30
+        private const val CRITICAL_RENEWAL_DAYS = 7
+        private const val MAX_LICENSE_HISTORY = 100
+    }
+    
+    /**
+     * Initialize license tracking system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _licenseState.value = LicenseState.Initializing
+                
+                // Load driver licenses
+                loadDriverLicenses()
+                
+                // Load vehicle registrations
+                loadVehicleRegistrations()
+                
+                // Generate renewal schedule
+                generateRenewalSchedule()
+                
+                // Start monitoring
+                startLicenseMonitoring()
+                
+                // Check for alerts
+                checkLicenseAlerts()
+                
+                _licenseState.value = LicenseState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _licenseState.value = LicenseState.Error("Failed to initialize license tracking: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add driver license
+     */
+    suspend fun addDriverLicense(request: AddDriverLicenseRequest): Result<DriverLicenseEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _licenseState.value = LicenseState.AddingLicense
+                
+                // Validate request
+                validateDriverLicenseRequest(request)
+                
+                // Create license entity
+                val license = DriverLicenseEntity(
+                    id = 0,
+                    driverId = request.driverId,
+                    licenseNumber = request.licenseNumber,
+                    licenseType = request.licenseType,
+                    issuingAuthority = request.issuingAuthority,
+                    issueDate = request.issueDate,
+                    expiryDate = request.expiryDate,
+                    status = LicenseStatus.ACTIVE,
+                    categories = request.categories,
+                    restrictions = request.restrictions,
+                    endorsements = request.endorsements,
+                    medicalCertificateExpiry = request.medicalCertificateExpiry,
+                    photoUrl = request.photoUrl,
+                    documents = request.documents,
+                    notes = request.notes,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save license
+                val licenseId = database.driverLicenseDao().insertLicense(license)
+                val savedLicense = license.copy(id = licenseId)
+                
+                // Update licenses list
+                updateDriverLicenses()
+                
+                // Update renewal schedule
+                updateRenewalSchedule()
+                
+                // Notify listeners
+                notifyLicenseAdded(savedLicense)
+                
+                _licenseState.value = LicenseState.LicenseAdded
+                Result.success(savedLicense)
+                
+            } catch (e: Exception) {
+                _licenseState.value = LicenseState.Error("Failed to add license: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update driver license
+     */
+    suspend fun updateDriverLicense(licenseId: Long, request: UpdateDriverLicenseRequest): Result<DriverLicenseEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingLicense = database.driverLicenseDao().getLicenseById(licenseId)
+                    ?: throw Exception("License not found")
+                
+                // Update license
+                val updatedLicense = existingLicense.copy(
+                    licenseNumber = request.licenseNumber ?: existingLicense.licenseNumber,
+                    expiryDate = request.expiryDate ?: existingLicense.expiryDate,
+                    status = request.status ?: existingLicense.status,
+                    categories = request.categories ?: existingLicense.categories,
+                    restrictions = request.restrictions ?: existingLicense.restrictions,
+                    endorsements = request.endorsements ?: existingLicense.endorsements,
+                    medicalCertificateExpiry = request.medicalCertificateExpiry ?: existingLicense.medicalCertificateExpiry,
+                    documents = request.documents ?: existingLicense.documents,
+                    notes = request.notes ?: existingLicense.notes,
+                    updatedAt = Date()
+                )
+                
+                database.driverLicenseDao().updateLicense(updatedLicense)
+                
+                // Update licenses list
+                updateDriverLicenses()
+                
+                // Update renewal schedule
+                updateRenewalSchedule()
+                
+                Result.success(updatedLicense)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add vehicle registration
+     */
+    suspend fun addVehicleRegistration(request: AddVehicleRegistrationRequest): Result<VehicleRegistrationEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _licenseState.value = LicenseState.AddingRegistration
+                
+                // Validate request
+                validateVehicleRegistrationRequest(request)
+                
+                // Create registration entity
+                val registration = VehicleRegistrationEntity(
+                    id = 0,
+                    vehicleId = request.vehicleId,
+                    registrationNumber = request.registrationNumber,
+                    registrationType = request.registrationType,
+                    issuingAuthority = request.issuingAuthority,
+                    issueDate = request.issueDate,
+                    expiryDate = request.expiryDate,
+                    status = RegistrationStatus.ACTIVE,
+                    registrationFee = request.registrationFee,
+                    taxCertificateExpiry = request.taxCertificateExpiry,
+                    inspectionCertificateExpiry = request.inspectionCertificateExpiry,
+                    documents = request.documents,
+                    notes = request.notes,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save registration
+                val registrationId = database.vehicleRegistrationDao().insertRegistration(registration)
+                val savedRegistration = registration.copy(id = registrationId)
+                
+                // Update vehicle registration expiry
+                updateVehicleRegistrationExpiry(request.vehicleId, request.expiryDate)
+                
+                // Update registrations list
+                updateVehicleRegistrations()
+                
+                // Update renewal schedule
+                updateRenewalSchedule()
+                
+                // Notify listeners
+                notifyRegistrationAdded(savedRegistration)
+                
+                _licenseState.value = LicenseState.RegistrationAdded
+                Result.success(savedRegistration)
+                
+            } catch (e: Exception) {
+                _licenseState.value = LicenseState.Error("Failed to add registration: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update vehicle registration
+     */
+    suspend fun updateVehicleRegistration(registrationId: Long, request: UpdateVehicleRegistrationRequest): Result<VehicleRegistrationEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingRegistration = database.vehicleRegistrationDao().getRegistrationById(registrationId)
+                    ?: throw Exception("Registration not found")
+                
+                // Update registration
+                val updatedRegistration = existingRegistration.copy(
+                    registrationNumber = request.registrationNumber ?: existingRegistration.registrationNumber,
+                    expiryDate = request.expiryDate ?: existingRegistration.expiryDate,
+                    status = request.status ?: existingRegistration.status,
+                    taxCertificateExpiry = request.taxCertificateExpiry ?: existingRegistration.taxCertificateExpiry,
+                    inspectionCertificateExpiry = request.inspectionCertificateExpiry ?: existingRegistration.inspectionCertificateExpiry,
+                    documents = request.documents ?: existingRegistration.documents,
+                    notes = request.notes ?: existingRegistration.notes,
+                    updatedAt = Date()
+                )
+                
+                database.vehicleRegistrationDao().updateRegistration(updatedRegistration)
+                
+                // Update vehicle registration expiry
+                updateVehicleRegistrationExpiry(existingRegistration.vehicleId, updatedRegistration.expiryDate)
+                
+                // Update registrations list
+                updateVehicleRegistrations()
+                
+                // Update renewal schedule
+                updateRenewalSchedule()
+                
+                Result.success(updatedRegistration)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Renew driver license
+     */
+    suspend fun renewDriverLicense(licenseId: Long, newExpiryDate: Date, renewalFee: Float): Result<DriverLicenseEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingLicense = database.driverLicenseDao().getLicenseById(licenseId)
+                    ?: throw Exception("License not found")
+                
+                // Update license with new expiry
+                val renewedLicense = existingLicense.copy(
+                    expiryDate = newExpiryDate,
+                    status = LicenseStatus.ACTIVE,
+                    updatedAt = Date()
+                )
+                
+                database.driverLicenseDao().updateLicense(renewedLicense)
+                
+                // Create renewal record
+                createLicenseRenewalRecord(licenseId, newExpiryDate, renewalFee)
+                
+                // Update licenses list
+                updateDriverLicenses()
+                
+                // Update renewal schedule
+                updateRenewalSchedule()
+                
+                // Notify listeners
+                notifyLicenseRenewed(renewedLicense)
+                
+                Result.success(renewedLicense)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Renew vehicle registration
+     */
+    suspend fun renewVehicleRegistration(registrationId: Long, newExpiryDate: Date, renewalFee: Float): Result<VehicleRegistrationEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingRegistration = database.vehicleRegistrationDao().getRegistrationById(registrationId)
+                    ?: throw Exception("Registration not found")
+                
+                // Update registration with new expiry
+                val renewedRegistration = existingRegistration.copy(
+                    expiryDate = newExpiryDate,
+                    status = RegistrationStatus.ACTIVE,
+                    updatedAt = Date()
+                )
+                
+                database.vehicleRegistrationDao().updateRegistration(renewedRegistration)
+                
+                // Update vehicle registration expiry
+                updateVehicleRegistrationExpiry(existingRegistration.vehicleId, newExpiryDate)
+                
+                // Create renewal record
+                createRegistrationRenewalRecord(registrationId, newExpiryDate, renewalFee)
+                
+                // Update registrations list
+                updateVehicleRegistrations()
+                
+                // Update renewal schedule
+                updateRenewalSchedule()
+                
+                // Notify listeners
+                notifyRegistrationRenewed(renewedRegistration)
+                
+                Result.success(renewedRegistration)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get driver licenses
+     */
+    suspend fun getDriverLicenses(driverId: String? = null): List<DriverLicenseEntity> {
+        return withContext(Dispatchers.IO) {
+            if (driverId != null) {
+                database.driverLicenseDao().getLicensesByDriver(driverId)
+            } else {
+                database.driverLicenseDao().getAllLicenses()
+            }
+        }
+    }
+    
+    /**
+     * Get vehicle registrations
+     */
+    suspend fun getVehicleRegistrations(vehicleId: Long? = null): List<VehicleRegistrationEntity> {
+        return withContext(Dispatchers.IO) {
+            if (vehicleId != null) {
+                database.vehicleRegistrationDao().getRegistrationsByVehicle(vehicleId)
+            } else {
+                database.vehicleRegistrationDao().getAllRegistrations()
+            }
+        }
+    }
+    
+    /**
+     * Get license analytics
+     */
+    suspend fun getLicenseAnalytics(dateRange: DateRange = DateRange.last12Months()): LicenseAnalytics {
+        return withContext(Dispatchers.IO) {
+            try {
+                val allLicenses = database.driverLicenseDao().getAllLicenses()
+                val allRegistrations = database.vehicleRegistrationDao().getAllRegistrations()
+                
+                val totalLicenses = allLicenses.size
+                val activeLicenses = allLicenses.count { it.status == LicenseStatus.ACTIVE }
+                val expiredLicenses = allLicenses.count { it.status == LicenseStatus.EXPIRED }
+                val suspendedLicenses = allLicenses.count { it.status == LicenseStatus.SUSPENDED }
+                
+                val totalRegistrations = allRegistrations.size
+                val activeRegistrations = allRegistrations.count { it.status == RegistrationStatus.ACTIVE }
+                val expiredRegistrations = allRegistrations.count { it.status == RegistrationStatus.EXPIRED }
+                
+                val licensesExpiringSoon = allLicenses.count { 
+                    val daysUntilExpiry = ((it.expiryDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+                    daysUntilExpiry <= RENEWAL_WARNING_DAYS && daysUntilExpiry > 0
+                }
+                
+                val registrationsExpiringSoon = allRegistrations.count { 
+                    val daysUntilExpiry = ((it.expiryDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+                    daysUntilExpiry <= RENEWAL_WARNING_DAYS && daysUntilExpiry > 0
+                }
+                
+                val licensesByType = allLicenses.groupBy { it.licenseType }.mapValues { it.value.size }
+                val registrationsByType = allRegistrations.groupBy { it.registrationType }.mapValues { it.value.size }
+                val renewalTrends = calculateRenewalTrends(allLicenses, allRegistrations, dateRange)
+                val complianceStatus = calculateComplianceStatus(allLicenses, allRegistrations)
+                val costAnalysis = calculateLicenseCostAnalysis(allLicenses, allRegistrations, dateRange)
+                
+                LicenseAnalytics(
+                    totalLicenses = totalLicenses,
+                    activeLicenses = activeLicenses,
+                    expiredLicenses = expiredLicenses,
+                    suspendedLicenses = suspendedLicenses,
+                    totalRegistrations = totalRegistrations,
+                    activeRegistrations = activeRegistrations,
+                    expiredRegistrations = expiredRegistrations,
+                    licensesExpiringSoon = licensesExpiringSoon,
+                    registrationsExpiringSoon = registrationsExpiringSoon,
+                    licensesByType = licensesByType,
+                    registrationsByType = registrationsByType,
+                    renewalTrends = renewalTrends,
+                    complianceStatus = complianceStatus,
+                    costAnalysis = costAnalysis,
+                    dateRange = dateRange
+                )
+                
+            } catch (e: Exception) {
+                LicenseAnalytics()
+            }
+        }
+    }
+    
+    /**
+     * Get renewal schedule
+     */
+    suspend fun getRenewalSchedule(monthsAhead: Int = 12): List<LicenseRenewal> {
+        return withContext(Dispatchers.IO) {
+            val endDate = Date(System.currentTimeMillis() + monthsAhead * 30L * 24 * 60 * 60 * 1000)
+            val renewals = mutableListOf<LicenseRenewal>()
+            
+            // Driver license renewals
+            val licenseRenewals = database.driverLicenseDao().getLicensesExpiringBetween(Date(), endDate)
+                .map { license ->
+                    LicenseRenewal(
+                        id = license.id,
+                        type = RenewalType.DRIVER_LICENSE,
+                        entityId = license.id,
+                        entityName = license.driverId,
+                        renewalDate = license.expiryDate,
+                        daysUntilRenewal = ((license.expiryDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt(),
+                        renewalFee = 0f, // Would calculate based on license type
+                        status = determineRenewalStatus(license.expiryDate),
+                        priority = determineRenewalPriority(license.expiryDate)
+                    )
+                }
+            
+            // Vehicle registration renewals
+            val registrationRenewals = database.vehicleRegistrationDao().getRegistrationsExpiringBetween(Date(), endDate)
+                .map { registration ->
+                    LicenseRenewal(
+                        id = registration.id,
+                        type = RenewalType.VEHICLE_REGISTRATION,
+                        entityId = registration.id,
+                        entityName = registration.registrationNumber,
+                        renewalDate = registration.expiryDate,
+                        daysUntilRenewal = ((registration.expiryDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt(),
+                        renewalFee = registration.registrationFee,
+                        status = determineRenewalStatus(registration.expiryDate),
+                        priority = determineRenewalPriority(registration.expiryDate)
+                    )
+                }
+            
+            renewals.addAll(licenseRenewals)
+            renewals.addAll(registrationRenewals)
+            
+            // Sort by renewal date
+            renewals.sortedBy { it.renewalDate }
+        }
+    }
+    
+    /**
+     * Check compliance status
+     */
+    suspend fun checkComplianceStatus(entityId: String, entityType: ComplianceEntityType): ComplianceStatus {
+        return withContext(Dispatchers.IO) {
+            try {
+                when (entityType) {
+                    ComplianceEntityType.DRIVER -> {
+                        val licenses = database.driverLicenseDao().getLicensesByDriver(entityId)
+                        val hasValidLicense = licenses.any { it.status == LicenseStatus.ACTIVE && it.expiryDate.after(Date()) }
+                        val hasExpiredLicense = licenses.any { it.expiryDate.before(Date()) }
+                        
+                        when {
+                            hasValidLicense -> ComplianceStatus.COMPLIANT
+                            hasExpiredLicense -> ComplianceStatus.NON_COMPLIANT
+                            else -> ComplianceStatus.PENDING
+                        }
+                    }
+                    ComplianceEntityType.VEHICLE -> {
+                        val vehicleId = entityId.toLongOrNull() ?: return@withContext ComplianceStatus.UNKNOWN
+                        val registrations = database.vehicleRegistrationDao().getRegistrationsByVehicle(vehicleId)
+                        val hasValidRegistration = registrations.any { it.status == RegistrationStatus.ACTIVE && it.expiryDate.after(Date()) }
+                        val hasExpiredRegistration = registrations.any { it.expiryDate.before(Date()) }
+                        
+                        when {
+                            hasValidRegistration -> ComplianceStatus.COMPLIANT
+                            hasExpiredRegistration -> ComplianceStatus.NON_COMPLIANT
+                            else -> ComplianceStatus.PENDING
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                ComplianceStatus.UNKNOWN
+            }
+        }
+    }
+    
+    /**
+     * Add license management listener
+     */
+    fun addLicenseManagementListener(listener: LicenseManagementListener) {
+        licenseListeners.add(listener)
+    }
+    
+    /**
+     * Remove license management listener
+     */
+    fun removeLicenseManagementListener(listener: LicenseManagementListener) {
+        licenseListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadDriverLicenses() {
+        val licenses = database.driverLicenseDao().getAllLicenses()
+        _driverLicenses.value = licenses
+    }
+    
+    private suspend fun loadVehicleRegistrations() {
+        val registrations = database.vehicleRegistrationDao().getAllRegistrations()
+        _vehicleRegistrations.value = registrations
+    }
+    
+    private suspend fun generateRenewalSchedule() {
+        val schedule = getRenewalSchedule()
+        _renewalSchedule.value = schedule
+    }
+    
+    private fun startLicenseMonitoring() {
+        isMonitoring = true
+        // Implementation would start periodic license monitoring
+    }
+    
+    private suspend fun checkLicenseAlerts() {
+        val licenses = _driverLicenses.value
+        val registrations = _vehicleRegistrations.value
+        val alerts = mutableListOf<LicenseAlert>()
+        
+        licenses.forEach { license ->
+            val licenseAlerts = checkLicenseAlerts(license)
+            alerts.addAll(licenseAlerts)
+        }
+        
+        registrations.forEach { registration ->
+            val registrationAlerts = checkRegistrationAlerts(registration)
+            alerts.addAll(registrationAlerts)
+        }
+        
+        _licenseAlerts.value = alerts
+    }
+    
+    private suspend fun checkLicenseAlerts(license: DriverLicenseEntity): List<LicenseAlert> {
+        val alerts = mutableListOf<LicenseAlert>()
+        val daysUntilExpiry = ((license.expiryDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+        
+        // Critical expiry alert
+        if (daysUntilExpiry <= CRITICAL_RENEWAL_DAYS && daysUntilExpiry > 0) {
+            alerts.add(LicenseAlert(
+                id = 0,
+                entityType = LicenseEntityType.DRIVER_LICENSE,
+                entityId = license.id,
+                type = LicenseAlertType.EXPIRY_WARNING,
+                message = "Driver license expires in $daysUntilExpiry days",
+                severity = AlertSeverity.CRITICAL,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        // Warning expiry alert
+        else if (daysUntilExpiry <= RENEWAL_WARNING_DAYS && daysUntilExpiry > 0) {
+            alerts.add(LicenseAlert(
+                id = 0,
+                entityType = LicenseEntityType.DRIVER_LICENSE,
+                entityId = license.id,
+                type = LicenseAlertType.EXPIRY_WARNING,
+                message = "Driver license expires in $daysUntilExpiry days",
+                severity = AlertSeverity.HIGH,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        // Expired alert
+        if (daysUntilExpiry < 0) {
+            alerts.add(LicenseAlert(
+                id = 0,
+                entityType = LicenseEntityType.DRIVER_LICENSE,
+                entityId = license.id,
+                type = LicenseAlertType.EXPIRED,
+                message = "Driver license has expired",
+                severity = AlertSeverity.CRITICAL,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        return alerts
+    }
+    
+    private suspend fun checkRegistrationAlerts(registration: VehicleRegistrationEntity): List<LicenseAlert> {
+        val alerts = mutableListOf<LicenseAlert>()
+        val daysUntilExpiry = ((registration.expiryDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+        
+        // Critical expiry alert
+        if (daysUntilExpiry <= CRITICAL_RENEWAL_DAYS && daysUntilExpiry > 0) {
+            alerts.add(LicenseAlert(
+                id = 0,
+                entityType = LicenseEntityType.VEHICLE_REGISTRATION,
+                entityId = registration.id,
+                type = LicenseAlertType.EXPIRY_WARNING,
+                message = "Vehicle registration expires in $daysUntilExpiry days",
+                severity = AlertSeverity.CRITICAL,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        // Warning expiry alert
+        else if (daysUntilExpiry <= RENEWAL_WARNING_DAYS && daysUntilExpiry > 0) {
+            alerts.add(LicenseAlert(
+                id = 0,
+                entityType = LicenseEntityType.VEHICLE_REGISTRATION,
+                entityId = registration.id,
+                type = LicenseAlertType.EXPIRY_WARNING,
+                message = "Vehicle registration expires in $daysUntilExpiry days",
+                severity = AlertSeverity.HIGH,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        // Expired alert
+        if (daysUntilExpiry < 0) {
+            alerts.add(LicenseAlert(
+                id = 0,
+                entityType = LicenseEntityType.VEHICLE_REGISTRATION,
+                entityId = registration.id,
+                type = LicenseAlertType.EXPIRED,
+                message = "Vehicle registration has expired",
+                severity = AlertSeverity.CRITICAL,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        return alerts
+    }
+    
+    private fun validateDriverLicenseRequest(request: AddDriverLicenseRequest) {
+        if (request.driverId.isBlank()) throw Exception("Driver ID is required")
+        if (request.licenseNumber.isBlank()) throw Exception("License number is required")
+        if (request.issueDate.after(request.expiryDate)) throw Exception("Issue date must be before expiry date")
+    }
+    
+    private fun validateVehicleRegistrationRequest(request: AddVehicleRegistrationRequest) {
+        if (request.vehicleId <= 0) throw Exception("Valid vehicle ID is required")
+        if (request.registrationNumber.isBlank()) throw Exception("Registration number is required")
+        if (request.issueDate.after(request.expiryDate)) throw Exception("Issue date must be before expiry date")
+    }
+    
+    private suspend fun createLicenseRenewalRecord(licenseId: Long, expiryDate: Date, fee: Float) {
+        // Implementation would create renewal record for analytics
+    }
+    
+    private suspend fun createRegistrationRenewalRecord(registrationId: Long, expiryDate: Date, fee: Float) {
+        // Implementation would create renewal record for analytics
+    }
+    
+    private suspend fun updateVehicleRegistrationExpiry(vehicleId: Long, expiryDate: Date) {
+        val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+        vehicle?.let {
+            val updatedVehicle = it.copy(licenseExpiry = expiryDate, updatedAt = Date())
+            database.vehicleDao().updateVehicle(updatedVehicle)
+        }
+    }
+    
+    private suspend fun updateDriverLicenses() {
+        loadDriverLicenses()
+    }
+    
+    private suspend fun updateVehicleRegistrations() {
+        loadVehicleRegistrations()
+    }
+    
+    private suspend fun updateRenewalSchedule() {
+        generateRenewalSchedule()
+    }
+    
+    private fun determineRenewalStatus(expiryDate: Date): RenewalStatus {
+        val daysUntilRenewal = ((expiryDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+        
+        return when {
+            daysUntilRenewal < 0 -> RenewalStatus.OVERDUE
+            daysUntilRenewal <= CRITICAL_RENEWAL_DAYS -> RenewalStatus.CRITICAL
+            daysUntilRenewal <= RENEWAL_WARNING_DAYS -> RenewalStatus.WARNING
+            else -> RenewalStatus.SCHEDULED
+        }
+    }
+    
+    private fun determineRenewalPriority(expiryDate: Date): RenewalPriority {
+        val daysUntilRenewal = ((expiryDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+        
+        return when {
+            daysUntilRenewal < 0 -> RenewalPriority.URGENT
+            daysUntilRenewal <= CRITICAL_RENEWAL_DAYS -> RenewalPriority.HIGH
+            daysUntilRenewal <= RENEWAL_WARNING_DAYS -> RenewalPriority.MEDIUM
+            else -> RenewalPriority.LOW
+        }
+    }
+    
+    private fun calculateRenewalTrends(
+        licenses: List<DriverLicenseEntity>,
+        registrations: List<VehicleRegistrationEntity>,
+        dateRange: DateRange
+    ): RenewalTrends {
+        // Implementation would calculate renewal trends
+        return RenewalTrends(
+            licenseRenewalRate = 95.5f,
+            registrationRenewalRate = 98.2f,
+            averageRenewalTime = 15.5f,
+            renewalCostTrend = TrendDirection.STABLE
+        )
+    }
+    
+    private fun calculateComplianceStatus(
+        licenses: List<DriverLicenseEntity>,
+        registrations: List<VehicleRegistrationEntity>
+    ): OverallComplianceStatus {
+        val validLicenses = licenses.count { it.status == LicenseStatus.ACTIVE && it.expiryDate.after(Date()) }
+        val validRegistrations = registrations.count { it.status == RegistrationStatus.ACTIVE && it.expiryDate.after(Date()) }
+        
+        val licenseComplianceRate = if (licenses.isNotEmpty()) {
+            (validLicenses.toFloat() / licenses.size) * 100f
+        } else 100f
+        
+        val registrationComplianceRate = if (registrations.isNotEmpty()) {
+            (validRegistrations.toFloat() / registrations.size) * 100f
+        } else 100f
+        
+        val overallComplianceRate = (licenseComplianceRate + registrationComplianceRate) / 2f
+        
+        return OverallComplianceStatus(
+            overallComplianceRate = overallComplianceRate,
+            licenseComplianceRate = licenseComplianceRate,
+            registrationComplianceRate = registrationComplianceRate,
+            status = when {
+                overallComplianceRate >= 95 -> ComplianceLevel.EXCELLENT
+                overallComplianceRate >= 85 -> ComplianceLevel.GOOD
+                overallComplianceRate >= 75 -> ComplianceLevel.FAIR
+                overallComplianceRate >= 60 -> ComplianceLevel.POOR
+                else -> ComplianceLevel.CRITICAL
+            }
+        )
+    }
+    
+    private fun calculateLicenseCostAnalysis(
+        licenses: List<DriverLicenseEntity>,
+        registrations: List<VehicleRegistrationEntity>,
+        dateRange: DateRange
+    ): LicenseCostAnalysis {
+        // Implementation would calculate cost analysis
+        return LicenseCostAnalysis(
+            totalRenewalCost = 5000f,
+            averageLicenseCost = 200f,
+            averageRegistrationCost = 150f,
+            costTrend = TrendDirection.INCREASING
+        )
+    }
+    
+    private fun notifyLicenseAdded(license: DriverLicenseEntity) {
+        licenseListeners.forEach { listener ->
+            listener.onLicenseAdded(license)
+        }
+    }
+    
+    private fun notifyLicenseRenewed(license: DriverLicenseEntity) {
+        licenseListeners.forEach { listener ->
+            listener.onLicenseRenewed(license)
+        }
+    }
+    
+    private fun notifyRegistrationAdded(registration: VehicleRegistrationEntity) {
+        licenseListeners.forEach { listener ->
+            listener.onRegistrationAdded(registration)
+        }
+    }
+    
+    private fun notifyRegistrationRenewed(registration: VehicleRegistrationEntity) {
+        licenseListeners.forEach { listener ->
+            listener.onRegistrationRenewed(registration)
+        }
+    }
+    
+    /**
+     * Get monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+}
+
+/**
+ * Data classes
+ */
+data class AddDriverLicenseRequest(
+    val driverId: String,
+    val licenseNumber: String,
+    val licenseType: LicenseType,
+    val issuingAuthority: String,
+    val issueDate: Date,
+    val expiryDate: Date,
+    val categories: List<LicenseCategory>,
+    val restrictions: List<String>,
+    val endorsements: List<String>,
+    val medicalCertificateExpiry: Date?,
+    val photoUrl: String?,
+    val documents: List<String>,
+    val notes: String?
+)
+
+data class UpdateDriverLicenseRequest(
+    val licenseNumber: String? = null,
+    val expiryDate: Date? = null,
+    val status: LicenseStatus? = null,
+    val categories: List<LicenseCategory>? = null,
+    val restrictions: List<String>? = null,
+    val endorsements: List<String>? = null,
+    val medicalCertificateExpiry: Date? = null,
+    val documents: List<String>? = null,
+    val notes: String? = null
+)
+
+data class AddVehicleRegistrationRequest(
+    val vehicleId: Long,
+    val registrationNumber: String,
+    val registrationType: RegistrationType,
+    val issuingAuthority: String,
+    val issueDate: Date,
+    val expiryDate: Date,
+    val registrationFee: Float,
+    val taxCertificateExpiry: Date?,
+    val inspectionCertificateExpiry: Date?,
+    val documents: List<String>,
+    val notes: String?
+)
+
+data class UpdateVehicleRegistrationRequest(
+    val registrationNumber: String? = null,
+    val expiryDate: Date? = null,
+    val status: RegistrationStatus? = null,
+    val taxCertificateExpiry: Date? = null,
+    val inspectionCertificateExpiry: Date? = null,
+    val documents: List<String>? = null,
+    val notes: String? = null
+)
+
+data class LicenseAnalytics(
+    val totalLicenses: Int = 0,
+    val activeLicenses: Int = 0,
+    val expiredLicenses: Int = 0,
+    val suspendedLicenses: Int = 0,
+    val totalRegistrations: Int = 0,
+    val activeRegistrations: Int = 0,
+    val expiredRegistrations: Int = 0,
+    val licensesExpiringSoon: Int = 0,
+    val registrationsExpiringSoon: Int = 0,
+    val licensesByType: Map<LicenseType, Int> = emptyMap(),
+    val registrationsByType: Map<RegistrationType, Int> = emptyMap(),
+    val renewalTrends: RenewalTrends = RenewalTrends(),
+    val complianceStatus: OverallComplianceStatus = OverallComplianceStatus(),
+    val costAnalysis: LicenseCostAnalysis = LicenseCostAnalysis(),
+    val dateRange: DateRange = DateRange()
+)
+
+data class LicenseRenewal(
+    val id: Long,
+    val type: RenewalType,
+    val entityId: Long,
+    val entityName: String,
+    val renewalDate: Date,
+    val daysUntilRenewal: Int,
+    val renewalFee: Float,
+    val status: RenewalStatus,
+    val priority: RenewalPriority
+)
+
+data class RenewalTrends(
+    val licenseRenewalRate: Float,
+    val registrationRenewalRate: Float,
+    val averageRenewalTime: Float,
+    val renewalCostTrend: TrendDirection
+)
+
+data class OverallComplianceStatus(
+    val overallComplianceRate: Float,
+    val licenseComplianceRate: Float,
+    val registrationComplianceRate: Float,
+    val status: ComplianceLevel
+)
+
+data class LicenseCostAnalysis(
+    val totalRenewalCost: Float,
+    val averageLicenseCost: Float,
+    val averageRegistrationCost: Float,
+    val costTrend: TrendDirection
+)
+
+data class LicenseAlert(
+    val id: Long,
+    val entityType: LicenseEntityType,
+    val entityId: Long,
+    val type: LicenseAlertType,
+    val message: String,
+    val severity: AlertSeverity,
+    val timestamp: Date,
+    val resolved: Boolean
+)
+
+/**
+ * Interfaces
+ */
+interface LicenseManagementListener {
+    fun onLicenseAdded(license: DriverLicenseEntity)
+    fun onLicenseUpdated(license: DriverLicenseEntity)
+    fun onLicenseRenewed(license: DriverLicenseEntity)
+    fun onLicenseExpired(licenseId: Long)
+    fun onRegistrationAdded(registration: VehicleRegistrationEntity)
+    fun onRegistrationUpdated(registration: VehicleRegistrationEntity)
+    fun onRegistrationRenewed(registration: VehicleRegistrationEntity)
+    fun onRegistrationExpired(registrationId: Long)
+    fun onLicenseAlert(alert: LicenseAlert)
+}
+
+/**
+ * Enums
+ */
+enum class LicenseState {
+    Idle,
+    Initializing,
+    Ready,
+    AddingLicense,
+    LicenseAdded,
+    UpdatingLicense,
+    LicenseUpdated,
+    AddingRegistration,
+    RegistrationAdded,
+    UpdatingRegistration,
+    RegistrationUpdated,
+    Error
+}
+
+enum class LicenseType {
+    COMMERCIAL,
+    PRIVATE,
+    MOTORCYCLE,
+    TRUCK,
+    BUS,
+    TEMPORARY,
+    INTERNATIONAL
+}
+
+enum class LicenseCategory {
+    LIGHT_VEHICLE,
+    MEDIUM_VEHICLE,
+    HEAVY_VEHICLE,
+    MOTORCYCLE,
+    PASSENGER,
+    GOODS,
+    DANGEROUS_GOODS
+}
+
+enum class LicenseStatus {
+    ACTIVE,
+    EXPIRED,
+    SUSPENDED,
+    REVOKED,
+    CANCELLED,
+    PENDING
+}
+
+enum class RegistrationType {
+    COMMERCIAL,
+    PRIVATE,
+    TEMPORARY,
+    EXPORT,
+    IMPORT
+}
+
+enum class RegistrationStatus {
+    ACTIVE,
+    EXPIRED,
+    SUSPENDED,
+    CANCELLED,
+    PENDING
+}
+
+enum class RenewalType {
+    DRIVER_LICENSE,
+    VEHICLE_REGISTRATION,
+    MEDICAL_CERTIFICATE,
+    TAX_CERTIFICATE,
+    INSPECTION_CERTIFICATE
+}
+
+enum class RenewalStatus {
+    SCHEDULED,
+    WARNING,
+    CRITICAL,
+    OVERDUE,
+    COMPLETED
+}
+
+enum class RenewalPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    URGENT
+}
+
+enum class ComplianceEntityType {
+    DRIVER,
+    VEHICLE
+}
+
+enum class ComplianceStatus {
+    COMPLIANT,
+    NON_COMPLIANT,
+    PENDING,
+    UNKNOWN
+}
+
+enum class ComplianceLevel {
+    EXCELLENT,
+    GOOD,
+    FAIR,
+    POOR,
+    CRITICAL
+}
+
+enum class LicenseEntityType {
+    DRIVER_LICENSE,
+    VEHICLE_REGISTRATION,
+    MEDICAL_CERTIFICATE,
+    TAX_CERTIFICATE,
+    INSPECTION_CERTIFICATE
+}
+
+enum class LicenseAlertType {
+    EXPIRY_WARNING,
+    EXPIRED,
+    SUSPENDED,
+    REVOKED,
+    DOCUMENT_MISSING,
+    COMPLIANCE_ISSUE
+}

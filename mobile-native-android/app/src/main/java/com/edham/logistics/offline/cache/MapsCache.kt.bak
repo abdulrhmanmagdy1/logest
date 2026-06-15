@@ -1,0 +1,544 @@
+package com.edham.logistics.offline.cache
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Maps Cache - Optimized caching for maps data
+ * Handles tiles, routes, geocoding, and places data
+ */
+
+// Temporarily disabled due to missing dependencies
+// @Singleton
+// class MapsCache @Inject constructor(
+//     private val offlineDatabase: OfflineDatabase,
+//     private val cacheMetrics: CacheMetrics
+// ) {
+class MapsCache {
+
+    private val cacheScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val memoryCache = ConcurrentHashMap<String, CachedMapsData>()
+    private val maxMemoryCacheSize = 200 // Maximum map items in memory
+    private val cacheAccessOrder = mutableListOf<String>()
+    
+    // Cache configuration
+    private val tileExpiryTime = 24 * 60 * 60 * 1000L // 24 hours for tiles
+    private val routeExpiryTime = 2 * 60 * 60 * 1000L // 2 hours for routes
+    private val geocodingExpiryTime = 7 * 24 * 60 * 60 * 1000L // 7 days for geocoding
+    private val placesExpiryTime = 24 * 60 * 60 * 1000L // 24 hours for places
+    private val maxCacheSize = 100 * 1024 * 1024L // 100MB
+    
+    init {
+        startCacheMaintenance()
+    }
+
+    /**
+     * Get map tiles from cache
+     */
+    suspend fun getMapTiles(tileKey: String): CachedMapsDataEntity? {
+        return try {
+            // Check memory cache first
+            val cached = memoryCache[tileKey]
+            if (cached != null && !isExpired(cached)) {
+                updateAccessOrder(tileKey)
+                cacheMetrics.recordCacheHit("maps_tiles")
+                return cached.toEntity()
+            }
+            
+            // Check database cache
+            val dbData = offlineDatabase.cachedMapsDataDao().getCachedData(tileKey)
+            if (dbData != null && !isExpired(dbData)) {
+                // Add to memory cache
+                addToMemoryCache(dbData)
+                cacheMetrics.recordCacheHit("maps_tiles")
+                return dbData
+            }
+            
+            cacheMetrics.recordCacheMiss("maps_tiles")
+            null
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting map tiles from cache")
+            null
+        }
+    }
+
+    /**
+     * Put map tiles in cache
+     */
+    suspend fun putMapTiles(tileKey: String, tilesData: String, bounds: String? = null) {
+        try {
+            val cacheData = CachedMapsDataEntity(
+                cacheKey = tileKey,
+                data = tilesData,
+                dataType = "TILES",
+                bounds = bounds,
+                timestamp = System.currentTimeMillis(),
+                expiryTime = System.currentTimeMillis() + tileExpiryTime,
+                size = tilesData.length.toLong()
+            )
+            
+            // Update in database
+            offlineDatabase.cachedMapsDataDao().insertCachedData(cacheData)
+            
+            // Add to memory cache
+            addToMemoryCache(cacheData)
+            
+            cacheMetrics.recordCachePut("maps_tiles")
+            Timber.d("Cached map tiles: $tileKey")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching map tiles")
+        }
+    }
+
+    /**
+     * Get route from cache
+     */
+    suspend fun getRoute(routeKey: String): CachedMapsDataEntity? {
+        return try {
+            // Check memory cache first
+            val cached = memoryCache[routeKey]
+            if (cached != null && !isExpired(cached)) {
+                updateAccessOrder(routeKey)
+                cacheMetrics.recordCacheHit("maps_route")
+                return cached.toEntity()
+            }
+            
+            // Check database cache
+            val dbData = offlineDatabase.cachedMapsDataDao().getCachedData(routeKey)
+            if (dbData != null && !isExpired(dbData)) {
+                // Add to memory cache
+                addToMemoryCache(dbData)
+                cacheMetrics.recordCacheHit("maps_route")
+                return dbData
+            }
+            
+            cacheMetrics.recordCacheMiss("maps_route")
+            null
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting route from cache")
+            null
+        }
+    }
+
+    /**
+     * Put route in cache
+     */
+    suspend fun putRoute(routeKey: String, routeData: String) {
+        try {
+            val cacheData = CachedMapsDataEntity(
+                cacheKey = routeKey,
+                data = routeData,
+                dataType = "ROUTE",
+                bounds = null,
+                timestamp = System.currentTimeMillis(),
+                expiryTime = System.currentTimeMillis() + routeExpiryTime,
+                size = routeData.length.toLong()
+            )
+            
+            // Update in database
+            offlineDatabase.cachedMapsDataDao().insertCachedData(cacheData)
+            
+            // Add to memory cache
+            addToMemoryCache(cacheData)
+            
+            cacheMetrics.recordCachePut("maps_route")
+            Timber.d("Cached route: $routeKey")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching route")
+        }
+    }
+
+    /**
+     * Get geocoding data from cache
+     */
+    suspend fun getGeocoding(query: String): CachedMapsDataEntity? {
+        return try {
+            // Check memory cache first
+            val cached = memoryCache[query]
+            if (cached != null && !isExpired(cached)) {
+                updateAccessOrder(query)
+                cacheMetrics.recordCacheHit("maps_geocoding")
+                return cached.toEntity()
+            }
+            
+            // Check database cache
+            val dbData = offlineDatabase.cachedMapsDataDao().getCachedData(query)
+            if (dbData != null && !isExpired(dbData)) {
+                // Add to memory cache
+                addToMemoryCache(dbData)
+                cacheMetrics.recordCacheHit("maps_geocoding")
+                return dbData
+            }
+            
+            cacheMetrics.recordCacheMiss("maps_geocoding")
+            null
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting geocoding from cache")
+            null
+        }
+    }
+
+    /**
+     * Put geocoding data in cache
+     */
+    suspend fun putGeocoding(query: String, geocodingData: String) {
+        try {
+            val cacheData = CachedMapsDataEntity(
+                cacheKey = query,
+                data = geocodingData,
+                dataType = "GEOCODING",
+                bounds = null,
+                timestamp = System.currentTimeMillis(),
+                expiryTime = System.currentTimeMillis() + geocodingExpiryTime,
+                size = geocodingData.length.toLong()
+            )
+            
+            // Update in database
+            offlineDatabase.cachedMapsDataDao().insertCachedData(cacheData)
+            
+            // Add to memory cache
+            addToMemoryCache(cacheData)
+            
+            cacheMetrics.recordCachePut("maps_geocoding")
+            Timber.d("Cached geocoding: $query")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching geocoding")
+        }
+    }
+
+    /**
+     * Get places data from cache
+     */
+    suspend fun getPlaces(placeId: String): CachedMapsDataEntity? {
+        return try {
+            // Check memory cache first
+            val cached = memoryCache[placeId]
+            if (cached != null && !isExpired(cached)) {
+                updateAccessOrder(placeId)
+                cacheMetrics.recordCacheHit("maps_places")
+                return cached.toEntity()
+            }
+            
+            // Check database cache
+            val dbData = offlineDatabase.cachedMapsDataDao().getCachedData(placeId)
+            if (dbData != null && !isExpired(dbData)) {
+                // Add to memory cache
+                addToMemoryCache(dbData)
+                cacheMetrics.recordCacheHit("maps_places")
+                return dbData
+            }
+            
+            cacheMetrics.recordCacheMiss("maps_places")
+            null
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting places from cache")
+            null
+        }
+    }
+
+    /**
+     * Put places data in cache
+     */
+    suspend fun putPlaces(placeId: String, placesData: String) {
+        try {
+            val cacheData = CachedMapsDataEntity(
+                cacheKey = placeId,
+                data = placesData,
+                dataType = "PLACES",
+                bounds = null,
+                timestamp = System.currentTimeMillis(),
+                expiryTime = System.currentTimeMillis() + placesExpiryTime,
+                size = placesData.length.toLong()
+            )
+            
+            // Update in database
+            offlineDatabase.cachedMapsDataDao().insertCachedData(cacheData)
+            
+            // Add to memory cache
+            addToMemoryCache(cacheData)
+            
+            cacheMetrics.recordCachePut("maps_places")
+            Timber.d("Cached places: $placeId")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching places")
+        }
+    }
+
+    /**
+     * Clear all maps cache
+     */
+    suspend fun clearCache() {
+        try {
+            // Clear memory cache
+            memoryCache.clear()
+            cacheAccessOrder.clear()
+            
+            // Clear database cache
+            offlineDatabase.cachedMapsDataDao().deleteExpiredData(System.currentTimeMillis())
+            
+            cacheMetrics.recordCacheClear("maps")
+            Timber.d("Cleared maps cache")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error clearing maps cache")
+        }
+    }
+
+    /**
+     * Clear expired cache entries
+     */
+    suspend fun clearExpiredCache() {
+        try {
+            val currentTime = System.currentTimeMillis()
+            
+            // Clear from database
+            val deletedCount = offlineDatabase.cachedMapsDataDao().deleteExpiredData(currentTime)
+            
+            // Clear from memory
+            val expiredIds = mutableListOf<String>()
+            memoryCache.forEach { (id, cached) ->
+                if (currentTime > cached.expiresAt) {
+                    expiredIds.add(id)
+                }
+            }
+            
+            expiredIds.forEach { id ->
+                memoryCache.remove(id)
+                cacheAccessOrder.remove(id)
+                cacheMetrics.recordCacheEviction("maps")
+            }
+            
+            Timber.d("Cleared ${deletedCount + expiredIds.size} expired maps cache entries")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error clearing expired maps cache")
+        }
+    }
+
+    /**
+     * Get cache statistics
+     */
+    fun getCacheStats(): MapsCacheStats {
+        return try {
+            val memorySize = memoryCache.size
+            val totalSize = cacheAccessOrder.size
+            val hitRate = cacheMetrics.getHitRate("maps")
+            val memoryUsage = estimateMemoryUsage()
+            
+            val tilesCount = memoryCache.values.count { it.dataType == "TILES" }
+            val routesCount = memoryCache.values.count { it.dataType == "ROUTE" }
+            val geocodingCount = memoryCache.values.count { it.dataType == "GEOCODING" }
+            val placesCount = memoryCache.values.count { it.dataType == "PLACES" }
+            
+            MapsCacheStats(
+                memoryCacheSize = memorySize,
+                totalCacheSize = totalSize,
+                hitRate = hitRate,
+                memoryUsageBytes = memoryUsage,
+                maxMemoryCacheSize = maxMemoryCacheSize,
+                tilesCount = tilesCount,
+                routesCount = routesCount,
+                geocodingCount = geocodingCount,
+                placesCount = placesCount,
+                oldestEntry = cacheAccessOrder.firstOrNull(),
+                newestEntry = cacheAccessOrder.lastOrNull()
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting maps cache stats")
+            MapsCacheStats(0, 0, 0.0, 0L, maxMemoryCacheSize, 0, 0, 0, 0, null, null)
+        }
+    }
+
+    /**
+     * Preload cache with frequently used data
+     */
+    suspend fun preloadCache(tileKeys: List<String>, routeKeys: List<String>) {
+        try {
+            // Preload tiles
+            tileKeys.forEach { key ->
+                getMapTiles(key)
+            }
+            
+            // Preload routes
+            routeKeys.forEach { key ->
+                getRoute(key)
+            }
+            
+            Timber.d("Preloaded maps cache with ${tileKeys.size} tiles and ${routeKeys.size} routes")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error preloading maps cache")
+        }
+    }
+
+    /**
+     * Get cache size by type
+     */
+    suspend fun getCacheSizeByType(): Map<String, Int> {
+        return try {
+            val validData = offlineDatabase.cachedMapsDataDao().getValidCachedDataByType("TILES", System.currentTimeMillis())
+            val types = mutableMapOf<String, Int>()
+            
+            types["TILES"] = validData.size
+            
+            // Get other types
+            listOf("ROUTE", "GEOCODING", "PLACES").forEach { type ->
+                val data = offlineDatabase.cachedMapsDataDao().getValidCachedDataByType(type, System.currentTimeMillis())
+                types[type] = data.size
+            }
+            
+            types
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting cache size by type")
+            emptyMap()
+        }
+    }
+
+    // Private methods
+
+    private fun addToMemoryCache(cacheData: CachedMapsDataEntity) {
+        val cachedMapsData = CachedMapsData(
+            data = cacheData.data,
+            dataType = cacheData.dataType,
+            cachedAt = System.currentTimeMillis(),
+            expiresAt = cacheData.expiryTime
+        )
+        
+        // Check if cache is full
+        if (memoryCache.size >= maxMemoryCacheSize) {
+            evictLRU()
+        }
+        
+        memoryCache[cacheData.cacheKey] = cachedMapsData
+        updateAccessOrder(cacheData.cacheKey)
+    }
+
+    private fun evictLRU() {
+        if (cacheAccessOrder.isNotEmpty()) {
+            val lruId = cacheAccessOrder.removeFirst()
+            memoryCache.remove(lruId)
+            cacheMetrics.recordCacheEviction("maps")
+        }
+    }
+
+    private fun updateAccessOrder(cacheKey: String) {
+        cacheAccessOrder.remove(cacheKey)
+        cacheAccessOrder.add(cacheKey)
+    }
+
+    private fun isExpired(cachedMapsData: CachedMapsData): Boolean {
+        return System.currentTimeMillis() > cachedMapsData.expiresAt
+    }
+
+    private fun isExpired(cacheData: CachedMapsDataEntity): Boolean {
+        return System.currentTimeMillis() > cacheData.expiryTime
+    }
+
+    private fun estimateMemoryUsage(): Long {
+        return memoryCache.values.sumOf { 
+            it.data.length.toLong()
+        }
+    }
+
+    private fun startCacheMaintenance() {
+        cacheScope.launch {
+            while (isActive) {
+                try {
+                    // Clean up expired entries
+                    cleanupExpiredEntries()
+                    
+                    // Update cache metrics
+                    updateCacheMetrics()
+                    
+                    delay(60000) // Run maintenance every minute
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in maps cache maintenance")
+                    delay(300000) // Wait longer on error
+                }
+            }
+        }
+    }
+
+    private suspend fun cleanupExpiredEntries() {
+        try {
+            val currentTime = System.currentTimeMillis()
+            val expiredIds = mutableListOf<String>()
+            
+            memoryCache.forEach { (id, cached) ->
+                if (currentTime > cached.expiresAt) {
+                    expiredIds.add(id)
+                }
+            }
+            
+            expiredIds.forEach { id ->
+                memoryCache.remove(id)
+                cacheAccessOrder.remove(id)
+                cacheMetrics.recordCacheEviction("maps")
+            }
+            
+            if (expiredIds.isNotEmpty()) {
+                Timber.d("Cleaned up ${expiredIds.size} expired maps cache entries")
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error cleaning up expired maps cache entries")
+        }
+    }
+
+    private fun updateCacheMetrics() {
+        try {
+            val stats = getCacheStats()
+            cacheMetrics.updateCacheStats("maps", stats)
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating maps cache metrics")
+        }
+    }
+}
+
+// Data classes for maps caching
+
+data class CachedMapsData(
+    val data: String,
+    val dataType: String,
+    val cachedAt: Long,
+    val expiresAt: Long
+)
+
+fun CachedMapsData.toEntity(): CachedMapsDataEntity {
+    return CachedMapsDataEntity(
+        cacheKey = this.hashCode().toString(), // Generate unique key
+        data = this.data,
+        dataType = this.dataType,
+        bounds = null,
+        timestamp = this.cachedAt,
+        expiryTime = this.expiresAt,
+        size = this.data.length.toLong()
+    )
+}
+
+data class MapsCacheStats(
+    val memoryCacheSize: Int,
+    val totalCacheSize: Int,
+    val hitRate: Double,
+    val memoryUsageBytes: Long,
+    val maxMemoryCacheSize: Int,
+    val tilesCount: Int,
+    val routesCount: Int,
+    val geocodingCount: Int,
+    val placesCount: Int,
+    val oldestEntry: String?,
+    val newestEntry: String?
+)

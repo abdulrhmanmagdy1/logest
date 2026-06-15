@@ -1,0 +1,515 @@
+package com.edham.logistics.core.network
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.os.Build
+import com.edham.logistics.core.utils.DeviceInfo
+import com.edham.logistics.core.utils.NetworkUtils
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.Cache
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
+import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import java.io.File
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * API optimization system for production performance
+ */
+@Singleton
+class ApiOptimizer @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val deviceInfo: DeviceInfo,
+    private val networkUtils: NetworkUtils
+) {
+    
+    companion object {
+        private const val CACHE_SIZE = 10 * 1024 * 1024L // 10MB
+        private const val CACHE_MAX_AGE = 5 * 60 // 5 minutes
+        private const val CACHE_MAX_STALE = 60 * 60 // 1 hour
+        private const val CONNECT_TIMEOUT = 30L
+        private const val READ_TIMEOUT = 30L
+        private const val WRITE_TIMEOUT = 30L
+        private const val MAX_RETRIES = 3
+        private const val RETRY_DELAY_MS = 1000L
+    }
+    
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val _networkState = MutableStateFlow(NetworkState.UNKNOWN)
+    val networkState: StateFlow<NetworkState> = _networkState.asStateFlow()
+    
+    private val _apiPerformance = MutableStateFlow(ApiPerformance())
+    val apiPerformance: StateFlow<ApiPerformance> = _apiPerformance.asStateFlow()
+    
+    private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            super.onAvailable(network)
+            updateNetworkState()
+        }
+        
+        override fun onLost(network: Network) {
+            super.onLost(network)
+            updateNetworkState()
+        }
+        
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            super.onCapabilitiesChanged(network, networkCapabilities)
+            updateNetworkState()
+        }
+    }
+    
+    init {
+        registerNetworkCallback()
+        updateNetworkState()
+    }
+    
+    /**
+     * Create optimized OkHttpClient
+     */
+    fun createOptimizedOkHttpClient(): OkHttpClient {
+        return OkHttpClient.Builder()
+            .cache(createCache())
+            .addInterceptor(createCacheInterceptor())
+            .addInterceptor(createNetworkInterceptor())
+            .addInterceptor(createPerformanceInterceptor())
+            .addInterceptor(createRetryInterceptor())
+            .addInterceptor(createUserAgentInterceptor())
+            .addInterceptor(createLoggingInterceptor())
+            .connectTimeout(CONNECT_TIMEOUT, TimeUnit.SECONDS)
+            .readTimeout(READ_TIMEOUT, TimeUnit.SECONDS)
+            .writeTimeout(WRITE_TIMEOUT, TimeUnit.SECONDS)
+            .build()
+    }
+    
+    /**
+     * Create optimized Retrofit
+     */
+    fun createOptimizedRetrofit(
+        baseUrl: String,
+        okHttpClient: OkHttpClient
+    ): Retrofit {
+        return Retrofit.Builder()
+            .baseUrl(baseUrl)
+            .client(okHttpClient)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+    }
+    
+    /**
+     * Create HTTP cache
+     */
+    private fun createCache(): Cache {
+        val cacheDir = File(context.cacheDir, "http_cache")
+        return Cache(cacheDir, CACHE_SIZE)
+    }
+    
+    /**
+     * Create cache interceptor
+     */
+    private fun createCacheInterceptor(): Interceptor {
+        return Interceptor { chain ->
+            val request = chain.request()
+            val response = chain.proceed(request)
+            
+            // Cache control based on network state
+            val cacheControl = when (networkState.value) {
+                NetworkState.CONNECTED -> {
+                    // Use cache when available, but validate with server
+                    "public, max-age=$CACHE_MAX_AGE"
+                }
+                NetworkState.SLOW -> {
+                    // Prefer cache when network is slow
+                    "public, max-stale=$CACHE_MAX_STALE"
+                }
+                NetworkState.OFFLINE -> {
+                    // Use cache only when offline
+                    "public, only-if-cached, max-stale=$CACHE_MAX_STALE"
+                }
+                NetworkState.UNKNOWN -> {
+                    // Default cache behavior
+                    "public, max-age=$CACHE_MAX_AGE"
+                }
+            }
+            
+            response.newBuilder()
+                .header("Cache-Control", cacheControl)
+                .build()
+        }
+    }
+    
+    /**
+     * Create network interceptor
+     */
+    private fun createNetworkInterceptor(): Interceptor {
+        return Interceptor { chain ->
+            val request = chain.request()
+            
+            // Check network connectivity
+            if (networkState.value == NetworkState.OFFLINE) {
+                // Try to get from cache
+                val cacheRequest = request.newBuilder()
+                    .header("Cache-Control", "only-if-cached")
+                    .build()
+                
+                val cacheResponse = chain.proceed(cacheRequest)
+                if (cacheResponse.code == 504) { // Gateway Timeout (cache miss)
+                    throw NetworkException("No internet connection and no cached data available")
+                }
+                return@Interceptor cacheResponse
+            }
+            
+            // Add network-specific headers
+            val modifiedRequest = request.newBuilder()
+                .header("X-Network-Type", networkState.value.name)
+                .header("X-Device-Info", deviceInfo.getDeviceInfoString())
+                .header("X-App-Version", getAppVersion())
+                .build()
+            
+            chain.proceed(modifiedRequest)
+        }
+    }
+    
+    /**
+     * Create performance interceptor
+     */
+    private fun createPerformanceInterceptor(): Interceptor {
+        return Interceptor { chain ->
+            val startTime = System.currentTimeMillis()
+            val request = chain.request()
+            
+            try {
+                val response = chain.proceed(request)
+                val endTime = System.currentTimeMillis()
+                val duration = endTime - startTime
+                
+                // Update performance metrics
+                updateApiPerformance(request.url.toString(), response.code, duration)
+                
+                response
+            } catch (e: Exception) {
+                val endTime = System.currentTimeMillis()
+                val duration = endTime - startTime
+                
+                // Update error metrics
+                updateApiPerformance(request.url.toString(), -1, duration)
+                
+                throw e
+            }
+        }
+    }
+    
+    /**
+     * Create retry interceptor
+     */
+    private fun createRetryInterceptor(): Interceptor {
+        return Interceptor { chain ->
+            val request = chain.request()
+            var lastException: Exception? = null
+            
+            repeat(MAX_RETRIES) { attempt ->
+                try {
+                    return@Interceptor chain.proceed(request)
+                } catch (e: Exception) {
+                    lastException = e
+                    
+                    // Check if we should retry
+                    if (!shouldRetry(e, attempt)) {
+                        throw e
+                    }
+                    
+                    // Delay before retry
+                    delay(RETRY_DELAY_MS * (attempt + 1))
+                }
+            }
+            
+            throw lastException ?: RuntimeException("Max retries exceeded")
+        }
+    }
+    
+    /**
+     * Create user agent interceptor
+     */
+    private fun createUserAgentInterceptor(): Interceptor {
+        return Interceptor { chain ->
+            val request = chain.request()
+            val userAgent = buildUserAgent()
+            
+            val modifiedRequest = request.newBuilder()
+                .header("User-Agent", userAgent)
+                .build()
+            
+            chain.proceed(modifiedRequest)
+        }
+    }
+    
+    /**
+     * Create logging interceptor
+     */
+    private fun createLoggingInterceptor(): HttpLoggingInterceptor {
+        return HttpLoggingInterceptor().apply {
+            level = if (BuildConfig.DEBUG) {
+                HttpLoggingInterceptor.Level.BODY
+            } else {
+                HttpLoggingInterceptor.Level.NONE
+            }
+        }
+    }
+    
+    /**
+     * Execute API call with optimization
+     */
+    suspend fun <T> executeOptimizedCall(
+        apiCall: suspend () -> T,
+        url: String = "unknown"
+    ): Result<T> {
+        return try {
+            val startTime = System.currentTimeMillis()
+            val result = apiCall()
+            val endTime = System.currentTimeMillis()
+            val duration = endTime - startTime
+            
+            // Update performance metrics
+            updateApiPerformance(url, 200, duration)
+            
+            Result.Success(result)
+        } catch (e: Exception) {
+            // Update error metrics
+            updateApiPerformance(url, -1, 0)
+            
+            Result.Error(e)
+        }
+    }
+    
+    /**
+     * Execute API call with retry and caching
+     */
+    suspend fun <T> executeWithRetryAndCache(
+        apiCall: suspend () -> T,
+        url: String = "unknown",
+        maxRetries: Int = MAX_RETRIES
+    ): Result<T> {
+        var lastException: Exception? = null
+        
+        repeat(maxRetries) { attempt ->
+            try {
+                return executeOptimizedCall(apiCall, url)
+            } catch (e: Exception) {
+                lastException = e
+                
+                if (!shouldRetry(e, attempt)) {
+                    return Result.Error(e)
+                }
+                
+                delay(RETRY_DELAY_MS * (attempt + 1))
+            }
+        }
+        
+        return Result.Error(lastException ?: RuntimeException("Max retries exceeded"))
+    }
+    
+    /**
+     * Batch API calls for efficiency
+     */
+    suspend fun <T> batchApiCalls(
+        calls: List<suspend () -> T>,
+        concurrency: Int = 3
+    ): List<Result<T>> {
+        return withContext(Dispatchers.IO) {
+            calls.chunked(concurrency).map { batch ->
+                batch.map { call ->
+                    async { executeOptimizedCall { call() } }
+                }.awaitAll()
+            }.flatten()
+        }
+    }
+    
+    /**
+     * Check if request should be retried
+     */
+    private fun shouldRetry(exception: Exception, attempt: Int): Boolean {
+        if (attempt >= MAX_RETRIES) return false
+        
+        return when (exception) {
+            is NetworkException -> exception.isRecoverable
+            is TimeoutException -> true
+            is java.net.SocketTimeoutException -> true
+            is java.net.UnknownHostException -> true
+            is java.io.IOException -> true
+            is retrofit2.HttpException -> {
+                // Retry on server errors (5xx) but not client errors (4xx)
+                exception.code() in 500..599
+            }
+            else -> false
+        }
+    }
+    
+    /**
+     * Update network state
+     */
+    private fun updateNetworkState() {
+        val networkCapabilities = connectivityManager.activeNetworkInfo
+        val newState = when {
+            networkCapabilities?.isConnected == true -> {
+                if (networkUtils.isSlowConnection()) {
+                    NetworkState.SLOW
+                } else {
+                    NetworkState.CONNECTED
+                }
+            }
+            else -> NetworkState.OFFLINE
+        }
+        
+        _networkState.value = newState
+    }
+    
+    /**
+     * Register network callback
+     */
+    private fun registerNetworkCallback() {
+        val networkRequest = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        
+        connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
+    }
+    
+    /**
+     * Update API performance metrics
+     */
+    private fun updateApiPerformance(url: String, statusCode: Int, duration: Long) {
+        val currentPerformance = _apiPerformance.value
+        val newPerformance = currentPerformance.copy(
+            totalRequests = currentPerformance.totalRequests + 1,
+            successfulRequests = if (statusCode in 200..299) currentPerformance.successfulRequests + 1 else currentPerformance.successfulRequests,
+            failedRequests = if (statusCode !in 200..299) currentPerformance.failedRequests + 1 else currentPerformance.failedRequests,
+            averageResponseTime = (currentPerformance.averageResponseTime * currentPerformance.totalRequests + duration) / (currentPerformance.totalRequests + 1),
+            lastRequestTime = System.currentTimeMillis()
+        )
+        
+        _apiPerformance.value = newPerformance
+    }
+    
+    /**
+     * Build user agent string
+     */
+    private fun buildUserAgent(): String {
+        val appVersion = getAppVersion()
+        val deviceInfo = deviceInfo.getDeviceInfo()
+        val androidVersion = Build.VERSION.RELEASE
+        val deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}"
+        
+        return "EdhamLogistics/$appVersion (Android $androidVersion; $deviceModel)"
+    }
+    
+    /**
+     * Get app version
+     */
+    private fun getAppVersion(): String {
+        return try {
+            val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            packageInfo.versionName ?: "Unknown"
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    /**
+     * Get API performance summary
+     */
+    fun getPerformanceSummary(): ApiPerformanceSummary {
+        val performance = _apiPerformance.value
+        val successRate = if (performance.totalRequests > 0) {
+            (performance.successfulRequests.toFloat() / performance.totalRequests * 100)
+        } else 0f
+        
+        return ApiPerformanceSummary(
+            totalRequests = performance.totalRequests,
+            successRate = successRate,
+            averageResponseTime = performance.averageResponseTime,
+            networkState = networkState.value
+        )
+    }
+    
+    /**
+     * Clear cache
+     */
+    fun clearCache() {
+        scope.launch {
+            try {
+                val cacheDir = File(context.cacheDir, "http_cache")
+                cacheDir.deleteRecursively()
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        connectivityManager.unregisterNetworkCallback(networkCallback)
+    }
+}
+
+/**
+ * Network state enum
+ */
+enum class NetworkState {
+    CONNECTED,
+    SLOW,
+    OFFLINE,
+    UNKNOWN
+}
+
+/**
+ * API performance data class
+ */
+data class ApiPerformance(
+    val totalRequests: Long = 0,
+    val successfulRequests: Long = 0,
+    val failedRequests: Long = 0,
+    val averageResponseTime: Long = 0,
+    val lastRequestTime: Long = 0
+)
+
+/**
+ * API performance summary
+ */
+data class ApiPerformanceSummary(
+    val totalRequests: Long,
+    val successRate: Float,
+    val averageResponseTime: Long,
+    val networkState: NetworkState
+)
+
+/**
+ * Extension function for chunked list
+ */
+private fun <T> List<T>.chunked(size: Int): List<List<T>> {
+    return (0..lastIndex step size).map { i ->
+        subList(i, minOf(i + size, size))
+    }
+}

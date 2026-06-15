@@ -1,0 +1,498 @@
+package com.edham.logistics.performance
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import androidx.room.*
+import androidx.paging.*
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Database Query Optimizer for Efficient Database Operations
+ */
+class DatabaseQueryOptimizer(private val database: RoomDatabase) {
+    
+    private val queryScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val queryCache = ConcurrentHashMap<String, Any>()
+    private val indexSuggestions = mutableMapOf<String, List<String>>()
+    
+    /**
+     * Optimized query with caching and indexing suggestions
+     */
+    suspend fun <T> executeOptimizedQuery(
+        query: String,
+        params: Array<Any> = emptyArray(),
+        cacheKey: String? = null,
+        cacheExpiryMs: Long = 300000 // 5 minutes
+    ): T? = withContext(Dispatchers.IO) {
+        val key = cacheKey ?: generateCacheKey(query, params)
+        
+        // Check cache first
+        @Suppress("UNCHECKED_CAST")
+        val cachedResult = queryCache[key] as? T
+        if (cachedResult != null) {
+            return@withContext cachedResult
+        }
+        
+        // Execute query with optimization
+        val result = executeQueryWithOptimization(query, params)
+        
+        // Cache result
+        if (result != null) {
+            queryCache[key] = result
+            
+            // Schedule cache expiry
+            queryScope.launch {
+                delay(cacheExpiryMs)
+                queryCache.remove(key)
+            }
+        }
+        
+        return@withContext result
+    }
+    
+    /**
+     * Create optimized paging source for large datasets
+     */
+    fun <T : Any> createOptimizedPagingSource(
+        query: String,
+        params: Array<Any> = emptyArray(),
+        pageSize: Int = 20
+    ): PagingSource<Int, T> {
+        return OptimizedPagingSource(query, params, pageSize, database)
+    }
+    
+    /**
+     * Create flow for real-time data updates
+     */
+    fun <T> createOptimizedFlow(
+        query: String,
+        params: Array<Any> = emptyArray(),
+        updateIntervalMs: Long = 5000 // 5 seconds
+    ): Flow<List<T>> = flow {
+        while (true) {
+            val result = executeOptimizedQuery<List<T>>(query, params)
+            emit(result ?: emptyList())
+            delay(updateIntervalMs)
+        }
+    }.flowOn(Dispatchers.IO)
+    
+    /**
+     * Batch insert for better performance
+     */
+    suspend fun <T> batchInsert(
+        entities: List<T>,
+        tableName: String,
+        batchSize: Int = 100
+    ): Int = withContext(Dispatchers.IO) {
+        val totalInserted = entities.chunked(batchSize).sumOf { batch ->
+            insertBatch(batch, tableName)
+        }
+        
+        // Invalidate related cache entries
+        invalidateCacheForTable(tableName)
+        
+        return@withContext totalInserted
+    }
+    
+    /**
+     * Batch update for better performance
+     */
+    suspend fun batchUpdate(
+        updates: List<BatchUpdateOperation>,
+        batchSize: Int = 50
+    ): Int = withContext(Dispatchers.IO) {
+        val totalUpdated = updates.chunked(batchSize).sumOf { batch ->
+            updateBatch(batch)
+        }
+        
+        // Invalidate cache for updated tables
+        updates.map { it.tableName }.distinct().forEach { tableName ->
+            invalidateCacheForTable(tableName)
+        }
+        
+        return@withContext totalUpdated
+    }
+    
+    /**
+     * Analyze and suggest indexes for better query performance
+     */
+    fun analyzeQueryPerformance(query: String): QueryAnalysisResult {
+        val suggestions = mutableListOf<String>()
+        val estimatedRows = estimateQueryRows(query)
+        val complexity = calculateQueryComplexity(query)
+        
+        // Check for missing indexes
+        val whereClause = extractWhereClause(query)
+        if (whereClause.isNotEmpty()) {
+            val columns = extractColumnsFromWhere(whereClause)
+            columns.forEach { column ->
+                if (!hasIndex(column)) {
+                    suggestions.add("Consider adding index on column: $column")
+                }
+            }
+        }
+        
+        // Check for full table scans
+        if (complexity > QueryComplexity.MEDIUM && !hasLimitClause(query)) {
+            suggestions.add("Consider adding LIMIT clause to prevent full table scans")
+        }
+        
+        // Check for N+1 query patterns
+        if (hasSubqueryPattern(query)) {
+            suggestions.add("Consider using JOIN instead of subquery for better performance")
+        }
+        
+        return QueryAnalysisResult(
+            query = query,
+            estimatedRows = estimatedRows,
+            complexity = complexity,
+            suggestions = suggestions,
+            recommendedIndexes = generateIndexRecommendations(query)
+        )
+    }
+    
+    /**
+     * Execute query with performance optimizations
+     */
+    private suspend fun <T> executeQueryWithOptimization(
+        query: String,
+        params: Array<Any>
+    ): T? = withContext(Dispatchers.IO) {
+        try {
+            // Apply query optimizations
+            val optimizedQuery = applyQueryOptimizations(query)
+            
+            // Execute with prepared statement
+            val connection = database.openHelper.writableDatabase
+            val statement = connection.compileStatement(optimizedQuery)
+            
+            // Set parameters
+            params.forEachIndexed { index, param ->
+                when (param) {
+                    is String -> statement.bindString(index + 1, param)
+                    is Int -> statement.bindLong(index + 1, param.toLong())
+                    is Long -> statement.bindLong(index + 1, param)
+                    is Double -> statement.bindDouble(index + 1, param)
+                    is Float -> statement.bindDouble(index + 1, param.toDouble())
+                    else -> statement.bindString(index + 1, param.toString())
+                }
+            }
+            
+            // Execute query
+            val result = executeStatement(statement)
+            statement.close()
+            
+            return@withContext result
+        } catch (e: Exception) {
+            // Log error and return null
+            return@withContext null
+        }
+    }
+    
+    /**
+     * Apply common query optimizations
+     */
+    private fun applyQueryOptimizations(query: String): String {
+        var optimizedQuery = query
+        
+        // Add LIMIT if not present and query is SELECT
+        if (query.trim().startsWith("SELECT", ignoreCase = true) && 
+            !query.contains("LIMIT", ignoreCase = true)) {
+            optimizedQuery += " LIMIT 1000"
+        }
+        
+        // Optimize ORDER BY (use indexed columns if possible)
+        if (query.contains("ORDER BY", ignoreCase = true)) {
+            optimizedQuery = optimizeOrderByClause(optimizedQuery)
+        }
+        
+        // Add query hints for better execution plan
+        optimizedQuery = "/*+ INDEXED */ $optimizedQuery"
+        
+        return optimizedQuery
+    }
+    
+    /**
+     * Optimize ORDER BY clause
+     */
+    private fun optimizeOrderByClause(query: String): String {
+        // Simplified optimization - in real implementation, analyze available indexes
+        return query
+    }
+    
+    /**
+     * Execute prepared statement
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> executeStatement(statement: android.database.sqlite.SQLiteStatement): T? {
+        return when {
+            statement.simpleQueryForLong() != null -> {
+                statement.simpleQueryForLong() as T
+            }
+            statement.simpleQueryForString() != null -> {
+                statement.simpleQueryForString() as T
+            }
+            else -> {
+                // For complex queries, use rawQuery
+                null
+            }
+        }
+    }
+    
+    /**
+     * Insert batch of entities
+     */
+    private fun <T> insertBatch(entities: List<T>, tableName: String): Int {
+        val connection = database.openHelper.writableDatabase
+        var inserted = 0
+        
+        try {
+            connection.beginTransaction()
+            entities.forEach { entity ->
+                // Simplified - in real implementation, use proper entity insertion
+                val values = entityToContentValues(entity)
+                val rowId = connection.insert(tableName, null, values)
+                if (rowId != -1L) inserted++
+            }
+            connection.setTransactionSuccessful()
+        } finally {
+            connection.endTransaction()
+        }
+        
+        return inserted
+    }
+    
+    /**
+     * Update batch of entities
+     */
+    private fun updateBatch(updates: List<BatchUpdateOperation>): Int {
+        val connection = database.openHelper.writableDatabase
+        var updated = 0
+        
+        try {
+            connection.beginTransaction()
+            updates.forEach { update ->
+                val rowsAffected = connection.update(
+                    update.tableName,
+                    0,
+                    update.values,
+                    update.whereClause,
+                    update.whereArgs
+                )
+                updated += rowsAffected
+            }
+            connection.setTransactionSuccessful()
+        } finally {
+            connection.endTransaction()
+        }
+        
+        return updated
+    }
+    
+    /**
+     * Convert entity to ContentValues (simplified)
+     */
+    private fun entityToContentValues(entity: Any): android.content.ContentValues {
+        // Simplified - in real implementation, use reflection or annotation processing
+        return android.content.ContentValues()
+    }
+    
+    /**
+     * Generate cache key for query
+     */
+    private fun generateCacheKey(query: String, params: Array<Any>): String {
+        return "$query:${params.contentToString()}"
+    }
+    
+    /**
+     * Invalidate cache entries for specific table
+     */
+    private fun invalidateCacheForTable(tableName: String) {
+        queryCache.entries.removeIf { it.key.contains(tableName, ignoreCase = true) }
+    }
+    
+    /**
+     * Query analysis helper methods
+     */
+    private fun extractWhereClause(query: String): String {
+        val whereIndex = query.indexOf("WHERE", ignoreCase = true)
+        return if (whereIndex != -1) {
+            val orderByIndex = query.indexOf("ORDER BY", ignoreCase = true)
+            val limitIndex = query.indexOf("LIMIT", ignoreCase = true)
+            
+            val endIndex = listOfNotNull(
+                orderByIndex.takeIf { it > whereIndex },
+                limitIndex.takeIf { it > whereIndex }
+            ).minOrNull() ?: query.length
+            
+            query.substring(whereIndex + 5, endIndex).trim()
+        } else ""
+    }
+    
+    private fun extractColumnsFromWhere(whereClause: String): List<String> {
+        // Simplified column extraction - in real implementation, use proper SQL parsing
+        val columns = mutableListOf<String>()
+        val operators = listOf("=", ">", "<", ">=", "<=", "LIKE", "IN")
+        
+        operators.forEach { operator ->
+            val pattern = Regex("""(\w+)\s*$operator""")
+            pattern.findAll(whereClause).forEach { match ->
+                columns.add(match.groupValues[1])
+            }
+        }
+        
+        return columns.distinct()
+    }
+    
+    private fun hasIndex(column: String): Boolean {
+        // Simplified - in real implementation, check database schema
+        return indexSuggestions[column]?.isNotEmpty() == true
+    }
+    
+    private fun hasLimitClause(query: String): Boolean {
+        return query.contains("LIMIT", ignoreCase = true)
+    }
+    
+    private fun hasSubqueryPattern(query: String): Boolean {
+        return query.contains("SELECT", ignoreCase = true) && 
+               query.split("SELECT", ignoreCase = true).size > 2
+    }
+    
+    private fun estimateQueryRows(query: String): Int {
+        // Simplified estimation - in real implementation, use EXPLAIN QUERY PLAN
+        return when {
+            query.contains("LIMIT", ignoreCase = true) -> {
+                val limitMatch = Regex("""LIMIT\s+(\d+)""").find(query)
+                limitMatch?.groupValues?.get(1)?.toInt() ?: 1000
+            }
+            query.contains("WHERE", ignoreCase = true) -> 100
+            else -> 1000
+        }
+    }
+    
+    private fun calculateQueryComplexity(query: String): QueryComplexity {
+        var complexity = QueryComplexity.LOW
+        
+        if (query.contains("JOIN", ignoreCase = true)) {
+            complexity = QueryComplexity.MEDIUM
+        }
+        
+        if (query.contains("SUBQUERY", ignoreCase = true) || 
+            query.split("SELECT", ignoreCase = true).size > 2) {
+            complexity = QueryComplexity.HIGH
+        }
+        
+        if (query.contains("GROUP BY", ignoreCase = true) && 
+            query.contains("HAVING", ignoreCase = true)) {
+            complexity = QueryComplexity.VERY_HIGH
+        }
+        
+        return complexity
+    }
+    
+    private fun generateIndexRecommendations(query: String): List<String> {
+        val recommendations = mutableListOf<String>()
+        val whereColumns = extractColumnsFromWhere(extractWhereClause(query))
+        val orderByColumns = extractOrderByColumns(query)
+        
+        (whereColumns + orderByColumns).distinct().forEach { column ->
+            if (!hasIndex(column)) {
+                recommendations.add("CREATE INDEX idx_${column.toLowerCase()} ON table_name ($column)")
+            }
+        }
+        
+        return recommendations
+    }
+    
+    private fun extractOrderByColumns(query: String): List<String> {
+        val orderByIndex = query.indexOf("ORDER BY", ignoreCase = true)
+        if (orderByIndex == -1) return emptyList()
+        
+        val orderByClause = query.substring(orderByIndex + 8)
+            .split("LIMIT", ignoreCase = true)[0]
+            .trim()
+        
+        return orderByClause.split(",").map { it.trim().split(" ")[0] }
+    }
+    
+    /**
+     * Optimized PagingSource implementation
+     */
+    private class OptimizedPagingSource<T : Any>(
+        private val query: String,
+        private val params: Array<Any>,
+        private val pageSize: Int,
+        private val database: RoomDatabase
+    ) : PagingSource<Int, T>() {
+        
+        override suspend fun load(params: LoadParams<Int>): LoadResult<Int, T> {
+            return try {
+                val offset = params.key ?: 0
+                val limit = params.loadSize
+                
+                // Add LIMIT and OFFSET to query
+                val paginatedQuery = if (query.contains("LIMIT", ignoreCase = true)) {
+                    query.replace(Regex("""LIMIT\s+\d+"""), "LIMIT $limit OFFSET $offset")
+                } else {
+                    "$query LIMIT $limit OFFSET $offset"
+                }
+                
+                val connection = database.openHelper.readableDatabase
+                val cursor = connection.rawQuery(paginatedQuery, params.map { it.toString() }.toTypedArray())
+                
+                val items = mutableListOf<T>()
+                while (cursor.moveToNext()) {
+                    // Simplified - in real implementation, map cursor to entities
+                    // items.add(mapCursorToEntity<T>(cursor))
+                }
+                
+                cursor.close()
+                
+                LoadResult.Page(
+                    data = items,
+                    prevKey = if (offset == 0) null else offset - pageSize,
+                    nextKey = if (items.size < limit) null else offset + limit
+                )
+            } catch (e: Exception) {
+                LoadResult.Error(e)
+            }
+        }
+        
+        override fun getRefreshKey(state: PagingState<Int, T>): Int? {
+            return state.anchorPosition
+        }
+    }
+    
+    /**
+     * Data classes
+     */
+    data class QueryAnalysisResult(
+        val query: String,
+        val estimatedRows: Int,
+        val complexity: QueryComplexity,
+        val suggestions: List<String>,
+        val recommendedIndexes: List<String>
+    )
+    
+    data class BatchUpdateOperation(
+        val tableName: String,
+        val values: android.content.ContentValues,
+        val whereClause: String,
+        val whereArgs: Array<String>
+    )
+    
+    enum class QueryComplexity {
+        LOW, MEDIUM, HIGH, VERY_HIGH
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        queryScope.cancel()
+        queryCache.clear()
+        indexSuggestions.clear()
+    }
+}

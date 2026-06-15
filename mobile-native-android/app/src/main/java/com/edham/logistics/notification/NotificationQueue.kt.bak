@@ -1,0 +1,702 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.NotificationApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Notification Queue - Manages notification delivery queue with retry mechanism
+ * 
+ * Features:
+ * - Priority-based notification queuing
+ * - Retry mechanism for failed notifications
+ * - Rate limiting and throttling
+ * - Batch processing
+ * - Queue analytics and monitoring
+ * - Persistent queue storage
+ * - Background processing
+ */
+@Singleton
+class NotificationQueue @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val notificationApi: NotificationApi,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _queueState = MutableStateFlow<QueueState>(QueueState.Idle)
+    val queueState: StateFlow<QueueState> = _queueState.asStateFlow()
+    
+    private val _queueStats = MutableStateFlow<QueueStats>(QueueStats())
+    val queueStats: StateFlow<QueueStats> = _queueStats.asStateFlow()
+    
+    private val _processingQueue = MutableStateFlow<List<QueuedNotification>>(emptyList())
+    val processingQueue: StateFlow<List<QueuedNotification>> = _processingQueue.asStateFlow()
+    
+    private val memoryQueue = PriorityBlockingQueue<QueuedNotification>()
+    private val processingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var isProcessing = false
+    private var processingJob: Job? = null
+    
+    companion object {
+        private const val TAG = "NotificationQueue"
+        private const val MAX_RETRY_ATTEMPTS = 3
+        private const val RETRY_DELAY_MS = 5000L
+        private const val BATCH_SIZE = 10
+        private const val PROCESSING_INTERVAL_MS = 1000L
+        private const val RATE_LIMIT_PER_SECOND = 50
+        private const val MAX_QUEUE_SIZE = 1000
+    }
+    
+    /**
+     * Initialize notification queue
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _queueState.value = QueueState.Initializing
+                
+                // Load queued notifications from database
+                loadQueuedNotifications()
+                
+                // Start queue processing
+                startQueueProcessing()
+                
+                _queueState.value = QueueState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _queueState.value = QueueState.Error("Failed to initialize notification queue: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add notification to queue
+     */
+    suspend fun enqueueNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        priority: NotificationPriority = NotificationPriority.NORMAL
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val queueId = UUID.randomUUID().toString()
+                
+                val queuedNotification = QueuedNotification(
+                    id = queueId,
+                    notification = notification,
+                    request = request,
+                    priority = priority,
+                    status = QueueStatus.PENDING,
+                    retryCount = 0,
+                    maxRetries = MAX_RETRY_ATTEMPTS,
+                    createdAt = Date(),
+                    scheduledAt = Date(),
+                    lastAttemptAt = null,
+                    nextRetryAt = null,
+                    errorMessage = null
+                )
+                
+                // Check queue size
+                if (memoryQueue.size >= MAX_QUEUE_SIZE) {
+                    // Remove oldest low priority notification
+                    removeOldestLowPriorityNotification()
+                }
+                
+                // Add to memory queue
+                memoryQueue.add(queuedNotification)
+                
+                // Save to database
+                saveQueuedNotification(queuedNotification)
+                
+                // Update stats
+                updateQueueStats()
+                
+                // Start processing if not already running
+                if (!isProcessing) {
+                    startProcessing()
+                }
+                
+                Result.success(queueId)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add bulk notifications to queue
+     */
+    suspend fun enqueueBulkNotifications(
+        notifications: List<Pair<Notification, NotificationRequest>>,
+        priority: NotificationPriority = NotificationPriority.NORMAL
+    ): Result<List<String>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val queueIds = mutableListOf<String>()
+                
+                notifications.forEach { (notification, request) ->
+                    val result = enqueueNotification(notification, request, priority)
+                    if (result.isSuccess) {
+                        queueIds.add(result.getOrThrow())
+                    }
+                }
+                
+                Result.success(queueIds)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule notification for future delivery
+     */
+    suspend fun scheduleNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        scheduledTime: Date,
+        priority: NotificationPriority = NotificationPriority.NORMAL
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val queueId = UUID.randomUUID().toString()
+                
+                val queuedNotification = QueuedNotification(
+                    id = queueId,
+                    notification = notification,
+                    request = request,
+                    priority = priority,
+                    status = QueueStatus.SCHEDULED,
+                    retryCount = 0,
+                    maxRetries = MAX_RETRY_ATTEMPTS,
+                    createdAt = Date(),
+                    scheduledAt = scheduledTime,
+                    lastAttemptAt = null,
+                    nextRetryAt = null,
+                    errorMessage = null
+                )
+                
+                // Add to memory queue
+                memoryQueue.add(queuedNotification)
+                
+                // Save to database
+                saveQueuedNotification(queuedNotification)
+                
+                // Update stats
+                updateQueueStats()
+                
+                Result.success(queueId)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Remove notification from queue
+     */
+    suspend fun dequeueNotification(queueId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Remove from memory queue
+                val removed = memoryQueue.removeIf { it.id == queueId }
+                
+                if (removed) {
+                    // Remove from database
+                    database.queuedNotificationDao().deleteNotification(queueId)
+                    
+                    // Update stats
+                    updateQueueStats()
+                    
+                    Result.success(true)
+                } else {
+                    Result.failure(Exception("Notification not found in queue"))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Retry failed notification
+     */
+    suspend fun retryNotification(queueId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val queuedNotification = memoryQueue.find { it.id == queueId }
+                    ?: throw Exception("Notification not found in queue")
+                
+                if (queuedNotification.retryCount >= queuedNotification.maxRetries) {
+                    throw Exception("Maximum retry attempts exceeded")
+                }
+                
+                // Reset notification for retry
+                val updatedNotification = queuedNotification.copy(
+                    status = QueueStatus.PENDING,
+                    retryCount = queuedNotification.retryCount + 1,
+                    nextRetryAt = Date(System.currentTimeMillis() + RETRY_DELAY_MS),
+                    errorMessage = null
+                )
+                
+                // Update in memory queue
+                memoryQueue.remove(queuedNotification)
+                memoryQueue.add(updatedNotification)
+                
+                // Update in database
+                updateQueuedNotification(updatedNotification)
+                
+                // Update stats
+                updateQueueStats()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get queue statistics
+     */
+    suspend fun getQueueStats(): Result<QueueStats> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val stats = QueueStats(
+                    totalQueued = memoryQueue.size,
+                    pending = memoryQueue.count { it.status == QueueStatus.PENDING },
+                    processing = memoryQueue.count { it.status == QueueStatus.PROCESSING },
+                    completed = memoryQueue.count { it.status == QueueStatus.COMPLETED },
+                    failed = memoryQueue.count { it.status == QueueStatus.FAILED },
+                    scheduled = memoryQueue.count { it.status == QueueStatus.SCHEDULED },
+                    priorityStats = memoryQueue.groupBy { it.priority }
+                        .mapValues { it.value.size },
+                    categoryStats = memoryQueue.groupBy { it.notification.category }
+                        .mapValues { it.value.size }
+                )
+                
+                Result.success(stats)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Clear queue
+     */
+    suspend fun clearQueue(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Clear memory queue
+                memoryQueue.clear()
+                
+                // Clear database
+                database.queuedNotificationDao().clearQueue()
+                
+                // Update stats
+                updateQueueStats()
+                
+                // Stop processing
+                stopProcessing()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Pause queue processing
+     */
+    suspend fun pauseProcessing(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                stopProcessing()
+                _queueState.value = QueueState.Paused
+                Result.success(true)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Resume queue processing
+     */
+    suspend fun resumeProcessing(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                startProcessing()
+                _queueState.value = QueueState.Processing
+                Result.success(true)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadQueuedNotifications() {
+        try {
+            val queuedNotifications = database.queuedNotificationDao().getAllNotifications()
+                .map { it.toDomainModel() }
+            
+            queuedNotifications.forEach { notification ->
+                memoryQueue.add(notification)
+            }
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun startQueueProcessing() {
+        if (!isProcessing) {
+            isProcessing = true
+            processingJob = processingScope.launch {
+                while (isProcessing) {
+                    try {
+                        processQueue()
+                        delay(PROCESSING_INTERVAL_MS)
+                    } catch (e: Exception) {
+                        // Handle error
+                        delay(1000) // Brief pause before retry
+                    }
+                }
+            }
+        }
+    }
+    
+    private fun stopProcessing() {
+        isProcessing = false
+        processingJob?.cancel()
+        processingJob = null
+    }
+    
+    private suspend fun processQueue() {
+        try {
+            // Get notifications ready for processing
+            val readyNotifications = getReadyNotifications()
+            
+            if (readyNotifications.isNotEmpty()) {
+                _queueState.value = QueueState.Processing
+                
+                // Process in batches
+                readyNotifications.chunked(BATCH_SIZE).forEach { batch ->
+                    processBatch(batch)
+                }
+                
+                // Update processing queue display
+                updateProcessingQueue()
+                
+                // Update stats
+                updateQueueStats()
+            } else {
+                _queueState.value = QueueState.Idle
+            }
+            
+        } catch (e: Exception) {
+            _queueState.value = QueueState.Error("Queue processing error: ${e.message}")
+        }
+    }
+    
+    private suspend fun getReadyNotifications(): List<QueuedNotification> {
+        val now = Date()
+        return memoryQueue.filter { notification ->
+            (notification.status == QueueStatus.PENDING && notification.scheduledAt <= now) ||
+            (notification.status == QueueStatus.FAILED && notification.nextRetryAt != null && notification.nextRetryAt <= now)
+        }.sortedBy { it.priority.ordinal }.take(BATCH_SIZE)
+    }
+    
+    private suspend fun processBatch(notifications: List<QueuedNotification>) {
+        for (notification in notifications) {
+            if (!isProcessing) break
+            
+            try {
+                // Update status to processing
+                val processingNotification = notification.copy(
+                    status = QueueStatus.PROCESSING,
+                    lastAttemptAt = Date()
+                )
+                updateQueuedNotificationInQueue(processingNotification)
+                
+                // Send notification
+                val success = sendNotification(processingNotification.notification, processingNotification.request)
+                
+                if (success) {
+                    // Mark as completed
+                    val completedNotification = processingNotification.copy(
+                        status = QueueStatus.COMPLETED
+                    )
+                    updateQueuedNotificationInQueue(completedNotification)
+                    
+                    // Remove from queue
+                    memoryQueue.remove(completedNotification)
+                    
+                } else {
+                    // Mark as failed
+                    val failedNotification = processingNotification.copy(
+                        status = QueueStatus.FAILED,
+                        errorMessage = "Failed to send notification"
+                    )
+                    
+                    if (failedNotification.retryCount < failedNotification.maxRetries) {
+                        // Schedule for retry
+                        val retryNotification = failedNotification.copy(
+                            nextRetryAt = Date(System.currentTimeMillis() + RETRY_DELAY_MS)
+                        )
+                        updateQueuedNotificationInQueue(retryNotification)
+                    } else {
+                        // Max retries reached, keep as failed
+                        updateQueuedNotificationInQueue(failedNotification)
+                    }
+                }
+                
+            } catch (e: Exception) {
+                // Handle individual notification error
+                val errorNotification = notification.copy(
+                    status = QueueStatus.FAILED,
+                    errorMessage = e.message
+                )
+                updateQueuedNotificationInQueue(errorNotification)
+            }
+            
+            // Rate limiting
+            delay(1000 / RATE_LIMIT_PER_SECOND)
+        }
+    }
+    
+    private suspend fun sendNotification(
+        notification: Notification,
+        request: NotificationRequest
+    ): Boolean {
+        return try {
+            // Check network connectivity
+            if (!networkUtils.isNetworkAvailable()) {
+                return false
+            }
+            
+            // Send via API
+            val result = notificationApi.sendNotification(request)
+            result.success
+            
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    private suspend fun saveQueuedNotification(notification: QueuedNotification) {
+        try {
+            database.queuedNotificationDao().insertNotification(notification.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun updateQueuedNotification(notification: QueuedNotification) {
+        try {
+            database.queuedNotificationDao().updateNotification(notification.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun updateQueuedNotificationInQueue(notification: QueuedNotification) {
+        // Update in memory queue
+        memoryQueue.removeIf { it.id == notification.id }
+        memoryQueue.add(notification)
+        
+        // Update in database (async)
+        processingScope.launch {
+            updateQueuedNotification(notification)
+        }
+    }
+    
+    private fun removeOldestLowPriorityNotification() {
+        val oldestLowPriority = memoryQueue
+            .filter { it.priority == NotificationPriority.LOW }
+            .minByOrNull { it.createdAt }
+        
+        oldestLowPriority?.let {
+            memoryQueue.remove(it)
+            processingScope.launch {
+                database.queuedNotificationDao().deleteNotification(it.id)
+            }
+        }
+    }
+    
+    private fun updateProcessingQueue() {
+        val processingNotifications = memoryQueue.filter { 
+            it.status == QueueStatus.PROCESSING || it.status == QueueStatus.PENDING 
+        }.sortedBy { it.priority.ordinal }
+        _processingQueue.value = processingNotifications
+    }
+    
+    private fun updateQueueStats() {
+        try {
+            val stats = QueueStats(
+                totalQueued = memoryQueue.size,
+                pending = memoryQueue.count { it.status == QueueStatus.PENDING },
+                processing = memoryQueue.count { it.status == QueueStatus.PROCESSING },
+                completed = memoryQueue.count { it.status == QueueStatus.COMPLETED },
+                failed = memoryQueue.count { it.status == QueueStatus.FAILED },
+                scheduled = memoryQueue.count { it.status == QueueStatus.SCHEDULED },
+                priorityStats = memoryQueue.groupBy { it.priority }
+                    .mapValues { it.value.size },
+                categoryStats = memoryQueue.groupBy { it.notification.category }
+                    .mapValues { it.value.size }
+            )
+            
+            _queueStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun startProcessing() {
+        startQueueProcessing()
+    }
+    
+    /**
+     * Get processing status
+     */
+    fun isProcessing(): Boolean = isProcessing
+    
+    /**
+     * Get queue size
+     */
+    fun getQueueSize(): Int = memoryQueue.size
+}
+
+/**
+ * Data classes
+ */
+data class QueuedNotification(
+    val id: String,
+    val notification: Notification,
+    val request: NotificationRequest,
+    val priority: NotificationPriority,
+    val status: QueueStatus,
+    val retryCount: Int,
+    val maxRetries: Int,
+    val createdAt: Date,
+    val scheduledAt: Date,
+    val lastAttemptAt: Date?,
+    val nextRetryAt: Date?,
+    val errorMessage: String?
+)
+
+data class QueueStats(
+    val totalQueued: Int = 0,
+    val pending: Int = 0,
+    val processing: Int = 0,
+    val completed: Int = 0,
+    val failed: Int = 0,
+    val scheduled: Int = 0,
+    val priorityStats: Map<NotificationPriority, Int> = emptyMap(),
+    val categoryStats: Map<NotificationCategory, Int> = emptyMap()
+)
+
+/**
+ * Enums
+ */
+enum class QueueState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Paused,
+    Error
+}
+
+enum class QueueStatus {
+    PENDING,
+    PROCESSING,
+    COMPLETED,
+    FAILED,
+    SCHEDULED
+}
+
+/**
+ * Priority blocking queue for notifications
+ */
+class PriorityBlockingQueue<T : Comparable<T>> {
+    private val queue = ConcurrentLinkedQueue<T>()
+    
+    fun add(item: T) {
+        queue.add(item)
+    }
+    
+    fun removeIf(predicate: (T) -> Boolean): Boolean {
+        return queue.removeIf(predicate)
+    }
+    
+    fun remove(item: T): Boolean {
+        return queue.remove(item)
+    }
+    
+    fun clear() {
+        queue.clear()
+    }
+    
+    fun size(): Int = queue.size
+    
+    fun isEmpty(): Boolean = queue.isEmpty()
+    
+    fun filter(predicate: (T) -> Boolean): List<T> {
+        return queue.filter(predicate)
+    }
+    
+    fun find(predicate: (T) -> Boolean): T? {
+        return queue.find(predicate)
+    }
+    
+    fun minByOrNull(selector: (T) -> Comparable<*>): T? {
+        return queue.minByOrNull(selector)
+    }
+    
+    fun sortedBy(selector: (T) -> Comparable<*>): List<T> {
+        return queue.sortedBy(selector)
+    }
+    
+    fun take(n: Int): List<T> {
+        return queue.take(n)
+    }
+    
+    fun chunked(size: Int): List<List<T>> {
+        return queue.toList().chunked(size)
+    }
+    
+    fun count(predicate: (T) -> Boolean): Int {
+        return queue.count(predicate)
+    }
+    
+    fun groupBy(keySelector: (T) -> K): Map<K, List<T>> {
+        return queue.groupBy(keySelector)
+    }
+}

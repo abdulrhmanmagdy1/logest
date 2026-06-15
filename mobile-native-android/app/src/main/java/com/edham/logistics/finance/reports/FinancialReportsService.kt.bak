@@ -1,0 +1,827 @@
+package com.edham.logistics.finance.reports
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.FinancialReportsApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Financial Reports Service - Generates comprehensive financial reports
+ * 
+ * Features:
+ * - Multiple report types (Income Statement, Balance Sheet, Cash Flow, etc.)
+ * - Customizable date ranges and filters
+ * - Export to PDF and Excel
+ * - Automated report scheduling
+ * - Report templates and branding
+ * - Comparative analysis reports
+ * - Budget vs actual reports
+ */
+@Singleton
+class FinancialReportsService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val financialReportsApi: FinancialReportsApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _financialReportsState = MutableStateFlow<FinancialReportsState>(FinancialReportsState.Idle)
+    val financialReportsState: StateFlow<FinancialReportsState> = _financialReportsState.asStateFlow()
+    
+    private val _reports = MutableStateFlow<List<FinancialReport>>(emptyList())
+    val reports: StateFlow<List<FinancialReport>> = _reports.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "FinancialReportsService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val REPORT_CACHE_SIZE = 50
+        private const val REPORT_GENERATION_TIMEOUT_MS = 60000L // 1 minute
+    }
+    
+    /**
+     * Initialize financial reports service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _financialReportsState.value = FinancialReportsState.Initializing
+                
+                // Load report templates
+                loadReportTemplates()
+                
+                // Load recent reports
+                loadRecentReports()
+                
+                isInitialized = true
+                _financialReportsState.value = FinancialReportsState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _financialReportsState.value = FinancialReportsState.Error("Failed to initialize financial reports service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate income statement
+     */
+    suspend fun generateIncomeStatement(
+        dateRange: DateRange,
+        filters: ReportFilters? = null
+    ): Result<FinancialReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Financial reports service not initialized")
+                }
+                
+                _financialReportsState.value = FinancialReportsState.Processing
+                
+                // Get financial data
+                val revenue = getRevenueData(dateRange, filters)
+                val expenses = getExpenseData(dateRange, filters)
+                
+                // Calculate income statement
+                val incomeStatementData = IncomeStatementData(
+                    totalRevenue = revenue.totalRevenue,
+                    operatingRevenue = revenue.operatingRevenue,
+                    nonOperatingRevenue = revenue.nonOperatingRevenue,
+                    costOfGoodsSold = expenses.costOfGoodsSold,
+                    operatingExpenses = expenses.operatingExpenses,
+                    nonOperatingExpenses = expenses.nonOperatingExpenses,
+                    grossProfit = revenue.totalRevenue - expenses.costOfGoodsSold,
+                    operatingIncome = (revenue.totalRevenue - expenses.costOfGoodsSold) - expenses.operatingExpenses,
+                    netIncome = calculateNetIncome(revenue, expenses),
+                    earningsBeforeTax = calculateEarningsBeforeTax(revenue, expenses),
+                    earningsAfterTax = calculateNetIncome(revenue, expenses),
+                    profitMargin = calculateProfitMargin(revenue, expenses)
+                )
+                
+                // Create report
+                val report = FinancialReport(
+                    id = UUID.randomUUID().toString(),
+                    type = ReportType.INCOME_STATEMENT,
+                    title = "Income Statement",
+                    dateRange = dateRange,
+                    currency = DEFAULT_CURRENCY,
+                    data = incomeStatementData,
+                    status = ReportStatus.COMPLETED,
+                    generatedAt = Date(),
+                    metadata = mapOf(
+                        "generated_by" to "system",
+                        "report_period" to "${dateRange.startDate} to ${dateRange.endDate}",
+                        "currency" to DEFAULT_CURRENCY
+                    )
+                )
+                
+                // Save report
+                val savedReport = saveReport(report)
+                
+                // Add to reports list
+                addToReports(savedReport)
+                
+                _financialReportsState.value = FinancialReportsState.Ready
+                Result.success(savedReport)
+                
+            } catch (e: Exception) {
+                _financialReportsState.value = FinancialReportsState.Error("Income statement generation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate balance sheet
+     */
+    suspend fun generateBalanceSheet(
+        dateRange: DateRange,
+        filters: ReportFilters? = null
+    ): Result<FinancialReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Financial reports service not initialized")
+                }
+                
+                _financialReportsState.value = FinancialReportsState.Processing
+                
+                // Get balance sheet data
+                val assets = getAssetsData(dateRange, filters)
+                val liabilities = getLiabilitiesData(dateRange, filters)
+                val equity = getEquityData(dateRange, filters)
+                
+                // Calculate balance sheet
+                val balanceSheetData = BalanceSheetData(
+                    currentAssets = assets.currentAssets,
+                    nonCurrentAssets = assets.nonCurrentAssets,
+                    totalAssets = assets.currentAssets + assets.nonCurrentAssets,
+                    currentLiabilities = liabilities.currentLiabilities,
+                    nonCurrentLiabilities = liabilities.nonCurrentLiabilities,
+                    totalLiabilities = liabilities.currentLiabilities + liabilities.nonCurrentLiabilities,
+                    shareCapital = equity.shareCapital,
+                    retainedEarnings = equity.retainedEarnings,
+                    totalEquity = equity.shareCapital + equity.retainedEarnings,
+                    totalLiabilitiesAndEquity = (liabilities.currentLiabilities + liabilities.nonCurrentLiabilities) + (equity.shareCapital + equity.retainedEarnings),
+                    workingCapital = assets.currentAssets - liabilities.currentLiabilities,
+                    debtToEquityRatio = calculateDebtToEquityRatio(liabilities, equity)
+                )
+                
+                // Create report
+                val report = FinancialReport(
+                    id = UUID.randomUUID().toString(),
+                    type = ReportType.BALANCE_SHEET,
+                    title = "Balance Sheet",
+                    dateRange = dateRange,
+                    currency = DEFAULT_CURRENCY,
+                    data = balanceSheetData,
+                    status = ReportStatus.COMPLETED,
+                    generatedAt = Date(),
+                    metadata = mapOf(
+                        "generated_by" to "system",
+                        "report_period" to "${dateRange.startDate} to ${dateRange.endDate}",
+                        "currency" to DEFAULT_CURRENCY
+                    )
+                )
+                
+                // Save report
+                val savedReport = saveReport(report)
+                
+                // Add to reports list
+                addToReports(savedReport)
+                
+                _financialReportsState.value = FinancialReportsState.Ready
+                Result.success(savedReport)
+                
+            } catch (e: Exception) {
+                _financialReportsState.value = FinancialReportsState.Error("Balance sheet generation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate cash flow statement
+     */
+    suspend fun generateCashFlowStatement(
+        dateRange: DateRange,
+        filters: ReportFilters? = null
+    ): Result<FinancialReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Financial reports service not initialized")
+                }
+                
+                _financialReportsState.value = FinancialReportsState.Processing
+                
+                // Get cash flow data
+                val operatingActivities = getCashFlowFromOperatingActivities(dateRange, filters)
+                val investingActivities = getCashFlowFromInvestingActivities(dateRange, filters)
+                val financingActivities = getCashFlowFromFinancingActivities(dateRange, filters)
+                
+                // Calculate cash flow statement
+                val cashFlowData = CashFlowStatementData(
+                    netIncome = operatingActivities.netIncome,
+                    depreciation = operatingActivities.depreciation,
+                    changesInWorkingCapital = operatingActivities.changesInWorkingCapital,
+                    cashFlowFromOperatingActivities = operatingActivities.total,
+                    cashFlowFromInvestingActivities = investingActivities.total,
+                    cashFlowFromFinancingActivities = financingActivities.total,
+                    netIncreaseInCash = operatingActivities.total + investingActivities.total + financingActivities.total,
+                    cashAtBeginning = getCashAtBeginning(dateRange),
+                    cashAtEnd = getCashAtEnd(dateRange),
+                    freeCashFlow = operatingActivities.total - investingActivities.total
+                )
+                
+                // Create report
+                val report = FinancialReport(
+                    id = UUID.randomUUID().toString(),
+                    type = ReportType.CASH_FLOW_STATEMENT,
+                    title = "Cash Flow Statement",
+                    dateRange = dateRange,
+                    currency = DEFAULT_CURRENCY,
+                    data = cashFlowData,
+                    status = ReportStatus.COMPLETED,
+                    generatedAt = Date(),
+                    metadata = mapOf(
+                        "generated_by" to "system",
+                        "report_period" to "${dateRange.startDate} to ${dateRange.endDate}",
+                        "currency" to DEFAULT_CURRENCY
+                    )
+                )
+                
+                // Save report
+                val savedReport = saveReport(report)
+                
+                // Add to reports list
+                addToReports(savedReport)
+                
+                _financialReportsState.value = FinancialReportsState.Ready
+                Result.success(savedReport)
+                
+            } catch (e: Exception) {
+                _financialReportsState.value = FinancialReportsState.Error("Cash flow statement generation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate custom financial report
+     */
+    suspend fun generateCustomReport(
+        reportConfig: CustomReportConfig
+    ): Result<FinancialReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Financial reports service not initialized")
+                }
+                
+                _financialReportsState.value = FinancialReportsState.Processing
+                
+                // Generate custom report based on configuration
+                val customData = generateCustomReportData(reportConfig)
+                
+                // Create report
+                val report = FinancialReport(
+                    id = UUID.randomUUID().toString(),
+                    type = ReportType.CUSTOM,
+                    title = reportConfig.title,
+                    dateRange = reportConfig.dateRange,
+                    currency = reportConfig.currency ?: DEFAULT_CURRENCY,
+                    data = customData,
+                    status = ReportStatus.COMPLETED,
+                    generatedAt = Date(),
+                    metadata = mapOf(
+                        "generated_by" to "system",
+                        "report_period" to "${reportConfig.dateRange.startDate} to ${reportConfig.dateRange.endDate}",
+                        "currency" to (reportConfig.currency ?: DEFAULT_CURRENCY),
+                        "custom_config" to reportConfig.toString()
+                    )
+                )
+                
+                // Save report
+                val savedReport = saveReport(report)
+                
+                // Add to reports list
+                addToReports(savedReport)
+                
+                _financialReportsState.value = FinancialReportsState.Ready
+                Result.success(savedReport)
+                
+            } catch (e: Exception) {
+                _financialReportsState.value = FinancialReportsState.Error("Custom report generation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get report by ID
+     */
+    suspend fun getReport(reportId: String): FinancialReport? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _reports.value.find { it.id == reportId }
+                    ?: database.financialReportDao().getReportById(reportId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get reports history
+     */
+    suspend fun getReportsHistory(
+        reportType: ReportType? = null,
+        dateRange: DateRange? = null
+    ): Result<List<FinancialReport>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val reports = database.financialReportDao().getReportsHistory(
+                    reportType = reportType,
+                    startDate = dateRange?.startDate,
+                    endDate = dateRange?.endDate
+                ).map { it.toDomainModel() }
+                
+                Result.success(reports)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Export report to PDF
+     */
+    suspend fun exportReportToPDF(
+        reportId: String,
+        template: ReportTemplate = ReportTemplate.DEFAULT
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val report = getReport(reportId) ?: throw Exception("Report not found")
+                
+                _financialReportsState.value = FinancialReportsState.Processing
+                
+                // Generate PDF
+                val pdfPath = financialReportsApi.generatePDFReport(report, template)
+                
+                _financialReportsState.value = FinancialReportsState.Ready
+                Result.success(pdfPath)
+                
+            } catch (e: Exception) {
+                _financialReportsState.value = FinancialReportsState.Error("PDF export failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Export report to Excel
+     */
+    suspend fun exportReportToExcel(
+        reportId: String,
+        template: ReportTemplate = ReportTemplate.DEFAULT
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val report = getReport(reportId) ?: throw Exception("Report not found")
+                
+                _financialReportsState.value = FinancialReportsState.Processing
+                
+                // Generate Excel
+                val excelPath = financialReportsApi.generateExcelReport(report, template)
+                
+                _financialReportsState.value = FinancialReportsState.Ready
+                Result.success(excelPath)
+                
+            } catch (e: Exception) {
+                _financialReportsState.value = FinancialReportsState.Error("Excel export failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule automated report generation
+     */
+    suspend fun scheduleReport(
+        scheduleConfig: ReportScheduleConfig
+    ): Result<ReportSchedule> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _financialReportsState.value = FinancialReportsState.Processing
+                
+                // Create schedule
+                val schedule = ReportSchedule(
+                    id = UUID.randomUUID().toString(),
+                    reportType = scheduleConfig.reportType,
+                    title = scheduleConfig.title,
+                    schedule = scheduleConfig.schedule,
+                    filters = scheduleConfig.filters,
+                    template = scheduleConfig.template,
+                    recipients = scheduleConfig.recipients,
+                    isActive = true,
+                    createdAt = Date(),
+                    lastRun = null,
+                    nextRun = calculateNextRun(scheduleConfig.schedule)
+                )
+                
+                // Save schedule
+                val savedSchedule = database.financialReportScheduleDao().insertSchedule(schedule.toEntity())
+                    .let { id -> schedule.copy(id = id.toString()) }
+                
+                _financialReportsState.value = FinancialReportsState.Ready
+                Result.success(savedSchedule)
+                
+            } catch (e: Exception) {
+                _financialReportsState.value = FinancialReportsState.Error("Report scheduling failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get report templates
+     */
+    suspend fun getReportTemplates(): Result<List<ReportTemplate>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val templates = financialReportsApi.getReportTemplates()
+                Result.success(templates)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadReportTemplates() {
+        // Load report templates from API or local storage
+    }
+    
+    private suspend fun loadRecentReports() {
+        try {
+            val reports = database.financialReportDao().getRecentReports(REPORT_CACHE_SIZE)
+                .map { it.toDomainModel() }
+            
+            _reports.value = reports
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun getRevenueData(dateRange: DateRange, filters: ReportFilters?): RevenueData {
+        // Get revenue data from database
+        val invoices = database.invoiceDao().getInvoicesByDateRange(
+            dateRange.startDate,
+            dateRange.endDate
+        ).map { it.toDomainModel() }
+        
+        return RevenueData(
+            totalRevenue = invoices.sumOf { it.totalAmount.toDouble() }.toFloat(),
+            operatingRevenue = invoices.filter { it.metadata["type"] == "operating" }.sumOf { it.totalAmount.toDouble() }.toFloat(),
+            nonOperatingRevenue = invoices.filter { it.metadata["type"] == "non-operating" }.sumOf { it.totalAmount.toDouble() }.toFloat()
+        )
+    }
+    
+    private suspend fun getExpenseData(dateRange: DateRange, filters: ReportFilters?): ExpenseData {
+        // Get expense data from database
+        val expenses = database.expenseDao().getExpensesByDateRange(
+            dateRange.startDate,
+            dateRange.endDate
+        ).map { it.toDomainModel() }
+        
+        return ExpenseData(
+            costOfGoodsSold = expenses.filter { it.category.toString() == "FUEL" || it.category.toString() == "MAINTENANCE" }.sumOf { it.amount.toDouble() }.toFloat(),
+            operatingExpenses = expenses.filter { it.category.toString() in listOf("TIRES", "PARTS", "TOLLS", "PARKING") }.sumOf { it.amount.toDouble() }.toFloat(),
+            nonOperatingExpenses = expenses.filter { it.category.toString() in listOf("OFFICE_SUPPLIES", "UTILITIES", "MARKETING") }.sumOf { it.amount.toDouble() }.toFloat()
+        )
+    }
+    
+    private suspend fun getAssetsData(dateRange: DateRange, filters: ReportFilters?): AssetsData {
+        // Get assets data - this would integrate with asset management
+        return AssetsData(
+            currentAssets = 500000f, // Example values
+            nonCurrentAssets = 2000000f
+        )
+    }
+    
+    private suspend fun getLiabilitiesData(dateRange: DateRange, filters: ReportFilters?): LiabilitiesData {
+        // Get liabilities data
+        return LiabilitiesData(
+            currentLiabilities = 300000f, // Example values
+            nonCurrentLiabilities = 800000f
+        )
+    }
+    
+    private suspend fun getEquityData(dateRange: DateRange, filters: ReportFilters?): EquityData {
+        // Get equity data
+        return EquityData(
+            shareCapital = 1000000f, // Example values
+            retainedEarnings = 400000f
+        )
+    }
+    
+    private suspend fun getCashFlowFromOperatingActivities(dateRange: DateRange, filters: ReportFilters?): OperatingActivitiesCashFlow {
+        // Calculate cash flow from operating activities
+        return OperatingActivitiesCashFlow(
+            netIncome = 200000f, // Example values
+            depreciation = 50000f,
+            changesInWorkingCapital = -30000f,
+            total = 220000f
+        )
+    }
+    
+    private suspend fun getCashFlowFromInvestingActivities(dateRange: DateRange, filters: ReportFilters?): InvestingActivitiesCashFlow {
+        // Calculate cash flow from investing activities
+        return InvestingActivitiesCashFlow(
+            equipmentPurchases = -100000f, // Example values
+            assetSales = 20000f,
+            total = -80000f
+        )
+    }
+    
+    private suspend fun getCashFlowFromFinancingActivities(dateRange: DateRange, filters: ReportFilters?): FinancingActivitiesCashFlow {
+        // Calculate cash flow from financing activities
+        return FinancingActivitiesCashFlow(
+            loanProceeds = 50000f, // Example values
+            loanRepayments = -30000f,
+            dividendPayments = -20000f,
+            total = 0f
+        )
+    }
+    
+    private fun calculateNetIncome(revenue: RevenueData, expenses: ExpenseData): Float {
+        return (revenue.totalRevenue - expenses.costOfGoodsSold - expenses.operatingExpenses - expenses.nonOperatingExpenses)
+    }
+    
+    private fun calculateEarningsBeforeTax(revenue: RevenueData, expenses: ExpenseData): Float {
+        return (revenue.totalRevenue - expenses.costOfGoodsSold - expenses.operatingExpenses)
+    }
+    
+    private fun calculateProfitMargin(revenue: RevenueData, expenses: ExpenseData): Float {
+        val netIncome = calculateNetIncome(revenue, expenses)
+        return if (revenue.totalRevenue > 0) (netIncome / revenue.totalRevenue) * 100f else 0f
+    }
+    
+    private fun calculateDebtToEquityRatio(liabilities: LiabilitiesData, equity: EquityData): Float {
+        val totalLiabilities = liabilities.currentLiabilities + liabilities.nonCurrentLiabilities
+        val totalEquity = equity.shareCapital + equity.retainedEarnings
+        return if (totalEquity > 0) totalLiabilities / totalEquity else 0f
+    }
+    
+    private fun getCashAtBeginning(dateRange: DateRange): Float {
+        // Get cash balance at beginning of period
+        return 100000f // Example value
+    }
+    
+    private fun getCashAtEnd(dateRange: DateRange): Float {
+        // Get cash balance at end of period
+        return 140000f // Example value
+    }
+    
+    private suspend fun generateCustomReportData(config: CustomReportConfig): Any {
+        // Generate custom report data based on configuration
+        return mapOf(
+            "custom_data" to "Generated based on config",
+            "config" to config.toString()
+        )
+    }
+    
+    private fun calculateNextRun(schedule: String): Date {
+        // Calculate next run date based on schedule
+        val calendar = Calendar.getInstance()
+        calendar.add(Calendar.DAY_OF_MONTH, 1) // Example: next day
+        return calendar.time
+    }
+    
+    private suspend fun saveReport(report: FinancialReport): FinancialReport {
+        // Save report to database
+        val savedReport = database.financialReportDao().insertReport(report.toEntity())
+            .let { id -> report.copy(id = id.toString()) }
+        
+        return savedReport
+    }
+    
+    private fun addToReports(report: FinancialReport) {
+        val currentReports = _reports.value.toMutableList()
+        currentReports.add(0, report) // Add to beginning
+        
+        // Keep only last REPORT_CACHE_SIZE reports in cache
+        if (currentReports.size > REPORT_CACHE_SIZE) {
+            currentReports.removeAt(currentReports.size - 1)
+        }
+        
+        _reports.value = currentReports
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class FinancialReport(
+    val id: String = "",
+    val type: ReportType,
+    val title: String,
+    val dateRange: DateRange,
+    val currency: String,
+    val data: Any,
+    val status: ReportStatus,
+    val generatedAt: Date,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class IncomeStatementData(
+    val totalRevenue: Float,
+    val operatingRevenue: Float,
+    val nonOperatingRevenue: Float,
+    val costOfGoodsSold: Float,
+    val operatingExpenses: Float,
+    val nonOperatingExpenses: Float,
+    val grossProfit: Float,
+    val operatingIncome: Float,
+    val netIncome: Float,
+    val earningsBeforeTax: Float,
+    val earningsAfterTax: Float,
+    val profitMargin: Float
+)
+
+data class BalanceSheetData(
+    val currentAssets: Float,
+    val nonCurrentAssets: Float,
+    val totalAssets: Float,
+    val currentLiabilities: Float,
+    val nonCurrentLiabilities: Float,
+    val totalLiabilities: Float,
+    val shareCapital: Float,
+    val retainedEarnings: Float,
+    val totalEquity: Float,
+    val totalLiabilitiesAndEquity: Float,
+    val workingCapital: Float,
+    val debtToEquityRatio: Float
+)
+
+data class CashFlowStatementData(
+    val netIncome: Float,
+    val depreciation: Float,
+    val changesInWorkingCapital: Float,
+    val cashFlowFromOperatingActivities: Float,
+    val cashFlowFromInvestingActivities: Float,
+    val cashFlowFromFinancingActivities: Float,
+    val netIncreaseInCash: Float,
+    val cashAtBeginning: Float,
+    val cashAtEnd: Float,
+    val freeCashFlow: Float
+)
+
+data class ReportFilters(
+    val customerIds: List<String>? = null,
+    val expenseCategories: List<String>? = null,
+    val minAmount: Float? = null,
+    val maxAmount: Float? = null
+)
+
+data class CustomReportConfig(
+    val title: String,
+    val dateRange: DateRange,
+    val currency: String? = null,
+    val includeRevenue: Boolean = true,
+    val includeExpenses: Boolean = true,
+    val includeAssets: Boolean = false,
+    val includeLiabilities: Boolean = false,
+    val customFields: Map<String, Any> = emptyMap()
+)
+
+data class ReportSchedule(
+    val id: String = "",
+    val reportType: ReportType,
+    val title: String,
+    val schedule: String,
+    val filters: ReportFilters?,
+    val template: ReportTemplate,
+    val recipients: List<String>,
+    val isActive: Boolean,
+    val createdAt: Date,
+    val lastRun: Date?,
+    val nextRun: Date
+)
+
+data class ReportScheduleConfig(
+    val reportType: ReportType,
+    val title: String,
+    val schedule: String,
+    val filters: ReportFilters? = null,
+    val template: ReportTemplate = ReportTemplate.DEFAULT,
+    val recipients: List<String> = emptyList()
+)
+
+data class RevenueData(
+    val totalRevenue: Float,
+    val operatingRevenue: Float,
+    val nonOperatingRevenue: Float
+)
+
+data class ExpenseData(
+    val costOfGoodsSold: Float,
+    val operatingExpenses: Float,
+    val nonOperatingExpenses: Float
+)
+
+data class AssetsData(
+    val currentAssets: Float,
+    val nonCurrentAssets: Float
+)
+
+data class LiabilitiesData(
+    val currentLiabilities: Float,
+    val nonCurrentLiabilities: Float
+)
+
+data class EquityData(
+    val shareCapital: Float,
+    val retainedEarnings: Float
+)
+
+data class OperatingActivitiesCashFlow(
+    val netIncome: Float,
+    val depreciation: Float,
+    val changesInWorkingCapital: Float,
+    val total: Float
+)
+
+data class InvestingActivitiesCashFlow(
+    val equipmentPurchases: Float,
+    val assetSales: Float,
+    val total: Float
+)
+
+data class FinancingActivitiesCashFlow(
+    val loanProceeds: Float,
+    val loanRepayments: Float,
+    val dividendPayments: Float,
+    val total: Float
+)
+
+/**
+ * Enums
+ */
+enum class FinancialReportsState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class ReportType {
+    INCOME_STATEMENT,
+    BALANCE_SHEET,
+    CASH_FLOW_STATEMENT,
+    TRIAL_BALANCE,
+    BUDGET_VS_ACTUAL,
+    COMPARATIVE_ANALYSIS,
+    CUSTOM
+}
+
+enum class ReportStatus {
+    PENDING,
+    PROCESSING,
+    COMPLETED,
+    FAILED,
+    CANCELLED
+}
+
+enum class ReportTemplate {
+    DEFAULT,
+    DETAILED,
+    SUMMARY,
+    MANAGEMENT,
+    SHAREHOLDER
+}

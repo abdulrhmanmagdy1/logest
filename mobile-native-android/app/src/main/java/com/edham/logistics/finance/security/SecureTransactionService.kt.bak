@@ -1,0 +1,742 @@
+package com.edham.logistics.finance.security
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.SecureTransactionApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Secure Transaction Service - Manages secure financial transactions
+ * 
+ * Features:
+ * - Transaction encryption and decryption
+ * - Digital signatures
+ * - Anti-fraud detection
+ * - Transaction validation
+ * - Secure key management
+ * - Transaction monitoring
+ * - Compliance checking
+ */
+@Singleton
+class SecureTransactionService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val secureTransactionApi: SecureTransactionApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _secureTransactionState = MutableStateFlow<SecureTransactionState>(SecureTransactionState.Idle)
+    val secureTransactionState: StateFlow<SecureTransactionState> = _secureTransactionState.asStateFlow()
+    
+    private val _secureTransactions = MutableStateFlow<List<SecureTransaction>>(emptyList())
+    val secureTransactions: StateFlow<List<SecureTransaction>> = _secureTransactions.asStateFlow()
+    
+    private var encryptionKey: SecretKey? = null
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "SecureTransactionService"
+        private const val ENCRYPTION_ALGORITHM = "AES/CBC/PKCS5Padding"
+        private const val KEY_ALGORITHM = "AES"
+        private const val KEY_SIZE = 256
+        private const val IV_SIZE = 16
+        private const val TRANSACTION_TIMEOUT_MS = 300000L // 5 minutes
+        private const val MAX_RETRY_ATTEMPTS = 3
+        private const val FRAUD_THRESHOLD = 10000f // SAR
+    }
+    
+    /**
+     * Initialize secure transaction service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _secureTransactionState.value = SecureTransactionState.Initializing
+                
+                // Initialize encryption key
+                initializeEncryptionKey()
+                
+                // Load recent secure transactions
+                loadRecentSecureTransactions()
+                
+                // Initialize fraud detection
+                initializeFraudDetection()
+                
+                isInitialized = true
+                _secureTransactionState.value = SecureTransactionState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _secureTransactionState.value = SecureTransactionState.Error("Failed to initialize secure transaction service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process secure transaction
+     */
+    suspend fun processSecureTransaction(
+        transactionRequest: SecureTransactionRequest
+    ): Result<SecureTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Secure transaction service not initialized")
+                }
+                
+                _secureTransactionState.value = SecureTransactionState.Processing
+                
+                // Validate transaction request
+                validateTransactionRequest(transactionRequest)
+                
+                // Check for fraud
+                val fraudCheck = checkForFraud(transactionRequest)
+                if (fraudCheck.isFraud) {
+                    throw Exception("Transaction flagged as fraud: ${fraudCheck.reason}")
+                }
+                
+                // Encrypt transaction data
+                val encryptedData = encryptTransactionData(transactionRequest)
+                
+                // Generate digital signature
+                val digitalSignature = generateDigitalSignature(transactionRequest)
+                
+                // Create secure transaction
+                val secureTransaction = SecureTransaction(
+                    id = UUID.randomUUID().toString(),
+                    type = transactionRequest.type,
+                    amount = transactionRequest.amount,
+                    currency = transactionRequest.currency,
+                    senderId = transactionRequest.senderId,
+                    receiverId = transactionRequest.receiverId,
+                    encryptedData = encryptedData.encryptedData,
+                    iv = encryptedData.iv,
+                    digitalSignature = digitalSignature,
+                    status = SecureTransactionStatus.PENDING,
+                    fraudScore = fraudCheck.score,
+                    metadata = transactionRequest.metadata,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Submit to secure transaction processor
+                val processedTransaction = submitToSecureProcessor(secureTransaction)
+                
+                // Save to database
+                val savedTransaction = database.secureTransactionDao().insertSecureTransaction(processedTransaction.toEntity())
+                    .let { id -> processedTransaction.copy(id = id.toString()) }
+                
+                // Add to secure transactions list
+                addToSecureTransactions(savedTransaction)
+                
+                _secureTransactionState.value = SecureTransactionState.Ready
+                Result.success(savedTransaction)
+                
+            } catch (e: Exception) {
+                _secureTransactionState.value = SecureTransactionState.Error("Secure transaction processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Verify transaction
+     */
+    suspend fun verifyTransaction(
+        transactionId: String,
+        verificationCode: String
+    ): Result<SecureTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transaction = getSecureTransaction(transactionId)
+                    ?: throw Exception("Transaction not found")
+                
+                _secureTransactionState.value = SecureTransactionState.Processing
+                
+                // Decrypt transaction data
+                val decryptedData = decryptTransactionData(
+                    transaction.encryptedData,
+                    transaction.iv
+                )
+                
+                // Verify digital signature
+                val signatureValid = verifyDigitalSignature(
+                    decryptedData,
+                    transaction.digitalSignature
+                )
+                
+                if (!signatureValid) {
+                    throw Exception("Invalid digital signature")
+                }
+                
+                // Update transaction status
+                val updatedTransaction = transaction.copy(
+                    status = SecureTransactionStatus.VERIFIED,
+                    verificationCode = verificationCode,
+                    verifiedAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.secureTransactionDao().updateSecureTransaction(updatedTransaction.toEntity())
+                
+                // Update in list
+                updateSecureTransactionInList(updatedTransaction)
+                
+                _secureTransactionState.value = SecureTransactionState.Ready
+                Result.success(updatedTransaction)
+                
+            } catch (e: Exception) {
+                _secureTransactionState.value = SecureTransactionState.Error("Transaction verification failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Cancel secure transaction
+     */
+    suspend fun cancelSecureTransaction(
+        transactionId: String,
+        reason: String
+    ): Result<SecureTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transaction = getSecureTransaction(transactionId)
+                    ?: throw Exception("Transaction not found")
+                
+                if (transaction.status != SecureTransactionStatus.PENDING) {
+                    throw Exception("Cannot cancel transaction in ${transaction.status} status")
+                }
+                
+                _secureTransactionState.value = SecureTransactionState.Processing
+                
+                // Update transaction status
+                val updatedTransaction = transaction.copy(
+                    status = SecureTransactionStatus.CANCELLED,
+                    cancellationReason = reason,
+                    cancelledAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.secureTransactionDao().updateSecureTransaction(updatedTransaction.toEntity())
+                
+                // Update in list
+                updateSecureTransactionInList(updatedTransaction)
+                
+                _secureTransactionState.value = SecureTransactionState.Ready
+                Result.success(updatedTransaction)
+                
+            } catch (e: Exception) {
+                _secureTransactionState.value = SecureTransactionState.Error("Transaction cancellation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get secure transaction by ID
+     */
+    suspend fun getSecureTransaction(transactionId: String): SecureTransaction? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _secureTransactions.value.find { it.id == transactionId }
+                    ?: database.secureTransactionDao().getSecureTransactionById(transactionId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get secure transaction history
+     */
+    suspend fun getSecureTransactionHistory(
+        userId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        status: SecureTransactionStatus? = null
+    ): Result<List<SecureTransaction>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = database.secureTransactionDao().getSecureTransactionHistory(
+                    userId = userId,
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    status = status
+                ).map { it.toDomainModel() }
+                
+                Result.success(transactions)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fraud analysis
+     */
+    suspend fun getFraudAnalysis(
+        transactionId: String
+    ): Result<FraudAnalysis> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transaction = getSecureTransaction(transactionId)
+                    ?: throw Exception("Transaction not found")
+                
+                // Perform comprehensive fraud analysis
+                val analysis = FraudAnalysis(
+                    transactionId = transactionId,
+                    fraudScore = transaction.fraudScore,
+                    riskFactors = analyzeRiskFactors(transaction),
+                    recommendation = generateFraudRecommendation(transaction.fraudScore),
+                    analysisDate = Date(),
+                    isHighRisk = transaction.fraudScore > 0.7f
+                )
+                
+                Result.success(analysis)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get compliance report
+     */
+    suspend fun getComplianceReport(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<ComplianceReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = getSecureTransactionHistory(null, dateRange).getOrThrow()
+                
+                // Generate compliance report
+                val report = ComplianceReport(
+                    period = dateRange,
+                    totalTransactions = transactions.size,
+                    compliantTransactions = transactions.count { it.status == SecureTransactionStatus.COMPLETED },
+                    highRiskTransactions = transactions.count { it.fraudScore > 0.7f },
+                    averageFraudScore = if (transactions.isNotEmpty()) transactions.map { it.fraudScore }.average().toFloat() else 0f,
+                    complianceScore = calculateComplianceScore(transactions),
+                    violations = identifyComplianceViolations(transactions),
+                    generatedAt = Date()
+                )
+                
+                Result.success(report)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun initializeEncryptionKey() {
+        try {
+            // Try to load existing key
+            encryptionKey = securityUtils.loadEncryptionKey()
+            
+            // Generate new key if none exists
+            if (encryptionKey == null) {
+                val keyGenerator = KeyGenerator.getInstance(KEY_ALGORITHM)
+                keyGenerator.init(KEY_SIZE)
+                encryptionKey = keyGenerator.generateKey()
+                
+                // Save key securely
+                securityUtils.saveEncryptionKey(encryptionKey)
+            }
+            
+        } catch (e: Exception) {
+            throw Exception("Failed to initialize encryption key: ${e.message}")
+        }
+    }
+    
+    private suspend fun loadRecentSecureTransactions() {
+        try {
+            val transactions = database.secureTransactionDao().getRecentSecureTransactions(50)
+                .map { it.toDomainModel() }
+            
+            _secureTransactions.value = transactions
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun initializeFraudDetection() {
+        // Initialize fraud detection models and rules
+    }
+    
+    private fun validateTransactionRequest(request: SecureTransactionRequest) {
+        if (request.senderId.isBlank()) throw Exception("Sender ID is required")
+        if (request.receiverId.isBlank()) throw Exception("Receiver ID is required")
+        if (request.amount <= 0) throw Exception("Amount must be positive")
+        if (request.currency.isBlank()) throw Exception("Currency is required")
+        if (request.type == null) throw Exception("Transaction type is required")
+    }
+    
+    private suspend fun checkForFraud(request: SecureTransactionRequest): FraudCheck {
+        var fraudScore = 0f
+        val riskFactors = mutableListOf<String>()
+        
+        // Check amount threshold
+        if (request.amount > FRAUD_THRESHOLD) {
+            fraudScore += 0.3f
+            riskFactors.add("High amount transaction")
+        }
+        
+        // Check transaction frequency
+        val recentTransactions = _secureTransactions.value.filter { 
+            it.senderId == request.senderId && 
+            (Date().time - it.createdAt.time) < 3600000 // Last hour
+        }
+        
+        if (recentTransactions.size > 5) {
+            fraudScore += 0.2f
+            riskFactors.add("High transaction frequency")
+        }
+        
+        // Check unusual patterns
+        val userAverageAmount = calculateUserAverageAmount(request.senderId)
+        if (request.amount > userAverageAmount * 3) {
+            fraudScore += 0.2f
+            riskFactors.add("Unusual amount for user")
+        }
+        
+        // Check time of day
+        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        if (hour < 6 || hour > 22) {
+            fraudScore += 0.1f
+            riskFactors.add("Unusual transaction time")
+        }
+        
+        return FraudCheck(
+            isFraud = fraudScore > 0.5f,
+            score = fraudScore,
+            riskFactors = riskFactors
+        )
+    }
+    
+    private fun encryptTransactionData(request: SecureTransactionRequest): EncryptedData {
+        try {
+            val cipher = Cipher.getInstance(ENCRYPTION_ALGORITHM)
+            
+            // Generate random IV
+            val iv = ByteArray(IV_SIZE)
+            SecureRandom().nextBytes(iv)
+            val ivSpec = IvParameterSpec(iv)
+            
+            // Initialize cipher
+            cipher.init(Cipher.ENCRYPT_MODE, encryptionKey, ivSpec)
+            
+            // Convert request to JSON and encrypt
+            val jsonData = securityUtils.toJson(request)
+            val encryptedData = cipher.doFinal(jsonData.toByteArray())
+            
+            return EncryptedData(
+                encryptedData = Base64.getEncoder().encodeToString(encryptedData),
+                iv = Base64.getEncoder().encodeToString(iv)
+            )
+            
+        } catch (e: Exception) {
+            throw Exception("Failed to encrypt transaction data: ${e.message}")
+        }
+    }
+    
+    private fun generateDigitalSignature(request: SecureTransactionRequest): String {
+        try {
+            val dataToSign = "${request.senderId}${request.receiverId}${request.amount}${request.createdAt}"
+            return securityUtils.generateDigitalSignature(dataToSign)
+        } catch (e: Exception) {
+            throw Exception("Failed to generate digital signature: ${e.message}")
+        }
+    }
+    
+    private suspend fun submitToSecureProcessor(transaction: SecureTransaction): SecureTransaction {
+        // Submit to external secure transaction processor
+        return secureTransactionApi.processTransaction(transaction)
+    }
+    
+    private fun decryptTransactionData(encryptedData: String, iv: String): String {
+        try {
+            val cipher = Cipher.getInstance(ENCRYPTION_ALGORITHM)
+            val ivSpec = IvParameterSpec(Base64.getDecoder().decode(iv))
+            
+            cipher.init(Cipher.DECRYPT_MODE, encryptionKey, ivSpec)
+            val decryptedBytes = cipher.doFinal(Base64.getDecoder().decode(encryptedData))
+            
+            return String(decryptedBytes)
+            
+        } catch (e: Exception) {
+            throw Exception("Failed to decrypt transaction data: ${e.message}")
+        }
+    }
+    
+    private fun verifyDigitalSignature(data: String, signature: String): Boolean {
+        try {
+            return securityUtils.verifyDigitalSignature(data, signature)
+        } catch (e: Exception) {
+            throw Exception("Failed to verify digital signature: ${e.message}")
+        }
+    }
+    
+    private fun calculateUserAverageAmount(userId: String): Float {
+        val userTransactions = _secureTransactions.value.filter { it.senderId == userId }
+        return if (userTransactions.isNotEmpty()) {
+            userTransactions.map { it.amount }.average().toFloat()
+        } else {
+            0f
+        }
+    }
+    
+    private fun analyzeRiskFactors(transaction: SecureTransaction): List<RiskFactor> {
+        val riskFactors = mutableListOf<RiskFactor>()
+        
+        if (transaction.amount > FRAUD_THRESHOLD) {
+            riskFactors.add(
+                RiskFactor(
+                    type = RiskFactorType.HIGH_AMOUNT,
+                    description = "Transaction amount exceeds threshold",
+                    severity = RiskSeverity.HIGH
+                )
+            )
+        }
+        
+        if (transaction.fraudScore > 0.7f) {
+            riskFactors.add(
+                RiskFactor(
+                    type = RiskFactorType.HIGH_FRAUD_SCORE,
+                    description = "High fraud detection score",
+                    severity = RiskSeverity.CRITICAL
+                )
+            )
+        }
+        
+        return riskFactors
+    }
+    
+    private fun generateFraudRecommendation(fraudScore: Float): String {
+        return when {
+            fraudScore > 0.8f -> "Immediate manual review required"
+            fraudScore > 0.6f -> "Enhanced verification recommended"
+            fraudScore > 0.4f -> "Additional documentation may be required"
+            else -> "Standard processing acceptable"
+        }
+    }
+    
+    private fun calculateComplianceScore(transactions: List<SecureTransaction>): Float {
+        val compliantTransactions = transactions.count { it.status == SecureTransactionStatus.COMPLETED }
+        return if (transactions.isNotEmpty()) {
+            (compliantTransactions.toFloat() / transactions.size) * 100f
+        } else {
+            100f
+        }
+    }
+    
+    private fun identifyComplianceViolations(transactions: List<SecureTransaction>): List<ComplianceViolation> {
+        val violations = mutableListOf<ComplianceViolation>()
+        
+        // Check for transactions without proper verification
+        val unverifiedTransactions = transactions.filter { 
+            it.status == SecureTransactionStatus.COMPLETED && it.verifiedAt == null 
+        }
+        
+        if (unverifiedTransactions.isNotEmpty()) {
+            violations.add(
+                ComplianceViolation(
+                    type = ViolationType.UNVERIFIED_TRANSACTION,
+                    description = "Transactions completed without proper verification",
+                    count = unverifiedTransactions.size,
+                    severity = ViolationSeverity.MEDIUM
+                )
+            )
+        }
+        
+        return violations
+    }
+    
+    private fun addToSecureTransactions(transaction: SecureTransaction) {
+        val currentTransactions = _secureTransactions.value.toMutableList()
+        currentTransactions.add(0, transaction) // Add to beginning
+        
+        // Keep only last 100 transactions in cache
+        if (currentTransactions.size > 100) {
+            currentTransactions.removeAt(currentTransactions.size - 1)
+        }
+        
+        _secureTransactions.value = currentTransactions
+    }
+    
+    private fun updateSecureTransactionInList(transaction: SecureTransaction) {
+        val currentTransactions = _secureTransactions.value.toMutableList()
+        val index = currentTransactions.indexOfFirst { it.id == transaction.id }
+        
+        if (index != -1) {
+            currentTransactions[index] = transaction
+            _secureTransactions.value = currentTransactions
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class SecureTransaction(
+    val id: String = "",
+    val type: SecureTransactionType,
+    val amount: Float,
+    val currency: String,
+    val senderId: String,
+    val receiverId: String,
+    val encryptedData: String,
+    val iv: String,
+    val digitalSignature: String,
+    val status: SecureTransactionStatus,
+    val fraudScore: Float,
+    val verificationCode: String? = null,
+    val verifiedAt: Date? = null,
+    val cancellationReason: String? = null,
+    val cancelledAt: Date? = null,
+    val metadata: Map<String, String> = emptyMap(),
+    val createdAt: Date,
+    val updatedAt: Date
+)
+
+data class SecureTransactionRequest(
+    val type: SecureTransactionType,
+    val amount: Float,
+    val currency: String,
+    val senderId: String,
+    val receiverId: String,
+    val metadata: Map<String, String> = emptyMap(),
+    val createdAt: Date = Date()
+)
+
+data class EncryptedData(
+    val encryptedData: String,
+    val iv: String
+)
+
+data class FraudCheck(
+    val isFraud: Boolean,
+    val score: Float,
+    val riskFactors: List<String>
+)
+
+data class FraudAnalysis(
+    val transactionId: String,
+    val fraudScore: Float,
+    val riskFactors: List<RiskFactor>,
+    val recommendation: String,
+    val analysisDate: Date,
+    val isHighRisk: Boolean
+)
+
+data class RiskFactor(
+    val type: RiskFactorType,
+    val description: String,
+    val severity: RiskSeverity
+)
+
+data class ComplianceReport(
+    val period: DateRange,
+    val totalTransactions: Int,
+    val compliantTransactions: Int,
+    val highRiskTransactions: Int,
+    val averageFraudScore: Float,
+    val complianceScore: Float,
+    val violations: List<ComplianceViolation>,
+    val generatedAt: Date
+)
+
+data class ComplianceViolation(
+    val type: ViolationType,
+    val description: String,
+    val count: Int,
+    val severity: ViolationSeverity
+)
+
+/**
+ * Enums
+ */
+enum class SecureTransactionState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class SecureTransactionType {
+    PAYMENT,
+    TRANSFER,
+    REFUND,
+    DEPOSIT,
+    WITHDRAWAL
+}
+
+enum class SecureTransactionStatus {
+    PENDING,
+    PROCESSING,
+    COMPLETED,
+    VERIFIED,
+    CANCELLED,
+    FAILED,
+    FLAGGED
+}
+
+enum class RiskFactorType {
+    HIGH_AMOUNT,
+    HIGH_FRAUD_SCORE,
+    UNUSUAL_PATTERN,
+    SUSPICIOUS_TIMING,
+    NEW_USER
+}
+
+enum class RiskSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class ViolationType {
+    UNVERIFIED_TRANSACTION,
+    MISSING_DOCUMENTATION,
+    SUSPICIOUS_PATTERN,
+    REGULATORY_VIOLATION
+}
+
+enum class ViolationSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

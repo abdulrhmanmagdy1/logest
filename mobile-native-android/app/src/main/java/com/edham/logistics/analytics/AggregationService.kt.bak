@@ -1,0 +1,1073 @@
+package com.edham.logistics.analytics
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.AggregationApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Aggregation Service - Data aggregation and batch processing
+ * 
+ * Features:
+ * - Real-time data aggregation
+ * - Batch processing for large datasets
+ * - Performance optimization
+ * - Data caching and storage
+ * - Scheduled aggregation tasks
+ * - Aggregation pipeline management
+ * - Data quality validation
+ */
+@Singleton
+class AggregationService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val aggregationApi: AggregationApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _aggregationState = MutableStateFlow<AggregationState>(AggregationState.Idle)
+    val aggregationState: StateFlow<AggregationState> = _aggregationState.asStateFlow()
+    
+    private val _aggregationResults = MutableStateFlow<AggregationResults>(AggregationResults())
+    val aggregationResults: StateFlow<AggregationResults> = _aggregationResults.asStateFlow()
+    
+    private var isInitialized = false
+    private var aggregationTimer: Timer? = null
+    
+    companion object {
+        private const val TAG = "AggregationService"
+        private const val AGGREGATION_INTERVAL_MS = 60000L // 1 minute
+        private const val BATCH_SIZE = 1000
+        private const val CACHE_SIZE = 100
+        private const val MAX_RETRY_ATTEMPTS = 3
+    }
+    
+    /**
+     * Initialize aggregation service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _aggregationState.value = AggregationState.Initializing
+                
+                // Load cached aggregation results
+                loadCachedAggregationResults()
+                
+                // Initialize aggregation pipelines
+                initializeAggregationPipelines()
+                
+                // Start aggregation timer
+                startAggregationTimer()
+                
+                // Perform initial aggregation
+                performInitialAggregation()
+                
+                isInitialized = true
+                _aggregationState.value = AggregationState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _aggregationState.value = AggregationState.Error("Failed to initialize aggregation service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Aggregate fleet data
+     */
+    suspend fun aggregateFleetData(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<FleetAggregation> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Aggregation service not initialized")
+                }
+                
+                _aggregationState.value = AggregationState.Aggregating
+                
+                // Get fleet data
+                val vehicles = database.vehicleDao().getAllVehicles()
+                val activeVehicles = database.vehicleDao().getActiveVehicles()
+                val shipments = database.shipmentDao().getShipments(dateRange.startDate, dateRange.endDate)
+                val fuelConsumption = database.fuelConsumptionDao().getAllFuelConsumption()
+                val maintenanceRecords = database.maintenanceDao().getAllMaintenance()
+                
+                // Perform aggregation
+                val fleetAggregation = FleetAggregation(
+                    period = dateRange,
+                    totalVehicles = vehicles.size,
+                    activeVehicles = activeVehicles.size,
+                    utilizationRate = calculateFleetUtilizationRate(vehicles, activeVehicles),
+                    totalDistance = shipments.sumOf { it.distance ?: 0.0 },
+                    totalFuelConsumption = fuelConsumption.sumOf { it.liters ?: 0.0 },
+                    totalFuelCost = fuelConsumption.sumOf { it.cost ?: 0.0 },
+                    totalMaintenanceCost = maintenanceRecords.sumOf { it.cost ?: 0.0 },
+                    averageVehicleAge = calculateAverageVehicleAge(vehicles),
+                    vehiclesByType = aggregateVehiclesByType(vehicles),
+                    vehiclesByStatus = aggregateVehiclesByStatus(vehicles),
+                    performanceMetrics = calculateFleetPerformanceMetrics(vehicles, shipments, dateRange),
+                    generatedAt = Date()
+                )
+                
+                // Cache results
+                cacheAggregationResult("fleet", fleetAggregation)
+                
+                _aggregationState.value = AggregationState.Ready
+                Result.success(fleetAggregation)
+                
+            } catch (e: Exception) {
+                _aggregationState.value = AggregationState.Error("Failed to aggregate fleet data: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Aggregate shipment data
+     */
+    suspend fun aggregateShipmentData(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<ShipmentAggregation> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Aggregation service not initialized")
+                }
+                
+                _aggregationState.value = AggregationState.Aggregating
+                
+                // Get shipment data
+                val shipments = database.shipmentDao().getShipments(dateRange.startDate, dateRange.endDate)
+                val completedShipments = shipments.filter { it.status == ShipmentStatus.COMPLETED }
+                val delayedShipments = shipments.filter { it.isDelayed }
+                
+                // Perform aggregation
+                val shipmentAggregation = ShipmentAggregation(
+                    period = dateRange,
+                    totalShipments = shipments.size,
+                    completedShipments = completedShipments.size,
+                    delayedShipments = delayedShipments.size,
+                    completionRate = if (shipments.isNotEmpty()) (completedShipments.size.toFloat() / shipments.size) * 100f else 0f,
+                    onTimeDeliveryRate = if (completedShipments.isNotEmpty()) ((completedShipments.size - delayedShipments.size).toFloat() / completedShipments.size) * 100f else 0f,
+                    averageDeliveryTime = calculateAverageDeliveryTime(completedShipments),
+                    totalRevenue = shipments.sumOf { it.revenue ?: 0.0 },
+                    shipmentsByStatus = aggregateShipmentsByStatus(shipments),
+                    shipmentsByType = aggregateShipmentsByType(shipments),
+                    shipmentsByRegion = aggregateShipmentsByRegion(shipments),
+                    deliveryTimeDistribution = calculateDeliveryTimeDistribution(completedShipments),
+                    performanceMetrics = calculateShipmentPerformanceMetrics(shipments, dateRange),
+                    generatedAt = Date()
+                )
+                
+                // Cache results
+                cacheAggregationResult("shipment", shipmentAggregation)
+                
+                _aggregationState.value = AggregationState.Ready
+                Result.success(shipmentAggregation)
+                
+            } catch (e: Exception) {
+                _aggregationState.value = AggregationState.Error("Failed to aggregate shipment data: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Aggregate driver performance data
+     */
+    suspend fun aggregateDriverPerformanceData(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<DriverPerformanceAggregation> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Aggregation service not initialized")
+                }
+                
+                _aggregationState.value = AggregationState.Aggregating
+                
+                // Get driver data
+                val drivers = database.driverDao().getAllDrivers()
+                val shipments = database.shipmentDao().getShipments(dateRange.startDate, dateRange.endDate)
+                
+                // Perform aggregation
+                val driverPerformanceAggregation = DriverPerformanceAggregation(
+                    period = dateRange,
+                    totalDrivers = drivers.size,
+                    activeDrivers = drivers.count { it.isActive },
+                    averagePerformance = calculateAverageDriverPerformance(drivers, shipments, dateRange),
+                    topPerformers = getTopPerformingDrivers(drivers, shipments, dateRange, 10),
+                    performanceByRegion = aggregateDriverPerformanceByRegion(drivers, shipments, dateRange),
+                    performanceByVehicle = aggregateDriverPerformanceByVehicle(drivers, shipments, dateRange),
+                    performanceMetrics = calculateDriverPerformanceMetrics(drivers, shipments, dateRange),
+                    generatedAt = Date()
+                )
+                
+                // Cache results
+                cacheAggregationResult("driver_performance", driverPerformanceAggregation)
+                
+                _aggregationState.value = AggregationState.Ready
+                Result.success(driverPerformanceAggregation)
+                
+            } catch (e: Exception) {
+                _aggregationState.value = AggregationState.Error("Failed to aggregate driver performance data: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Aggregate financial data
+     */
+    suspend fun aggregateFinancialData(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<FinancialAggregation> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Aggregation service not initialized")
+                }
+                
+                _aggregationState.value = AggregationState.Aggregating
+                
+                // Get financial data
+                val invoices = database.invoiceDao().getInvoices(dateRange.startDate, dateRange.endDate)
+                val expenses = database.expenseDao().getExpenses(dateRange.startDate, dateRange.endDate)
+                val payments = database.paymentDao().getPayments(dateRange.startDate, dateRange.endDate)
+                
+                // Perform aggregation
+                val financialAggregation = FinancialAggregation(
+                    period = dateRange,
+                    totalRevenue = invoices.sumOf { it.total ?: 0.0 },
+                    totalExpenses = expenses.sumOf { it.amount ?: 0.0 },
+                    netProfit = (invoices.sumOf { it.total ?: 0.0 }) - (expenses.sumOf { it.amount ?: 0.0 }),
+                    totalPayments = payments.size,
+                    paidInvoices = invoices.count { it.status == InvoiceStatus.PAID },
+                    outstandingInvoices = invoices.count { it.status != InvoiceStatus.PAID },
+                    revenueByMonth = aggregateRevenueByMonth(invoices),
+                    expensesByCategory = aggregateExpensesByCategory(expenses),
+                    paymentsByMethod = aggregatePaymentsByMethod(payments),
+                    financialMetrics = calculateFinancialMetrics(invoices, expenses, payments, dateRange),
+                    generatedAt = Date()
+                )
+                
+                // Cache results
+                cacheAggregationResult("financial", financialAggregation)
+                
+                _aggregationState.value = AggregationState.Ready
+                Result.success(financialAggregation)
+                
+            } catch (e: Exception) {
+                _aggregationState.value = AggregationState.Error("Failed to aggregate financial data: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Aggregate temperature data
+     */
+    suspend fun aggregateTemperatureData(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<TemperatureAggregation> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Aggregation service not initialized")
+                }
+                
+                _aggregationState.value = AggregationState.Aggregating
+                
+                // Get temperature data
+                val temperatureLogs = database.temperatureLogDao().getTemperatureLogs(dateRange.startDate, dateRange.endDate)
+                val alerts = database.alertDao().getTemperatureAlerts(dateRange.startDate, dateRange.endDate)
+                
+                // Perform aggregation
+                val temperatureAggregation = TemperatureAggregation(
+                    period = dateRange,
+                    totalReadings = temperatureLogs.size,
+                    averageTemperature = temperatureLogs.map { it.temperature }.average().toFloat(),
+                    minTemperature = temperatureLogs.minOfOrNull { it.temperature } ?: 0f,
+                    maxTemperature = temperatureLogs.maxOfOrNull { it.temperature } ?: 0f,
+                    temperatureAlerts = alerts.size,
+                    complianceRate = calculateTemperatureComplianceRate(temperatureLogs, alerts),
+                    temperatureByVehicle = aggregateTemperatureByVehicle(temperatureLogs),
+                    temperatureByHour = aggregateTemperatureByHour(temperatureLogs),
+                    temperatureTrends = calculateTemperatureTrends(temperatureLogs),
+                    generatedAt = Date()
+                )
+                
+                // Cache results
+                cacheAggregationResult("temperature", temperatureAggregation)
+                
+                _aggregationState.value = AggregationState.Ready
+                Result.success(temperatureAggregation)
+                
+            } catch (e: Exception) {
+                _aggregationState.value = AggregationState.Error("Failed to aggregate temperature data: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Perform batch aggregation
+     */
+    suspend fun performBatchAggregation(
+        aggregationTasks: List<AggregationTask>
+    ): Result<BatchAggregationResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Aggregation service not initialized")
+                }
+                
+                _aggregationState.value = AggregationState.Aggregating
+                
+                val results = mutableListOf<AggregationResult>()
+                val errors = mutableListOf<String>()
+                
+                aggregationTasks.forEach { task ->
+                    try {
+                        val result = when (task.type) {
+                            AggregationType.FLEET -> {
+                                val aggregation = aggregateFleetData(task.dateRange).getOrThrow()
+                                AggregationResult(
+                                    type = task.type,
+                                    success = true,
+                                    data = aggregation,
+                                    timestamp = Date()
+                                )
+                            }
+                            AggregationType.SHIPMENT -> {
+                                val aggregation = aggregateShipmentData(task.dateRange).getOrThrow()
+                                AggregationResult(
+                                    type = task.type,
+                                    success = true,
+                                    data = aggregation,
+                                    timestamp = Date()
+                                )
+                            }
+                            AggregationType.DRIVER_PERFORMANCE -> {
+                                val aggregation = aggregateDriverPerformanceData(task.dateRange).getOrThrow()
+                                AggregationResult(
+                                    type = task.type,
+                                    success = true,
+                                    data = aggregation,
+                                    timestamp = Date()
+                                )
+                            }
+                            AggregationType.FINANCIAL -> {
+                                val aggregation = aggregateFinancialData(task.dateRange).getOrThrow()
+                                AggregationResult(
+                                    type = task.type,
+                                    success = true,
+                                    data = aggregation,
+                                    timestamp = Date()
+                                )
+                            }
+                            AggregationType.TEMPERATURE -> {
+                                val aggregation = aggregateTemperatureData(task.dateRange).getOrThrow()
+                                AggregationResult(
+                                    type = task.type,
+                                    success = true,
+                                    data = aggregation,
+                                    timestamp = Date()
+                                )
+                            }
+                        }
+                        results.add(result)
+                    } catch (e: Exception) {
+                        errors.add("Failed to aggregate ${task.type}: ${e.message}")
+                    }
+                }
+                
+                val batchResult = BatchAggregationResult(
+                    totalTasks = aggregationTasks.size,
+                    successfulTasks = results.size,
+                    failedTasks = errors.size,
+                    results = results,
+                    errors = errors,
+                    timestamp = Date()
+                )
+                
+                _aggregationState.value = AggregationState.Ready
+                Result.success(batchResult)
+                
+            } catch (e: Exception) {
+                _aggregationState.value = AggregationState.Error("Failed to perform batch aggregation: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get cached aggregation result
+     */
+    suspend fun getCachedAggregationResult(
+        type: String,
+        dateRange: DateRange? = null
+    ): Any? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try to get from cache first
+                val cachedResult = _aggregationResults.value.results[type]
+                if (cachedResult != null && dateRange != null) {
+                    // Check if cached result is still valid
+                    val cacheAge = Date().time - cachedResult.timestamp.time
+                    val maxAge = 5 * 60 * 1000L // 5 minutes
+                    
+                    if (cacheAge < maxAge) {
+                        return cachedResult.data
+                    }
+                }
+                
+                // If not in cache or expired, get from database
+                when (type) {
+                    "fleet" -> {
+                        val result = database.aggregationResultDao().getAggregationResult("fleet", dateRange?.startDate, dateRange?.endDate)
+                        result?.let { cacheAggregationResult(type, it.toDomainModel()) }
+                    }
+                    "shipment" -> {
+                        val result = database.aggregationResultDao().getAggregationResult("shipment", dateRange?.startDate, dateRange?.endDate)
+                        result?.let { cacheAggregationResult(type, it.toDomainModel()) }
+                    }
+                    "driver_performance" -> {
+                        val result = database.aggregationResultDao().getAggregationResult("driver_performance", dateRange?.startDate, dateRange?.endDate)
+                        result?.let { cacheAggregationResult(type, it.toDomainModel()) }
+                    }
+                    "financial" -> {
+                        val result = database.aggregationResultDao().getAggregationResult("financial", dateRange?.startDate, dateRange?.endDate)
+                        result?.let { cacheAggregationResult(type, it.toDomainModel()) }
+                    }
+                    "temperature" -> {
+                        val result = database.aggregationResultDao().getAggregationResult("temperature", dateRange?.startDate, dateRange?.endDate)
+                        result?.let { cacheAggregationResult(type, it.toDomainModel()) }
+                    }
+                    else -> null
+                }
+                
+                _aggregationResults.value.results[type]?.data
+                
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadCachedAggregationResults() {
+        try {
+            // Load recent aggregation results from database
+            val results = database.aggregationResultDao().getRecentAggregationResults(CACHE_SIZE)
+                .map { it.toDomainModel() }
+            
+            val resultsMap = results.associateBy { it.type }
+            _aggregationResults.value = AggregationResults(results = resultsMap)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun initializeAggregationPipelines() {
+        // Initialize aggregation pipelines for different data types
+    }
+    
+    private fun startAggregationTimer() {
+        aggregationTimer = Timer()
+        aggregationTimer?.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                // Perform scheduled aggregation
+                performScheduledAggregation()
+            }
+        }, 0, AGGREGATION_INTERVAL_MS)
+    }
+    
+    private suspend fun performInitialAggregation() {
+        try {
+            // Perform initial aggregation for all data types
+            val tasks = listOf(
+                AggregationTask(AggregationType.FLEET, DateRange.last30Days()),
+                AggregationTask(AggregationType.SHIPMENT, DateRange.last30Days()),
+                AggregationTask(AggregationType.DRIVER_PERFORMANCE, DateRange.last30Days()),
+                AggregationTask(AggregationType.FINANCIAL, DateRange.last30Days()),
+                AggregationTask(AggregationType.TEMPERATURE, DateRange.last30Days())
+            )
+            
+            performBatchAggregation(tasks)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun performScheduledAggregation() {
+        try {
+            // Perform scheduled aggregation for real-time data
+            val tasks = listOf(
+                AggregationTask(AggregationType.FLEET, DateRange.today()),
+                AggregationTask(AggregationType.SHIPMENT, DateRange.today()),
+                AggregationTask(AggregationType.DRIVER_PERFORMANCE, DateRange.today()),
+                AggregationTask(AggregationType.FINANCIAL, DateRange.today()),
+                AggregationTask(AggregationType.TEMPERATURE, DateRange.today())
+            )
+            
+            performBatchAggregation(tasks)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun cacheAggregationResult(type: String, data: Any) {
+        val currentResults = _aggregationResults.value.results.toMutableMap()
+        currentResults[type] = CachedAggregationResult(
+            type = type,
+            data = data,
+            timestamp = Date()
+        )
+        
+        // Keep only CACHE_SIZE results in cache
+        if (currentResults.size > CACHE_SIZE) {
+            val oldestKey = currentResults.entries.minByOrNull { it.value.timestamp }?.key
+            oldestKey?.let { currentResults.remove(it) }
+        }
+        
+        _aggregationResults.value = AggregationResults(results = currentResults)
+    }
+    
+    private fun calculateFleetUtilizationRate(vehicles: List<Vehicle>, activeVehicles: List<Vehicle>): Float {
+        return if (vehicles.isNotEmpty()) (activeVehicles.size.toFloat() / vehicles.size) * 100f else 0f
+    }
+    
+    private fun calculateAverageVehicleAge(vehicles: List<Vehicle>): Float {
+        return if (vehicles.isNotEmpty()) {
+            val currentYear = Calendar.getInstance().get(Calendar.YEAR)
+            vehicles.map { currentYear - it.year }.average().toFloat()
+        } else {
+            0f
+        }
+    }
+    
+    private fun aggregateVehiclesByType(vehicles: List<Vehicle>): Map<String, Int> {
+        return vehicles.groupingBy { it.type }.eachCount()
+    }
+    
+    private fun aggregateVehiclesByStatus(vehicles: List<Vehicle>): Map<String, Int> {
+        return vehicles.groupingBy { it.status.name }.eachCount()
+    }
+    
+    private fun calculateFleetPerformanceMetrics(vehicles: List<Vehicle>, shipments: List<Shipment>, dateRange: DateRange): FleetPerformanceMetrics {
+        val totalDistance = shipments.sumOf { it.distance ?: 0.0 }
+        val totalFuelConsumption = database.fuelExpenseDao().getTotalFuelConsumption(dateRange.startDate, dateRange.endDate)
+        val averageSpeed = if (shipments.isNotEmpty()) shipments.map { it.averageSpeed ?: 0.0 }.average() else 0.0
+        
+        return FleetPerformanceMetrics(
+            totalDistance = totalDistance,
+            totalFuelConsumption = totalFuelConsumption,
+            averageSpeed = averageSpeed,
+            fuelEfficiency = if (totalFuelConsumption > 0) totalDistance / totalFuelConsumption else 0.0,
+            averageDowntime = calculateAverageDowntime(vehicles, dateRange),
+            utilizationRate = calculateFleetUtilizationRate(vehicles, vehicles.filter { it.isActive })
+        )
+    }
+    
+    private fun aggregateShipmentsByStatus(shipments: List<Shipment>): Map<String, Int> {
+        return shipments.groupingBy { it.status.name }.eachCount()
+    }
+    
+    private fun aggregateShipmentsByType(shipments: List<Shipment>): Map<String, Int> {
+        return shipments.groupingBy { it.type.name }.eachCount()
+    }
+    
+    private fun aggregateShipmentsByRegion(shipments: List<Shipment>): Map<String, Int> {
+        return shipments.groupingBy { it.destinationRegion ?: "Unknown" }.eachCount()
+    }
+    
+    private fun calculateAverageDeliveryTime(completedShipments: List<Shipment>): Double {
+        val deliveryTimes = completedShipments.mapNotNull { it.deliveryTime }
+        return if (deliveryTimes.isNotEmpty()) deliveryTimes.average() else 0.0
+    }
+    
+    private fun calculateDeliveryTimeDistribution(completedShipments: List<Shipment>): Map<String, Int> {
+        val deliveryTimes = completedShipments.mapNotNull { it.deliveryTime }
+        return deliveryTimes.groupingBy { time ->
+            when {
+                time < 2 -> "Under 2 hours"
+                time < 4 -> "2-4 hours"
+                time < 8 -> "4-8 hours"
+                time < 24 -> "8-24 hours"
+                else -> "Over 24 hours"
+            }
+        }.eachCount()
+    }
+    
+    private fun calculateShipmentPerformanceMetrics(shipments: List<Shipment>, dateRange: DateRange): ShipmentPerformanceMetrics {
+        val completedShipments = shipments.filter { it.status == ShipmentStatus.COMPLETED }
+        val delayedShipments = shipments.filter { it.isDelayed }
+        
+        return ShipmentPerformanceMetrics(
+            completionRate = if (shipments.isNotEmpty()) (completedShipments.size.toFloat() / shipments.size) * 100f else 0f,
+            onTimeDeliveryRate = if (completedShipments.isNotEmpty()) ((completedShipments.size - delayedShipments.size).toFloat() / completedShipments.size) * 100f else 0f,
+            averageDeliveryTime = calculateAverageDeliveryTime(completedShipments),
+            customerSatisfactionScore = calculateCustomerSatisfactionScore(completedShipments),
+            revenuePerShipment = if (shipments.isNotEmpty()) shipments.sumOf { it.revenue ?: 0.0 } / shipments.size else 0.0
+        )
+    }
+    
+    private fun calculateAverageDriverPerformance(drivers: List<Driver>, shipments: List<Shipment>, dateRange: DateRange): Float {
+        val driverPerformances = drivers.map { driver ->
+            val driverShipments = shipments.filter { it.driverId == driver.id }
+            val completedShipments = driverShipments.filter { it.status == ShipmentStatus.COMPLETED }
+            val delayedShipments = driverShipments.filter { it.isDelayed }
+            
+            if (completedShipments.isNotEmpty()) {
+                ((completedShipments.size - delayedShipments.size).toFloat() / completedShipments.size) * 100f
+            } else {
+                0f
+            }
+        }
+        
+        return if (driverPerformances.isNotEmpty()) driverPerformances.average().toFloat() else 0f
+    }
+    
+    private fun getTopPerformingDrivers(drivers: List<Driver>, shipments: List<Shipment>, dateRange: DateRange, limit: Int): List<DriverPerformance> {
+        return drivers.map { driver ->
+            val driverShipments = shipments.filter { it.driverId == driver.id }
+            val completedShipments = driverShipments.filter { it.status == ShipmentStatus.COMPLETED }
+            val delayedShipments = driverShipments.filter { it.isDelayed }
+            val totalDistance = driverShipments.sumOf { it.distance ?: 0.0 }
+            val totalRevenue = driverShipments.sumOf { it.revenue ?: 0.0 }
+            
+            DriverPerformance(
+                driverId = driver.id,
+                driverName = driver.name,
+                totalShipments = driverShipments.size,
+                completedShipments = completedShipments.size,
+                delayedShipments = delayedShipments.size,
+                completionRate = if (driverShipments.isNotEmpty()) (completedShipments.size.toFloat() / driverShipments.size) * 100f else 0f,
+                onTimeDeliveryRate = if (completedShipments.isNotEmpty()) ((completedShipments.size - delayedShipments.size).toFloat() / completedShipments.size) * 100f else 0f,
+                totalDistance = totalDistance,
+                totalRevenue = totalRevenue,
+                averageRating = calculateDriverAverageRating(driver.id, dateRange)
+            )
+        }.sortedByDescending { it.completionRate * it.onTimeDeliveryRate }
+         .take(limit)
+    }
+    
+    private fun aggregateDriverPerformanceByRegion(drivers: List<Driver>, shipments: List<Shipment>, dateRange: DateRange): Map<String, RegionalDriverPerformance> {
+        return shipments.groupingBy { it.destinationRegion ?: "Unknown" }
+            .mapValues { regionShipments ->
+                val regionDrivers = regionShipments.mapNotNull { shipment ->
+                    drivers.find { it.id == shipment.driverId }
+                }.distinct()
+                
+                RegionalDriverPerformance(
+                    region = regionShipments.key,
+                    totalDrivers = regionDrivers.size,
+                    averagePerformance = calculateAverageDriverPerformance(regionDrivers, regionShipments, dateRange),
+                    totalShipments = regionShipments.size,
+                    completedShipments = regionShipments.count { it.status == ShipmentStatus.COMPLETED }
+                )
+            }
+    }
+    
+    private fun aggregateDriverPerformanceByVehicle(drivers: List<Driver>, shipments: List<Shipment>, dateRange: DateRange): Map<String, VehicleDriverPerformance> {
+        return shipments.groupingBy { it.vehicleId ?: "Unknown" }
+            .mapValues { vehicleShipments ->
+                val vehicleDrivers = vehicleShipments.mapNotNull { shipment ->
+                    drivers.find { it.id == shipment.driverId }
+                }.distinct()
+                
+                VehicleDriverPerformance(
+                    vehicleId = vehicleShipments.key,
+                    totalDrivers = vehicleDrivers.size,
+                    averagePerformance = calculateAverageDriverPerformance(vehicleDrivers, vehicleShipments, dateRange),
+                    totalShipments = vehicleShipments.size,
+                    completedShipments = vehicleShipments.count { it.status == ShipmentStatus.COMPLETED }
+                )
+            }
+    }
+    
+    private fun calculateDriverPerformanceMetrics(drivers: List<Driver>, shipments: List<Shipment>, dateRange: DateRange): DriverPerformanceMetrics {
+        val totalShipments = shipments.size
+        val completedShipments = shipments.filter { it.status == ShipmentStatus.COMPLETED }
+        val activeDrivers = drivers.count { it.isActive }
+        
+        return DriverPerformanceMetrics(
+            totalDrivers = drivers.size,
+            activeDrivers = activeDrivers,
+            totalShipments = totalShipments,
+            completedShipments = completedShipments.size,
+            averagePerformance = calculateAverageDriverPerformance(drivers, shipments, dateRange),
+            driverUtilizationRate = if (activeDrivers > 0) (totalShipments.toFloat() / activeDrivers) else 0f
+        )
+    }
+    
+    private fun aggregateRevenueByMonth(invoices: List<Invoice>): Map<String, Double> {
+        return invoices.groupingBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.issueDate
+            "${calendar.get(Calendar.YEAR)}-${calendar.get(Calendar.MONTH) + 1}"
+        }.eachCount().mapValues { it.value.toDouble() }
+    }
+    
+    private fun aggregateExpensesByCategory(expenses: List<Expense>): Map<String, Double> {
+        return expenses.groupingBy { it.category.name }
+            .eachSumByDouble { it.amount ?: 0.0 }
+    }
+    
+    private fun aggregatePaymentsByMethod(payments: List<Payment>): Map<String, Int> {
+        return payments.groupingBy { it.method.name }.eachCount()
+    }
+    
+    private fun calculateFinancialMetrics(invoices: List<Invoice>, expenses: List<Expense>, payments: List<Payment>, dateRange: DateRange): FinancialMetrics {
+        val totalRevenue = invoices.sumOf { it.total ?: 0.0 }
+        val totalExpenses = expenses.sumOf { it.amount ?: 0.0 }
+        val netProfit = totalRevenue - totalExpenses
+        val paidInvoices = invoices.count { it.status == InvoiceStatus.PAID }
+        
+        return FinancialMetrics(
+            totalRevenue = totalRevenue,
+            totalExpenses = totalExpenses,
+            netProfit = netProfit,
+            profitMargin = if (totalRevenue > 0) (netProfit / totalRevenue) * 100f else 0f,
+            collectionRate = if (invoices.isNotEmpty()) (paidInvoices.toFloat() / invoices.size) * 100f else 0f,
+            averageInvoiceValue = if (invoices.isNotEmpty()) totalRevenue / invoices.size else 0.0,
+            daysSalesOutstanding = calculateDaysSalesOutstanding(invoices)
+        )
+    }
+    
+    private fun calculateTemperatureComplianceRate(temperatureLogs: List<TemperatureLog>, alerts: List<Alert>): Float {
+        val totalReadings = temperatureLogs.size
+        val compliantReadings = temperatureLogs.count { it.isCompliant }
+        
+        return if (totalReadings > 0) (compliantReadings.toFloat() / totalReadings) * 100f else 100f
+    }
+    
+    private fun aggregateTemperatureByVehicle(temperatureLogs: List<TemperatureLog>): Map<String, Float> {
+        return temperatureLogs.groupingBy { it.vehicleId }
+            .mapValues { it.value.map { log -> log.temperature }.average().toFloat() }
+    }
+    
+    private fun aggregateTemperatureByHour(temperatureLogs: List<TemperatureLog>): Map<Int, Float> {
+        return temperatureLogs.groupingBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.timestamp
+            calendar.get(Calendar.HOUR_OF_DAY)
+        }.mapValues { it.value.map { log -> log.temperature }.average().toFloat() }
+    }
+    
+    private fun calculateTemperatureTrends(temperatureLogs: List<TemperatureLog>): List<TemperatureTrend> {
+        return temperatureLogs.groupingBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.timestamp
+            calendar.set(Calendar.HOUR_OF_DAY, 0)
+            calendar.set(Calendar.MINUTE, 0)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            calendar.time
+        }.mapValues { logs ->
+            TemperatureTrend(
+                date = logs.key,
+                averageTemperature = logs.value.map { it.temperature }.average().toFloat(),
+                minTemperature = logs.value.minOfOrNull { it.temperature } ?: 0f,
+                maxTemperature = logs.value.maxOfOrNull { it.temperature } ?: 0f
+            )
+        }.values.sortedBy { it.date }
+    }
+    
+    private fun calculateAverageDowntime(vehicles: List<Vehicle>, dateRange: DateRange): Double {
+        // Implementation for calculating average downtime
+        return 0.0 // Placeholder
+    }
+    
+    private fun calculateCustomerSatisfactionScore(completedShipments: List<Shipment>): Float {
+        val ratings = completedShipments.mapNotNull { it.customerRating }
+        return if (ratings.isNotEmpty()) ratings.average().toFloat() else 0f
+    }
+    
+    private fun calculateDriverAverageRating(driverId: String, dateRange: DateRange): Float {
+        // Implementation for calculating driver average rating
+        return 0f // Placeholder
+    }
+    
+    private fun calculateDaysSalesOutstanding(invoices: List<Invoice>): Double {
+        val unpaidInvoices = invoices.filter { it.status != InvoiceStatus.PAID }
+        return if (unpaidInvoices.isNotEmpty()) {
+            val currentDate = Date()
+            val totalDays = unpaidInvoices.sumOf { invoice ->
+                val daysSinceIssue = (currentDate.time - invoice.issueDate.time) / (1000 * 60 * 60 * 24)
+                daysSinceIssue * (invoice.total ?: 0.0)
+            }
+            totalDays / unpaidInvoices.sumOf { it.total ?: 0.0 }
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        aggregationTimer?.cancel()
+        aggregationTimer = null
+    }
+}
+
+/**
+ * Data classes for aggregation
+ */
+data class AggregationResults(
+    val results: Map<String, CachedAggregationResult> = emptyMap()
+)
+
+data class CachedAggregationResult(
+    val type: String,
+    val data: Any,
+    val timestamp: Date
+)
+
+data class FleetAggregation(
+    val period: DateRange,
+    val totalVehicles: Int,
+    val activeVehicles: Int,
+    val utilizationRate: Float,
+    val totalDistance: Double,
+    val totalFuelConsumption: Double,
+    val totalFuelCost: Double,
+    val totalMaintenanceCost: Double,
+    val averageVehicleAge: Float,
+    val vehiclesByType: Map<String, Int>,
+    val vehiclesByStatus: Map<String, Int>,
+    val performanceMetrics: FleetPerformanceMetrics,
+    val generatedAt: Date
+)
+
+data class ShipmentAggregation(
+    val period: DateRange,
+    val totalShipments: Int,
+    val completedShipments: Int,
+    val delayedShipments: Int,
+    val completionRate: Float,
+    val onTimeDeliveryRate: Float,
+    val averageDeliveryTime: Double,
+    val totalRevenue: Double,
+    val shipmentsByStatus: Map<String, Int>,
+    val shipmentsByType: Map<String, Int>,
+    val shipmentsByRegion: Map<String, Int>,
+    val deliveryTimeDistribution: Map<String, Int>,
+    val performanceMetrics: ShipmentPerformanceMetrics,
+    val generatedAt: Date
+)
+
+data class DriverPerformanceAggregation(
+    val period: DateRange,
+    val totalDrivers: Int,
+    val activeDrivers: Int,
+    val averagePerformance: Float,
+    val topPerformers: List<DriverPerformance>,
+    val performanceByRegion: Map<String, RegionalDriverPerformance>,
+    val performanceByVehicle: Map<String, VehicleDriverPerformance>,
+    val performanceMetrics: DriverPerformanceMetrics,
+    val generatedAt: Date
+)
+
+data class FinancialAggregation(
+    val period: DateRange,
+    val totalRevenue: Double,
+    val totalExpenses: Double,
+    val netProfit: Double,
+    val totalPayments: Int,
+    val paidInvoices: Int,
+    val outstandingInvoices: Int,
+    val revenueByMonth: Map<String, Double>,
+    val expensesByCategory: Map<String, Double>,
+    val paymentsByMethod: Map<String, Int>,
+    val financialMetrics: FinancialMetrics,
+    val generatedAt: Date
+)
+
+data class TemperatureAggregation(
+    val period: DateRange,
+    val totalReadings: Int,
+    val averageTemperature: Float,
+    val minTemperature: Float,
+    val maxTemperature: Float,
+    val temperatureAlerts: Int,
+    val complianceRate: Float,
+    val temperatureByVehicle: Map<String, Float>,
+    val temperatureByHour: Map<Int, Float>,
+    val temperatureTrends: List<TemperatureTrend>,
+    val generatedAt: Date
+)
+
+data class AggregationTask(
+    val type: AggregationType,
+    val dateRange: DateRange
+)
+
+data class AggregationResult(
+    val type: AggregationType,
+    val success: Boolean,
+    val data: Any,
+    val timestamp: Date
+)
+
+data class BatchAggregationResult(
+    val totalTasks: Int,
+    val successfulTasks: Int,
+    val failedTasks: Int,
+    val results: List<AggregationResult>,
+    val errors: List<String>,
+    val timestamp: Date
+)
+
+// Supporting data classes
+data class FleetPerformanceMetrics(
+    val totalDistance: Double,
+    val totalFuelConsumption: Double,
+    val averageSpeed: Double,
+    val fuelEfficiency: Double,
+    val averageDowntime: Double,
+    val utilizationRate: Float
+)
+
+data class ShipmentPerformanceMetrics(
+    val completionRate: Float,
+    val onTimeDeliveryRate: Float,
+    val averageDeliveryTime: Double,
+    val customerSatisfactionScore: Float,
+    val revenuePerShipment: Double
+)
+
+data class DriverPerformance(
+    val driverId: String,
+    val driverName: String,
+    val totalShipments: Int,
+    val completedShipments: Int,
+    val delayedShipments: Int,
+    val completionRate: Float,
+    val onTimeDeliveryRate: Float,
+    val totalDistance: Double,
+    val totalRevenue: Double,
+    val averageRating: Float
+)
+
+data class RegionalDriverPerformance(
+    val region: String,
+    val totalDrivers: Int,
+    val averagePerformance: Float,
+    val totalShipments: Int,
+    val completedShipments: Int
+)
+
+data class VehicleDriverPerformance(
+    val vehicleId: String,
+    val totalDrivers: Int,
+    val averagePerformance: Float,
+    val totalShipments: Int,
+    val completedShipments: Int
+)
+
+data class DriverPerformanceMetrics(
+    val totalDrivers: Int,
+    val activeDrivers: Int,
+    val totalShipments: Int,
+    val completedShipments: Int,
+    val averagePerformance: Float,
+    val driverUtilizationRate: Float
+)
+
+data class FinancialMetrics(
+    val totalRevenue: Double,
+    val totalExpenses: Double,
+    val netProfit: Double,
+    val profitMargin: Float,
+    val collectionRate: Float,
+    val averageInvoiceValue: Double,
+    val daysSalesOutstanding: Double
+)
+
+data class TemperatureTrend(
+    val date: Date,
+    val averageTemperature: Float,
+    val minTemperature: Float,
+    val maxTemperature: Float
+)
+
+data class DateRange(
+    val startDate: Date,
+    val endDate: Date
+) {
+    companion object {
+        fun last30Days(): DateRange {
+            val calendar = Calendar.getInstance()
+            val endDate = calendar.time
+            calendar.add(Calendar.DAY_OF_MONTH, -30)
+            val startDate = calendar.time
+            return DateRange(startDate, endDate)
+        }
+        
+        fun last7Days(): DateRange {
+            val calendar = Calendar.getInstance()
+            val endDate = calendar.time
+            calendar.add(Calendar.DAY_OF_MONTH, -7)
+            val startDate = calendar.time
+            return DateRange(startDate, endDate)
+        }
+        
+        fun today(): DateRange {
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.HOUR_OF_DAY, 0)
+            calendar.set(Calendar.MINUTE, 0)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            val startDate = calendar.time
+            
+            calendar.add(Calendar.DAY_OF_MONTH, 1)
+            val endDate = calendar.time
+            
+            return DateRange(startDate, endDate)
+        }
+    }
+}
+
+/**
+ * Enums
+ */
+enum class AggregationState {
+    Idle,
+    Initializing,
+    Ready,
+    Aggregating,
+    Error
+}
+
+enum class AggregationType {
+    FLEET,
+    SHIPMENT,
+    DRIVER_PERFORMANCE,
+    FINANCIAL,
+    TEMPERATURE
+}

@@ -1,0 +1,923 @@
+package com.edham.logistics.feature.fuel
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+/**
+ * Comprehensive Fuel Theft Detection System
+ * 
+ * Provides advanced fuel theft detection capabilities including:
+ * - Real-time fuel level monitoring and anomaly detection
+ * - Statistical analysis for unusual fuel consumption patterns
+ * - Location-based theft detection with geofencing
+ * - Driver behavior analysis for suspicious activities
+ * - Automated alerts and incident reporting
+ */
+class FuelTheftDetection {
+    
+    companion object {
+        private const val TAG = "FuelTheftDetection"
+        private const val THEFT_DETECTION_THRESHOLD = 15.0 // 15% sudden fuel drop
+        private const val UNUSUAL_CONSUMPTION_THRESHOLD = 2.5 // 2.5x normal consumption
+        private const val IDLE_THEFT_THRESHOLD = 5.0 // 5L fuel drop while idle
+        private const val LOCATION_THEFT_RADIUS = 100.0 // 100 meters from authorized locations
+    }
+    
+    private val fuelLevelHistory = mutableMapOf<String, MutableList<FuelLevelRecord>>()
+    private val theftIncidents = mutableMapOf<String, MutableList<TheftIncident>>()
+    private val vehicleTheftProfiles = mutableMapOf<String, VehicleTheftProfile>()
+    private val geofenceZones = mutableMapOf<String, GeofenceZone>()
+    private val driverBehaviorPatterns = mutableMapOf<String, DriverBehaviorPattern>()
+    
+    /**
+     * Records fuel level data for theft detection analysis
+     */
+    suspend fun recordFuelLevel(
+        vehicleId: String,
+        currentFuelLevel: Double,
+        totalTankCapacity: Double,
+        location: LocationData,
+        driverId: String? = null,
+        engineStatus: EngineStatus,
+        timestamp: LocalDateTime = LocalDateTime.now()
+    ): Result<FuelLevelRecord> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Recording fuel level for vehicle: $vehicleId, level: $currentFuelLevel")
+            
+            // Validate fuel level data
+            val validationResult = validateFuelLevelData(currentFuelLevel, totalTankCapacity)
+            
+            if (!validationResult.isValid) {
+                Log.e(TAG, "Invalid fuel level data: ${validationResult.errors}")
+                return@withContext Result.failure(
+                    IllegalArgumentException("Invalid fuel level data: ${validationResult.errors.joinToString(", ")}")
+                )
+            }
+            
+            // Get previous fuel level record
+            val previousRecord = getLatestFuelLevelRecord(vehicleId)
+            val fuelLevelDifference = if (previousRecord != null) {
+                previousRecord.currentFuelLevel - currentFuelLevel
+            } else {
+                0.0
+            }
+            
+            // Calculate fuel percentage
+            val fuelPercentage = (currentFuelLevel / totalTankCapacity) * 100
+            
+            // Create fuel level record
+            val record = FuelLevelRecord(
+                id = generateFuelLevelRecordId(),
+                vehicleId = vehicleId,
+                currentFuelLevel = currentFuelLevel,
+                totalTankCapacity = totalTankCapacity,
+                fuelPercentage = fuelPercentage,
+                fuelLevelDifference = fuelLevelDifference,
+                location = location,
+                driverId = driverId,
+                engineStatus = engineStatus,
+                timestamp = timestamp
+            )
+            
+            // Store fuel level record
+            val vehicleRecords = fuelLevelHistory.getOrPut(vehicleId) { mutableListOf() }
+            vehicleRecords.add(record)
+            
+            // Perform theft detection analysis
+            val theftDetectionResult = analyzeForTheft(vehicleId, record)
+            
+            if (theftDetectionResult.isTheftDetected) {
+                Log.w(TAG, "Fuel theft detected: ${theftDetectionResult.reason}")
+                handleTheftDetection(vehicleId, theftDetectionResult, record)
+            }
+            
+            // Update vehicle theft profile
+            updateVehicleTheftProfile(vehicleId, record, theftDetectionResult)
+            
+            // Update driver behavior pattern if applicable
+            driverId?.let { updateDriverBehaviorPattern(it, record, theftDetectionResult) }
+            
+            Log.d(TAG, "Fuel level recorded successfully: ${record.id}")
+            Result.success(record)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error recording fuel level", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Analyzes fuel data for potential theft patterns
+     */
+    suspend fun analyzeForTheftPatterns(
+        vehicleId: String,
+        timeWindow: TimeWindow = TimeWindow.LAST_24_HOURS
+    ): Result<TheftAnalysisResult> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Analyzing theft patterns for vehicle: $vehicleId")
+            
+            val fuelRecords = getFuelRecordsInTimeWindow(vehicleId, timeWindow)
+            
+            if (fuelRecords.size < 2) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("Insufficient fuel data for analysis")
+                )
+            }
+            
+            // Analyze sudden fuel drops
+            val suddenDrops = analyzeSuddenFuelDrops(fuelRecords)
+            
+            // Analyze unusual consumption patterns
+            val unusualConsumption = analyzeUnusualConsumption(fuelRecords)
+            
+            // Analyze location-based anomalies
+            val locationAnomalies = analyzeLocationAnomalies(fuelRecords)
+            
+            // Analyze time-based patterns
+            val timePatterns = analyzeTimeBasedPatterns(fuelRecords)
+            
+            // Analyze driver behavior if available
+            val driverAnalysis = analyzeDriverBehavior(vehicleId, fuelRecords)
+            
+            // Calculate overall theft risk score
+            val riskScore = calculateTheftRiskScore(
+                suddenDrops, unusualConsumption, locationAnomalies, timePatterns, driverAnalysis
+            )
+            
+            val analysisResult = TheftAnalysisResult(
+                vehicleId = vehicleId,
+                timeWindow = timeWindow,
+                riskScore = riskScore,
+                suddenDrops = suddenDrops,
+                unusualConsumption = unusualConsumption,
+                locationAnomalies = locationAnomalies,
+                timePatterns = timePatterns,
+                driverAnalysis = driverAnalysis,
+                recommendations = generateTheftPreventionRecommendations(riskScore),
+                analysisTimestamp = LocalDateTime.now()
+            )
+            
+            Result.success(analysisResult)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error analyzing theft patterns", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Creates geofence zones for authorized fueling areas
+     */
+    suspend fun createGeofenceZone(
+        zoneId: String,
+        name: String,
+        centerLocation: LocationData,
+        radius: Double,
+        zoneType: GeofenceType,
+        authorizedVehicles: List<String>,
+        activeHours: TimeRange? = null
+    ): Result<GeofenceZone> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Creating geofence zone: $zoneId")
+            
+            val geofenceZone = GeofenceZone(
+                id = zoneId,
+                name = name,
+                centerLocation = centerLocation,
+                radius = radius,
+                zoneType = zoneType,
+                authorizedVehicles = authorizedVehicles,
+                activeHours = activeHours,
+                isActive = true,
+                createdAt = LocalDateTime.now()
+            )
+            
+            geofenceZones[zoneId] = geofenceZone
+            
+            Log.d(TAG, "Geofence zone created successfully: $zoneId")
+            Result.success(geofenceZone)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating geofence zone", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets comprehensive theft analytics for a vehicle
+     */
+    suspend fun getVehicleTheftAnalytics(
+        vehicleId: String,
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS
+    ): Result<VehicleTheftAnalytics> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting theft analytics for vehicle: $vehicleId")
+            
+            val theftIncidents = getTheftIncidentsInTimeWindow(vehicleId, timeWindow)
+            val fuelRecords = getFuelRecordsInTimeWindow(vehicleId, timeWindow)
+            val vehicleProfile = vehicleTheftProfiles[vehicleId]
+            
+            if (fuelRecords.isEmpty()) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("No fuel data available for vehicle: $vehicleId")
+                )
+            }
+            
+            // Calculate theft metrics
+            val totalIncidents = theftIncidents.size
+            val confirmedThefts = theftIncidents.count { it.status == IncidentStatus.CONFIRMED }
+            val suspectedThefts = theftIncidents.count { it.status == IncidentStatus.SUSPECTED }
+            val falseAlarms = theftIncidents.count { it.status == IncidentStatus.FALSE_ALARM }
+            
+            // Calculate total estimated loss
+            val totalEstimatedLoss = theftIncidents
+                .filter { it.status == IncidentStatus.CONFIRMED }
+                .sumOf { it.estimatedFuelLoss }
+            
+            // Calculate theft frequency
+            val theftFrequency = if (timeWindow.duration.toDays() > 0) {
+                (totalIncidents.toDouble() / timeWindow.duration.toDays()) * 30 // Monthly frequency
+            } else {
+                0.0
+            }
+            
+            // Analyze theft patterns
+            val locationPatterns = analyzeTheftLocationPatterns(theftIncidents)
+            val timePatterns = analyzeTheftTimePatterns(theftIncidents)
+            val dayOfWeekPatterns = analyzeTheftDayOfWeekPatterns(theftIncidents)
+            
+            // Calculate risk level
+            val riskLevel = calculateVehicleRiskLevel(vehicleProfile, theftFrequency)
+            
+            // Generate recommendations
+            val recommendations = generateVehicleSecurityRecommendations(
+                vehicleId, theftIncidents, vehicleProfile
+            )
+            
+            val analytics = VehicleTheftAnalytics(
+                vehicleId = vehicleId,
+                timeWindow = timeWindow,
+                totalIncidents = totalIncidents,
+                confirmedThefts = confirmedThefts,
+                suspectedThefts = suspectedThefts,
+                falseAlarms = falseAlarms,
+                totalEstimatedLoss = totalEstimatedLoss,
+                theftFrequency = theftFrequency,
+                riskLevel = riskLevel,
+                locationPatterns = locationPatterns,
+                timePatterns = timePatterns,
+                dayOfWeekPatterns = dayOfWeekPatterns,
+                vehicleProfile = vehicleProfile,
+                recommendations = recommendations,
+                lastUpdated = LocalDateTime.now()
+            )
+            
+            Result.success(analytics)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting vehicle theft analytics", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets fleet-wide theft analytics
+     */
+    suspend fun getFleetTheftAnalytics(
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS
+    ): Result<FleetTheftAnalytics> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting fleet theft analytics")
+            
+            // Aggregate data from all vehicles
+            val allTheftIncidents = mutableListOf<TheftIncident>()
+            theftIncidents.values.forEach { incidents ->
+                allTheftIncidents.addAll(
+                    incidents.filter { it.timestamp >= LocalDateTime.now().minus(timeWindow.duration) }
+                )
+            }
+            
+            if (allTheftIncidents.isEmpty()) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("No theft data available for fleet")
+                )
+            }
+            
+            // Fleet-level metrics
+            val totalFleetIncidents = allTheftIncidents.size
+            val confirmedFleetThefts = allTheftIncidents.count { it.status == IncidentStatus.CONFIRMED }
+            val totalFleetLoss = allTheftIncidents
+                .filter { it.status == IncidentStatus.CONFIRMED }
+                .sumOf { it.estimatedFuelLoss }
+            
+            // Vehicle distribution
+            val vehicleTheftDistribution = allTheftIncidents
+                .groupingBy { it.vehicleId }
+                .eachCount()
+            
+            // High-risk vehicles
+            val highRiskVehicles = identifyHighRiskVehicles(vehicleTheftDistribution)
+            
+            // Geographic hotspots
+            val geographicHotspots = analyzeGeographicTheftHotspots(allTheftIncidents)
+            
+            // Temporal patterns
+            val fleetTimePatterns = analyzeFleetTimePatterns(allTheftIncidents)
+            
+            // Detection method effectiveness
+            val detectionMethodStats = analyzeDetectionMethodEffectiveness(allTheftIncidents)
+            
+            val analytics = FleetTheftAnalytics(
+                timeWindow = timeWindow,
+                totalFleetIncidents = totalFleetIncidents,
+                confirmedFleetThefts = confirmedFleetThefts,
+                totalFleetLoss = totalFleetLoss,
+                vehicleTheftDistribution = vehicleTheftDistribution,
+                highRiskVehicles = highRiskVehicles,
+                geographicHotspots = geographicHotspots,
+                fleetTimePatterns = fleetTimePatterns,
+                detectionMethodStats = detectionMethodStats,
+                recommendations = generateFleetSecurityRecommendations(allTheftIncidents),
+                lastUpdated = LocalDateTime.now()
+            )
+            
+            Result.success(analytics)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting fleet theft analytics", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Updates theft incident status
+     */
+    suspend fun updateTheftIncidentStatus(
+        incidentId: String,
+        status: IncidentStatus,
+        resolvedBy: String? = null,
+        resolutionNotes: String? = null
+    ): Result<TheftIncident> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Updating theft incident status: $incidentId")
+            
+            val incident = findTheftIncidentById(incidentId)
+                ?: return@withContext Result.failure(
+                    IllegalArgumentException("Theft incident not found: $incidentId")
+                )
+            
+            val updatedIncident = incident.copy(
+                status = status,
+                resolvedBy = resolvedBy,
+                resolutionNotes = resolutionNotes,
+                resolvedAt = if (status != IncidentStatus.OPEN) LocalDateTime.now() else null
+            )
+            
+            // Update incident in storage
+            val vehicleIncidents = theftIncidents.getOrPut(incident.vehicleId) { mutableListOf() }
+            val incidentIndex = vehicleIncidents.indexOfFirst { it.id == incidentId }
+            if (incidentIndex >= 0) {
+                vehicleIncidents[incidentIndex] = updatedIncident
+            }
+            
+            Log.d(TAG, "Theft incident status updated: $incidentId")
+            Result.success(updatedIncident)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating theft incident status", e)
+            Result.failure(e)
+        }
+    }
+    
+    // Private helper methods
+    
+    private fun validateFuelLevelData(currentFuelLevel: Double, totalTankCapacity: Double): ValidationResult {
+        val errors = mutableListOf<String>()
+        
+        if (currentFuelLevel < 0) {
+            errors.add("Fuel level cannot be negative")
+        }
+        
+        if (totalTankCapacity <= 0) {
+            errors.add("Tank capacity must be positive")
+        }
+        
+        if (currentFuelLevel > totalTankCapacity) {
+            errors.add("Fuel level cannot exceed tank capacity")
+        }
+        
+        return ValidationResult(isValid = errors.isEmpty(), errors = errors)
+    }
+    
+    private fun getLatestFuelLevelRecord(vehicleId: String): FuelLevelRecord? {
+        return fuelLevelHistory[vehicleId]?.maxByOrNull { it.timestamp }
+    }
+    
+    private fun getFuelRecordsInTimeWindow(
+        vehicleId: String,
+        timeWindow: TimeWindow
+    ): List<FuelLevelRecord> {
+        val cutoffDate = LocalDateTime.now().minus(timeWindow.duration)
+        return fuelLevelHistory[vehicleId]?.filter { it.timestamp >= cutoffDate } ?: emptyList()
+    }
+    
+    private fun analyzeForTheft(vehicleId: String, currentRecord: FuelLevelRecord): TheftDetectionResult {
+        val previousRecords = fuelLevelHistory[vehicleId]?.takeLast(10) ?: emptyList()
+        
+        if (previousRecords.isEmpty()) {
+            return TheftDetectionResult(isTheftDetected = false, reason = null, confidence = 0.0)
+        }
+        
+        val previousRecord = previousRecords.last()
+        val fuelDrop = previousRecord.currentFuelLevel - currentRecord.currentFuelLevel
+        val fuelDropPercentage = (fuelDrop / previousRecord.totalTankCapacity) * 100
+        
+        // Check for sudden fuel drop while engine is off
+        if (currentRecord.engineStatus == EngineStatus.OFF && fuelDropPercentage > THEFT_DETECTION_THRESHOLD) {
+            return TheftDetectionResult(
+                isTheftDetected = true,
+                reason = "Sudden fuel drop of ${fuelDropPercentage.format(1)}% while engine is off",
+                confidence = 0.85,
+                detectionMethod = DetectionMethod.SUDDEN_DROP_OFF,
+                estimatedLoss = fuelDrop
+            )
+        }
+        
+        // Check for fuel drop while idle
+        if (currentRecord.engineStatus == EngineStatus.IDLE && fuelDrop > IDLE_THEFT_THRESHOLD) {
+            return TheftDetectionResult(
+                isTheftDetected = true,
+                reason = "Fuel drop of ${fuelDrop.format(1)}L detected while vehicle is idle",
+                confidence = 0.75,
+                detectionMethod = DetectionMethod.IDLE_THEFT,
+                estimatedLoss = fuelDrop
+            )
+        }
+        
+        // Check for unusual consumption rate
+        val consumptionRate = calculateConsumptionRate(previousRecords, currentRecord)
+        val normalRate = calculateNormalConsumptionRate(vehicleId, previousRecords)
+        
+        if (consumptionRate > normalRate * UNUSUAL_CONSUMPTION_THRESHOLD) {
+            return TheftDetectionResult(
+                isTheftDetected = true,
+                reason = "Unusual consumption rate detected: ${consumptionRate.format(2)}L/hr (normal: ${normalRate.format(2)}L/hr)",
+                confidence = 0.70,
+                detectionMethod = DetectionMethod.UNUSUAL_CONSUMPTION,
+                estimatedLoss = fuelDrop
+            )
+        }
+        
+        // Check location-based theft
+        val locationResult = checkLocationBasedTheft(currentRecord)
+        if (locationResult.isTheftDetected) {
+            return locationResult
+        }
+        
+        return TheftDetectionResult(isTheftDetected = false, reason = null, confidence = 0.0)
+    }
+    
+    private fun calculateConsumptionRate(records: List<FuelLevelRecord>, currentRecord: FuelLevelRecord): Double {
+        if (records.isEmpty()) return 0.0
+        
+        val latestRecord = records.last()
+        val timeDifference = java.time.Duration.between(latestRecord.timestamp, currentRecord.timestamp).toHours()
+        val fuelDifference = latestRecord.currentFuelLevel - currentRecord.currentFuelLevel
+        
+        return if (timeDifference > 0) fuelDifference / timeDifference else 0.0
+    }
+    
+    private fun calculateNormalConsumptionRate(vehicleId: String, records: List<FuelLevelRecord>): Double {
+        if (records.size < 3) return 5.0 // Default normal rate
+        
+        val consumptionRates = mutableListOf<Double>()
+        
+        for (i in 1 until records.size) {
+            val timeDiff = java.time.Duration.between(records[i-1].timestamp, records[i].timestamp).toHours()
+            val fuelDiff = records[i-1].currentFuelLevel - records[i].currentFuelLevel
+            
+            if (timeDiff > 0) {
+                consumptionRates.add(fuelDiff / timeDiff)
+            }
+        }
+        
+        return if (consumptionRates.isNotEmpty()) {
+            consumptionRates.average()
+        } else {
+            5.0
+        }
+    }
+    
+    private fun checkLocationBasedTheft(record: FuelLevelRecord): TheftDetectionResult {
+        // Check if vehicle is in authorized fueling zone
+        val isInAuthorizedZone = geofenceZones.values.any { zone ->
+            zone.authorizedVehicles.contains(record.vehicleId) &&
+            isLocationInZone(record.location, zone) &&
+            isZoneActive(zone)
+        }
+        
+        // Check for fuel drop in unauthorized location
+        val previousRecord = fuelLevelHistory[record.vehicleId]?.last()
+        if (previousRecord != null) {
+            val fuelDrop = previousRecord.currentFuelLevel - record.currentFuelLevel
+            val fuelDropPercentage = (fuelDrop / previousRecord.totalTankCapacity) * 100
+            
+            if (!isInAuthorizedZone && fuelDropPercentage > THEFT_DETECTION_THRESHOLD / 2) {
+                return TheftDetectionResult(
+                    isTheftDetected = true,
+                    reason = "Fuel drop of ${fuelDropPercentage.format(1)}% detected in unauthorized location",
+                    confidence = 0.80,
+                    detectionMethod = DetectionMethod.LOCATION_BASED,
+                    estimatedLoss = fuelDrop
+                )
+            }
+        }
+        
+        return TheftDetectionResult(isTheftDetected = false, reason = null, confidence = 0.0)
+    }
+    
+    private fun isLocationInZone(location: LocationData, zone: GeofenceZone): Boolean {
+        val distance = calculateDistance(location, zone.centerLocation)
+        return distance <= zone.radius
+    }
+    
+    private fun isZoneActive(zone: GeofenceZone): Boolean {
+        if (!zone.isActive) return false
+        
+        val currentTime = LocalDateTime.now()
+        zone.activeHours?.let { timeRange ->
+            return currentTime.toLocalTime().isAfter(timeRange.startTime) && 
+                   currentTime.toLocalTime().isBefore(timeRange.endTime)
+        }
+        
+        return true
+    }
+    
+    private fun calculateDistance(location1: LocationData, location2: LocationData): Double {
+        // Simplified distance calculation (in reality, would use Haversine formula)
+        val latDiff = location1.latitude - location2.latitude
+        val lonDiff = location1.longitude - location2.longitude
+        
+        return kotlin.math.sqrt(latDiff * latDiff + lonDiff * lonDiff) * 111000 // Approximate conversion to meters
+    }
+    
+    private fun handleTheftDetection(vehicleId: String, detectionResult: TheftDetectionResult, record: FuelLevelRecord) {
+        // Create theft incident
+        val incident = TheftIncident(
+            id = generateTheftIncidentId(),
+            vehicleId = vehicleId,
+            detectionMethod = detectionResult.detectionMethod,
+            estimatedFuelLoss = detectionResult.estimatedLoss,
+            confidence = detectionResult.confidence,
+            location = record.location,
+            driverId = record.driverId,
+            timestamp = record.timestamp,
+            status = IncidentStatus.OPEN,
+            description = detectionResult.reason,
+            fuelLevelBefore = fuelLevelHistory[vehicleId]?.last()?.currentFuelLevel,
+            fuelLevelAfter = record.currentFuelLevel
+        )
+        
+        // Store theft incident
+        val vehicleIncidents = theftIncidents.getOrPut(vehicleId) { mutableListOf() }
+        vehicleIncidents.add(incident)
+        
+        // Log the incident
+        Log.w(TAG, "Fuel theft incident created: ${incident.id} for vehicle: $vehicleId")
+    }
+    
+    private fun updateVehicleTheftProfile(vehicleId: String, record: FuelLevelRecord, detectionResult: TheftDetectionResult) {
+        val profile = vehicleTheftProfiles.getOrPut(vehicleId) {
+            VehicleTheftProfile(
+                vehicleId = vehicleId,
+                totalIncidents = 0,
+                confirmedThefts = 0,
+                riskLevel = RiskLevel.LOW,
+                lastIncidentDate = null,
+                averageFuelConsumption = 0.0,
+                suspiciousLocations = mutableListOf(),
+                createdAt = LocalDateTime.now()
+            )
+        }
+        
+        // Update profile based on detection result
+        if (detectionResult.isTheftDetected) {
+            profile.totalIncidents++
+            profile.lastIncidentDate = record.timestamp
+            
+            // Add suspicious location if not already present
+            if (!profile.suspiciousLocations.any { loc ->
+                calculateDistance(loc, record.location) < LOCATION_THEFT_RADIUS
+            }) {
+                profile.suspiciousLocations.add(record.location)
+            }
+        }
+        
+        // Update average fuel consumption
+        val recentRecords = fuelLevelHistory[vehicleId]?.takeLast(20) ?: emptyList()
+        if (recentRecords.size >= 2) {
+            profile.averageFuelConsumption = calculateNormalConsumptionRate(vehicleId, recentRecords)
+        }
+        
+        // Update risk level
+        profile.riskLevel = calculateVehicleRiskLevel(profile, 0.0)
+    }
+    
+    private fun updateDriverBehaviorPattern(driverId: String, record: FuelLevelRecord, detectionResult: TheftDetectionResult) {
+        val pattern = driverBehaviorPatterns.getOrPut(driverId) {
+            DriverBehaviorPattern(
+                driverId = driverId,
+                totalTrips = 0,
+                theftIncidents = 0,
+                averageFuelEfficiency = 0.0,
+                suspiciousActivities = mutableListOf(),
+                riskScore = 0.0,
+                createdAt = LocalDateTime.now()
+            )
+        }
+        
+        // Update pattern based on detection result
+        if (detectionResult.isTheftDetected) {
+            pattern.theftIncidents++
+            pattern.suspiciousActivities.add(
+                SuspiciousActivity(
+                    type = SuspiciousActivityType.FUEL_THEFT,
+                    timestamp = record.timestamp,
+                    location = record.location,
+                    description = detectionResult.reason
+                )
+            )
+        }
+        
+        // Update risk score
+        pattern.riskScore = calculateDriverRiskScore(pattern)
+    }
+    
+    // Additional analysis methods would be implemented here...
+    
+    // Utility methods
+    private fun Double.format(digits: Int): String {
+        return String.format("%.${digits}f", this)
+    }
+    
+    // ID generation methods
+    private fun generateFuelLevelRecordId(): String = "FLR_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    private fun generateTheftIncidentId(): String = "FTI_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    
+    // Data classes and enums
+    
+    data class FuelLevelRecord(
+        val id: String,
+        val vehicleId: String,
+        val currentFuelLevel: Double,
+        val totalTankCapacity: Double,
+        val fuelPercentage: Double,
+        val fuelLevelDifference: Double,
+        val location: LocationData,
+        val driverId: String?,
+        val engineStatus: EngineStatus,
+        val timestamp: LocalDateTime
+    )
+    
+    data class TheftIncident(
+        val id: String,
+        val vehicleId: String,
+        val detectionMethod: DetectionMethod,
+        val estimatedFuelLoss: Double,
+        val confidence: Double,
+        val location: LocationData,
+        val driverId: String?,
+        val timestamp: LocalDateTime,
+        var status: IncidentStatus,
+        val description: String,
+        val fuelLevelBefore: Double?,
+        val fuelLevelAfter: Double,
+        val resolvedBy: String? = null,
+        val resolutionNotes: String? = null,
+        val resolvedAt: LocalDateTime? = null
+    )
+    
+    data class VehicleTheftProfile(
+        val vehicleId: String,
+        var totalIncidents: Int,
+        var confirmedThefts: Int,
+        var riskLevel: RiskLevel,
+        var lastIncidentDate: LocalDateTime?,
+        var averageFuelConsumption: Double,
+        val suspiciousLocations: MutableList<LocationData>,
+        val createdAt: LocalDateTime
+    )
+    
+    data class GeofenceZone(
+        val id: String,
+        val name: String,
+        val centerLocation: LocationData,
+        val radius: Double,
+        val zoneType: GeofenceType,
+        val authorizedVehicles: List<String>,
+        val activeHours: TimeRange?,
+        var isActive: Boolean,
+        val createdAt: LocalDateTime
+    )
+    
+    data class DriverBehaviorPattern(
+        val driverId: String,
+        var totalTrips: Int,
+        var theftIncidents: Int,
+        var averageFuelEfficiency: Double,
+        val suspiciousActivities: MutableList<SuspiciousActivity>,
+        var riskScore: Double,
+        val createdAt: LocalDateTime
+    )
+    
+    data class TheftDetectionResult(
+        val isTheftDetected: Boolean,
+        val reason: String?,
+        val confidence: Double,
+        val detectionMethod: DetectionMethod,
+        val estimatedLoss: Double
+    )
+    
+    data class TheftAnalysisResult(
+        val vehicleId: String,
+        val timeWindow: TimeWindow,
+        val riskScore: Double,
+        val suddenDrops: List<SuddenFuelDrop>,
+        val unusualConsumption: List<UnusualConsumption>,
+        val locationAnomalies: List<LocationAnomaly>,
+        val timePatterns: List<TimePattern>,
+        val driverAnalysis: DriverAnalysis?,
+        val recommendations: List<TheftPreventionRecommendation>,
+        val analysisTimestamp: LocalDateTime
+    )
+    
+    data class VehicleTheftAnalytics(
+        val vehicleId: String,
+        val timeWindow: TimeWindow,
+        val totalIncidents: Int,
+        val confirmedThefts: Int,
+        val suspectedThefts: Int,
+        val falseAlarms: Int,
+        val totalEstimatedLoss: Double,
+        val theftFrequency: Double,
+        val riskLevel: RiskLevel,
+        val locationPatterns: Map<String, Int>,
+        val timePatterns: Map<String, Int>,
+        val dayOfWeekPatterns: Map<String, Int>,
+        val vehicleProfile: VehicleTheftProfile?,
+        val recommendations: List<SecurityRecommendation>,
+        val lastUpdated: LocalDateTime
+    )
+    
+    data class FleetTheftAnalytics(
+        val timeWindow: TimeWindow,
+        val totalFleetIncidents: Int,
+        val confirmedFleetThefts: Int,
+        val totalFleetLoss: Double,
+        val vehicleTheftDistribution: Map<String, Int>,
+        val highRiskVehicles: List<String>,
+        val geographicHotspots: List<GeographicHotspot>,
+        val fleetTimePatterns: Map<String, Int>,
+        val detectionMethodStats: Map<DetectionMethod, Int>,
+        val recommendations: List<FleetSecurityRecommendation>,
+        val lastUpdated: LocalDateTime
+    )
+    
+    // Supporting data classes
+    data class LocationData(
+        val latitude: Double,
+        val longitude: Double,
+        val address: String? = null
+    )
+    
+    data class TimeRange(
+        val startTime: java.time.LocalTime,
+        val endTime: java.time.LocalTime
+    )
+    
+    data class ValidationResult(
+        val isValid: Boolean,
+        val errors: List<String>
+    )
+    
+    data class SuddenFuelDrop(
+        val timestamp: LocalDateTime,
+        val fuelDrop: Double,
+        val percentage: Double,
+        val location: LocationData
+    )
+    
+    data class UnusualConsumption(
+        val timestamp: LocalDateTime,
+        val consumptionRate: Double,
+        val normalRate: Double,
+        val multiplier: Double
+    )
+    
+    data class LocationAnomaly(
+        val location: LocationData,
+        val fuelDrop: Double,
+        val isAuthorizedZone: Boolean
+    )
+    
+    data class TimePattern(
+        val hourOfDay: Int,
+        val incidentCount: Int,
+        val riskLevel: Double
+    )
+    
+    data class DriverAnalysis(
+        val driverId: String,
+        val riskScore: Double,
+        val incidentCount: Int,
+        val efficiencyScore: Double
+    )
+    
+    data class SuspiciousActivity(
+        val type: SuspiciousActivityType,
+        val timestamp: LocalDateTime,
+        val location: LocationData,
+        val description: String
+    )
+    
+    data class GeographicHotspot(
+        val location: LocationData,
+        val radius: Double,
+        val incidentCount: Int,
+        val riskLevel: Double
+    )
+    
+    data class TheftPreventionRecommendation(
+        val type: PreventionType,
+        val title: String,
+        val description: String,
+        val priority: Priority
+    )
+    
+    data class SecurityRecommendation(
+        val category: SecurityCategory,
+        val recommendation: String,
+        val priority: Priority
+    )
+    
+    data class FleetSecurityRecommendation(
+        val category: FleetSecurityCategory,
+        val recommendation: String,
+        val affectedVehicles: List<String>,
+        val priority: Priority
+    )
+    
+    // Enums
+    enum class EngineStatus {
+        RUNNING, IDLE, OFF
+    }
+    
+    enum class DetectionMethod {
+        SUDDEN_DROP_OFF, IDLE_THEFT, UNUSUAL_CONSUMPTION, LOCATION_BASED, BEHAVIOR_PATTERN
+    }
+    
+    enum class IncidentStatus {
+        OPEN, SUSPECTED, CONFIRMED, FALSE_ALARM, RESOLVED
+    }
+    
+    enum class GeofenceType {
+        FUELING_STATION, DEPOT, AUTHORIZED_AREA, RESTRICTED_AREA
+    }
+    
+    enum class RiskLevel {
+        LOW, MEDIUM, HIGH, CRITICAL
+    }
+    
+    enum class SuspiciousActivityType {
+        FUEL_THEFT, UNAUTHORIZED_FUELING, TAMPERING, UNUSUAL_LOCATION
+    }
+    
+    enum class TimeWindow(val duration: java.time.Duration) {
+        LAST_24_HOURS(java.time.Duration.ofHours(24)),
+        LAST_7_DAYS(java.time.Duration.ofDays(7)),
+        LAST_30_DAYS(java.time.Duration.ofDays(30)),
+        LAST_90_DAYS(java.time.Duration.ofDays(90))
+    }
+    
+    enum class PreventionType {
+        MONITORING, SECURITY, GEOGRAPHIC, BEHAVIORAL
+    }
+    
+    enum class Priority {
+        LOW, MEDIUM, HIGH, CRITICAL
+    }
+    
+    enum class SecurityCategory {
+        VEHICLE_SECURITY, DRIVER_MONITORING, LOCATION_TRACKING, SYSTEM_ALERTS
+    }
+    
+    enum class FleetSecurityCategory {
+        POLICY_UPDATE, SECURITY_EQUIPMENT, MONITORING_ENHANCEMENT, DRIVER_TRAINING
+    }
+    
+    // Additional analysis methods would be implemented here...
+    // For brevity, some methods are stubbed but would contain full implementations
+}

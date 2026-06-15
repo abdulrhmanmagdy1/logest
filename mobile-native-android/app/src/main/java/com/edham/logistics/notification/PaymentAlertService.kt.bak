@@ -1,0 +1,902 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.PaymentApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Payment Alert Service - Specialized service for payment-related alerts
+ * 
+ * Features:
+ * - Payment due alerts
+ * - Payment overdue alerts
+ * - Payment failure alerts
+ * - Payment success alerts
+ * - Refund alerts
+ * - Payment method alerts
+ * - Invoice alerts
+ * - Payment analytics and reporting
+ */
+@Singleton
+class PaymentAlertService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val paymentApi: PaymentApi,
+    private val networkUtils: NetworkUtils,
+    private val smartNotificationManager: SmartNotificationManager
+) {
+    
+    private val _paymentAlertState = MutableStateFlow<PaymentAlertState>(PaymentAlertState.Idle)
+    val paymentAlertState: StateFlow<PaymentAlertState> = _paymentAlertState.asStateFlow()
+    
+    private val _activePaymentAlerts = MutableStateFlow<List<PaymentAlert>>(emptyList())
+    val activePaymentAlerts: StateFlow<List<PaymentAlert>> = _activePaymentAlerts.asStateFlow()
+    
+    private val _paymentAnalytics = MutableStateFlow<PaymentAnalytics>(PaymentAnalytics())
+    val paymentAnalytics: StateFlow<PaymentAnalytics> = _paymentAnalytics.asStateFlow()
+    
+    private var isInitialized = false
+    private val paymentAlertListeners = mutableListOf<PaymentAlertListener>()
+    
+    companion object {
+        private const val TAG = "PaymentAlertService"
+        private const val PAYMENT_DUE_WARNING_DAYS = 3
+        private const val PAYMENT_OVERDUE_DAYS = 1
+        private const val PAYMENT_CRITICAL_OVERDUE_DAYS = 7
+        private const val MAX_ACTIVE_PAYMENT_ALERTS = 50
+    }
+    
+    /**
+     * Initialize payment alert service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _paymentAlertState.value = PaymentAlertState.Initializing
+                
+                // Load payment alert configuration
+                loadPaymentAlertConfiguration()
+                
+                // Initialize payment rules
+                initializePaymentRules()
+                
+                // Load active payment alerts
+                loadActivePaymentAlerts()
+                
+                // Start payment monitoring
+                startPaymentMonitoring()
+                
+                isInitialized = true
+                _paymentAlertState.value = PaymentAlertState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _paymentAlertState.value = PaymentAlertState.Error("Failed to initialize payment alert service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create payment alert
+     */
+    suspend fun createPaymentAlert(
+        paymentId: String,
+        paymentData: PaymentAlertData
+    ): Result<PaymentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Payment alert service not initialized")
+                }
+                
+                // Validate payment data
+                validatePaymentAlertData(paymentId, paymentData)
+                
+                // Determine alert severity
+                val severity = determinePaymentSeverity(paymentData)
+                
+                // Check for duplicate alerts
+                if (isDuplicatePaymentAlert(paymentId, severity)) {
+                    throw Exception("Duplicate payment alert detected")
+                }
+                
+                // Create alert
+                val alert = PaymentAlert(
+                    id = UUID.randomUUID().toString(),
+                    paymentId = paymentId,
+                    severity = severity,
+                    title = generateAlertTitle(paymentData),
+                    message = generateAlertMessage(paymentData),
+                    amount = paymentData.amount,
+                    currency = paymentData.currency,
+                    dueDate = paymentData.dueDate,
+                    overdueDays = paymentData.overdueDays,
+                    paymentMethod = paymentData.paymentMethod,
+                    recipients = determinePaymentRecipients(paymentId, severity, paymentData),
+                    metadata = paymentData.toMetadata(),
+                    status = PaymentAlertStatus.ACTIVE,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    acknowledgedAt = null,
+                    acknowledgedBy = null,
+                    resolvedAt = null,
+                    resolvedBy = null,
+                    resolution = null
+                )
+                
+                // Save alert to database
+                database.paymentAlertDao().insertAlert(alert.toEntity())
+                
+                // Add to active alerts
+                addToActivePaymentAlerts(alert)
+                
+                // Process alert
+                processPaymentAlert(alert)
+                
+                // Update analytics
+                updatePaymentAnalytics()
+                
+                // Notify listeners
+                notifyPaymentAlertCreated(alert)
+                
+                Result.success(alert)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle payment due alert
+     */
+    suspend fun handlePaymentDue(
+        paymentId: String,
+        amount: Float,
+        dueDate: Date,
+        customerId: String,
+        customerName: String,
+        customerEmail: String,
+        customerPhone: String
+    ): Result<PaymentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Calculate days until due
+                val daysUntilDue = ((dueDate.time - Date().time) / (24 * 60 * 60 * 1000)).toInt()
+                
+                // Determine alert type based on days until due
+                val alertType = when {
+                    daysUntilDue <= PAYMENT_OVERDUE_DAYS -> PaymentAlertType.OVERDUE
+                    daysUntilDue <= PAYMENT_DUE_WARNING_DAYS -> PaymentAlertType.DUE_SOON
+                    else -> PaymentAlertType.SCHEDULED
+                }
+                
+                // Create payment alert data
+                val paymentData = PaymentAlertData(
+                    paymentType = alertType,
+                    amount = amount,
+                    currency = "SAR",
+                    dueDate = dueDate,
+                    daysUntilDue = daysUntilDue,
+                    overdueDays = if (daysUntilDue < 0) -daysUntilDue else 0,
+                    customerId = customerId,
+                    customerName = customerName,
+                    customerEmail = customerEmail,
+                    customerPhone = customerPhone,
+                    urgency = determinePaymentUrgency(daysUntilDue),
+                    metadata = mapOf(
+                        "paymentId" to paymentId,
+                        "customerName" to customerName
+                    )
+                )
+                
+                createPaymentAlert(paymentId, paymentData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle payment failure
+     */
+    suspend fun handlePaymentFailure(
+        paymentId: String,
+        amount: Float,
+        failureReason: String,
+        paymentMethod: String,
+        retryCount: Int
+    ): Result<PaymentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get payment details
+                val payment = database.paymentDao().getPaymentById(paymentId)
+                    ?: throw Exception("Payment not found")
+                
+                // Create payment failure alert data
+                val paymentData = PaymentAlertData(
+                    paymentType = PaymentAlertType.PAYMENT_FAILED,
+                    amount = amount,
+                    currency = payment.currency,
+                    dueDate = payment.dueDate,
+                    failureReason = failureReason,
+                    paymentMethod = paymentMethod,
+                    retryCount = retryCount,
+                    customerId = payment.customerId.toString(),
+                    customerName = payment.customerName,
+                    customerEmail = payment.customerEmail,
+                    customerPhone = payment.customerPhone,
+                    urgency = if (retryCount >= 3) PaymentUrgency.CRITICAL else PaymentUrgency.HIGH,
+                    metadata = mapOf(
+                        "paymentId" to paymentId,
+                        "failureReason" to failureReason,
+                        "retryCount" to retryCount.toString()
+                    )
+                )
+                
+                createPaymentAlert(paymentId, paymentData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle payment success
+     */
+    suspend fun handlePaymentSuccess(
+        paymentId: String,
+        amount: Float,
+        paymentMethod: String,
+        transactionId: String,
+        processedAt: Date
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get active alerts for this payment
+                val activeAlerts = _activePaymentAlerts.value.filter { 
+                    it.paymentId == paymentId && it.status == PaymentAlertStatus.ACTIVE 
+                }
+                
+                // Resolve all active alerts
+                activeAlerts.forEach { alert ->
+                    resolvePaymentAlert(
+                        alert.id,
+                        "SYSTEM",
+                        "Payment processed successfully",
+                        transactionId,
+                        paymentMethod
+                    )
+                }
+                
+                // Create success notification
+                val payment = database.paymentDao().getPaymentById(paymentId)
+                payment?.let {
+                    val successData = PaymentAlertData(
+                        paymentType = PaymentAlertType.PAYMENT_SUCCESS,
+                        amount = amount,
+                        currency = it.currency,
+                        dueDate = it.dueDate,
+                        paymentMethod = paymentMethod,
+                        transactionId = transactionId,
+                        processedAt = processedAt,
+                        customerId = it.customerId.toString(),
+                        customerName = it.customerName,
+                        customerEmail = it.customerEmail,
+                        customerPhone = it.customerPhone,
+                        urgency = PaymentUrgency.NORMAL,
+                        metadata = mapOf(
+                            "paymentId" to paymentId,
+                            "transactionId" to transactionId
+                        )
+                    )
+                    
+                    createPaymentAlert(paymentId, successData)
+                }
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle refund alert
+     */
+    suspend fun handleRefundAlert(
+        paymentId: String,
+        refundAmount: Float,
+        refundReason: String,
+        customerId: String,
+        customerName: String,
+        customerEmail: String,
+        customerPhone: String
+    ): Result<PaymentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Create refund alert data
+                val paymentData = PaymentAlertData(
+                    paymentType = PaymentAlertType.REFUND,
+                    amount = refundAmount,
+                    currency = "SAR",
+                    refundAmount = refundAmount,
+                    refundReason = refundReason,
+                    customerId = customerId,
+                    customerName = customerName,
+                    customerEmail = customerEmail,
+                    customerPhone = customerPhone,
+                    urgency = PaymentUrgency.NORMAL,
+                    metadata = mapOf(
+                        "paymentId" to paymentId,
+                        "refundReason" to refundReason
+                    )
+                )
+                
+                createPaymentAlert(paymentId, paymentData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle invoice alert
+     */
+    suspend fun handleInvoiceAlert(
+        invoiceId: String,
+        invoiceAmount: Float,
+        dueDate: Date,
+        customerId: String,
+        customerName: String,
+        customerEmail: String,
+        customerPhone: String
+    ): Result<PaymentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Calculate days until due
+                val daysUntilDue = ((dueDate.time - Date().time) / (24 * 60 * 60 * 1000)).toInt()
+                
+                // Create invoice alert data
+                val paymentData = PaymentAlertData(
+                    paymentType = PaymentAlertType.INVOICE_DUE,
+                    amount = invoiceAmount,
+                    currency = "SAR",
+                    dueDate = dueDate,
+                    daysUntilDue = daysUntilDue,
+                    overdueDays = if (daysUntilDue < 0) -daysUntilDue else 0,
+                    invoiceId = invoiceId,
+                    customerId = customerId,
+                    customerName = customerName,
+                    customerEmail = customerEmail,
+                    customerPhone = customerPhone,
+                    urgency = determinePaymentUrgency(daysUntilDue),
+                    metadata = mapOf(
+                        "invoiceId" to invoiceId,
+                        "customerName" to customerName
+                    )
+                )
+                
+                createPaymentAlert(invoiceId, paymentData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Resolve payment alert
+     */
+    suspend fun resolvePaymentAlert(
+        alertId: String,
+        resolvedBy: String,
+        resolution: String,
+        transactionId: String? = null,
+        paymentMethod: String? = null
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activePaymentAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Payment alert not found")
+                
+                // Update alert status
+                val resolvedAlert = alert.copy(
+                    status = PaymentAlertStatus.RESOLVED,
+                    resolvedAt = Date(),
+                    resolvedBy = resolvedBy,
+                    resolution = resolution,
+                    transactionId = transactionId,
+                    paymentMethod = paymentMethod,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.paymentAlertDao().updateAlert(resolvedAlert.toEntity())
+                
+                // Remove from active alerts
+                removeFromActivePaymentAlerts(alertId)
+                
+                // Update analytics
+                updatePaymentAnalytics()
+                
+                // Notify listeners
+                notifyPaymentAlertResolved(resolvedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get payment alerts by severity
+     */
+    suspend fun getPaymentAlertsBySeverity(severity: PaymentSeverity): List<PaymentAlert> {
+        return _activePaymentAlerts.value.filter { it.severity == severity }
+    }
+    
+    /**
+     * Get payment alerts by customer
+     */
+    suspend fun getPaymentAlertsByCustomer(customerId: String): List<PaymentAlert> {
+        return _activePaymentAlerts.value.filter { it.metadata["customerId"] == customerId }
+    }
+    
+    /**
+     * Get active payment alerts
+     */
+    suspend fun getActivePaymentAlerts(): List<PaymentAlert> {
+        return _activePaymentAlerts.value.filter { it.status == PaymentAlertStatus.ACTIVE }
+    }
+    
+    /**
+     * Get payment analytics
+     */
+    suspend fun getPaymentAnalytics(dateRange: DateRange = DateRange.last30Days()): Result<PaymentAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val analytics = database.paymentAlertDao().getPaymentAnalytics(dateRange.startDate, dateRange.endDate)
+                Result.success(analytics)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add payment alert listener
+     */
+    fun addPaymentAlertListener(listener: PaymentAlertListener) {
+        paymentAlertListeners.add(listener)
+    }
+    
+    /**
+     * Remove payment alert listener
+     */
+    fun removePaymentAlertListener(listener: PaymentAlertListener) {
+        paymentAlertListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadPaymentAlertConfiguration() {
+        // Load payment alert configuration
+    }
+    
+    private suspend fun initializePaymentRules() {
+        // Initialize payment rules
+    }
+    
+    private suspend fun loadActivePaymentAlerts() {
+        try {
+            val alerts = database.paymentAlertDao().getActiveAlerts()
+                .map { it.toDomainModel() }
+                .sortedByDescending { it.createdAt }
+                .take(MAX_ACTIVE_PAYMENT_ALERTS)
+            
+            _activePaymentAlerts.value = alerts
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun startPaymentMonitoring() {
+        // Start payment monitoring
+    }
+    
+    private fun validatePaymentAlertData(paymentId: String, paymentData: PaymentAlertData) {
+        if (paymentId.isBlank()) throw Exception("Payment ID cannot be empty")
+        if (paymentData.amount <= 0) throw Exception("Amount must be positive")
+    }
+    
+    private fun determinePaymentSeverity(paymentData: PaymentAlertData): PaymentSeverity {
+        return when (paymentData.paymentType) {
+            PaymentAlertType.PAYMENT_FAILED -> {
+                when (paymentData.retryCount) {
+                    0, 1, 2 -> PaymentSeverity.HIGH
+                    else -> PaymentSeverity.CRITICAL
+                }
+            }
+            PaymentAlertType.OVERDUE -> {
+                when (paymentData.overdueDays) {
+                    in 1..3 -> PaymentSeverity.HIGH
+                    in 4..7 -> PaymentSeverity.SEVERE
+                    else -> PaymentSeverity.CRITICAL
+                }
+            }
+            PaymentAlertType.DUE_SOON -> PaymentSeverity.MEDIUM
+            PaymentAlertType.SCHEDULED -> PaymentSeverity.LOW
+            PaymentAlertType.PAYMENT_SUCCESS -> PaymentSeverity.LOW
+            PaymentAlertType.REFUND -> PaymentSeverity.MEDIUM
+            PaymentAlertType.INVOICE_DUE -> PaymentSeverity.MEDIUM
+            else -> PaymentSeverity.LOW
+        }
+    }
+    
+    private fun isDuplicatePaymentAlert(paymentId: String, severity: PaymentSeverity): Boolean {
+        val cutoffTime = Date(System.currentTimeMillis() - 5 * 60 * 1000L) // 5 minutes
+        return _activePaymentAlerts.value.any { alert ->
+            alert.paymentId == paymentId &&
+            alert.severity == severity &&
+            alert.createdAt.after(cutoffTime)
+        }
+    }
+    
+    private fun determinePaymentUrgency(daysUntilDue: Int): PaymentUrgency {
+        return when {
+            daysUntilDue < 0 -> PaymentUrgency.CRITICAL
+            daysUntilDue <= PAYMENT_DUE_WARNING_DAYS -> PaymentUrgency.HIGH
+            else -> PaymentUrgency.NORMAL
+        }
+    }
+    
+    private fun determinePaymentRecipients(
+        paymentId: String,
+        severity: PaymentSeverity,
+        paymentData: PaymentAlertData
+    ): List<NotificationRecipient> {
+        val recipients = mutableListOf<NotificationRecipient>()
+        
+        // Always notify customer
+        if (paymentData.customerEmail.isNotBlank()) {
+            recipients.add(
+                NotificationRecipient(
+                    id = paymentData.customerId,
+                    type = RecipientType.CUSTOMER,
+                    address = paymentData.customerEmail,
+                    name = paymentData.customerName
+                )
+            )
+        }
+        
+        // Notify customer via SMS for critical alerts
+        if (severity == PaymentSeverity.CRITICAL && paymentData.customerPhone.isNotBlank()) {
+            recipients.add(
+                NotificationRecipient(
+                    id = "${paymentData.customerId}_sms",
+                    type = RecipientType.CUSTOMER,
+                    address = paymentData.customerPhone,
+                    name = paymentData.customerName
+                )
+            )
+        }
+        
+        // Always notify finance team for significant amounts or critical alerts
+        if (paymentData.amount >= 1000f || severity == PaymentSeverity.CRITICAL) {
+            recipients.add(
+                NotificationRecipient(
+                    id = "finance_team",
+                    type = RecipientType.ADMIN,
+                    address = "finance@edham.com",
+                    name = "Finance Team"
+                )
+            )
+        }
+        
+        return recipients
+    }
+    
+    private suspend fun processPaymentAlert(alert: PaymentAlert) {
+        try {
+            // Create notification request
+            val notificationRequest = NotificationRequest(
+                title = alert.title,
+                message = alert.message,
+                category = NotificationCategory.PAYMENT,
+                priority = mapSeverityToPriority(alert.severity),
+                recipients = alert.recipients,
+                data = alert.metadata + mapOf(
+                    "alertId" to alert.id,
+                    "paymentId" to alert.paymentId,
+                    "amount" to alert.amount.toString(),
+                    "currency" to alert.currency,
+                    "dueDate" to alert.dueDate.toString()
+                ),
+                channels = determineNotificationChannels(alert)
+            )
+            
+            // Send notification
+            smartNotificationManager.sendNotification(notificationRequest)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun generateAlertTitle(paymentData: PaymentAlertData): String {
+        return when (paymentData.paymentType) {
+            PaymentAlertType.SCHEDULED -> "دفيع مجدول"
+            PaymentAlertType.DUE_SOON -> "الدفع مستحق قريباً"
+            PaymentAlertType.OVERDUE -> "الدفع متأخر"
+            PaymentAlertType.PAYMENT_FAILED -> "فشل الدفع"
+            PaymentAlertType.PAYMENT_SUCCESS -> "تم الدفع بنجاح"
+            PaymentAlertType.REFUND -> "استرداد"
+            PaymentAlertType.INVOICE_DUE -> "فاتورة مستحقة"
+        }
+    }
+    
+    private fun generateAlertMessage(paymentData: PaymentAlertData): String {
+        val amount = "${paymentData.amount} ${paymentData.currency}"
+        
+        return when (paymentData.paymentType) {
+            PaymentAlertType.SCHEDULED -> "دفع بقيمة $amount مستحق بتاريخ ${paymentData.dueDate}"
+            PaymentAlertType.DUE_SOON -> "دفع بقيمة $amount مستحق خلال ${paymentData.daysUntilDue} أيام"
+            PaymentAlertType.OVERDUE -> "دفع بقيمة $amount متأخر منذ ${paymentData.overdueDays} يوم"
+            PaymentAlertType.PAYMENT_FAILED -> "فشل دفع بقيمة $amount. ${paymentData.failureReason}. ${if (paymentData.retryCount > 0) "المحاولة ${paymentData.retryCount}" else ""}"
+            PaymentAlertType.PAYMENT_SUCCESS -> "تم استلام دفع بقيمة $amount بنجاح"
+            PaymentAlertType.REFUND -> "تم استرداد مبلغ ${paymentData.refundAmount} ${paymentData.currency}. السبب: ${paymentData.refundReason}"
+            PaymentAlertType.INVOICE_DUE -> "فاتورة بقيمة $amount مستحقة بتاريخ ${paymentData.dueDate}"
+        }
+    }
+    
+    private fun mapSeverityToPriority(severity: PaymentSeverity): NotificationPriority {
+        return when (severity) {
+            PaymentSeverity.CRITICAL -> NotificationPriority.EMERGENCY
+            PaymentSeverity.SEVERE -> NotificationPriority.HIGH
+            PaymentSeverity.HIGH -> NotificationPriority.HIGH
+            PaymentSeverity.MEDIUM -> NotificationPriority.NORMAL
+            PaymentSeverity.LOW -> NotificationPriority.NORMAL
+        }
+    }
+    
+    private fun determineNotificationChannels(alert: PaymentAlert): List<NotificationChannel> {
+        return when (alert.severity) {
+            PaymentSeverity.CRITICAL -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL,
+                NotificationChannel.IN_APP
+            )
+            PaymentSeverity.SEVERE -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL
+            )
+            PaymentSeverity.HIGH -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.EMAIL
+            )
+            PaymentSeverity.MEDIUM -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.EMAIL
+            )
+            PaymentSeverity.LOW -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.IN_APP
+            )
+        }
+    }
+    
+    private fun addToActivePaymentAlerts(alert: PaymentAlert) {
+        val currentAlerts = _activePaymentAlerts.value.toMutableList()
+        currentAlerts.add(0, alert)
+        
+        // Keep only max alerts
+        if (currentAlerts.size > MAX_ACTIVE_PAYMENT_ALERTS) {
+            currentAlerts.removeAt(currentAlerts.size - 1)
+        }
+        
+        _activePaymentAlerts.value = currentAlerts
+    }
+    
+    private fun removeFromActivePaymentAlerts(alertId: String) {
+        val currentAlerts = _activePaymentAlerts.value.toMutableList()
+        currentAlerts.removeAll { it.id == alertId }
+        _activePaymentAlerts.value = currentAlerts
+    }
+    
+    private suspend fun updatePaymentAnalytics() {
+        try {
+            val alerts = _activePaymentAlerts.value
+            val analytics = PaymentAnalytics(
+                totalActive = alerts.size,
+                criticalAlerts = alerts.count { it.severity == PaymentSeverity.CRITICAL },
+                severeAlerts = alerts.count { it.severity == PaymentSeverity.SEVERE },
+                highAlerts = alerts.count { it.severity == PaymentSeverity.HIGH },
+                mediumAlerts = alerts.count { it.severity == PaymentSeverity.MEDIUM },
+                lowAlerts = alerts.count { it.severity == PaymentSeverity.LOW },
+                totalAmount = alerts.sumOf { it.amount },
+                typeStats = alerts.groupBy { it.metadata["paymentType"] }
+                    .mapValues { it.value.size },
+                currencyStats = alerts.groupBy { it.currency }
+                    .mapValues { it.value.sumOf { it.amount } }
+            )
+            
+            _paymentAnalytics.value = analytics
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun notifyPaymentAlertCreated(alert: PaymentAlert) {
+        paymentAlertListeners.forEach { listener ->
+            listener.onPaymentAlertCreated(alert)
+        }
+    }
+    
+    private fun notifyPaymentAlertResolved(alert: PaymentAlert) {
+        paymentAlertListeners.forEach { listener ->
+            listener.onPaymentAlertResolved(alert)
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class PaymentAlertData(
+    val paymentType: PaymentAlertType,
+    val amount: Float,
+    val currency: String,
+    val dueDate: Date? = null,
+    val daysUntilDue: Int = 0,
+    val overdueDays: Int = 0,
+    val failureReason: String? = null,
+    val paymentMethod: String? = null,
+    val transactionId: String? = null,
+    val processedAt: Date? = null,
+    val retryCount: Int = 0,
+    val refundAmount: Float? = null,
+    val refundReason: String? = null,
+    val invoiceId: String? = null,
+    val customerId: String,
+    val customerName: String,
+    val customerEmail: String,
+    val customerPhone: String,
+    val urgency: PaymentUrgency = PaymentUrgency.NORMAL,
+    val metadata: Map<String, String> = emptyMap()
+) {
+    fun toMetadata(): Map<String, String> {
+        return metadata + mapOf(
+            "paymentType" to paymentType.name,
+            "amount" to amount.toString(),
+            "currency" to currency,
+            "dueDate" to (dueDate?.toString() ?: ""),
+            "daysUntilDue" to daysUntilDue.toString(),
+            "overdueDays" to overdueDays.toString(),
+            "failureReason" to (failureReason ?: ""),
+            "paymentMethod" to (paymentMethod ?: ""),
+            "transactionId" to (transactionId ?: ""),
+            "retryCount" to retryCount.toString(),
+            "refundAmount" to (refundAmount?.toString() ?: ""),
+            "refundReason" to (refundReason ?: ""),
+            "invoiceId" to (invoiceId ?: ""),
+            "customerId" to customerId,
+            "customerName" to customerName,
+            "customerEmail" to customerEmail,
+            "customerPhone" to customerPhone,
+            "urgency" to urgency.name
+        )
+    }
+}
+
+data class PaymentAlert(
+    val id: String,
+    val paymentId: String,
+    val severity: PaymentSeverity,
+    val title: String,
+    val message: String,
+    val amount: Float,
+    val currency: String,
+    val dueDate: Date?,
+    val overdueDays: Int,
+    val paymentMethod: String?,
+    val recipients: List<NotificationRecipient>,
+    val metadata: Map<String, String>,
+    val status: PaymentAlertStatus,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val acknowledgedAt: Date?,
+    val acknowledgedBy: String?,
+    val resolvedAt: Date?,
+    val resolvedBy: String?,
+    val resolution: String?,
+    val transactionId: String?,
+    val resolvedPaymentMethod: String?
+)
+
+data class PaymentAnalytics(
+    val totalActive: Int = 0,
+    val criticalAlerts: Int = 0,
+    val severeAlerts: Int = 0,
+    val highAlerts: Int = 0,
+    val mediumAlerts: Int = 0,
+    val lowAlerts: Int = 0,
+    val totalAmount: Float = 0f,
+    val typeStats: Map<String, Int> = emptyMap(),
+    val currencyStats: Map<String, Float> = emptyMap()
+)
+
+/**
+ * Interfaces
+ */
+interface PaymentAlertListener {
+    fun onPaymentAlertCreated(alert: PaymentAlert)
+    fun onPaymentAlertResolved(alert: PaymentAlert)
+}
+
+/**
+ * Enums
+ */
+enum class PaymentAlertState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class PaymentSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    SEVERE,
+    CRITICAL
+}
+
+enum class PaymentAlertStatus {
+    ACTIVE,
+    ACKNOWLEDGED,
+    RESOLVED
+}
+
+enum class PaymentAlertType {
+    SCHEDULED,
+    DUE_SOON,
+    OVERDUE,
+    PAYMENT_FAILED,
+    PAYMENT_SUCCESS,
+    REFUND,
+    INVOICE_DUE
+}
+
+enum class PaymentUrgency {
+    NORMAL,
+    HIGH,
+    CRITICAL
+}

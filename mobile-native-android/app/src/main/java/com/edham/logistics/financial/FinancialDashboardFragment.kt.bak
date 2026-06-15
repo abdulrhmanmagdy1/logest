@@ -1,0 +1,565 @@
+package com.edham.logistics.financial
+
+import android.app.DownloadManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
+import android.view.*
+import android.widget.*
+import androidx.core.content.FileProvider
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.edham.logistics.R
+import com.edham.logistics.adapters.InvoiceAdapter
+import com.edham.logistics.adapters.PaymentAdapter
+import com.edham.logistics.financial.FinancialService.*
+import com.google.android.material.tabs.TabLayout
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * Financial dashboard fragment
+ * Provides invoice management, payment tracking, and financial overview
+ */
+class FinancialDashboardFragment : Fragment() {
+
+    private lateinit var financialService: FinancialService
+    private lateinit var tabLayout: TabLayout
+    private lateinit var recyclerView: RecyclerView
+    private lateinit var swipeRefreshLayout: androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+    private lateinit var emptyStateLayout: LinearLayout
+    private lateinit var loadingProgressBar: ProgressBar
+    private lateinit var statisticsLayout: LinearLayout
+    private lateinit var totalInvoicesText: TextView
+    private lateinit var totalAmountText: TextView
+    private lateinit var totalPaidText: TextView
+    private lateinit var outstandingBalanceText: TextView
+    private lateinit var collectionRateText: TextView
+
+    private var currentTab = FinancialTab.INVOICES
+    private var currentPage = 0
+    private val pageSize = 20
+    private var isLoading = false
+
+    private val invoices = mutableListOf<Invoice>()
+    private val payments = mutableListOf<Payment>()
+    private var invoiceStatistics: InvoiceStatistics? = null
+    private var customerBalance: CustomerBalance? = null
+
+    enum class FinancialTab {
+        INVOICES, PAYMENTS, BALANCE, STATISTICS
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View? {
+        return inflater.inflate(R.layout.fragment_financial_dashboard, container, false)
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        financialService = FinancialService(requireContext())
+        
+        setupViews(view)
+        setupTabs()
+        setupRecyclerView()
+        setupSwipeRefresh()
+        setupStatistics()
+        
+        // Load initial data
+        loadCurrentTabData()
+    }
+
+    private fun setupViews(view: View) {
+        tabLayout = view.findViewById(R.id.tabLayout)
+        recyclerView = view.findViewById(R.id.recyclerView)
+        swipeRefreshLayout = view.findViewById(R.id.swipeRefreshLayout)
+        emptyStateLayout = view.findViewById(R.id.emptyStateLayout)
+        loadingProgressBar = view.findViewById(R.id.loadingProgressBar)
+        statisticsLayout = view.findViewById(R.id.statisticsLayout)
+        
+        // Statistics views
+        totalInvoicesText = view.findViewById(R.id.totalInvoicesText)
+        totalAmountText = view.findViewById(R.id.totalAmountText)
+        totalPaidText = view.findViewById(R.id.totalPaidText)
+        outstandingBalanceText = view.findViewById(R.id.outstandingBalanceText)
+        collectionRateText = view.findViewById(R.id.collectionRateText)
+    }
+
+    private fun setupTabs() {
+        tabLayout.addTab(tabLayout.newTab().setText("Invoices"))
+        tabLayout.addTab(tabLayout.newTab().setText("Payments"))
+        tabLayout.addTab(tabLayout.newTab().setText("Balance"))
+        tabLayout.addTab(tabLayout.newTab().setText("Statistics"))
+        
+        tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab?) {
+                currentTab = when (tab?.position) {
+                    0 -> FinancialTab.INVOICES
+                    1 -> FinancialTab.PAYMENTS
+                    2 -> FinancialTab.BALANCE
+                    3 -> FinancialTab.STATISTICS
+                    else -> FinancialTab.INVOICES
+                }
+                currentPage = 0
+                loadCurrentTabData()
+            }
+
+            override fun onTabUnselected(tab: TabLayout.Tab?) {}
+            override fun onTabReselected(tab: TabLayout.Tab?) {}
+        })
+    }
+
+    private fun setupRecyclerView() {
+        recyclerView.layoutManager = LinearLayoutManager(requireContext())
+        recyclerView.setHasFixedSize(true)
+        
+        // Setup scroll listener for pagination
+        recyclerView.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                super.onScrolled(recyclerView, dx, dy)
+                
+                val layoutManager = recyclerView.layoutManager as LinearLayoutManager
+                val visibleItemCount = layoutManager.childCount
+                val totalItemCount = layoutManager.itemCount
+                val firstVisibleItemPosition = layoutManager.findFirstVisibleItemPosition()
+                
+                if (!isLoading && (visibleItemCount + firstVisibleItemPosition) >= totalItemCount) {
+                    loadMoreData()
+                }
+            }
+        })
+    }
+
+    private fun setupSwipeRefresh() {
+        swipeRefreshLayout.setOnRefreshListener {
+            currentPage = 0
+            loadCurrentTabData()
+        }
+    }
+
+    private fun setupStatistics() {
+        // Load statistics
+        lifecycleScope.launch {
+            try {
+                val statisticsResult = financialService.getInvoiceStatistics()
+                if (statisticsResult.isSuccess) {
+                    invoiceStatistics = statisticsResult.getOrNull()
+                    updateStatisticsDisplay()
+                }
+            } catch (e: Exception) {
+                // Handle error
+            }
+        }
+    }
+
+    private fun loadCurrentTabData() {
+        when (currentTab) {
+            FinancialTab.INVOICES -> loadInvoices()
+            FinancialTab.PAYMENTS -> loadPayments()
+            FinancialTab.BALANCE -> loadBalance()
+            FinancialTab.STATISTICS -> loadStatistics()
+        }
+    }
+
+    private fun loadInvoices() {
+        showLoading(true)
+        
+        lifecycleScope.launch {
+            try {
+                val customerId = getCurrentCustomerId()
+                val result = financialService.getCustomerInvoices(customerId, currentPage, pageSize)
+                
+                if (result.isSuccess) {
+                    val response = result.getOrNull()
+                    
+                    if (currentPage == 0) {
+                        invoices.clear()
+                    }
+                    
+                    response?.content?.let { invoices.addAll(it) }
+                    updateInvoicesDisplay()
+                } else {
+                    showError("Failed to load invoices")
+                }
+            } catch (e: Exception) {
+                showError("Error loading invoices: ${e.message}")
+            } finally {
+                showLoading(false)
+            }
+        }
+    }
+
+    private fun loadPayments() {
+        showLoading(true)
+        
+        lifecycleScope.launch {
+            try {
+                // Get payments for all invoices
+                val allPayments = mutableListOf<Payment>()
+                
+                invoices.forEach { invoice ->
+                    val paymentsResult = financialService.getInvoicePayments(invoice.id)
+                    if (paymentsResult.isSuccess) {
+                        allPayments.addAll(paymentsResult.getOrNull() ?: emptyList())
+                    }
+                }
+                
+                payments.clear()
+                payments.addAll(allPayments)
+                updatePaymentsDisplay()
+                
+            } catch (e: Exception) {
+                showError("Error loading payments: ${e.message}")
+            } finally {
+                showLoading(false)
+            }
+        }
+    }
+
+    private fun loadBalance() {
+        showLoading(true)
+        
+        lifecycleScope.launch {
+            try {
+                val customerId = getCurrentCustomerId()
+                val result = financialService.getCustomerBalance(customerId)
+                
+                if (result.isSuccess) {
+                    customerBalance = result.getOrNull()
+                    updateBalanceDisplay()
+                } else {
+                    showError("Failed to load balance")
+                }
+            } catch (e: Exception) {
+                showError("Error loading balance: ${e.message}")
+            } finally {
+                showLoading(false)
+            }
+        }
+    }
+
+    private fun loadStatistics() {
+        showLoading(true)
+        
+        lifecycleScope.launch {
+            try {
+                val result = financialService.getInvoiceStatistics()
+                
+                if (result.isSuccess) {
+                    invoiceStatistics = result.getOrNull()
+                    updateStatisticsDisplay()
+                } else {
+                    showError("Failed to load statistics")
+                }
+            } catch (e: Exception) {
+                showError("Error loading statistics: ${e.message}")
+            } finally {
+                showLoading(false)
+            }
+        }
+    }
+
+    private fun loadMoreData() {
+        if (isLoading) return
+        
+        isLoading = true
+        currentPage++
+        
+        when (currentTab) {
+            FinancialTab.INVOICES -> loadInvoices()
+            else -> {} // Other tabs don't support pagination
+        }
+    }
+
+    private fun updateInvoicesDisplay() {
+        if (currentTab == FinancialTab.INVOICES) {
+            val adapter = InvoiceAdapter(invoices) { invoice ->
+                showInvoiceOptions(invoice)
+            }
+            recyclerView.adapter = adapter
+            
+            if (invoices.isEmpty()) {
+                showEmptyState("No invoices found")
+            } else {
+                hideEmptyState()
+            }
+        }
+    }
+
+    private fun updatePaymentsDisplay() {
+        if (currentTab == FinancialTab.PAYMENTS) {
+            val adapter = PaymentAdapter(payments) { payment ->
+                showPaymentDetails(payment)
+            }
+            recyclerView.adapter = adapter
+            
+            if (payments.isEmpty()) {
+                showEmptyState("No payments found")
+            } else {
+                hideEmptyState()
+            }
+        }
+    }
+
+    private fun updateBalanceDisplay() {
+        if (currentTab == FinancialTab.BALANCE) {
+            val balanceView = layoutInflater.inflate(R.layout.item_balance, null)
+            
+            customerBalance?.let { balance ->
+                balanceView.findViewById<TextView>(R.id.customerNameText).text = balance.customerName
+                balanceView.findViewById<TextView>(R.id.totalInvoicesText).text = balance.totalInvoices.toString()
+                balanceView.findViewById<TextView>(R.id.totalAmountText).text = 
+                    String.format("SAR %.2f", balance.totalAmount)
+                balanceView.findViewById<TextView>(R.id.paidAmountText).text = 
+                    String.format("SAR %.2f", balance.paidAmount)
+                balanceView.findViewById<TextView>(R.id.outstandingBalanceText).text = 
+                    String.format("SAR %.2f", balance.outstandingBalance)
+                balanceView.findViewById<TextView>(R.id.overdueAmountText).text = 
+                    String.format("SAR %.2f", balance.overdueAmount)
+            }
+            
+            recyclerView.adapter = null
+            // Custom balance display logic here
+        }
+    }
+
+    private fun updateStatisticsDisplay() {
+        invoiceStatistics?.let { stats ->
+            totalInvoicesText.text = stats.totalInvoices.toString()
+            totalAmountText.text = String.format("SAR %.2f", stats.totalAmount)
+            totalPaidText.text = String.format("SAR %.2f", stats.totalPaid)
+            outstandingBalanceText.text = String.format("SAR %.2f", stats.totalOutstanding)
+            collectionRateText.text = String.format("%.1f%%", stats.collectionRate)
+        }
+    }
+
+    private fun showInvoiceOptions(invoice: Invoice) {
+        val options = arrayOf("View Details", "Download PDF", "Share", "Make Payment")
+        
+        AlertDialog.Builder(requireContext())
+            .setTitle("Invoice ${invoice.invoiceNumber}")
+            .setItems(options) { _, which ->
+                when (options[which]) {
+                    "View Details" -> showInvoiceDetails(invoice)
+                    "Download PDF" -> downloadInvoicePDF(invoice)
+                    "Share" -> shareInvoice(invoice)
+                    "Make Payment" -> makePayment(invoice)
+                }
+            }
+            .show()
+    }
+
+    private fun showInvoiceDetails(invoice: Invoice) {
+        lifecycleScope.launch {
+            val result = financialService.getInvoiceSummary(invoice.id)
+            
+            if (result.isSuccess) {
+                val summary = result.getOrNull()
+                // Show details dialog
+                showInvoiceDetailsDialog(summary)
+            } else {
+                showError("Failed to load invoice details")
+            }
+        }
+    }
+
+    private fun downloadInvoicePDF(invoice: Invoice) {
+        lifecycleScope.launch {
+            showLoading(true, "Downloading PDF...")
+            
+            try {
+                val result = financialService.downloadInvoicePDF(invoice.id)
+                
+                if (result.isSuccess) {
+                    val filePath = result.getOrNull()
+                    filePath?.let {
+                        if (financialService.openPDFFile(it)) {
+                            showSuccess("PDF downloaded successfully")
+                        } else {
+                            showError("Failed to open PDF")
+                        }
+                    }
+                } else {
+                    showError("Failed to download PDF")
+                }
+            } catch (e: Exception) {
+                showError("Error downloading PDF: ${e.message}")
+            } finally {
+                showLoading(false)
+            }
+        }
+    }
+
+    private fun shareInvoice(invoice: Invoice) {
+        val success = financialService.shareInvoice(invoice.id)
+        
+        if (success) {
+            showSuccess("Invoice shared successfully")
+        } else {
+            showError("Failed to share invoice")
+        }
+    }
+
+    private fun makePayment(invoice: Invoice) {
+        // Show payment dialog
+        showPaymentDialog(invoice)
+    }
+
+    private fun showPaymentDialog(invoice: Invoice) {
+        val dialogView = layoutInflater.inflate(R.layout.dialog_payment, null)
+        val amountEditText = dialogView.findViewById<EditText>(R.id.amountEditText)
+        val methodSpinner = dialogView.findViewById<Spinner>(R.id.methodSpinner)
+        val notesEditText = dialogView.findViewById<EditText>(R.id.notesEditText)
+        
+        // Set amount to outstanding balance
+        amountEditText.setText(invoice.outstandingBalance.toString())
+        
+        AlertDialog.Builder(requireContext())
+            .setTitle("Make Payment")
+            .setView(dialogView)
+            .setPositiveButton("Pay") { _, _ ->
+                val amount = amountEditText.text.toString().toDoubleOrNull()
+                val method = methodSpinner.selectedItem.toString()
+                val notes = notesEditText.text.toString()
+                
+                if (amount != null && amount > 0) {
+                    processPayment(invoice, amount, PaymentMethod.valueOf(method), notes)
+                } else {
+                    showError("Please enter a valid amount")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun processPayment(invoice: Invoice, amount: Double, method: PaymentMethod, notes: String) {
+        lifecycleScope.launch {
+            showLoading(true, "Processing payment...")
+            
+            try {
+                val result = financialService.processPayment(
+                    invoiceId = invoice.id,
+                    amount = amount,
+                    paymentMethod = method,
+                    notes = notes
+                )
+                
+                if (result.isSuccess) {
+                    showSuccess("Payment processed successfully")
+                    // Refresh data
+                    loadCurrentTabData()
+                } else {
+                    showError("Failed to process payment")
+                }
+            } catch (e: Exception) {
+                showError("Error processing payment: ${e.message}")
+            } finally {
+                showLoading(false)
+            }
+        }
+    }
+
+    private fun showPaymentDetails(payment: Payment) {
+        val details = """
+            Payment Number: ${payment.paymentNumber}
+            Amount: SAR ${payment.amount}
+            Method: ${payment.paymentMethod}
+            Date: ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(payment.paymentDate)}
+            Status: ${payment.status}
+            Transaction ID: ${payment.transactionId ?: "N/A"}
+            Notes: ${payment.notes ?: "N/A"}
+        """.trimIndent()
+        
+        AlertDialog.Builder(requireContext())
+            .setTitle("Payment Details")
+            .setMessage(details)
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun showInvoiceDetailsDialog(summary: InvoiceSummary?) {
+        summary?.let {
+            val details = """
+                Invoice Number: ${it.invoice.invoiceNumber}
+                Total Amount: SAR ${it.invoice.totalAmount}
+                Paid Amount: SAR ${it.totalPaid}
+                Remaining Balance: SAR ${it.remainingBalance}
+                Status: ${it.paymentStatus}
+                Due Date: ${SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(it.invoice.dueDate)}
+                
+                Items:
+                ${it.invoice.items.joinToString("\n") { "- ${it.description}: SAR ${it.total}" }}
+            """.trimIndent()
+            
+            AlertDialog.Builder(requireContext())
+                .setTitle("Invoice Details")
+                .setMessage(details)
+                .setPositiveButton("OK", null)
+                .show()
+        }
+    }
+
+    private fun showLoading(show: Boolean, message: String = "Loading...") {
+        isLoading = show
+        loadingProgressBar.visibility = if (show) View.VISIBLE else View.GONE
+        swipeRefreshLayout.isRefreshing = false
+        
+        if (show && message != "Loading...") {
+            Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showEmptyState(message: String) {
+        emptyStateLayout.visibility = View.VISIBLE
+        recyclerView.visibility = View.GONE
+        statisticsLayout.visibility = View.GONE
+        
+        emptyStateLayout.findViewById<TextView>(R.id.emptyStateText).text = message
+    }
+
+    private fun hideEmptyState() {
+        emptyStateLayout.visibility = View.GONE
+        recyclerView.visibility = View.VISIBLE
+        
+        if (currentTab == FinancialTab.STATISTICS) {
+            statisticsLayout.visibility = View.VISIBLE
+        } else {
+            statisticsLayout.visibility = View.GONE
+        }
+    }
+
+    private fun showError(message: String) {
+        Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
+    }
+
+    private fun showSuccess(message: String) {
+        Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun getCurrentCustomerId(): Long {
+        // Get current user ID from shared preferences or authentication
+        return 1L // Placeholder
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        financialService.clearCache()
+    }
+
+    companion object {
+        fun newInstance(): FinancialDashboardFragment {
+            return FinancialDashboardFragment()
+        }
+    }
+}

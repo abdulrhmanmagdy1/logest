@@ -1,0 +1,618 @@
+package com.edham.logistics.maintenance
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import com.edham.logistics.R
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.MaintenanceEntity
+import com.edham.logistics.data.local.entity.ServiceReminderEntity
+import com.edham.logistics.data.remote.api.MaintenanceApi
+import com.edham.logistics.utils.NetworkUtils
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.*
+import timber.log.Timber
+import java.util.*
+import javax.inject.Inject
+
+/**
+ * Automated Reminders Service - Background service for automated maintenance reminders
+ * 
+ * Features:
+ * - Automated service reminders
+ * - Maintenance scheduling reminders
+ * - Oil change notifications
+ * - Tire replacement alerts
+ * - Inspection due notifications
+ * - License expiry reminders
+ * - Insurance renewal alerts
+ * - Custom reminder scheduling
+ * - Multi-channel notifications
+ */
+@AndroidEntryPoint
+class AutomatedRemindersService : Service() {
+
+    @Inject
+    lateinit var database: EdhamDatabase
+
+    @Inject
+    lateinit var maintenanceApi: MaintenanceApi
+
+    @Inject
+    lateinit var networkUtils: NetworkUtils
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var reminderJob: Job? = null
+    private var isRunning = false
+
+    companion object {
+        private const val TAG = "AutomatedRemindersService"
+        private const val NOTIFICATION_CHANNEL_ID = "maintenance_reminders_channel"
+        private const val NOTIFICATION_ID = 2001
+        private const val REMINDER_CHECK_INTERVAL = 3600000L // 1 hour
+        private const val OIL_CHANGE_INTERVAL_KM = 5000
+        private const val TIRE_REPLACEMENT_INTERVAL_KM = 40000
+        private const val INSPECTION_INTERVAL_DAYS = 90
+        private const val LICENSE_RENEWAL_DAYS = 30
+        private const val INSURANCE_RENEWAL_DAYS = 45
+
+        fun startService(context: Context) {
+            val intent = Intent(context, AutomatedRemindersService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun stopService(context: Context) {
+            val intent = Intent(context, AutomatedRemindersService::class.java)
+            context.stopService(intent)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        Timber.d("AutomatedRemindersService created")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            "START_REMINDERS" -> {
+                startReminderService()
+            }
+            "STOP_REMINDERS" -> {
+                stopReminderService()
+            }
+            "CHECK_REMINDERS" -> {
+                checkAndSendReminders()
+            }
+            "CREATE_REMINDER" -> {
+                val reminderType = intent.getStringExtra("reminder_type")
+                val vehicleId = intent.getLongExtra("vehicle_id", -1)
+                val dueDate = intent.getLongExtra("due_date", 0)
+                val message = intent.getStringExtra("message")
+                
+                if (reminderType != null && vehicleId != -1L && dueDate > 0 && message != null) {
+                    createCustomReminder(reminderType, vehicleId, Date(dueDate), message)
+                }
+            }
+        }
+
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startReminderService() {
+        if (isRunning) {
+            Timber.d("Reminder service already running")
+            return
+        }
+
+        isRunning = true
+        startForeground(NOTIFICATION_ID, createNotification())
+
+        reminderJob = serviceScope.launch {
+            Timber.d("Starting automated reminders service")
+
+            // Initialize reminders
+            initializeReminders()
+
+            // Start continuous reminder checking
+            startReminderChecking()
+        }
+    }
+
+    private fun stopReminderService() {
+        if (!isRunning) {
+            Timber.d("Reminder service not running")
+            return
+        }
+
+        isRunning = false
+        reminderJob?.cancel()
+        stopForeground(true)
+        stopSelf()
+
+        Timber.d("Automated reminders service stopped")
+    }
+
+    private suspend fun initializeReminders() {
+        try {
+            // Load all vehicles
+            val vehicles = database.vehicleDao().getAllVehicles()
+            
+            // Generate initial reminders for each vehicle
+            vehicles.forEach { vehicle ->
+                generateVehicleReminders(vehicle)
+            }
+
+            // Load existing custom reminders
+            val existingReminders = database.serviceReminderDao().getAllReminders()
+            
+            // Schedule notifications for existing reminders
+            existingReminders.forEach { reminder ->
+                scheduleReminderNotification(reminder)
+            }
+
+            Timber.d("Initialized reminders for ${vehicles.size} vehicles")
+
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to initialize reminders")
+        }
+    }
+
+    private fun startReminderChecking() {
+        serviceScope.launch {
+            while (isRunning) {
+                try {
+                    checkAndSendReminders()
+                    delay(REMINDER_CHECK_INTERVAL)
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in reminder checking loop")
+                    delay(REMINDER_CHECK_INTERVAL)
+                }
+            }
+        }
+    }
+
+    private suspend fun checkAndSendReminders() {
+        try {
+            val vehicles = database.vehicleDao().getAllVehicles()
+            val currentDate = Date()
+            
+            vehicles.forEach { vehicle ->
+                // Check oil change reminders
+                checkOilChangeReminder(vehicle, currentDate)
+                
+                // Check tire replacement reminders
+                checkTireReplacementReminder(vehicle, currentDate)
+                
+                // Check inspection reminders
+                checkInspectionReminder(vehicle, currentDate)
+                
+                // Check license renewal reminders
+                checkLicenseRenewalReminder(vehicle, currentDate)
+                
+                // Check insurance renewal reminders
+                checkInsuranceRenewalReminder(vehicle, currentDate)
+                
+                // Check maintenance schedule reminders
+                checkMaintenanceScheduleReminders(vehicle, currentDate)
+            }
+
+            // Check custom reminders
+            checkCustomReminders(currentDate)
+
+            // Sync with server
+            syncRemindersWithServer()
+
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to check reminders")
+        }
+    }
+
+    private suspend fun checkOilChangeReminder(vehicle: VehicleEntity, currentDate: Date) {
+        val lastOilChangeMileage = vehicle.lastOilChangeMileage
+        val currentMileage = vehicle.mileage
+        val nextOilChangeMileage = lastOilChangeMileage + OIL_CHANGE_INTERVAL_KM
+        val milesUntilNextOilChange = nextOilChangeMileage - currentMileage
+
+        if (milesUntilNextOilChange <= 500) {
+            val reminder = ServiceReminderEntity(
+                id = 0,
+                vehicleId = vehicle.id,
+                reminderType = "OIL_CHANGE",
+                title = "تغيير الزيت مطلوب",
+                message = "المركبة ${vehicle.vehicleId} تحتاج لتغيير الزيت خلال $milesUntilNextOilChange كم",
+                dueDate = Date(currentDate.time + calculateDaysForMiles(milesUntilNextOilChange) * 24 * 60 * 60 * 1000),
+                priority = if (milesUntilNextOilChange <= 100) "HIGH" else "MEDIUM",
+                status = "PENDING",
+                createdAt = Date(),
+                updatedAt = Date()
+            )
+
+            // Check if reminder already exists
+            val existingReminder = database.serviceReminderDao().getReminderByVehicleAndType(
+                vehicle.id, "OIL_CHANGE"
+            )
+
+            if (existingReminder == null || existingReminder.status == "COMPLETED") {
+                database.serviceReminderDao().insertReminder(reminder)
+                sendNotification(reminder.title, reminder.message, "OIL_CHANGE", vehicle.id)
+                createCalendarEvent(reminder, vehicle)
+            }
+        }
+    }
+
+    private suspend fun checkTireReplacementReminder(vehicle: VehicleEntity, currentDate: Date) {
+        val lastTireReplacementMileage = vehicle.lastTireReplacementMileage
+        val currentMileage = vehicle.mileage
+        val nextTireReplacementMileage = lastTireReplacementMileage + TIRE_REPLACEMENT_INTERVAL_KM
+        val milesUntilNextReplacement = nextTireReplacementMileage - currentMileage
+
+        if (milesUntilNextReplacement <= 1000) {
+            val reminder = ServiceReminderEntity(
+                id = 0,
+                vehicleId = vehicle.id,
+                reminderType = "TIRE_REPLACEMENT",
+                title = "استبدال الإطارات مطلوب",
+                message = "المركبة ${vehicle.vehicleId} تحتاج لاستبدال الإطارات خلال $milesUntilNextReplacement كم",
+                dueDate = Date(currentDate.time + calculateDaysForMiles(milesUntilNextReplacement) * 24 * 60 * 60 * 1000),
+                priority = if (milesUntilNextReplacement <= 200) "HIGH" else "MEDIUM",
+                status = "PENDING",
+                createdAt = Date(),
+                updatedAt = Date()
+            )
+
+            val existingReminder = database.serviceReminderDao().getReminderByVehicleAndType(
+                vehicle.id, "TIRE_REPLACEMENT"
+            )
+
+            if (existingReminder == null || existingReminder.status == "COMPLETED") {
+                database.serviceReminderDao().insertReminder(reminder)
+                sendNotification(reminder.title, reminder.message, "TIRE_REPLACEMENT", vehicle.id)
+                createCalendarEvent(reminder, vehicle)
+            }
+        }
+    }
+
+    private suspend fun checkInspectionReminder(vehicle: VehicleEntity, currentDate: Date) {
+        val lastInspectionDate = vehicle.lastInspectionDate
+        val nextInspectionDate = Date(lastInspectionDate.time + INSPECTION_INTERVAL_DAYS * 24 * 60 * 60 * 1000)
+        val daysUntilNextInspection = ((nextInspectionDate.time - currentDate.time) / (24 * 60 * 60 * 1000)).toInt()
+
+        if (daysUntilNextInspection <= 7) {
+            val reminder = ServiceReminderEntity(
+                id = 0,
+                vehicleId = vehicle.id,
+                reminderType = "INSPECTION",
+                title = "فحص المركبة مطلوب",
+                message = "المركبة ${vehicle.vehicleId} تحتاج لفحص خلال $daysUntilNextInspection أيام",
+                dueDate = nextInspectionDate,
+                priority = if (daysUntilNextInspection <= 3) "HIGH" else "MEDIUM",
+                status = "PENDING",
+                createdAt = Date(),
+                updatedAt = Date()
+            )
+
+            val existingReminder = database.serviceReminderDao().getReminderByVehicleAndType(
+                vehicle.id, "INSPECTION"
+            )
+
+            if (existingReminder == null || existingReminder.status == "COMPLETED") {
+                database.serviceReminderDao().insertReminder(reminder)
+                sendNotification(reminder.title, reminder.message, "INSPECTION", vehicle.id)
+                createCalendarEvent(reminder, vehicle)
+            }
+        }
+    }
+
+    private suspend fun checkLicenseRenewalReminder(vehicle: VehicleEntity, currentDate: Date) {
+        val licenseExpiryDate = vehicle.licenseExpiryDate
+        val daysUntilExpiry = ((licenseExpiryDate.time - currentDate.time) / (24 * 60 * 60 * 1000)).toInt()
+
+        if (daysUntilExpiry <= LICENSE_RENEWAL_DAYS) {
+            val reminder = ServiceReminderEntity(
+                id = 0,
+                vehicleId = vehicle.id,
+                reminderType = "LICENSE_RENEWAL",
+                title = "تجديد رخصة المركبة",
+                message = "رخصة المركبة ${vehicle.vehicleId} تنتهي خلال $daysUntilExpiry أيام",
+                dueDate = licenseExpiryDate,
+                priority = if (daysUntilExpiry <= 7) "HIGH" else "MEDIUM",
+                status = "PENDING",
+                createdAt = Date(),
+                updatedAt = Date()
+            )
+
+            val existingReminder = database.serviceReminderDao().getReminderByVehicleAndType(
+                vehicle.id, "LICENSE_RENEWAL"
+            )
+
+            if (existingReminder == null || existingReminder.status == "COMPLETED") {
+                database.serviceReminderDao().insertReminder(reminder)
+                sendNotification(reminder.title, reminder.message, "LICENSE_RENEWAL", vehicle.id)
+                createCalendarEvent(reminder, vehicle)
+            }
+        }
+    }
+
+    private suspend fun checkInsuranceRenewalReminder(vehicle: VehicleEntity, currentDate: Date) {
+        val insuranceExpiryDate = vehicle.insuranceExpiryDate
+        val daysUntilExpiry = ((insuranceExpiryDate.time - currentDate.time) / (24 * 60 * 60 * 1000)).toInt()
+
+        if (daysUntilExpiry <= INSURANCE_RENEWAL_DAYS) {
+            val reminder = ServiceReminderEntity(
+                id = 0,
+                vehicleId = vehicle.id,
+                reminderType = "INSURANCE_RENEWAL",
+                title = "تجديد تأمين المركبة",
+                message = "تأمين المركبة ${vehicle.vehicleId} ينتهي خلال $daysUntilExpiry أيام",
+                dueDate = insuranceExpiryDate,
+                priority = if (daysUntilExpiry <= 14) "HIGH" else "MEDIUM",
+                status = "PENDING",
+                createdAt = Date(),
+                updatedAt = Date()
+            )
+
+            val existingReminder = database.serviceReminderDao().getReminderByVehicleAndType(
+                vehicle.id, "INSURANCE_RENEWAL"
+            )
+
+            if (existingReminder == null || existingReminder.status == "COMPLETED") {
+                database.serviceReminderDao().insertReminder(reminder)
+                sendNotification(reminder.title, reminder.message, "INSURANCE_RENEWAL", vehicle.id)
+                createCalendarEvent(reminder, vehicle)
+            }
+        }
+    }
+
+    private suspend fun checkMaintenanceScheduleReminders(vehicle: VehicleEntity, currentDate: Date) {
+        val upcomingMaintenance = database.maintenanceDao().getUpcomingMaintenanceByVehicle(
+            vehicle.id, currentDate
+        )
+
+        upcomingMaintenance.forEach { maintenance ->
+            val daysUntilMaintenance = ((maintenance.scheduledDate.time - currentDate.time) / (24 * 60 * 60 * 1000)).toInt()
+
+            if (daysUntilMaintenance <= 3 && daysUntilMaintenance > 0) {
+                val reminder = ServiceReminderEntity(
+                    id = 0,
+                    vehicleId = vehicle.id,
+                    reminderType = "MAINTENANCE_SCHEDULE",
+                    title = "موعد الصيانة",
+                    message = "صيانة مجدولة للمركبة ${vehicle.vehicleId} خلال $daysUntilMaintenance أيام",
+                    dueDate = maintenance.scheduledDate,
+                    priority = if (daysUntilMaintenance <= 1) "HIGH" else "MEDIUM",
+                    status = "PENDING",
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+
+                val existingReminder = database.serviceReminderDao().getReminderByVehicleAndTypeAndMaintenance(
+                    vehicle.id, "MAINTENANCE_SCHEDULE", maintenance.id
+                )
+
+                if (existingReminder == null) {
+                    database.serviceReminderDao().insertReminder(reminder)
+                    sendNotification(reminder.title, reminder.message, "MAINTENANCE_SCHEDULE", vehicle.id)
+                    createCalendarEvent(reminder, vehicle)
+                }
+            }
+        }
+    }
+
+    private suspend fun checkCustomReminders(currentDate: Date) {
+        val customReminders = database.serviceReminderDao().getPendingCustomReminders(currentDate)
+        
+        customReminders.forEach { reminder ->
+            val daysUntilDue = ((reminder.dueDate.time - currentDate.time) / (24 * 60 * 60 * 1000)).toInt()
+            
+            if (daysUntilDue <= 0) {
+                // Send notification for due reminder
+                sendNotification(reminder.title, reminder.message, reminder.reminderType, reminder.vehicleId)
+                
+                // Update reminder status
+                val updatedReminder = reminder.copy(
+                    status = "SENT",
+                    sentAt = currentDate,
+                    updatedAt = currentDate
+                )
+                database.serviceReminderDao().updateReminder(updatedReminder)
+            }
+        }
+    }
+
+    private suspend fun generateVehicleReminders(vehicle: VehicleEntity) {
+        val currentDate = Date()
+        
+        // Generate oil change reminder
+        generateOilChangeReminder(vehicle, currentDate)
+        
+        // Generate tire replacement reminder
+        generateTireReplacementReminder(vehicle, currentDate)
+        
+        // Generate inspection reminder
+        generateInspectionReminder(vehicle, currentDate)
+        
+        // Generate license renewal reminder
+        generateLicenseRenewalReminder(vehicle, currentDate)
+        
+        // Generate insurance renewal reminder
+        generateInsuranceRenewalReminder(vehicle, currentDate)
+    }
+
+    private suspend fun createCustomReminder(
+        reminderType: String,
+        vehicleId: Long,
+        dueDate: Date,
+        message: String
+    ) {
+        val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+        
+        if (vehicle != null) {
+            val reminder = ServiceReminderEntity(
+                id = 0,
+                vehicleId = vehicleId,
+                reminderType = reminderType,
+                title = "تنبيه مخصص",
+                message = message,
+                dueDate = dueDate,
+                priority = "MEDIUM",
+                status = "PENDING",
+                createdAt = Date(),
+                updatedAt = Date()
+            )
+            
+            database.serviceReminderDao().insertReminder(reminder)
+            scheduleReminderNotification(reminder)
+        }
+    }
+
+    private suspend fun scheduleReminderNotification(reminder: ServiceReminderEntity) {
+        val currentTime = System.currentTimeMillis()
+        val reminderTime = reminder.dueDate.time
+        
+        if (reminderTime > currentTime) {
+            val delay = reminderTime - currentTime
+            
+            serviceScope.launch {
+                delay(delay)
+                sendNotification(reminder.title, reminder.message, reminder.reminderType, reminder.vehicleId)
+                
+                // Update reminder status
+                val updatedReminder = reminder.copy(
+                    status = "SENT",
+                    sentAt = Date(),
+                    updatedAt = Date()
+                )
+                database.serviceReminderDao().updateReminder(updatedReminder)
+            }
+        }
+    }
+
+    private fun sendNotification(title: String, message: String, type: String, vehicleId: Long) {
+        val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(message)
+            .setPriority(getNotificationPriority(type))
+            .setAutoCancel(true)
+            .setContentIntent(createNotificationIntent(type, vehicleId))
+            .build()
+
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(System.currentTimeMillis().hashCode(), notification)
+    }
+
+    private fun createNotificationIntent(type: String, vehicleId: Long): PendingIntent {
+        val intent = Intent(this, MaintenanceActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            putExtra("reminder_type", type)
+            putExtra("vehicle_id", vehicleId)
+        }
+        
+        return PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun createCalendarEvent(reminder: ServiceReminderEntity, vehicle: VehicleEntity) {
+        // Implementation would create calendar event
+        // This would integrate with Android Calendar API
+        try {
+            // Create calendar intent
+            val calendarIntent = Intent(Intent.ACTION_INSERT).apply {
+                data = android.net.Uri.parse("content://com.android.calendar/events")
+                type = "vnd.android.cursor.item/event"
+                putExtra(android.provider.CalendarContract.Events.TITLE, reminder.title)
+                putExtra(android.provider.CalendarContract.Events.DESCRIPTION, reminder.message)
+                putExtra(android.provider.CalendarContract.Events.EVENT_LOCATION, "Workshop")
+                putExtra(android.provider.CalendarContract.Events.DTSTART, reminder.dueDate.time)
+                putExtra(android.provider.CalendarContract.Events.DURATION, 3600000) // 1 hour
+                putExtra(android.provider.CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().id)
+            }
+            
+            startActivity(calendarIntent)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to create calendar event")
+        }
+    }
+
+    private suspend fun syncRemindersWithServer() {
+        if (networkUtils.isNetworkAvailable()) {
+            try {
+                // Sync reminders with server
+                val localReminders = database.serviceReminderDao().getAllReminders()
+                
+                // Implementation would sync with server API
+                // maintenanceApi.syncReminders(localReminders)
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to sync reminders with server")
+            }
+        }
+    }
+
+    private fun getNotificationPriority(type: String): Int {
+        return when (type) {
+            "OIL_CHANGE", "TIRE_REPLACEMENT", "INSPECTION", "LICENSE_RENEWAL", "INSURANCE_RENEWAL" -> {
+                NotificationCompat.PRIORITY_HIGH
+            }
+            "MAINTENANCE_SCHEDULE" -> NotificationCompat.PRIORITY_DEFAULT
+            else -> NotificationCompat.PRIORITY_LOW
+        }
+    }
+
+    private fun calculateDaysForMiles(miles: Int): Int {
+        // Assume average of 100 miles per day
+        return (miles / 100).coerceAtLeast(1)
+    }
+
+    private fun createNotification(): Notification {
+        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("خدمة التنبيهات التلقائية")
+            .setContentText("جاري مراقبة تنبيهات الصيانة")
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "Maintenance Reminders",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Notifications for maintenance reminders and alerts"
+                enableLights(true)
+                enableVibration(true)
+            }
+
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceScope.cancel()
+        Timber.d("AutomatedRemindersService destroyed")
+    }
+}

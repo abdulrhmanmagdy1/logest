@@ -1,0 +1,865 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.TireEntity
+import com.edham.logistics.data.local.entity.TireInspectionEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Tire Manager - Comprehensive tire management and tracking system
+ * 
+ * Features:
+ * - Tire inventory management
+ * - Tire rotation scheduling
+ * - Tire condition monitoring
+ * - Tire replacement tracking
+ * - Tire performance analytics
+ * - Tire pressure monitoring
+ * - Tire wear analysis
+ * - Cost tracking
+ */
+@Singleton
+class TireManager @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _tireManagementState = MutableStateFlow<TireManagementState>(TireManagementState.Idle)
+    val tireManagementState: StateFlow<TireManagementState> = _tireManagementState.asStateFlow()
+    
+    private val _tires = MutableStateFlow<List<TireEntity>>(emptyList())
+    val tires: StateFlow<List<TireEntity>> = _tires.asStateFlow()
+    
+    private val _tireInspections = MutableStateFlow<List<TireInspectionEntity>>(emptyList())
+    val tireInspections: StateFlow<List<TireInspectionEntity>> = _tireInspections.asStateFlow()
+    
+    private val _tireAnalytics = MutableStateFlow<TireAnalytics?>(null)
+    val tireAnalytics: StateFlow<TireAnalytics?> = _tireAnalytics.asStateFlow()
+    
+    private val _tireAlerts = MutableStateFlow<List<TireAlert>>(emptyList())
+    val tireAlerts: StateFlow<List<TireAlert>> = _tireAlerts.asStateFlow()
+    
+    private val _rotationSchedule = MutableStateFlow<List<TireRotation>>(emptyList())
+    val rotationSchedule: StateFlow<List<TireRotation>> = _rotationSchedule.asStateFlow()
+    
+    private var isMonitoring = false
+    private val tireListeners = mutableListOf<TireManagementListener>()
+    
+    companion object {
+        private const val TAG = "TireManager"
+        private const val MONITORING_INTERVAL = 86400000L // 24 hours
+        private const val MIN_TIRE_PRESSURE = 28f // PSI
+        private const val MAX_TIRE_PRESSURE = 35f // PSI
+        private const val MIN_TREAD_DEPTH = 2.0f // mm
+        private const val CRITICAL_TREAD_DEPTH = 1.6f // mm
+        private const val ROTATION_INTERVAL_KM = 10000f // km
+        private const val MAX_TIRE_AGE_YEARS = 6 // years
+    }
+    
+    /**
+     * Initialize tire management system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _tireManagementState.value = TireManagementState.Initializing
+                
+                // Load all tires
+                loadTires()
+                
+                // Load tire inspections
+                loadTireInspections()
+                
+                // Generate rotation schedule
+                generateRotationSchedule()
+                
+                // Start monitoring
+                startTireMonitoring()
+                
+                // Check for alerts
+                checkTireAlerts()
+                
+                _tireManagementState.value = TireManagementState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _tireManagementState.value = TireManagementState.Error("Failed to initialize tire management: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add new tire
+     */
+    suspend fun addTire(request: AddTireRequest): Result<TireEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _tireManagementState.value = TireManagementState.AddingTire
+                
+                // Validate request
+                validateTireRequest(request)
+                
+                // Generate tire ID
+                val tireId = generateTireId()
+                
+                // Create tire entity
+                val tire = TireEntity(
+                    id = 0,
+                    tireId = tireId,
+                    vehicleId = request.vehicleId,
+                    position = request.position,
+                    brand = request.brand,
+                    model = request.model,
+                    size = request.size,
+                    type = request.type,
+                    purchaseDate = request.purchaseDate,
+                    purchasePrice = request.purchasePrice,
+                    installationDate = request.installationDate,
+                    currentMileage = request.currentMileage,
+                    currentPressure = request.currentPressure,
+                    treadDepth = request.treadDepth,
+                    condition = request.condition,
+                    status = TireStatus.ACTIVE,
+                    lastRotationDate = request.installationDate,
+                    rotationCount = 0,
+                    lastInspectionDate = Date(),
+                    nextInspectionDate = calculateNextInspectionDate(),
+                    expectedReplacementDate = calculateExpectedReplacementDate(request.purchaseDate, request.treadDepth),
+                    warrantyExpiryDate = request.warrantyExpiryDate,
+                    notes = request.notes,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save tire
+                val tireIdLong = database.tireDao().insertTire(tire)
+                val savedTire = tire.copy(id = tireIdLong)
+                
+                // Update tires list
+                updateTires()
+                
+                // Update rotation schedule
+                updateRotationSchedule()
+                
+                // Notify listeners
+                notifyTireAdded(savedTire)
+                
+                _tireManagementState.value = TireManagementState.TireAdded
+                Result.success(savedTire)
+                
+            } catch (e: Exception) {
+                _tireManagementState.value = TireManagementState.Error("Failed to add tire: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update tire
+     */
+    suspend fun updateTire(tireId: Long, request: UpdateTireRequest): Result<TireEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingTire = database.tireDao().getTireById(tireId)
+                    ?: throw Exception("Tire not found")
+                
+                // Update tire
+                val updatedTire = existingTire.copy(
+                    currentMileage = request.currentMileage ?: existingTire.currentMileage,
+                    currentPressure = request.currentPressure ?: existingTire.currentPressure,
+                    treadDepth = request.treadDepth ?: existingTire.treadDepth,
+                    condition = request.condition ?: existingTire.condition,
+                    status = request.status ?: existingTire.status,
+                    notes = request.notes ?: existingTire.notes,
+                    updatedAt = Date()
+                )
+                
+                database.tireDao().updateTire(updatedTire)
+                
+                // Update tires list
+                updateTires()
+                
+                // Check for alerts
+                checkTireAlert(updatedTire)
+                
+                Result.success(updatedTire)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Record tire inspection
+     */
+    suspend fun recordTireInspection(request: TireInspectionRequest): Result<TireInspectionEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val tire = database.tireDao().getTireById(request.tireId)
+                    ?: throw Exception("Tire not found")
+                
+                // Create inspection record
+                val inspection = TireInspectionEntity(
+                    id = 0,
+                    tireId = request.tireId,
+                    inspectionDate = request.inspectionDate,
+                    inspectorId = request.inspectorId,
+                    pressure = request.pressure,
+                    treadDepth = request.treadDepth,
+                    overallCondition = request.overallCondition,
+                    wearPattern = request.wearPattern,
+                    damageNotes = request.damageNotes,
+                    recommendations = request.recommendations,
+                    nextInspectionDate = calculateNextInspectionDate(request.inspectionDate),
+                    photos = request.photos,
+                    createdAt = Date()
+                )
+                
+                // Save inspection
+                val inspectionId = database.tireInspectionDao().insertInspection(inspection)
+                val savedInspection = inspection.copy(id = inspectionId)
+                
+                // Update tire
+                val updatedTire = tire.copy(
+                    currentPressure = request.pressure,
+                    treadDepth = request.treadDepth,
+                    condition = request.overallCondition,
+                    lastInspectionDate = request.inspectionDate,
+                    nextInspectionDate = calculateNextInspectionDate(request.inspectionDate),
+                    updatedAt = Date()
+                )
+                database.tireDao().updateTire(updatedTire)
+                
+                // Update lists
+                updateTires()
+                updateTireInspections()
+                
+                // Check for alerts
+                checkTireAlert(updatedTire)
+                
+                // Notify listeners
+                notifyTireInspection(savedInspection)
+                
+                Result.success(savedInspection)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Rotate tires
+     */
+    suspend fun rotateTires(vehicleId: Long, rotationMap: Map<TirePosition, TirePosition>): Result<List<TireEntity>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicleTires = database.tireDao().getTiresByVehicle(vehicleId)
+                val rotatedTires = mutableListOf<TireEntity>()
+                
+                rotationMap.forEach { (fromPosition, toPosition) ->
+                    val tire = vehicleTires.find { it.position == fromPosition }
+                    if (tire != null) {
+                        val rotatedTire = tire.copy(
+                            position = toPosition,
+                            lastRotationDate = Date(),
+                            rotationCount = tire.rotationCount + 1,
+                            updatedAt = Date()
+                        )
+                        database.tireDao().updateTire(rotatedTire)
+                        rotatedTires.add(rotatedTire)
+                    }
+                }
+                
+                // Update tires list
+                updateTires()
+                
+                // Update rotation schedule
+                updateRotationSchedule()
+                
+                Result.success(rotatedTires)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Replace tire
+     */
+    suspend fun replaceTire(tireId: Long, replacementTire: AddTireRequest): Result<TireEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val oldTire = database.tireDao().getTireById(tireId)
+                    ?: throw Exception("Tire not found")
+                
+                // Deactivate old tire
+                val deactivatedTire = oldTire.copy(
+                    status = TireStatus.REPLACED,
+                    replacementDate = Date(),
+                    updatedAt = Date()
+                )
+                database.tireDao().updateTire(deactivatedTire)
+                
+                // Add new tire
+                val newTire = addTire(replacementTire.copy(position = oldTire.position))
+                
+                if (newTire.isSuccess) {
+                    // Record replacement
+                    recordTireReplacement(oldTire, newTire.getOrThrow())
+                }
+                
+                Result.success(newTire.getOrThrow())
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get tires for vehicle
+     */
+    suspend fun getVehicleTires(vehicleId: Long): List<TireEntity> {
+        return withContext(Dispatchers.IO) {
+            database.tireDao().getTiresByVehicle(vehicleId)
+        }
+    }
+    
+    /**
+     * Get tire inspections
+     */
+    suspend fun getTireInspections(tireId: Long, limit: Int = 50): List<TireInspectionEntity> {
+        return withContext(Dispatchers.IO) {
+            database.tireInspectionDao().getInspectionsByTire(tireId, limit)
+        }
+    }
+    
+    /**
+     * Get tire analytics
+     */
+    suspend fun getTireAnalytics(dateRange: DateRange = DateRange.last90Days()): TireAnalytics {
+        return withContext(Dispatchers.IO) {
+            try {
+                val allTires = database.tireDao().getAllTires()
+                val allInspections = database.tireInspectionDao().getAllInspections()
+                
+                val totalTires = allTires.size
+                val activeTires = allTires.count { it.status == TireStatus.ACTIVE }
+                val replacedTires = allTires.count { it.status == TireStatus.REPLACED }
+                
+                val averageTreadDepth = allTires.map { it.treadDepth }.average().toFloat()
+                val averagePressure = allTires.map { it.currentPressure }.average().toFloat()
+                
+                val tiresNeedingReplacement = allTires.count { it.treadDepth <= CRITICAL_TREAD_DEPTH }
+                val tiresNeedingInspection = allTires.count { it.nextInspectionDate.before(Date()) }
+                val tiresWithLowPressure = allTires.count { it.currentPressure < MIN_TIRE_PRESSURE }
+                
+                val tireAgeDistribution = calculateTireAgeDistribution(allTires)
+                val treadDepthDistribution = calculateTreadDepthDistribution(allTires)
+                val conditionDistribution = calculateConditionDistribution(allTires)
+                val replacementTrends = calculateReplacementTrends(allTires, dateRange)
+                val costAnalysis = calculateTireCostAnalysis(allTires, dateRange)
+                
+                TireAnalytics(
+                    totalTires = totalTires,
+                    activeTires = activeTires,
+                    replacedTires = replacedTires,
+                    averageTreadDepth = averageTreadDepth,
+                    averagePressure = averagePressure,
+                    tiresNeedingReplacement = tiresNeedingReplacement,
+                    tiresNeedingInspection = tiresNeedingInspection,
+                    tiresWithLowPressure = tiresWithLowPressure,
+                    tireAgeDistribution = tireAgeDistribution,
+                    treadDepthDistribution = treadDepthDistribution,
+                    conditionDistribution = conditionDistribution,
+                    replacementTrends = replacementTrends,
+                    costAnalysis = costAnalysis,
+                    dateRange = dateRange
+                )
+                
+            } catch (e: Exception) {
+                TireAnalytics()
+            }
+        }
+    }
+    
+    /**
+     * Get rotation schedule
+     */
+    suspend fun getRotationSchedule(vehicleId: Long): List<TireRotation> {
+        return withContext(Dispatchers.IO) {
+            val rotations = _rotationSchedule.value.filter { it.vehicleId == vehicleId }
+            rotations
+        }
+    }
+    
+    /**
+     * Add tire management listener
+     */
+    fun addTireManagementListener(listener: TireManagementListener) {
+        tireListeners.add(listener)
+    }
+    
+    /**
+     * Remove tire management listener
+     */
+    fun removeTireManagementListener(listener: TireManagementListener) {
+        tireListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadTires() {
+        val tires = database.tireDao().getAllTires()
+        _tires.value = tires
+    }
+    
+    private suspend fun loadTireInspections() {
+        val inspections = database.tireInspectionDao().getAllInspections()
+        _tireInspections.value = inspections
+    }
+    
+    private suspend fun generateRotationSchedule() {
+        val vehicles = database.vehicleDao().getAllVehicles()
+        val schedule = mutableListOf<TireRotation>()
+        
+        vehicles.forEach { vehicle ->
+            val vehicleTires = database.tireDao().getTiresByVehicle(vehicle.id)
+            val nextRotationDate = calculateNextRotationDate(vehicleTires)
+            
+            schedule.add(TireRotation(
+                id = 0,
+                vehicleId = vehicle.id,
+                vehicleIdString = vehicle.vehicleId,
+                scheduledDate = nextRotationDate,
+                rotationType = RotationType.ROUTINE,
+                notes = "Routine tire rotation",
+                status = RotationStatus.SCHEDULED,
+                createdAt = Date()
+            ))
+        }
+        
+        _rotationSchedule.value = schedule
+    }
+    
+    private fun startTireMonitoring() {
+        isMonitoring = true
+        // Implementation would start periodic tire monitoring
+    }
+    
+    private suspend fun checkTireAlerts() {
+        val tires = _tires.value
+        val alerts = mutableListOf<TireAlert>()
+        
+        tires.forEach { tire ->
+            val tireAlerts = checkTireAlert(tire)
+            alerts.addAll(tireAlerts)
+        }
+        
+        _tireAlerts.value = alerts
+    }
+    
+    private suspend fun checkTireAlert(tire: TireEntity): List<TireAlert> {
+        val alerts = mutableListOf<TireAlert>()
+        
+        // Low tread depth alert
+        if (tire.treadDepth <= CRITICAL_TREAD_DEPTH) {
+            alerts.add(TireAlert(
+                id = 0,
+                tireId = tire.id,
+                type = TireAlertType.CRITICAL_TREAD,
+                message = "Critical tread depth: ${tire.treadDepth}mm",
+                severity = AlertSeverity.CRITICAL,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        // Low pressure alert
+        if (tire.currentPressure < MIN_TIRE_PRESSURE) {
+            alerts.add(TireAlert(
+                id = 0,
+                tireId = tire.id,
+                type = TireAlertType.LOW_PRESSURE,
+                message = "Low tire pressure: ${tire.currentPressure} PSI",
+                severity = AlertSeverity.HIGH,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        // Overdue inspection alert
+        if (tire.nextInspectionDate.before(Date())) {
+            alerts.add(TireAlert(
+                id = 0,
+                tireId = tire.id,
+                type = TireAlertType.OVERDUE_INSPECTION,
+                message = "Tire inspection is overdue",
+                severity = AlertSeverity.MEDIUM,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        // Old tire alert
+        val tireAge = calculateTireAge(tire.purchaseDate)
+        if (tireAge > MAX_TIRE_AGE_YEARS) {
+            alerts.add(TireAlert(
+                id = 0,
+                tireId = tire.id,
+                type = TireAlertType.AGE_LIMIT,
+                message = "Tire is ${tireAge} years old",
+                severity = AlertSeverity.MEDIUM,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        return alerts
+    }
+    
+    private fun validateTireRequest(request: AddTireRequest) {
+        if (request.vehicleId <= 0) throw Exception("Valid vehicle ID is required")
+        if (request.brand.isBlank()) throw Exception("Tire brand is required")
+        if (request.model.isBlank()) throw Exception("Tire model is required")
+        if (request.size.isBlank()) throw Exception("Tire size is required")
+        if (request.treadDepth < 0) throw Exception("Invalid tread depth")
+        if (request.currentPressure <= 0) throw Exception("Invalid pressure")
+    }
+    
+    private fun generateTireId(): String {
+        val timestamp = System.currentTimeMillis()
+        val random = (1000..9999).random()
+        return "TR-$timestamp-$random"
+    }
+    
+    private fun calculateNextInspectionDate(baseDate: Date = Date()): Date {
+        val calendar = Calendar.getInstance()
+        calendar.time = baseDate
+        calendar.add(Calendar.MONTH, 3)
+        return calendar.time
+    }
+    
+    private fun calculateExpectedReplacementDate(purchaseDate: Date, treadDepth: Float): Date {
+        val calendar = Calendar.getInstance()
+        calendar.time = purchaseDate
+        val estimatedLifeYears = (treadDepth / CRITICAL_TREAD_DEPTH) * MAX_TIRE_AGE_YEARS
+        calendar.add(Calendar.YEAR, estimatedLifeYears.toInt())
+        return calendar.time
+    }
+    
+    private fun calculateNextRotationDate(tires: List<TireEntity>): Date {
+        if (tires.isEmpty()) return Date()
+        
+        val lastRotation = tires.map { it.lastRotationDate }.maxOrNull()
+        val calendar = Calendar.getInstance()
+        calendar.time = lastRotation ?: Date()
+        calendar.add(Calendar.DAY_OF_MONTH, ROTATION_INTERVAL_KM.toInt())
+        return calendar.time
+    }
+    
+    private fun calculateTireAge(purchaseDate: Date): Int {
+        val calendar = Calendar.getInstance()
+        val currentCalendar = Calendar.getInstance()
+        currentCalendar.time = Date()
+        
+        calendar.time = purchaseDate
+        return currentCalendar.get(Calendar.YEAR) - calendar.get(Calendar.YEAR)
+    }
+    
+    private suspend fun recordTireReplacement(oldTire: TireEntity, newTire: TireEntity) {
+        // Implementation would record tire replacement for analytics
+    }
+    
+    private suspend fun updateTires() {
+        loadTires()
+    }
+    
+    private suspend fun updateTireInspections() {
+        loadTireInspections()
+    }
+    
+    private suspend fun updateRotationSchedule() {
+        generateRotationSchedule()
+    }
+    
+    private fun calculateTireAgeDistribution(tires: List<TireEntity>): Map<String, Int> {
+        return tires.groupBy { tire ->
+            val age = calculateTireAge(tire.purchaseDate)
+            when {
+                age < 1 -> "Less than 1 year"
+                age < 2 -> "1-2 years"
+                age < 3 -> "2-3 years"
+                age < 4 -> "3-4 years"
+                age < 5 -> "4-5 years"
+                else -> "5+ years"
+            }
+        }.mapValues { it.value.size }
+    }
+    
+    private fun calculateTreadDepthDistribution(tires: List<TireEntity>): Map<String, Int> {
+        return tires.groupBy { tire ->
+            when {
+                tire.treadDepth >= 8f -> "8mm+ (New)"
+                tire.treadDepth >= 6f -> "6-8mm"
+                tire.treadDepth >= 4f -> "4-6mm"
+                tire.treadDepth >= 2f -> "2-4mm"
+                tire.treadDepth >= CRITICAL_TREAD_DEPTH -> "1.6-2mm"
+                else -> "<1.6mm (Critical)"
+            }
+        }.mapValues { it.value.size }
+    }
+    
+    private fun calculateConditionDistribution(tires: List<TireEntity>): Map<TireCondition, Int> {
+        return tires.groupBy { it.condition }.mapValues { it.value.size }
+    }
+    
+    private fun calculateReplacementTrends(tires: List<TireEntity>, dateRange: DateRange): Map<String, Int> {
+        return tires.filter { it.status == TireStatus.REPLACED }
+            .filter { it.replacementDate?.let { it in dateRange.startDate..dateRange.endDate } == true }
+            .groupBy {
+                val calendar = Calendar.getInstance()
+                calendar.time = it.replacementDate ?: Date()
+                "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+            }
+            .mapValues { it.value.size }
+    }
+    
+    private fun calculateTireCostAnalysis(tires: List<TireEntity>, dateRange: DateRange): TireCostAnalysis {
+        val replacedTires = tires.filter { it.status == TireStatus.REPLACED }
+            .filter { it.replacementDate?.let { it in dateRange.startDate..dateRange.endDate } == true }
+        
+        val totalCost = replacedTires.sumOf { it.purchasePrice.toDouble() }.toFloat()
+        val averageCost = if (replacedTires.isNotEmpty()) {
+            totalCost / replacedTires.size
+        } else 0f
+        
+        return TireCostAnalysis(
+            totalReplacements = replacedTires.size,
+            totalCost = totalCost,
+            averageCost = averageCost,
+            costPerKm = 0f // Would calculate based on mileage
+        )
+    }
+    
+    private fun notifyTireAdded(tire: TireEntity) {
+        tireListeners.forEach { listener ->
+            listener.onTireAdded(tire)
+        }
+    }
+    
+    private fun notifyTireInspection(inspection: TireInspectionEntity) {
+        tireListeners.forEach { listener ->
+            listener.onTireInspection(inspection)
+        }
+    }
+    
+    /**
+     * Get management status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+}
+
+/**
+ * Data classes
+ */
+data class AddTireRequest(
+    val vehicleId: Long,
+    val position: TirePosition,
+    val brand: String,
+    val model: String,
+    val size: String,
+    val type: TireType,
+    val purchaseDate: Date,
+    val purchasePrice: Float,
+    val installationDate: Date,
+    val currentMileage: Float,
+    val currentPressure: Float,
+    val treadDepth: Float,
+    val condition: TireCondition,
+    val warrantyExpiryDate: Date?,
+    val notes: String?
+)
+
+data class UpdateTireRequest(
+    val currentMileage: Float? = null,
+    val currentPressure: Float? = null,
+    val treadDepth: Float? = null,
+    val condition: TireCondition? = null,
+    val status: TireStatus? = null,
+    val notes: String? = null
+)
+
+data class TireInspectionRequest(
+    val tireId: Long,
+    val inspectionDate: Date,
+    val inspectorId: String,
+    val pressure: Float,
+    val treadDepth: Float,
+    val overallCondition: TireCondition,
+    val wearPattern: WearPattern,
+    val damageNotes: String?,
+    val recommendations: List<String>,
+    val photos: List<String>
+)
+
+data class TireAnalytics(
+    val totalTires: Int = 0,
+    val activeTires: Int = 0,
+    val replacedTires: Int = 0,
+    val averageTreadDepth: Float = 0f,
+    val averagePressure: Float = 0f,
+    val tiresNeedingReplacement: Int = 0,
+    val tiresNeedingInspection: Int = 0,
+    val tiresWithLowPressure: Int = 0,
+    val tireAgeDistribution: Map<String, Int> = emptyMap(),
+    val treadDepthDistribution: Map<String, Int> = emptyMap(),
+    val conditionDistribution: Map<TireCondition, Int> = emptyMap(),
+    val replacementTrends: Map<String, Int> = emptyMap(),
+    val costAnalysis: TireCostAnalysis = TireCostAnalysis(),
+    val dateRange: DateRange = DateRange()
+)
+
+data class TireRotation(
+    val id: Long,
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val scheduledDate: Date,
+    val rotationType: RotationType,
+    val notes: String,
+    val status: RotationStatus,
+    val createdAt: Date
+)
+
+data class TireAlert(
+    val id: Long,
+    val tireId: Long,
+    val type: TireAlertType,
+    val message: String,
+    val severity: AlertSeverity,
+    val timestamp: Date,
+    val resolved: Boolean
+)
+
+data class TireCostAnalysis(
+    val totalReplacements: Int = 0,
+    val totalCost: Float = 0f,
+    val averageCost: Float = 0f,
+    val costPerKm: Float = 0f
+)
+
+/**
+ * Interfaces
+ */
+interface TireManagementListener {
+    fun onTireAdded(tire: TireEntity)
+    fun onTireUpdated(tire: TireEntity)
+    fun onTireInspection(inspection: TireInspectionEntity)
+    fun onTireRotated(tireId: Long)
+    fun onTireReplaced(oldTireId: Long, newTireId: Long)
+    fun onTireAlert(alert: TireAlert)
+}
+
+/**
+ * Enums
+ */
+enum class TireManagementState {
+    Idle,
+    Initializing,
+    Ready,
+    AddingTire,
+    TireAdded,
+    UpdatingTire,
+    TireUpdated,
+    InspectingTire,
+    TireInspected,
+    ReplacingTire,
+    TireReplaced,
+    Error
+}
+
+enum class TirePosition {
+    FRONT_LEFT,
+    FRONT_RIGHT,
+    REAR_LEFT,
+    REAR_RIGHT,
+    SPARE
+}
+
+enum class TireType {
+    SUMMER,
+    WINTER,
+    ALL_SEASON,
+    PERFORMANCE,
+    OFF_ROAD,
+    COMMERCIAL
+}
+
+enum class TireCondition {
+    EXCELLENT,
+    GOOD,
+    FAIR,
+    POOR,
+    CRITICAL
+}
+
+enum class TireStatus {
+    ACTIVE,
+    SPARE,
+    REPLACED,
+    DAMAGED,
+    RETIRED
+}
+
+enum class WearPattern {
+    EVEN,
+    CENTER_WEAR,
+    EDGE_WEAR,
+    CUPPING,
+    FEATHERING,
+    IRREGULAR
+}
+
+enum class RotationType {
+    ROUTINE,
+    SEASONAL,
+    EMERGENCY,
+    REPAIR
+}
+
+enum class RotationStatus {
+    SCHEDULED,
+    COMPLETED,
+    OVERDUE,
+    CANCELLED
+}
+
+enum class TireAlertType {
+    LOW_PRESSURE,
+    HIGH_PRESSURE,
+    CRITICAL_TREAD,
+    OVERDUE_INSPECTION,
+    AGE_LIMIT,
+    DAMAGE_DETECTED,
+    ROTATION_DUE
+}

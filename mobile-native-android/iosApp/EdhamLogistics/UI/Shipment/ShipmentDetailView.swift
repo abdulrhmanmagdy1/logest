@@ -141,8 +141,8 @@ struct ShipmentDetailView: View {
     }
 
     var actionButton: some View {
-        Button(action: { /* Handle status update */ }) {
-            Text("تحديث حالة الشحنة")
+        NavigationLink(destination: ProofOfDeliveryView(shipmentId: shipmentId)) {
+            Text("إكمال التسليم وإثباته")
                 .bold()
                 .frame(maxWidth: .infinity)
                 .frame(height: 56)

@@ -1,0 +1,285 @@
+package com.edham.logistics.auth
+
+import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
+import android.text.method.LinkMovementMethod
+import android.text.util.Linkify
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import androidx.core.widget.addTextChangedListener
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentLoginNewBinding
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.ValidationUtils
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Login Fragment - Handles user authentication
+ * 
+ * Features:
+ * - Email/password login
+ * - Remember me functionality
+ * - Biometric authentication
+ * - Forgot password
+ * - Navigation to registration
+ * - Arabic RTL support
+ */
+@AndroidEntryPoint
+class LoginFragment : Fragment() {
+
+    private var _binding: FragmentLoginNewBinding? = null
+    private val binding get() = _binding!!
+
+    @Inject
+    lateinit var authenticationManager: AuthenticationManager
+
+    @Inject
+    lateinit var networkUtils: NetworkUtils
+
+    @Inject
+    lateinit var validationUtils: ValidationUtils
+
+    private val viewModel: LoginViewModel by viewModels()
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentLoginNewBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupUI()
+        setupObservers()
+        setupClickListeners()
+        setupTextWatchers()
+        checkBiometricAvailability()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
+    private fun setupUI() {
+        // Set up terms and conditions link
+        binding.forgotPasswordText.movementMethod = LinkMovementMethod.getInstance()
+        binding.registerText.movementMethod = LinkMovementMethod.getInstance()
+        
+        // Configure text direction for RTL support
+        if (isRTL()) {
+            binding.emailEditText.textDirection = View.TEXT_DIRECTION_RTL
+            binding.passwordEditText.textDirection = View.TEXT_DIRECTION_RTL
+        }
+        
+        // Initially disable login button
+        updateLoginButtonState()
+    }
+
+    private fun setupObservers() {
+        // Observe authentication state
+        viewLifecycleOwner.lifecycleScope.launch {
+            authenticationManager.authState.collect { state ->
+                when (state) {
+                    is AuthState.Loading -> showLoading(true)
+                    is AuthState.Authenticated -> navigateToMain()
+                    is AuthState.Error -> showError(state.message)
+                    is AuthState.Unauthenticated -> showLoading(false)
+                    else -> {}
+                }
+            }
+        }
+
+        // Observe login result
+        viewModel.loginResult.observe(viewLifecycleOwner) { result ->
+            result.onSuccess { authResponse ->
+                // Handle successful login
+                showLoading(false)
+                navigateToMain()
+            }.onFailure { exception ->
+                showLoading(false)
+                showError(exception.message ?: "Login failed")
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.loginButton.setOnClickListener {
+            attemptLogin()
+        }
+
+        binding.biometricLoginButton.setOnClickListener {
+            attemptBiometricLogin()
+        }
+
+        binding.forgotPasswordText.setOnClickListener {
+            navigateToForgotPassword()
+        }
+
+        binding.registerText.setOnClickListener {
+            navigateToRegister()
+        }
+
+        binding.languageSwitch.setOnClickListener {
+            // Toggle language (Arabic/English)
+            toggleLanguage()
+        }
+    }
+
+    private fun setupTextWatchers() {
+        binding.emailEditText.addTextChangedListener { text ->
+            clearError(binding.emailInputLayout)
+            updateLoginButtonState()
+        }
+
+        binding.passwordEditText.addTextChangedListener { text ->
+            clearError(binding.passwordInputLayout)
+            updateLoginButtonState()
+        }
+    }
+
+    private fun attemptLogin() {
+        val email = binding.emailEditText.text.toString().trim()
+        val password = binding.passwordEditText.text.toString()
+        val rememberMe = binding.rememberMeCheckbox.isChecked
+
+        // Validate inputs
+        if (!validateInputs(email, password)) {
+            return
+        }
+
+        // Attempt login
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = authenticationManager.login(email, password, rememberMe)
+            result.onSuccess {
+                // Login successful - handled by observer
+            }.onFailure { exception ->
+                showError(exception.message ?: "Login failed")
+            }
+        }
+    }
+
+    private fun attemptBiometricLogin() {
+        if (!authenticationManager.hasValidToken()) {
+            showError("Please login with email and password first")
+            return
+        }
+
+        authenticationManager.authenticateWithBiometric(
+            activity = requireActivity(),
+            title = getString(R.string.biometric_login),
+            subtitle = getString(R.string.biometric_login_subtitle),
+            negativeButtonText = getString(R.string.cancel),
+            onSuccess = {
+                navigateToMain()
+            },
+            onError = { error ->
+                showError(error)
+            }
+        )
+    }
+
+    private fun validateInputs(email: String, password: String): Boolean {
+        var isValid = true
+
+        // Validate email
+        if (!validationUtils.isValidEmail(email)) {
+            binding.emailInputLayout.error = getString(R.string.invalid_email)
+            isValid = false
+        }
+
+        // Validate password
+        if (!validationUtils.isValidPassword(password)) {
+            binding.passwordInputLayout.error = getString(R.string.invalid_password)
+            isValid = false
+        }
+
+        return isValid
+    }
+
+    private fun updateLoginButtonState() {
+        val email = binding.emailEditText.text.toString().trim()
+        val password = binding.passwordEditText.text.toString()
+        
+        val isValid = validationUtils.isValidEmail(email) && 
+                      validationUtils.isValidPassword(password) &&
+                      networkUtils.isNetworkAvailable()
+        
+        binding.loginButton.isEnabled = isValid
+    }
+
+    private fun checkBiometricAvailability() {
+        if (authenticationManager.hasValidToken()) {
+            binding.biometricLoginButton.visibility = View.VISIBLE
+        } else {
+            binding.biometricLoginButton.visibility = View.GONE
+        }
+    }
+
+    private fun showLoading(show: Boolean) {
+        binding.progressOverlay.visibility = if (show) View.VISIBLE else View.GONE
+        binding.loginButton.isEnabled = !show
+        binding.biometricLoginButton.isEnabled = !show
+    }
+
+    private fun showError(message: String) {
+        // Show error message in a snackbar or toast
+        binding.emailInputLayout.error = if (message.contains("email", ignoreCase = true)) message else null
+        binding.passwordInputLayout.error = if (message.contains("password", ignoreCase = true)) message else null
+        
+        if (!message.contains("email", ignoreCase = true) && !message.contains("password", ignoreCase = true)) {
+            // Show general error
+            binding.emailInputLayout.error = message
+        }
+    }
+
+    private fun clearError(inputLayout: com.google.android.material.textfield.TextInputLayout) {
+        inputLayout.error = null
+        inputLayout.isErrorEnabled = false
+    }
+
+    private fun navigateToMain() {
+        findNavController().navigate(R.id.action_loginFragment_to_mainActivity)
+        requireActivity().finish()
+    }
+
+    private fun navigateToRegister() {
+        findNavController().navigate(R.id.action_loginFragment_to_registerFragment)
+    }
+
+    private fun navigateToForgotPassword() {
+        findNavController().navigate(R.id.action_loginFragment_to_forgotPasswordFragment)
+    }
+
+    private fun toggleLanguage() {
+        // Toggle between Arabic and English
+        val currentLanguage = binding.languageSwitch.text.toString()
+        val newLanguage = if (currentLanguage == "English") "العربية" else "English"
+        binding.languageSwitch.text = newLanguage
+        
+        // Restart activity with new language
+        requireActivity().recreate()
+    }
+
+    private fun isRTL(): Boolean {
+        return resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL
+    }
+
+    companion object {
+        private const val TAG = "LoginFragment"
+    }
+}

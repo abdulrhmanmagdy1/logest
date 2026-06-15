@@ -1,0 +1,356 @@
+package com.edham.logistics.auth
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.data.remote.api.AuthApi
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Token Manager - Handles JWT token lifecycle and auto-refresh
+ * 
+ * Features:
+ * - Automatic token refresh
+ * - Token validation
+ * - Secure storage
+ * - Background refresh scheduling
+ */
+@Singleton
+class TokenManager @Inject constructor(
+    private val context: Context,
+    private val authApi: AuthApi,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _tokenState = MutableStateFlow<TokenState>(TokenState.Initial)
+    val tokenState: StateFlow<TokenState> = _tokenState.asStateFlow()
+    
+    private val encryptedPrefs: SharedPreferences by lazy {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .setBlockModes(arrayOf(MasterKey.BlockMode.GCM))
+            .setEncryptionPaddings(arrayOf(MasterKey.EncryptionPadding.PKCS7_PADDING))
+            .setUserAuthenticationRequired(false)
+            .build()
+        
+        EncryptedSharedPreferences.create(
+            context,
+            "token_prefs",
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+    
+    private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    
+    // Token storage
+    private var accessToken: String?
+        get() = encryptedPrefs.getString("access_token", null)
+        set(value) = encryptedPrefs.edit().putString("access_token", value).apply()
+    
+    private var refreshToken: String?
+        get() = encryptedPrefs.getString("refresh_token", null)
+        set(value) = encryptedPrefs.edit().putString("refresh_token", value).apply()
+    
+    private var tokenExpiry: Long
+        get() = encryptedPrefs.getLong("token_expiry", 0)
+        set(value) = encryptedPrefs.edit().putLong("token_expiry", value).apply()
+    
+    private var lastRefresh: Long
+        get() = encryptedPrefs.getLong("last_refresh", 0)
+        set(value) = encryptedPrefs.edit().putLong("last_refresh", value).apply()
+    
+    private var refreshCount: Int
+        get() = encryptedPrefs.getInt("refresh_count", 0)
+        set(value) = encryptedPrefs.edit().putInt("refresh_count", value).apply()
+    
+    init {
+        initializeTokenState()
+        scheduleAutoRefresh()
+    }
+    
+    private fun initializeTokenState() {
+        if (hasValidToken()) {
+            _tokenState.value = TokenState.Valid
+        } else {
+            _tokenState.value = TokenState.Invalid
+        }
+    }
+    
+    /**
+     * Store new tokens
+     */
+    fun storeTokens(accessToken: String, refreshToken: String, expiresIn: Long) {
+        this.accessToken = accessToken
+        this.refreshToken = refreshToken
+        this.tokenExpiry = System.currentTimeMillis() + (expiresIn * 1000)
+        this.lastRefresh = System.currentTimeMillis()
+        this.refreshCount = 0
+        
+        _tokenState.value = TokenState.Valid
+        
+        // Schedule next refresh
+        scheduleTokenRefresh(expiresIn)
+    }
+    
+    /**
+     * Get current access token
+     */
+    fun getAccessToken(): String? {
+        return if (hasValidToken()) accessToken else null
+    }
+    
+    /**
+     * Get refresh token
+     */
+    fun getRefreshToken(): String? {
+        return refreshToken
+    }
+    
+    /**
+     * Check if access token is valid
+     */
+    fun hasValidToken(): Boolean {
+        val token = accessToken ?: return false
+        val expiry = tokenExpiry
+        return token.isNotEmpty() && System.currentTimeMillis() < expiry
+    }
+    
+    /**
+     * Check if token needs refresh (within 5 minutes of expiry)
+     */
+    fun needsRefresh(): Boolean {
+        val expiry = tokenExpiry
+        val fiveMinutes = 5 * 60 * 1000L
+        return System.currentTimeMillis() >= (expiry - fiveMinutes)
+    }
+    
+    /**
+     * Refresh token manually
+     */
+    suspend fun refreshToken(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _tokenState.value = TokenState.Refreshing
+                
+                val currentRefreshToken = refreshToken ?: return@withContext Result.failure(Exception("No refresh token"))
+                
+                if (!networkUtils.isNetworkAvailable()) {
+                    _tokenState.value = TokenState.NetworkError
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                // Check rate limiting
+                if (isRateLimited()) {
+                    _tokenState.value = TokenState.RateLimited
+                    return@withContext Result.failure(Exception("Too many refresh attempts"))
+                }
+                
+                val response = authApi.refreshToken(currentRefreshToken)
+                
+                if (response.isSuccessful) {
+                    val authResponse = response.body()!!
+                    storeTokens(authResponse.accessToken, authResponse.refreshToken, authResponse.expiresIn)
+                    Result.success(true)
+                } else {
+                    val error = response.errorBody()?.string() ?: "Token refresh failed"
+                    _tokenState.value = TokenState.Error(error)
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                _tokenState.value = TokenState.Error(e.message ?: "Token refresh failed")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Clear all tokens
+     */
+    fun clearTokens() {
+        encryptedPrefs.edit().clear().apply()
+        _tokenState.value = TokenState.Invalid
+        cancelAutoRefresh()
+    }
+    
+    /**
+     * Check if refresh is rate limited
+     */
+    private fun isRateLimited(): Boolean {
+        val last = lastRefresh
+        val count = refreshCount
+        val now = System.currentTimeMillis()
+        
+        // Reset count if last refresh was more than 1 hour ago
+        if (now - last > 60 * 60 * 1000) {
+            refreshCount = 0
+            return false
+        }
+        
+        // Allow max 5 refreshes per hour
+        return count >= 5
+    }
+    
+    /**
+     * Schedule automatic token refresh
+     */
+    private fun scheduleAutoRefresh() {
+        val expiry = tokenExpiry
+        val now = System.currentTimeMillis()
+        val timeUntilExpiry = expiry - now
+        
+        if (timeUntilExpiry > 0) {
+            // Refresh 5 minutes before expiry
+            val refreshDelay = timeUntilExpiry - (5 * 60 * 1000)
+            
+            if (refreshDelay > 0) {
+                scheduler.schedule({
+                    // Check if still needs refresh
+                    if (needsRefresh()) {
+                        // This will be handled by the interceptor
+                    }
+                }, refreshDelay, TimeUnit.MILLISECONDS)
+            }
+        }
+    }
+    
+    /**
+     * Schedule token refresh for specific expiry
+     */
+    private fun scheduleTokenRefresh(expiresIn: Long) {
+        cancelAutoRefresh()
+        
+        // Refresh 5 minutes before expiry
+        val refreshDelay = (expiresIn - 5 * 60) * 1000L
+        
+        if (refreshDelay > 0) {
+            scheduler.schedule({
+                if (needsRefresh()) {
+                    // Trigger refresh through interceptor
+                }
+            }, refreshDelay, TimeUnit.MILLISECONDS)
+        }
+    }
+    
+    /**
+     * Cancel auto refresh
+     */
+    private fun cancelAutoRefresh() {
+        // Cancel all scheduled tasks
+        scheduler.shutdownNow()
+        // Create new scheduler for future use
+        scheduler as ScheduledExecutorService
+    }
+    
+    /**
+     * Get token information
+     */
+    fun getTokenInfo(): TokenInfo {
+        return TokenInfo(
+            accessToken = accessToken,
+            refreshToken = refreshToken,
+            expiry = tokenExpiry,
+            lastRefresh = lastRefresh,
+            refreshCount = refreshCount,
+            isValid = hasValidToken(),
+            needsRefresh = needsRefresh()
+        )
+    }
+    
+    /**
+     * Validate token format
+     */
+    fun validateToken(token: String): Boolean {
+        return try {
+            val parts = token.split(".")
+            if (parts.size != 3) return false
+            
+            // Basic JWT format check
+            val header = parts[0]
+            val payload = parts[1]
+            val signature = parts[2]
+            
+            header.isNotEmpty() && payload.isNotEmpty() && signature.isNotEmpty()
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Get token expiry time
+     */
+    fun getTokenExpiry(): Long {
+        return tokenExpiry
+    }
+    
+    /**
+     * Get time until token expiry
+     */
+    fun getTimeUntilExpiry(): Long {
+        val expiry = tokenExpiry
+        val now = System.currentTimeMillis()
+        return maxOf(0, expiry - now)
+    }
+    
+    /**
+     * Check if token is expired
+     */
+    fun isTokenExpired(): Boolean {
+        return System.currentTimeMillis() >= tokenExpiry
+    }
+    
+    /**
+     * Force refresh token
+     */
+    suspend fun forceRefresh(): Result<Boolean> {
+        // Reset rate limiting for manual refresh
+        refreshCount = 0
+        return refreshToken()
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        cancelAutoRefresh()
+    }
+}
+
+/**
+ * Token state
+ */
+sealed class TokenState {
+    object Initial : TokenState()
+    object Valid : TokenState()
+    object Invalid : TokenState()
+    object Refreshing : TokenState()
+    object NetworkError : TokenState()
+    object RateLimited : TokenState()
+    data class Error(val message: String) : TokenState()
+}
+
+/**
+ * Token information
+ */
+data class TokenInfo(
+    val accessToken: String?,
+    val refreshToken: String?,
+    val expiry: Long,
+    val lastRefresh: Long,
+    val refreshCount: Int,
+    val isValid: Boolean,
+    val needsRefresh: Boolean
+)

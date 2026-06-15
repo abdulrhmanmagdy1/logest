@@ -1,0 +1,784 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.InAppNotificationEntity
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * In-App Notification Service - Manages in-app notifications display and interactions
+ * 
+ * Features:
+ * - In-app notification management
+ * - Real-time notification updates
+ * - Notification categorization
+ * - Read/unread status management
+ * - Notification persistence
+ * - Notification analytics
+ * - User interaction tracking
+ * - Notification history
+ */
+@Singleton
+class InAppNotificationService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _inAppNotifications = MutableStateFlow<List<InAppNotification>>(emptyList())
+    val inAppNotifications: StateFlow<List<InAppNotification>> = _inAppNotifications.asStateFlow()
+    
+    private val _unreadCount = MutableStateFlow(0)
+    val unreadCount: StateFlow<Int> = _unreadCount.asStateFlow()
+    
+    private val _notificationStats = MutableStateFlow<InAppNotificationStats>(InAppNotificationStats())
+    val notificationStats: StateFlow<InAppNotificationStats> = _notificationStats.asStateFlow()
+    
+    private val notificationListeners = mutableListOf<InAppNotificationListener>()
+    
+    companion object {
+        private const val TAG = "InAppNotificationService"
+        private const val MAX_NOTIFICATIONS_DISPLAY = 50
+        private const val NOTIFICATION_EXPIRY_DAYS = 30
+    }
+    
+    /**
+     * Initialize in-app notification service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Load existing notifications
+                loadNotifications()
+                
+                // Clean up expired notifications
+                cleanupExpiredNotifications()
+                
+                // Update statistics
+                updateNotificationStats()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add in-app notification
+     */
+    suspend fun addNotification(
+        notification: Notification
+    ): Result<InAppNotification> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Create in-app notification
+                val inAppNotification = InAppNotification(
+                    id = 0,
+                    notificationId = notification.id,
+                    title = notification.title,
+                    message = notification.message,
+                    category = notification.category,
+                    priority = notification.priority,
+                    status = notification.status,
+                    isRead = false,
+                    isExpanded = false,
+                    actions = generateNotificationActions(notification),
+                    data = notification.data,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    expiresAt = calculateExpiryDate(notification)
+                )
+                
+                // Save to database
+                val notificationId = database.inAppNotificationDao().insertNotification(inAppNotification.toEntity())
+                val savedNotification = inAppNotification.copy(id = notificationId)
+                
+                // Update notification list
+                updateNotificationList(savedNotification)
+                
+                // Update unread count
+                updateUnreadCount()
+                
+                // Update statistics
+                updateNotificationStats()
+                
+                // Notify listeners
+                notifyNotificationAdded(savedNotification)
+                
+                Result.success(savedNotification)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Mark notification as read
+     */
+    suspend fun markAsRead(notificationId: Long): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Update in database
+                database.inAppNotificationDao().markAsRead(notificationId)
+                
+                // Update local list
+                updateNotificationReadStatus(notificationId, true)
+                
+                // Update unread count
+                updateUnreadCount()
+                
+                // Update statistics
+                updateNotificationStats()
+                
+                // Notify listeners
+                notifyNotificationRead(notificationId)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Mark notification as unread
+     */
+    suspend fun markAsUnread(notificationId: Long): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Update in database
+                database.inAppNotificationDao().markAsUnread(notificationId)
+                
+                // Update local list
+                updateNotificationReadStatus(notificationId, false)
+                
+                // Update unread count
+                updateUnreadCount()
+                
+                // Update statistics
+                updateNotificationStats()
+                
+                // Notify listeners
+                notifyNotificationUnread(notificationId)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Mark all notifications as read
+     */
+    suspend fun markAllAsRead(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Update in database
+                database.inAppNotificationDao().markAllAsRead()
+                
+                // Update local list
+                updateAllNotificationsReadStatus(true)
+                
+                // Update unread count
+                _unreadCount.value = 0
+                
+                // Update statistics
+                updateNotificationStats()
+                
+                // Notify listeners
+                notifyAllNotificationsRead()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Delete notification
+     */
+    suspend fun deleteNotification(notificationId: Long): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get notification before deletion
+                val notification = _inAppNotifications.value.find { it.id == notificationId }
+                
+                // Delete from database
+                database.inAppNotificationDao().deleteNotification(notificationId)
+                
+                // Update local list
+                removeNotificationFromList(notificationId)
+                
+                // Update unread count if notification was unread
+                if (notification?.isRead == false) {
+                    _unreadCount.value = (_unreadCount.value - 1).coerceAtLeast(0)
+                }
+                
+                // Update statistics
+                updateNotificationStats()
+                
+                // Notify listeners
+                notifyNotificationDeleted(notificationId)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Delete all notifications
+     */
+    suspend fun deleteAllNotifications(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Delete from database
+                database.inAppNotificationDao().deleteAllNotifications()
+                
+                // Clear local list
+                _inAppNotifications.value = emptyList()
+                _unreadCount.value = 0
+                
+                // Update statistics
+                updateNotificationStats()
+                
+                // Notify listeners
+                notifyAllNotificationsDeleted()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Delete notifications by category
+     */
+    suspend fun deleteNotificationsByCategory(category: NotificationCategory): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Delete from database
+                database.inAppNotificationDao().deleteNotificationsByCategory(category.name)
+                
+                // Update local list
+                removeNotificationsByCategory(category)
+                
+                // Update unread count
+                updateUnreadCount()
+                
+                // Update statistics
+                updateNotificationStats()
+                
+                // Notify listeners
+                notifyNotificationsByCategoryDeleted(category)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Toggle notification expansion
+     */
+    suspend fun toggleNotificationExpansion(notificationId: Long): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get current notification
+                val notification = _inAppNotifications.value.find { it.id == notificationId }
+                    ?: throw Exception("Notification not found")
+                
+                // Toggle expansion
+                val updatedNotification = notification.copy(isExpanded = !notification.isExpanded)
+                
+                // Update in database
+                database.inAppNotificationDao().updateNotification(updatedNotification.toEntity())
+                
+                // Update local list
+                updateNotificationInList(updatedNotification)
+                
+                // Notify listeners
+                notifyNotificationExpansionToggled(notificationId, updatedNotification.isExpanded)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle notification action
+     */
+    suspend fun handleNotificationAction(
+        notificationId: Long,
+        action: NotificationAction
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get notification
+                val notification = _inAppNotifications.value.find { it.id == notificationId }
+                    ?: throw Exception("Notification not found")
+                
+                // Log action
+                logNotificationAction(notificationId, action)
+                
+                // Execute action
+                when (action.type) {
+                    ActionType.NAVIGATE -> handleNavigateAction(action)
+                    ActionType.CALL -> handleCallAction(action)
+                    ActionType.EMAIL -> handleEmailAction(action)
+                    ActionType.DISMISS -> handleDismissAction(notificationId)
+                    ActionType.MARK_READ -> markAsRead(notificationId)
+                    ActionType.DELETE -> deleteNotification(notificationId)
+                    ActionType.CUSTOM -> handleCustomAction(action)
+                }
+                
+                // Notify listeners
+                notifyNotificationActionHandled(notificationId, action)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get notifications by category
+     */
+    suspend fun getNotificationsByCategory(category: NotificationCategory): List<InAppNotification> {
+        return _inAppNotifications.value.filter { it.category == category }
+    }
+    
+    /**
+     * Get unread notifications
+     */
+    suspend fun getUnreadNotifications(): List<InAppNotification> {
+        return _inAppNotifications.value.filter { !it.isRead }
+    }
+    
+    /**
+     * Get notifications by priority
+     */
+    suspend fun getNotificationsByPriority(priority: NotificationPriority): List<InAppNotification> {
+        return _inAppNotifications.value.filter { it.priority == priority }
+    }
+    
+    /**
+     * Search notifications
+     */
+    suspend fun searchNotifications(query: String): List<InAppNotification> {
+        return _inAppNotifications.value.filter { notification ->
+            notification.title.contains(query, ignoreCase = true) ||
+            notification.message.contains(query, ignoreCase = true)
+        }
+    }
+    
+    /**
+     * Refresh notifications
+     */
+    suspend fun refreshNotifications(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                loadNotifications()
+                updateUnreadCount()
+                updateNotificationStats()
+                Result.success(true)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add notification listener
+     */
+    fun addNotificationListener(listener: InAppNotificationListener) {
+        notificationListeners.add(listener)
+    }
+    
+    /**
+     * Remove notification listener
+     */
+    fun removeNotificationListener(listener: InAppNotificationListener) {
+        notificationListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadNotifications() {
+        try {
+            val notifications = database.inAppNotificationDao().getAllNotifications()
+                .map { it.toDomainModel() }
+                .sortedByDescending { it.createdAt }
+                .take(MAX_NOTIFICATIONS_DISPLAY)
+            
+            _inAppNotifications.value = notifications
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun cleanupExpiredNotifications() {
+        try {
+            val expiryDate = Date(System.currentTimeMillis() - NOTIFICATION_EXPIRY_DAYS * 24 * 60 * 60 * 1000L)
+            database.inAppNotificationDao().deleteExpiredNotifications(expiryDate)
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun updateNotificationStats() {
+        try {
+            val notifications = _inAppNotifications.value
+            val stats = InAppNotificationStats(
+                totalCount = notifications.size,
+                unreadCount = notifications.count { !it.isRead },
+                categoryStats = notifications.groupBy { it.category }
+                    .mapValues { it.value.size },
+                priorityStats = notifications.groupBy { it.priority }
+                    .mapValues { it.value.size },
+                todayCount = notifications.count { 
+                    isToday(it.createdAt) 
+                }
+            )
+            
+            _notificationStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun updateNotificationList(notification: InAppNotification) {
+        val currentList = _inAppNotifications.value.toMutableList()
+        currentList.add(0, notification) // Add to beginning
+        
+        // Keep only max notifications
+        if (currentList.size > MAX_NOTIFICATIONS_DISPLAY) {
+            currentList.removeAt(currentList.size - 1)
+        }
+        
+        _inAppNotifications.value = currentList
+    }
+    
+    private fun updateNotificationReadStatus(notificationId: Long, isRead: Boolean) {
+        val currentList = _inAppNotifications.value.toMutableList()
+        val index = currentList.indexOfFirst { it.id == notificationId }
+        
+        if (index != -1) {
+            currentList[index] = currentList[index].copy(isRead = isRead)
+            _inAppNotifications.value = currentList
+        }
+    }
+    
+    private fun updateAllNotificationsReadStatus(isRead: Boolean) {
+        val currentList = _inAppNotifications.value.map { it.copy(isRead = isRead) }
+        _inAppNotifications.value = currentList
+    }
+    
+    private fun removeNotificationFromList(notificationId: Long) {
+        val currentList = _inAppNotifications.value.toMutableList()
+        currentList.removeAll { it.id == notificationId }
+        _inAppNotifications.value = currentList
+    }
+    
+    private fun removeNotificationsByCategory(category: NotificationCategory) {
+        val currentList = _inAppNotifications.value.toMutableList()
+        currentList.removeAll { it.category == category }
+        _inAppNotifications.value = currentList
+    }
+    
+    private fun updateNotificationInList(notification: InAppNotification) {
+        val currentList = _inAppNotifications.value.toMutableList()
+        val index = currentList.indexOfFirst { it.id == notification.id }
+        
+        if (index != -1) {
+            currentList[index] = notification
+            _inAppNotifications.value = currentList
+        }
+    }
+    
+    private suspend fun updateUnreadCount() {
+        try {
+            val count = database.inAppNotificationDao().getUnreadCount()
+            _unreadCount.value = count
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun calculateExpiryDate(notification: Notification): Date {
+        // Emergency notifications expire faster
+        val days = if (notification.priority == NotificationPriority.EMERGENCY) {
+            7
+        } else {
+            NOTIFICATION_EXPIRY_DAYS
+        }
+        
+        return Date(System.currentTimeMillis() + days * 24 * 60 * 60 * 1000L)
+    }
+    
+    private fun generateNotificationActions(notification: Notification): List<NotificationAction> {
+        val actions = mutableListOf<NotificationAction>()
+        
+        when (notification.category) {
+            NotificationCategory.SHIPMENT -> {
+                actions.add(
+                    NotificationAction(
+                        id = "track",
+                        title = "تتبع",
+                        type = ActionType.NAVIGATE,
+                        data = mapOf("shipmentId" to (notification.data["shipmentId"] ?: ""))
+                    )
+                )
+            }
+            
+            NotificationCategory.MAINTENANCE -> {
+                actions.add(
+                    NotificationAction(
+                        id = "schedule",
+                        title = "جدولة",
+                        type = ActionType.NAVIGATE,
+                        data = mapOf("vehicleId" to (notification.data["vehicleId"] ?: ""))
+                    )
+                )
+            }
+            
+            NotificationCategory.PAYMENT -> {
+                actions.add(
+                    NotificationAction(
+                        id = "pay",
+                        title = "دفع",
+                        type = ActionType.NAVIGATE,
+                        data = mapOf("paymentId" to (notification.data["paymentId"] ?: ""))
+                    )
+                )
+            }
+            
+            NotificationCategory.EMERGENCY -> {
+                actions.add(
+                    NotificationAction(
+                        id = "emergency_response",
+                        title = "استجابة طارئة",
+                        type = ActionType.CALL,
+                        data = mapOf("emergencyNumber" to "911")
+                    )
+                )
+            }
+        }
+        
+        // Add common actions
+        actions.add(
+            NotificationAction(
+                id = "mark_read",
+                title = "قراءة",
+                type = ActionType.MARK_READ,
+                data = emptyMap()
+            )
+        )
+        
+        actions.add(
+            NotificationAction(
+                id = "dismiss",
+                title = "تجاهل",
+                type = ActionType.DISMISS,
+                data = emptyMap()
+            )
+        )
+        
+        return actions
+    }
+    
+    private fun isToday(date: Date): Boolean {
+        val today = Calendar.getInstance()
+        val notificationDate = Calendar.getInstance()
+        notificationDate.time = date
+        
+        return today.get(Calendar.YEAR) == notificationDate.get(Calendar.YEAR) &&
+               today.get(Calendar.DAY_OF_YEAR) == notificationDate.get(Calendar.DAY_OF_YEAR)
+    }
+    
+    private fun handleNavigateAction(action: NotificationAction) {
+        // Handle navigation action
+        // This would navigate to the appropriate screen
+    }
+    
+    private fun handleCallAction(action: NotificationAction) {
+        // Handle call action
+        // This would initiate a phone call
+    }
+    
+    private fun handleEmailAction(action: NotificationAction) {
+        // Handle email action
+        // This would open email client
+    }
+    
+    private fun handleDismissAction(notificationId: Long) {
+        // Handle dismiss action
+        // This might mark as read or remove notification
+    }
+    
+    private fun handleCustomAction(action: NotificationAction) {
+        // Handle custom action
+        // This would execute custom logic based on action data
+    }
+    
+    private suspend fun logNotificationAction(notificationId: Long, action: NotificationAction) {
+        try {
+            // Log notification action for analytics
+            database.notificationActionLogDao().logAction(
+                notificationId = notificationId,
+                actionId = action.id,
+                actionType = action.type.name,
+                timestamp = Date()
+            )
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun notifyNotificationAdded(notification: InAppNotification) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationAdded(notification)
+        }
+    }
+    
+    private fun notifyNotificationRead(notificationId: Long) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationRead(notificationId)
+        }
+    }
+    
+    private fun notifyNotificationUnread(notificationId: Long) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationUnread(notificationId)
+        }
+    }
+    
+    private fun notifyAllNotificationsRead() {
+        notificationListeners.forEach { listener ->
+            listener.onAllNotificationsRead()
+        }
+    }
+    
+    private fun notifyNotificationDeleted(notificationId: Long) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationDeleted(notificationId)
+        }
+    }
+    
+    private fun notifyAllNotificationsDeleted() {
+        notificationListeners.forEach { listener ->
+            listener.onAllNotificationsDeleted()
+        }
+    }
+    
+    private fun notifyNotificationsByCategoryDeleted(category: NotificationCategory) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationsByCategoryDeleted(category)
+        }
+    }
+    
+    private fun notifyNotificationExpansionToggled(notificationId: Long, isExpanded: Boolean) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationExpansionToggled(notificationId, isExpanded)
+        }
+    }
+    
+    private fun notifyNotificationActionHandled(notificationId: Long, action: NotificationAction) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationActionHandled(notificationId, action)
+        }
+    }
+}
+
+/**
+ * Data classes
+ */
+data class InAppNotification(
+    val id: Long,
+    val notificationId: Long,
+    val title: String,
+    val message: String,
+    val category: NotificationCategory,
+    val priority: NotificationPriority,
+    val status: NotificationStatus,
+    val isRead: Boolean,
+    val isExpanded: Boolean,
+    val actions: List<NotificationAction>,
+    val data: Map<String, String>,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val expiresAt: Date
+)
+
+data class NotificationAction(
+    val id: String,
+    val title: String,
+    val type: ActionType,
+    val data: Map<String, String>
+)
+
+data class InAppNotificationStats(
+    val totalCount: Int = 0,
+    val unreadCount: Int = 0,
+    val categoryStats: Map<NotificationCategory, Int> = emptyMap(),
+    val priorityStats: Map<NotificationPriority, Int> = emptyMap(),
+    val todayCount: Int = 0
+)
+
+/**
+ * Interfaces
+ */
+interface InAppNotificationListener {
+    fun onNotificationAdded(notification: InAppNotification)
+    fun onNotificationRead(notificationId: Long)
+    fun onNotificationUnread(notificationId: Long)
+    fun onAllNotificationsRead()
+    fun onNotificationDeleted(notificationId: Long)
+    fun onAllNotificationsDeleted()
+    fun onNotificationsByCategoryDeleted(category: NotificationCategory)
+    fun onNotificationExpansionToggled(notificationId: Long, isExpanded: Boolean)
+    fun onNotificationActionHandled(notificationId: Long, action: NotificationAction)
+}
+
+/**
+ * Enums
+ */
+enum class ActionType {
+    NAVIGATE,
+    CALL,
+    EMAIL,
+    DISMISS,
+    MARK_READ,
+    DELETE,
+    CUSTOM
+}

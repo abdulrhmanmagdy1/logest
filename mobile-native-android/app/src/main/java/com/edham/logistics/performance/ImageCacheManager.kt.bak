@@ -1,0 +1,403 @@
+package com.edham.logistics.performance
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.LruCache
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.security.MessageDigest
+import kotlin.system.measureTimeMillis
+
+/**
+ * Image Cache Manager for Edham Logistics
+ * مدير التخزين المؤقت للصور لتطبيق إدهام اللوجستي
+ */
+class ImageCacheManager private constructor(private val context: Context) {
+
+    companion object {
+        @Volatile
+        private var INSTANCE: ImageCacheManager? = null
+
+        fun getInstance(context: Context): ImageCacheManager {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: ImageCacheManager(context.applicationContext).also { INSTANCE = it }
+            }
+        }
+
+        // Cache sizes
+        private const val MEMORY_CACHE_SIZE = 50 * 1024 * 1024 // 50MB
+        private const val DISK_CACHE_SIZE = 100 * 1024 * 1024 // 100MB
+        private const val MAX_IMAGE_SIZE = 2048 // pixels
+    }
+
+    // Memory cache
+    private val memoryCache = object : LruCache<String, Bitmap>(MEMORY_CACHE_SIZE) {
+        override fun sizeOf(key: String, bitmap: Bitmap): Int {
+            return bitmap.byteCount
+        }
+
+        override fun entryRemoved(
+            evicted: Boolean,
+            key: String,
+            oldValue: Bitmap,
+            newValue: Bitmap?
+        ) {
+            if (evicted && !oldValue.isRecycled) {
+                oldValue.recycle()
+            }
+        }
+    }
+
+    // Disk cache directory
+    private val diskCacheDir = File(context.cacheDir, "image_cache")
+    private val diskCache = mutableMapOf<String, File>()
+
+    init {
+        // Initialize disk cache
+        if (!diskCacheDir.exists()) {
+            diskCacheDir.mkdirs()
+        }
+        
+        // Load existing disk cache files
+        loadDiskCache()
+    }
+
+    /**
+     * Get cached image
+     * الحصول على الصورة المخزنة مؤقتاً
+     */
+    suspend fun getCachedImage(url: String): Bitmap? = withContext(Dispatchers.IO) {
+        val key = generateKey(url)
+        
+        // Check memory cache first
+        memoryCache.get(key)?.let { return@withContext it }
+        
+        // Check disk cache
+        diskCache[key]?.let { file ->
+            try {
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+                if (bitmap != null) {
+                    // Add to memory cache
+                    memoryCache.put(key, bitmap)
+                    return@withContext bitmap
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                // Remove corrupted file
+                file.delete()
+                diskCache.remove(key)
+            }
+        }
+        
+        return@withContext null
+    }
+
+    /**
+     * Cache image
+     * تخزين الصورة مؤقتاً
+     */
+    suspend fun cacheImage(url: String, bitmap: Bitmap): Boolean = withContext(Dispatchers.IO) {
+        val key = generateKey(url)
+        
+        try {
+            // Add to memory cache
+            memoryCache.put(key, bitmap)
+            
+            // Save to disk cache
+            val file = File(diskCacheDir, key)
+            val success = saveBitmapToFile(bitmap, file)
+            
+            if (success) {
+                diskCache[key] = file
+            }
+            
+            return@withContext success
+            
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return@withContext false
+        }
+    }
+
+    /**
+     * Cache image from URL
+     * تخزين الصورة من الرابط
+     */
+    suspend fun cacheImageFromUrl(url: String): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            // Check if already cached
+            getCachedImage(url)?.let { return@withContext it }
+            
+            // Download image (simplified - in production use proper image loading library)
+            val bitmap = downloadImage(url)
+            
+            if (bitmap != null) {
+                cacheImage(url, bitmap)
+                return@withContext bitmap
+            }
+            
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        
+        return@withContext null
+    }
+
+    /**
+     * Clear cache
+     * مسح التخزين المؤقت
+     */
+    suspend fun clearCache() = withContext(Dispatchers.IO) {
+        try {
+            // Clear memory cache
+            memoryCache.evictAll()
+            
+            // Clear disk cache
+            diskCacheDir.deleteRecursively()
+            diskCache.clear()
+            
+            // Recreate directory
+            diskCacheDir.mkdirs()
+            
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Get cache statistics
+     * الحصول على إحصائيات التخزين المؤقت
+     */
+    fun getCacheStats(): CacheStats {
+        val memorySize = memoryCache.size()
+        val memoryCount = memoryCache.size()
+        
+        var diskSize = 0L
+        var diskCount = 0
+        
+        diskCache.values.forEach { file ->
+            if (file.exists()) {
+                diskSize += file.length()
+                diskCount++
+            }
+        }
+        
+        return CacheStats(
+            memorySize = memorySize,
+            memoryCount = memoryCount,
+            diskSize = diskSize,
+            diskCount = diskCount,
+            maxMemorySize = MEMORY_CACHE_SIZE,
+            maxDiskSize = DISK_CACHE_SIZE.toLong()
+        )
+    }
+
+    /**
+     * Optimize cache
+     * تحسين التخزين المؤقت
+     */
+    suspend fun optimizeCache() = withContext(Dispatchers.IO) {
+        try {
+            // Remove old files from disk cache
+            val currentTime = System.currentTimeMillis()
+            val maxAge = 7 * 24 * 60 * 60 * 1000L // 7 days
+            
+            diskCache.entries.removeAll { (key, file) ->
+                if (!file.exists() || currentTime - file.lastModified() > maxAge) {
+                    file.delete()
+                    true
+                } else {
+                    false
+                }
+            }
+            
+            // Trim memory cache if needed
+            if (memoryCache.size() > MEMORY_CACHE_SIZE * 0.8) {
+                memoryCache.trimToSize((MEMORY_CACHE_SIZE * 0.6).toInt())
+            }
+            
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Load existing disk cache
+     * تحميل التخزين المؤقت على القرص الموجود
+     */
+    private fun loadDiskCache() {
+        try {
+            diskCacheDir.listFiles()?.forEach { file ->
+                if (file.isFile && file.name.endsWith(".cache")) {
+                    diskCache[file.nameWithoutExtension] = file
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Generate cache key
+     * إنشاء مفتاح التخزين المؤقت
+     */
+    private fun generateKey(url: String): String {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val hash = digest.digest(url.toByteArray())
+            hash.joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            url.hashCode().toString()
+        }
+    }
+
+    /**
+     * Save bitmap to file
+     * حفظ الصورة في ملف
+     */
+    private fun saveBitmapToFile(bitmap: Bitmap, file: File): Boolean {
+        return try {
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            }
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    /**
+     * Download image (simplified implementation)
+     * تحميل الصورة (تنفيذ مبسط)
+     */
+    private suspend fun downloadImage(url: String): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            // In production, use proper HTTP client like OkHttp
+            // This is a simplified implementation
+            val connection = java.net.URL(url).openConnection()
+            connection.doInput = true
+            connection.connect()
+            
+            val input = connection.getInputStream()
+            val options = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            
+            BitmapFactory.decodeStream(input, null, options)
+            
+            // Calculate sample size
+            options.inSampleSize = calculateInSampleSize(options, MAX_IMAGE_SIZE, MAX_IMAGE_SIZE)
+            options.inJustDecodeBounds = false
+            
+            // Decode bitmap
+            BitmapFactory.decodeStream(java.net.URL(url).openStream(), null, options)
+            
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    /**
+     * Calculate in sample size for bitmap decoding
+     * حساب حجم العينة لفك ترميز الصورة
+     */
+    private fun calculateInSampleSize(
+        options: BitmapFactory.Options,
+        reqWidth: Int,
+        reqHeight: Int
+    ): Int {
+        val height = options.outHeight
+        val width = options.outWidth
+        var inSampleSize = 1
+
+        if (height > reqHeight || width > reqWidth) {
+            val halfHeight = height / 2
+            val halfWidth = width / 2
+
+            while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
+                inSampleSize *= 2
+            }
+        }
+
+        return inSampleSize
+    }
+
+    /**
+     * Cache statistics data class
+     */
+    data class CacheStats(
+        val memorySize: Int,
+        val memoryCount: Int,
+        val diskSize: Long,
+        val diskCount: Int,
+        val maxMemorySize: Int,
+        val maxDiskSize: Long
+    )
+}
+
+/**
+ * Image loading utilities
+ * أدوات تحميل الصور
+ */
+object ImageUtils {
+    
+    /**
+     * Load image with caching and optimization
+     * تحميل الصورة مع التخزين المؤقت والتحسين
+     */
+    suspend fun loadImage(
+        context: Context,
+        url: String,
+        maxWidth: Int = 1024,
+        maxHeight: Int = 1024
+    ): Bitmap? {
+        val cacheManager = ImageCacheManager.getInstance(context)
+        
+        // Try to get from cache first
+        cacheManager.getCachedImage(url)?.let { return it }
+        
+        // Load and optimize image
+        return try {
+            val bitmap = cacheManager.cacheImageFromUrl(url)
+            bitmap?.let {
+                // Optimize if needed
+                if (it.width > maxWidth || it.height > maxHeight) {
+                    optimizeBitmap(it, maxWidth, maxHeight)
+                } else {
+                    it
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+    
+    /**
+     * Optimize bitmap size
+     * تحسين حجم الصورة
+     */
+    private fun optimizeBitmap(
+        original: Bitmap,
+        maxWidth: Int,
+        maxHeight: Int
+    ): Bitmap {
+        val width = original.width
+        val height = original.height
+        
+        val ratio = minOf(
+            maxWidth.toFloat() / width,
+            maxHeight.toFloat() / height
+        )
+        
+        val newWidth = (width * ratio).toInt()
+        val newHeight = (height * ratio).toInt()
+        
+        return Bitmap.createScaledBitmap(original, newWidth, newHeight, true)
+    }
+}

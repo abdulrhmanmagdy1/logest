@@ -1,0 +1,294 @@
+package com.edham.logistics.feature.accountant.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.accountant.domain.usecase.*
+import com.edham.logistics.feature.accountant.domain.model.*
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class AccountantDashboardViewModel @Inject constructor(
+    private val getAccountantDashboardUseCase: GetAccountantDashboardUseCase,
+    private val getInvoicesUseCase: GetInvoicesUseCase,
+    private val getPaymentsUseCase: GetPaymentsUseCase,
+    private val getDebtsUseCase: GetDebtsUseCase,
+    private val generateReportUseCase: GenerateReportUseCase,
+    private val createInvoiceUseCase: CreateInvoiceUseCase,
+    private val recordPaymentUseCase: RecordPaymentUseCase
+) : BaseViewModel<AccountantDashboardViewModel.AccountantDashboardUiState>() {
+
+    private val _uiState = MutableStateFlow(AccountantDashboardUiState())
+    val uiState: StateFlow<AccountantDashboardUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): AccountantDashboardUiState = AccountantDashboardUiState()
+
+    fun initialize() {
+        loadDashboard()
+    }
+
+    fun loadDashboard() {
+        viewModelScope.launch {
+            getAccountantDashboardUseCase().collect { result ->
+                when (result) {
+                    is Result.Loading -> {
+                        updateUiState { copy(isLoading = true, error = null) }
+                    }
+                    is Result.Success -> {
+                        updateUiState {
+                            copy(
+                                isLoading = false,
+                                dashboardData = result.data,
+                                error = null
+                            )
+                        }
+                    }
+                    is Result.Error -> {
+                        updateUiState {
+                            copy(
+                                isLoading = false,
+                                error = result.exception.message ?: "فشل تحميل لوحة التحكم"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun loadInvoices(
+        page: Int = 1,
+        pageSize: Int = 20,
+        status: String? = null,
+        customerId: String? = null,
+        search: String? = null
+    ) {
+        viewModelScope.launch {
+            getInvoicesUseCase(page, pageSize, status, customerId, search).collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            invoices = result.data,
+                            invoicesLoading = false
+                        )}
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(
+                            invoicesLoading = false,
+                            error = result.exception.message ?: "فشل تحميل الفواتير"
+                        )}
+                    }
+                    is Result.Loading -> {
+                        updateUiState { copy(invoicesLoading = true) }
+                    }
+                }
+            }
+        }
+    }
+
+    fun loadPayments(
+        page: Int = 1,
+        pageSize: Int = 20,
+        status: String? = null,
+        paymentMethod: String? = null,
+        customerId: String? = null,
+        search: String? = null
+    ) {
+        viewModelScope.launch {
+            getPaymentsUseCase(page, pageSize, status, paymentMethod, customerId, search).collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            payments = result.data,
+                            paymentsLoading = false
+                        )}
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(
+                            paymentsLoading = false,
+                            error = result.exception.message ?: "فشل تحميل المدفوعات"
+                        )}
+                    }
+                    is Result.Loading -> {
+                        updateUiState { copy(paymentsLoading = true) }
+                    }
+                }
+            }
+        }
+    }
+
+    fun loadDebts(
+        page: Int = 1,
+        pageSize: Int = 20,
+        status: String? = null,
+        customerId: String? = null,
+        isOverdue: Boolean? = null
+    ) {
+        viewModelScope.launch {
+            getDebtsUseCase(page, pageSize, status, customerId, isOverdue).collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            debts = result.data,
+                            debtsLoading = false
+                        )}
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(
+                            debtsLoading = false,
+                            error = result.exception.message ?: "فشل تحميل الديون"
+                        )}
+                    }
+                    is Result.Loading -> {
+                        updateUiState { copy(debtsLoading = true) }
+                    }
+                }
+            }
+        }
+    }
+
+    fun generateReport(
+        reportType: ReportType,
+        startDate: String,
+        endDate: String,
+        format: ReportFormat
+    ) {
+        viewModelScope.launch {
+            val request = GenerateReportRequest(
+                reportType = reportType,
+                startDate = startDate,
+                endDate = endDate,
+                format = format,
+                filters = null
+            )
+            
+            when (val result = generateReportUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        actionSuccess = "تم إنشاء التقرير بنجاح",
+                        error = null,
+                        generatedReport = result.data
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل إنشاء التقرير") }
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun createInvoice(
+        customerId: String,
+        shipmentId: String,
+        items: List<InvoiceItem>,
+        issueDate: String,
+        dueDate: String,
+        notes: String? = null
+    ) {
+        viewModelScope.launch {
+            val request = CreateInvoiceRequest(
+                customerId = customerId,
+                shipmentId = shipmentId,
+                items = items,
+                issueDate = issueDate,
+                dueDate = dueDate,
+                notes = notes
+            )
+            
+            when (val result = createInvoiceUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        actionSuccess = "تم إنشاء الفاتورة بنجاح",
+                        error = null
+                    )}
+                    loadInvoices() // Refresh invoices
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل إنشاء الفاتورة") }
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun recordPayment(
+        invoiceId: String,
+        amount: Double,
+        paymentMethod: PaymentMethod,
+        paymentDate: String,
+        notes: String? = null,
+        transactionId: String? = null
+    ) {
+        viewModelScope.launch {
+            val request = CreatePaymentRequest(
+                invoiceId = invoiceId,
+                amount = amount,
+                paymentMethod = paymentMethod,
+                paymentDate = paymentDate,
+                notes = notes,
+                transactionId = transactionId
+            )
+            
+            when (val result = recordPaymentUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        actionSuccess = "تم تسجيل الدفعة بنجاح",
+                        error = null
+                    )}
+                    loadPayments() // Refresh payments
+                    loadDashboard() // Refresh dashboard stats
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تسجيل الدفعة") }
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun clearError() {
+        updateUiState { copy(error = null) }
+    }
+
+    fun clearSuccess() {
+        updateUiState { copy(actionSuccess = null) }
+    }
+
+    fun clearGeneratedReport() {
+        updateUiState { copy(generatedReport = null) }
+    }
+
+    fun refresh() {
+        loadDashboard()
+    }
+
+    data class AccountantDashboardUiState(
+        val isLoading: Boolean = false,
+        val invoicesLoading: Boolean = false,
+        val paymentsLoading: Boolean = false,
+        val debtsLoading: Boolean = false,
+        val dashboardData: AccountantDashboardData? = null,
+        val invoices: List<Invoice>? = null,
+        val payments: List<Payment>? = null,
+        val debts: List<Debt>? = null,
+        val generatedReport: FinancialReport? = null,
+        val error: String? = null,
+        val actionSuccess: String? = null
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = copy(actionSuccess = message)
+    }
+}

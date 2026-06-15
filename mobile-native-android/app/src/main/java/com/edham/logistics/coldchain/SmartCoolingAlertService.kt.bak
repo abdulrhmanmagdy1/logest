@@ -1,0 +1,557 @@
+package com.edham.logistics.coldchain
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import com.github.mikephil.charting.data.*
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Smart Cooling Alert Service for Android - Temperature Monitoring with Multi-level Alerts
+ */
+class SmartCoolingAlertService {
+    
+    private val _activeAlerts = MutableStateFlow<List<SmartCoolingAlert>>(emptyList())
+    val activeAlerts: StateFlow<List<SmartCoolingAlert>> = _activeAlerts.asStateFlow()
+    
+    private val _temperatureHistory = MutableStateFlow<Map<String, List<TemperatureReading>>>(emptyMap())
+    val temperatureHistory: StateFlow<Map<String, List<TemperatureReading>>> = _temperatureHistory.asStateFlow()
+    
+    private val _failurePredictions = MutableStateFlow<Map<String, CoolingFailurePrediction>>(emptyMap())
+    val failurePredictions: StateFlow<Map<String, CoolingFailurePrediction>> = _failurePredictions.asStateFlow()
+    
+    private val _alertStatistics = MutableStateFlow<AlertStatistics>(AlertStatistics())
+    val alertStatistics: StateFlow<AlertStatistics> = _alertStatistics.asStateFlow()
+    
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val activeAlertsMap = ConcurrentHashMap<String, SmartCoolingAlert>()
+    private val temperatureReadingsMap = ConcurrentHashMap<String, MutableList<TemperatureReading>>()
+    private val failurePredictionsMap = ConcurrentHashMap<String, CoolingFailurePrediction>()
+    
+    // Alert level definitions
+    enum class AlertLevel(val arabicName: String, val severity: Int, val color: String, val escalationMinutes: Int) {
+        WARNING("تحذير", 1, "#F59E0B", 30),
+        CRITICAL("حرج", 2, "#EF4444", 15),
+        EMERGENCY("طوارئ", 3, "#DC2626", 5)
+    }
+    
+    // Risk level definitions
+    enum class RiskLevel(val arabicName: String, val color: String, val minScore: Double, val maxScore: Double) {
+        LOW("منخفض", "#10B981", 0.0, 0.29),
+        MEDIUM("متوسط", "#F59E0B", 0.30, 0.59),
+        HIGH("مرتفع", "#EF4444", 0.60, 0.79),
+        CRITICAL("حرج", "#DC2626", 0.80, 1.00)
+    }
+    
+    /**
+     * Smart Cooling Alert data class
+     */
+    data class SmartCoolingAlert(
+        val alertId: String,
+        val shipmentId: String,
+        val level: AlertLevel,
+        val currentTemperature: Double,
+        val thresholdTemperature: Double,
+        val productType: String,
+        val createdAt: LocalDateTime,
+        var lastEscalated: LocalDateTime? = null,
+        var escalationCount: Int = 0,
+        var acknowledged: Boolean = false,
+        var acknowledgedBy: String? = null,
+        var acknowledgedAt: LocalDateTime? = null,
+        val notifiedUsers: MutableList<String> = mutableListOf(),
+        val alertReason: String,
+        val temperatureDeviation: Double,
+        var durationMinutes: Int = 0,
+        var autoResolved: Boolean = false
+    )
+    
+    /**
+     * Temperature Reading data class
+     */
+    data class TemperatureReading(
+        val timestamp: LocalDateTime,
+        val temperature: Double,
+        val sensorId: String,
+        val batteryLevel: Double,
+        val location: String
+    )
+    
+    /**
+     * Cooling Failure Prediction data class
+     */
+    data class CoolingFailurePrediction(
+        val shipmentId: String,
+        var riskScore: Double = 0.0,
+        var riskLevel: String = "LOW",
+        var predictedFailureTime: LocalDateTime? = null,
+        val riskFactors: MutableList<String> = mutableListOf(),
+        var confidenceLevel: Double = 0.0,
+        var recommendation: String = "",
+        var lastUpdated: LocalDateTime = LocalDateTime.now()
+    )
+    
+    /**
+     * Alert Statistics data class
+     */
+    data class AlertStatistics(
+        val totalActiveAlerts: Int = 0,
+        val warningAlerts: Int = 0,
+        val criticalAlerts: Int = 0,
+        val emergencyAlerts: Int = 0,
+        val acknowledgedAlerts: Int = 0,
+        val autoResolvedAlerts: Int = 0,
+        val riskLevelDistribution: Map<String, Int> = emptyMap()
+    )
+    
+    /**
+     * Process new temperature reading
+     */
+    fun processTemperatureReading(
+        shipmentId: String,
+        temperature: Double,
+        productType: String,
+        sensorId: String = "SENSOR_DEFAULT",
+        batteryLevel: Double = 100.0,
+        location: String = "Unknown"
+    ) {
+        serviceScope.launch {
+            try {
+                // Store temperature reading
+                val reading = TemperatureReading(
+                    LocalDateTime.now(),
+                    temperature,
+                    sensorId,
+                    batteryLevel,
+                    location
+                )
+                
+                temperatureReadingsMap.computeIfAbsent(shipmentId) { mutableListOf() }.add(reading)
+                
+                // Keep only last 100 readings
+                val readings = temperatureReadingsMap[shipmentId]!!
+                if (readings.size > 100) {
+                    readings.removeAt(0)
+                }
+                
+                // Update temperature history flow
+                _temperatureHistory.value = temperatureReadingsMap.toMap()
+                
+                // Check temperature thresholds
+                checkTemperatureThresholds(shipmentId, temperature, productType)
+                
+                // Update failure prediction
+                updateFailurePrediction(shipmentId, readings)
+                
+                // Update statistics
+                updateAlertStatistics()
+                
+            } catch (e: Exception) {
+                // Handle error
+                e.printStackTrace()
+            }
+        }
+    }
+    
+    /**
+     * Check temperature thresholds and trigger alerts
+     */
+    private fun checkTemperatureThresholds(shipmentId: String, temperature: Double, productType: String) {
+        val warningThreshold = getWarningThreshold(productType)
+        val criticalThreshold = getCriticalThreshold(productType)
+        val emergencyThreshold = getEmergencyThreshold(productType)
+        
+        val alertLevel = when {
+            temperature >= emergencyThreshold -> AlertLevel.EMERGENCY to "درجة الحرارة في مستوى الطوارئ"
+            temperature >= criticalThreshold -> AlertLevel.CRITICAL to "درجة الحرارة في المستوى الحرج"
+            temperature >= warningThreshold -> AlertLevel.WARNING to "درجة الحرارة في مستوى التحذير"
+            else -> null
+        }
+        
+        if (alertLevel != null) {
+            createOrUpdateAlert(shipmentId, alertLevel.first, temperature, warningThreshold, productType, alertLevel.second)
+        } else {
+            // Check if existing alerts should be auto-resolved
+            autoResolveAlerts(shipmentId, temperature, productType)
+        }
+    }
+    
+    /**
+     * Create or update alert
+     */
+    private fun createOrUpdateAlert(
+        shipmentId: String,
+        level: AlertLevel,
+        temperature: Double,
+        threshold: Double,
+        productType: String,
+        reason: String
+    ) {
+        val existingAlert = activeAlertsMap[shipmentId]
+        
+        if (existingAlert == null || existingAlert.level.severity < level.severity) {
+            val alert = SmartCoolingAlert(
+                alertId = java.util.UUID.randomUUID().toString(),
+                shipmentId = shipmentId,
+                level = level,
+                currentTemperature = temperature,
+                thresholdTemperature = threshold,
+                productType = productType,
+                createdAt = LocalDateTime.now(),
+                alertReason = reason,
+                temperatureDeviation = kotlin.math.abs(temperature - threshold)
+            )
+            
+            activeAlertsMap[shipmentId] = alert
+            _activeAlerts.value = activeAlertsMap.values.toList()
+            
+            // Send local notification
+            sendLocalNotification(alert)
+        } else if (existingAlert != null) {
+            // Update existing alert
+            val updatedAlert = existingAlert.copy(
+                currentTemperature = temperature,
+                temperatureDeviation = kotlin.math.abs(temperature - threshold),
+                durationMinutes = java.time.Duration.between(existingAlert.createdAt, LocalDateTime.now()).toInt().also {
+                    existingAlert.durationMinutes = it
+                }
+            )
+            activeAlertsMap[shipmentId] = updatedAlert
+            _activeAlerts.value = activeAlertsMap.values.toList()
+        }
+    }
+    
+    /**
+     * Auto-resolve alerts when temperature returns to normal
+     */
+    private fun autoResolveAlerts(shipmentId: String, temperature: Double, productType: String) {
+        val alert = activeAlertsMap[shipmentId]
+        if (alert != null && !alert.acknowledged) {
+            val normalThreshold = getNormalThreshold(productType)
+            
+            if (temperature <= normalThreshold) {
+                val resolvedAlert = alert.copy(autoResolved = true)
+                activeAlertsMap[shipmentId] = resolvedAlert
+                _activeAlerts.value = activeAlertsMap.values.toList()
+                
+                // Send resolution notification
+                sendResolutionNotification(resolvedAlert, temperature)
+                
+                // Remove from active alerts after 5 minutes
+                serviceScope.launch {
+                    delay(5 * 60 * 1000) // 5 minutes
+                    activeAlertsMap.remove(shipmentId)
+                    _activeAlerts.value = activeAlertsMap.values.toList()
+                }
+            }
+        }
+    }
+    
+    /**
+     * Update cooling failure prediction
+     */
+    private fun updateFailurePrediction(shipmentId: String, readings: List<TemperatureReading>) {
+        if (readings.size < 10) return // Need sufficient data for prediction
+        
+        val prediction = failurePredictionsMap.computeIfAbsent(shipmentId) {
+            CoolingFailurePrediction(shipmentId)
+        }
+        
+        // Analyze temperature trends
+        val temperatures = readings.map { it.temperature }
+        
+        // Calculate risk factors
+        val riskFactors = mutableListOf<String>()
+        var riskScore = 0.0
+        
+        // Factor 1: Temperature trend analysis
+        val trend = calculateTemperatureTrend(temperatures)
+        if (trend > 0.5) {
+            riskScore += 0.3
+            riskFactors.add("ارتفاع مستمر في درجة الحرارة")
+        }
+        
+        // Factor 2: Temperature volatility
+        val volatility = calculateTemperatureVolatility(temperatures)
+        if (volatility > 2.0) {
+            riskScore += 0.2
+            riskFactors.add("تقلبات شديدة في درجة الحرارة")
+        }
+        
+        // Factor 3: Sensor battery level
+        val avgBatteryLevel = readings.map { it.batteryLevel }.average()
+        if (avgBatteryLevel < 20) {
+            riskScore += 0.25
+            riskFactors.add("بطارية المستشعر منخفضة")
+        }
+        
+        // Factor 4: Recent alerts
+        val alert = activeAlertsMap[shipmentId]
+        if (alert != null && alert.level.severity >= AlertLevel.CRITICAL.severity) {
+            riskScore += 0.25
+            riskFactors.add("تنبيهات حرجة نشطة")
+        }
+        
+        // Update prediction
+        prediction.riskScore = kotlin.math.min(riskScore, 1.0)
+        prediction.riskFactors.clear()
+        prediction.riskFactors.addAll(riskFactors)
+        prediction.lastUpdated = LocalDateTime.now()
+        
+        // Determine risk level
+        when {
+            riskScore >= 0.8 -> {
+                prediction.riskLevel = "CRITICAL"
+                prediction.recommendation = "اتخذ إجراء فوري لمنع فشل التبريد"
+                prediction.predictedFailureTime = LocalDateTime.now().plusHours(2)
+            }
+            riskScore >= 0.6 -> {
+                prediction.riskLevel = "HIGH"
+                prediction.recommendation = "راقب النظام عن كثب واستعد للإجراءات الوقائية"
+                prediction.predictedFailureTime = LocalDateTime.now().plusHours(6)
+            }
+            riskScore >= 0.3 -> {
+                prediction.riskLevel = "MEDIUM"
+                prediction.recommendation = "تحقق من نظام التبريد وصيانته"
+                prediction.predictedFailureTime = LocalDateTime.now().plusHours(12)
+            }
+            else -> {
+                prediction.riskLevel = "LOW"
+                prediction.recommendation = "الوضع طبيعي، استمر في المراقبة"
+            }
+        }
+        
+        // Calculate confidence based on data quality
+        prediction.confidenceLevel = kotlin.math.min(readings.size / 50.0, 1.0)
+        
+        failurePredictionsMap[shipmentId] = prediction
+        _failurePredictions.value = failurePredictionsMap.toMap()
+    }
+    
+    /**
+     * Calculate temperature trend
+     */
+    private fun calculateTemperatureTrend(temperatures: List<Double>): Double {
+        if (temperatures.size < 2) return 0.0
+        
+        // Simple linear regression
+        val n = temperatures.size.toDouble()
+        var sumX = 0.0
+        var sumY = 0.0
+        var sumXY = 0.0
+        var sumX2 = 0.0
+        
+        for (i in temperatures.indices) {
+            sumX += i
+            sumY += temperatures[i]
+            sumXY += i * temperatures[i]
+            sumX2 += i * i
+        }
+        
+        val slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX)
+        return slope
+    }
+    
+    /**
+     * Calculate temperature volatility
+     */
+    private fun calculateTemperatureVolatility(temperatures: List<Double>): Double {
+        if (temperatures.size < 2) return 0.0
+        
+        val mean = temperatures.average()
+        val variance = temperatures.map { kotlin.math.pow(it - mean, 2.0) }.average()
+        return kotlin.math.sqrt(variance)
+    }
+    
+    /**
+     * Send local notification for alert
+     */
+    private fun sendLocalNotification(alert: SmartCoolingAlert) {
+        // Implementation would depend on the notification system
+        // This is a placeholder for the actual notification implementation
+        println("ALERT: ${alert.level.arabicName} - ${alert.alertReason}")
+        println("Shipment: ${alert.shipmentId}, Temperature: ${alert.currentTemperature}°C")
+    }
+    
+    /**
+     * Send resolution notification
+     */
+    private fun sendResolutionNotification(alert: SmartCoolingAlert, normalTemperature: Double) {
+        println("RESOLVED: Alert for shipment ${alert.shipmentId} - Temperature back to normal: ${normalTemperature}°C")
+    }
+    
+    /**
+     * Update alert statistics
+     */
+    private fun updateAlertStatistics() {
+        val alerts = activeAlertsMap.values.toList()
+        
+        val statistics = AlertStatistics(
+            totalActiveAlerts = alerts.size,
+            warningAlerts = alerts.count { it.level == AlertLevel.WARNING },
+            criticalAlerts = alerts.count { it.level == AlertLevel.CRITICAL },
+            emergencyAlerts = alerts.count { it.level == AlertLevel.EMERGENCY },
+            acknowledgedAlerts = alerts.count { it.acknowledged },
+            autoResolvedAlerts = alerts.count { it.autoResolved },
+            riskLevelDistribution = failurePredictionsMap.values.groupingBy { it.riskLevel }.eachCount()
+        )
+        
+        _alertStatistics.value = statistics
+    }
+    
+    /**
+     * Acknowledge alert
+     */
+    fun acknowledgeAlert(alertId: String, userId: String) {
+        serviceScope.launch {
+            val alert = activeAlertsMap.values.find { it.alertId == alertId }
+            if (alert != null) {
+                val acknowledgedAlert = alert.copy(
+                    acknowledged = true,
+                    acknowledgedBy = userId,
+                    acknowledgedAt = LocalDateTime.now()
+                )
+                activeAlertsMap[alert.shipmentId] = acknowledgedAlert
+                _activeAlerts.value = activeAlertsMap.values.toList()
+                updateAlertStatistics()
+            }
+        }
+    }
+    
+    /**
+     * Get temperature chart data
+     */
+    fun getTemperatureChartData(shipmentId: String, hours: Int = 24): LineData {
+        val readings = temperatureReadingsMap[shipmentId]?.takeLast(hours * 2) ?: emptyList()
+        
+        val entries = readings.mapIndexed { index, reading ->
+            Entry(index.toFloat(), reading.temperature.toFloat())
+        }
+        
+        val dataSet = LineDataSet(entries, "درجة الحرارة").apply {
+            color = android.graphics.Color.parseColor("#F97316")
+            setCircleColor(android.graphics.Color.parseColor("#F97316"))
+            lineWidth = 2f
+            circleRadius = 4f
+            setDrawFilled(true)
+            fillColor = android.graphics.Color.parseColor("#F97316")
+            fillAlpha = 30
+        }
+        
+        return LineData(dataSet)
+    }
+    
+    /**
+     * Get temperature threshold lines for chart
+     */
+    fun getThresholdLines(productType: String): List<LimitLine> {
+        val lines = mutableListOf<LimitLine>()
+        
+        val warningThreshold = getWarningThreshold(productType)
+        val criticalThreshold = getCriticalThreshold(productType)
+        val emergencyThreshold = getEmergencyThreshold(productType)
+        
+        lines.add(LimitLine(warningThreshold.toFloat(), "تحذير").apply {
+            lineColor = android.graphics.Color.parseColor("#F59E0B")
+            lineWidth = 2f
+            enableDashedLine(10f, 10f, 0f)
+        })
+        
+        lines.add(LimitLine(criticalThreshold.toFloat(), "حرج").apply {
+            lineColor = android.graphics.Color.parseColor("#EF4444")
+            lineWidth = 2f
+            enableDashedLine(10f, 10f, 0f)
+        })
+        
+        lines.add(LimitLine(emergencyThreshold.toFloat(), "طوارئ").apply {
+            lineColor = android.graphics.Color.parseColor("#DC2626")
+            lineWidth = 2f
+            enableDashedLine(10f, 10f, 0f)
+        })
+        
+        return lines
+    }
+    
+    /**
+     * Get temperature thresholds based on product type
+     */
+    private fun getWarningThreshold(productType: String): Double {
+        return when (productType.uppercase()) {
+            "FROZEN" -> -15.0
+            "REFRIGERATED" -> 8.0
+            "AMBIENT" -> 25.0
+            "PHARMACEUTICAL" -> 8.0
+            else -> 25.0
+        }
+    }
+    
+    private fun getCriticalThreshold(productType: String): Double {
+        return when (productType.uppercase()) {
+            "FROZEN" -> -12.0
+            "REFRIGERATED" -> 10.0
+            "AMBIENT" -> 30.0
+            "PHARMACEUTICAL" -> 12.0
+            else -> 30.0
+        }
+    }
+    
+    private fun getEmergencyThreshold(productType: String): Double {
+        return when (productType.uppercase()) {
+            "FROZEN" -> -10.0
+            "REFRIGERATED" -> 15.0
+            "AMBIENT" -> 35.0
+            "PHARMACEUTICAL" -> 15.0
+            else -> 35.0
+        }
+    }
+    
+    private fun getNormalThreshold(productType: String): Double {
+        return when (productType.uppercase()) {
+            "FROZEN" -> -18.0
+            "REFRIGERATED" -> 4.0
+            "AMBIENT" -> 20.0
+            "PHARMACEUTICAL" -> 5.0
+            else -> 20.0
+        }
+    }
+    
+    /**
+     * Get alert by ID
+     */
+    fun getAlert(alertId: String): SmartCoolingAlert? {
+        return activeAlertsMap.values.find { it.alertId == alertId }
+    }
+    
+    /**
+     * Get failure prediction for shipment
+     */
+    fun getFailurePrediction(shipmentId: String): CoolingFailurePrediction? {
+        return failurePredictionsMap[shipmentId]
+    }
+    
+    /**
+     * Get temperature history for shipment
+     */
+    fun getTemperatureHistory(shipmentId: String, hours: Int = 24): List<TemperatureReading> {
+        val readings = temperatureReadingsMap[shipmentId] ?: return emptyList()
+        val cutoff = LocalDateTime.now().minusHours(hours.toLong())
+        
+        return readings.filter { it.timestamp.isAfter(cutoff) }
+            .sortedByDescending { it.timestamp }
+    }
+    
+    /**
+     * Clear all data (for testing)
+     */
+    fun clearAllData() {
+        activeAlertsMap.clear()
+        temperatureReadingsMap.clear()
+        failurePredictionsMap.clear()
+        
+        _activeAlerts.value = emptyList()
+        _temperatureHistory.value = emptyMap()
+        _failurePredictions.value = emptyMap()
+        _alertStatistics.value = AlertStatistics()
+    }
+}

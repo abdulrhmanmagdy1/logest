@@ -1,0 +1,530 @@
+package com.edham.logistics.shipment
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
+import android.util.Base64
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.ShipmentEntity
+import com.edham.logistics.data.local.entity.ShipmentScanEntity
+import com.edham.logistics.data.remote.api.ShipmentApi
+import com.edham.logistics.utils.NetworkUtils
+import com.google.zxing.*
+import com.google.zxing.common.HybridBinarizer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Barcode/QR Scanner Manager - Advanced barcode and QR code scanning system
+ * 
+ * Features:
+ * - Barcode and QR code scanning
+ * - Shipment identification
+ * - Package tracking
+ * - Scan history
+ * - Multiple format support
+ * - Real-time validation
+ */
+@Singleton
+class BarcodeScannerManager @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val shipmentApi: ShipmentApi,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _scannerState = MutableStateFlow<ScannerState>(ScannerState.Idle)
+    val scannerState: StateFlow<ScannerState> = _scannerState.asStateFlow()
+    
+    private val _scanResult = MutableStateFlow<ScanResult?>(null)
+    val scanResult: StateFlow<ScanResult?> = _scanResult.asStateFlow()
+    
+    private val _scanHistory = MutableStateFlow<List<ShipmentScanEntity>>(emptyList())
+    val scanHistory: StateFlow<List<ShipmentScanEntity>> = _scanHistory.asStateFlow()
+    
+    private val _supportedFormats = MutableStateFlow<List<BarcodeFormat>>(emptyList())
+    val supportedFormats: StateFlow<List<BarcodeFormat>> = _supportedFormats.asStateFlow()
+    
+    private var isScanning = false
+    private val reader: MultiFormatReader = MultiFormatReader()
+    private var lastScanTime = 0L
+    private var scanCount = 0
+    
+    companion object {
+        private const val TAG = "BarcodeScannerManager"
+        private const val SCAN_COOLDOWN = 1000L // 1 second between scans
+        private const val MAX_SCAN_HISTORY = 1000
+        private const val BARCODE_PREFIX = "BC"
+        private const val QR_PREFIX = "QR"
+    }
+    
+    init {
+        initializeSupportedFormats()
+    }
+    
+    /**
+     * Initialize supported barcode formats
+     */
+    private fun initializeSupportedFormats() {
+        val formats = listOf(
+            BarcodeFormat.QR_CODE,
+            BarcodeFormat.CODE_128,
+            BarcodeFormat.CODE_39,
+            BarcodeFormat.EAN_13,
+            BarcodeFormat.EAN_8,
+            BarcodeFormat.UPC_A,
+            BarcodeFormat.UPC_E,
+            BarcodeFormat.DATA_MATRIX,
+            BarcodeFormat.PDF_417
+        )
+        
+        _supportedFormats.value = formats
+        
+        val hints = mapOf(
+            DecodeHintType.POSSIBLE_FORMATS to formats,
+            DecodeHintType.TRY_HARDER to true,
+            DecodeHintType.CHARACTER_SET to "UTF-8"
+        )
+        
+        reader.setHints(hints)
+    }
+    
+    /**
+     * Start scanning
+     */
+    fun startScanning() {
+        if (isScanning) return
+        
+        try {
+            _scannerState.value = ScannerState.Starting
+            isScanning = true
+            _scannerState.value = ScannerState.Ready
+        } catch (e: Exception) {
+            _scannerState.value = ScannerState.Error("Failed to start scanner: ${e.message}")
+        }
+    }
+    
+    /**
+     * Stop scanning
+     */
+    fun stopScanning() {
+        isScanning = false
+        _scannerState.value = ScannerState.Stopped
+    }
+    
+    /**
+     * Process camera frame for barcode detection
+     */
+    suspend fun processFrame(
+        data: ByteArray,
+        width: Int,
+        height: Int,
+        format: Int,
+        rotation: Int
+    ): Result<ScanResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isScanning) {
+                    throw Exception("Scanner is not active")
+                }
+                
+                // Check scan cooldown
+                val currentTime = System.currentTimeMillis()
+                if (currentTime - lastScanTime < SCAN_COOLDOWN) {
+                    throw Exception("Scan cooldown active")
+                }
+                
+                _scannerState.value = ScannerState.Scanning
+                
+                // Convert image data to luminance source
+                val luminanceSource = createLuminanceSource(data, width, height, format, rotation)
+                
+                // Create binary bitmap
+                val binaryBitmap = BinaryBitmap(HybridBinarizer(luminanceSource))
+                
+                // Try to decode barcode
+                val result = reader.decodeWithState(binaryBitmap)
+                
+                // Process scan result
+                val scanResult = processScanResult(result)
+                
+                // Update scan time
+                lastScanTime = currentTime
+                scanCount++
+                
+                _scannerState.value = ScannerState.ScanSuccess
+                Result.success(scanResult)
+                
+            } catch (e: NotFoundException) {
+                _scannerState.value = ScannerState.NoBarcodeFound
+                Result.failure(Exception("No barcode found"))
+            } catch (e: Exception) {
+                _scannerState.value = ScannerState.Error("Scan failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process manual barcode input
+     */
+    suspend fun processManualInput(barcode: String): Result<ScanResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _scannerState.value = ScannerState.Processing
+                
+                // Validate barcode format
+                if (!isValidBarcodeFormat(barcode)) {
+                    throw Exception("Invalid barcode format")
+                }
+                
+                // Process barcode
+                val scanResult = processBarcodeString(barcode)
+                
+                _scannerState.value = ScannerState.ScanSuccess
+                Result.success(scanResult)
+                
+            } catch (e: Exception) {
+                _scannerState.value = ScannerState.Error("Processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate barcode for shipment
+     */
+    suspend fun generateBarcode(shipmentId: String, format: BarcodeFormat): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val barcode = when (format) {
+                    BarcodeFormat.QR_CODE -> generateQRCode(shipmentId)
+                    BarcodeFormat.CODE_128 -> generateCode128(shipmentId)
+                    else -> generateGenericBarcode(shipmentId, format)
+                }
+                
+                Result.success(barcode)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Validate barcode
+     */
+    suspend fun validateBarcode(barcode: String): Result<ValidationResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Check format validity
+                if (!isValidBarcodeFormat(barcode)) {
+                    Result.success(ValidationResult(false, "Invalid barcode format"))
+                }
+                
+                // Check if shipment exists
+                val shipment = findShipmentByBarcode(barcode)
+                if (shipment == null) {
+                    Result.success(ValidationResult(false, "Shipment not found"))
+                } else {
+                    Result.success(ValidationResult(true, "Valid shipment", shipment))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get scan history
+     */
+    suspend fun getScanHistory(limit: Int = 100): List<ShipmentScanEntity> {
+        return withContext(Dispatchers.IO) {
+            database.shipmentScanDao().getAllScans().take(limit)
+        }
+    }
+    
+    /**
+     * Get scan statistics
+     */
+    suspend fun getScanStats(): ScanStats {
+        return withContext(Dispatchers.IO) {
+            val allScans = database.shipmentScanDao().getAllScans()
+            
+            val totalScans = allScans.size
+            val todayScans = allScans.count { isToday(it.scannedAt) }
+            val successfulScans = allScans.count { it.isValid }
+            val failedScans = totalScans - successfulScans
+            val uniqueShipments = allScans.map { it.shipmentId }.distinct().size
+            
+            ScanStats(
+                totalScans = totalScans,
+                todayScans = todayScans,
+                successfulScans = successfulScans,
+                failedScans = failedScans,
+                successRate = if (totalScans > 0) successfulScans.toFloat() / totalScans else 0f,
+                uniqueShipments = uniqueShipments,
+                averageScansPerHour = calculateAverageScansPerHour(allScans)
+            )
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private fun createLuminanceSource(
+        data: ByteArray,
+        width: Int,
+        height: Int,
+        format: Int,
+        rotation: Int
+    ): LuminanceSource {
+        // Convert image data based on format
+        val yuvData = when (format) {
+            ImageFormat.NV21 -> data
+            ImageFormat.YUV_420_888 -> convertYUV420ToNV21(data, width, height)
+            else -> data
+        }
+        
+        // Apply rotation if needed
+        val rotatedData = if (rotation != 0) {
+            rotateYUVData(yuvData, width, height, rotation)
+        } else {
+            yuvData
+        }
+        
+        return PlanarYUVLuminanceSource(
+            rotatedData,
+            width,
+            height,
+            0,
+            0,
+            width,
+            height
+        )
+    }
+    
+    private fun convertYUV420ToNV21(data: ByteArray, width: Int, height: Int): ByteArray {
+        // Implementation would convert YUV_420_888 to NV21
+        return data // Placeholder
+    }
+    
+    private fun rotateYUVData(data: ByteArray, width: Int, height: Int, rotation: Int): ByteArray {
+        // Implementation would rotate YUV data
+        return data // Placeholder
+    }
+    
+    private suspend fun processScanResult(result: Result): ScanResult {
+        val barcode = result.text
+        val format = result.barcodeFormat
+        
+        // Validate and find shipment
+        val shipment = findShipmentByBarcode(barcode)
+        val isValid = shipment != null
+        
+        // Create scan entity
+        val scanEntity = ShipmentScanEntity(
+            id = 0,
+            shipmentId = shipment?.id ?: 0L,
+            barcode = barcode,
+            format = format.toString(),
+            scannedAt = Date(),
+            isValid = isValid,
+            scanData = result.resultMetadata.toString(),
+            createdAt = Date()
+        )
+        
+        // Save to database
+        val scanId = database.shipmentScanDao().insertScan(scanEntity)
+        val savedScan = scanEntity.copy(id = scanId)
+        
+        // Update scan history
+        updateScanHistory()
+        
+        // Update scan result
+        _scanResult.value = ScanResult(
+            barcode = barcode,
+            format = format,
+            shipment = shipment,
+            isValid = isValid,
+            scannedAt = Date()
+        )
+        
+        return ScanResult(
+            barcode = barcode,
+            format = format,
+            shipment = shipment,
+            isValid = isValid,
+            scannedAt = Date()
+        )
+    }
+    
+    private suspend fun processBarcodeString(barcode: String): ScanResult {
+        val shipment = findShipmentByBarcode(barcode)
+        val isValid = shipment != null
+        
+        // Create scan entity
+        val scanEntity = ShipmentScanEntity(
+            id = 0,
+            shipmentId = shipment?.id ?: 0L,
+            barcode = barcode,
+            format = "MANUAL",
+            scannedAt = Date(),
+            isValid = isValid,
+            scanData = "",
+            createdAt = Date()
+        )
+        
+        // Save to database
+        val scanId = database.shipmentScanDao().insertScan(scanEntity)
+        val savedScan = scanEntity.copy(id = scanId)
+        
+        // Update scan history
+        updateScanHistory()
+        
+        // Update scan result
+        _scanResult.value = ScanResult(
+            barcode = barcode,
+            format = BarcodeFormat.CODE_128,
+            shipment = shipment,
+            isValid = isValid,
+            scannedAt = Date()
+        )
+        
+        return ScanResult(
+            barcode = barcode,
+            format = BarcodeFormat.CODE_128,
+            shipment = shipment,
+            isValid = isValid,
+            scannedAt = Date()
+        )
+    }
+    
+    private suspend fun findShipmentByBarcode(barcode: String): ShipmentEntity? {
+        // Try to find shipment by barcode
+        var shipment = database.shipmentDao().getShipmentByBarcode(barcode)
+        
+        // If not found, try by QR code
+        if (shipment == null) {
+            shipment = database.shipmentDao().getShipmentByQRCode(barcode)
+        }
+        
+        // If not found, try by shipment ID
+        if (shipment == null && barcode.startsWith("SHP-")) {
+            shipment = database.shipmentDao().getShipmentByShipmentId(barcode)
+        }
+        
+        return shipment
+    }
+    
+    private fun isValidBarcodeFormat(barcode: String): Boolean {
+        // Check minimum length
+        if (barcode.length < 3) return false
+        
+        // Check for valid characters
+        val validChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-"
+        return barcode.all { it in validChars }
+    }
+    
+    private suspend fun generateQRCode(shipmentId: String): String {
+        // Implementation would generate QR code
+        return "$QR_PREFIX-$shipmentId"
+    }
+    
+    private suspend fun generateCode128(shipmentId: String): String {
+        // Implementation would generate Code 128 barcode
+        return "$BARCODE_PREFIX-$shipmentId"
+    }
+    
+    private suspend fun generateGenericBarcode(shipmentId: String, format: BarcodeFormat): String {
+        // Implementation would generate generic barcode
+        return "$BARCODE_PREFIX-$shipmentId"
+    }
+    
+    private suspend fun updateScanHistory() {
+        val history = database.shipmentScanDao().getAllScans().take(MAX_SCAN_HISTORY)
+        _scanHistory.value = history
+    }
+    
+    private fun isToday(date: Date): Boolean {
+        val today = Calendar.getInstance()
+        val checkDate = Calendar.getInstance()
+        checkDate.time = date
+        
+        return today.get(Calendar.YEAR) == checkDate.get(Calendar.YEAR) &&
+                today.get(Calendar.DAY_OF_YEAR) == checkDate.get(Calendar.DAY_OF_YEAR)
+    }
+    
+    private fun calculateAverageScansPerHour(scans: List<ShipmentScanEntity>): Double {
+        if (scans.isEmpty()) return 0.0
+        
+        val timeSpan = scans.maxOfOrNull { it.scannedAt.time }?.let { maxTime ->
+            val minTime = scans.minOfOrNull { it.scannedAt.time } ?: maxTime
+            (maxTime - minTime) / (1000 * 60 * 60) // Convert to hours
+        } ?: 1.0
+        
+        return scans.size / timeSpan
+    }
+    
+    /**
+     * Get scanner status
+     */
+    fun isScanning(): Boolean = isScanning
+    
+    /**
+     * Get scan count
+     */
+    fun getScanCount(): Int = scanCount
+}
+
+/**
+ * Data classes
+ */
+data class ScanResult(
+    val barcode: String,
+    val format: BarcodeFormat,
+    val shipment: ShipmentEntity?,
+    val isValid: Boolean,
+    val scannedAt: Date
+)
+
+data class ValidationResult(
+    val isValid: Boolean,
+    val message: String,
+    val shipment: ShipmentEntity? = null
+)
+
+data class ScanStats(
+    val totalScans: Int,
+    val todayScans: Int,
+    val successfulScans: Int,
+    val failedScans: Int,
+    val successRate: Float,
+    val uniqueShipments: Int,
+    val averageScansPerHour: Double
+)
+
+/**
+ * Enums
+ */
+enum class ScannerState {
+    Idle,
+    Starting,
+    Ready,
+    Scanning,
+    ScanSuccess,
+    NoBarcodeFound,
+    Processing,
+    Stopped,
+    Error
+}

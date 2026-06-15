@@ -1,0 +1,495 @@
+package com.edham.logistics.error
+
+import android.content.Context
+import android.util.Log
+import com.edham.logistics.BuildConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileWriter
+import java.io.PrintWriter
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Error Handler Logger
+ * Comprehensive logging system for developers with file logging and crash reporting
+ */
+class ErrorHandlerLogger(private val context: Context) {
+    
+    companion object {
+        private const val TAG_PREFIX = "EdhamLogistics"
+        private const val LOG_FILE_NAME = "error_logs.txt"
+        private const val CRASH_FILE_NAME = "crash_logs.txt"
+        private const val MAX_LOG_FILE_SIZE = 5 * 1024 * 1024 // 5MB
+        private const val MAX_LOG_ENTRIES = 1000
+        private const val DATE_FORMAT = "yyyy-MM-dd HH:mm:ss.SSS"
+    }
+    
+    private val logQueue = ConcurrentLinkedQueue<LogEntry>()
+    private val isLogging = AtomicBoolean(false)
+    private val dateFormat = SimpleDateFormat(DATE_FORMAT, Locale.getDefault())
+    private val logFile = File(context.filesDir, LOG_FILE_NAME)
+    private val crashFile = File(context.filesDir, CRASH_FILE_NAME)
+    
+    /**
+     * Log error with context
+     */
+    fun logError(
+        tag: String,
+        error: Throwable,
+        context: String? = null,
+        userId: String? = null,
+        sessionId: String? = null,
+        additionalData: Map<String, Any>? = null
+    ) {
+        val logEntry = LogEntry(
+            timestamp = System.currentTimeMillis(),
+            level = LogLevel.ERROR,
+            tag = tag,
+            message = error.message ?: "Unknown error",
+            throwable = error,
+            context = context,
+            userId = userId,
+            sessionId = sessionId,
+            additionalData = additionalData
+        )
+        
+        addToLogQueue(logEntry)
+        logToLogcat(logEntry)
+    }
+    
+    /**
+     * Log warning
+     */
+    fun logWarning(
+        tag: String,
+        message: String,
+        context: String? = null,
+        userId: String? = null,
+        additionalData: Map<String, Any>? = null
+    ) {
+        val logEntry = LogEntry(
+            timestamp = System.currentTimeMillis(),
+            level = LogLevel.WARNING,
+            tag = tag,
+            message = message,
+            context = context,
+            userId = userId,
+            additionalData = additionalData
+        )
+        
+        addToLogQueue(logEntry)
+        logToLogcat(logEntry)
+    }
+    
+    /**
+     * Log info
+     */
+    fun logInfo(
+        tag: String,
+        message: String,
+        context: String? = null,
+        additionalData: Map<String, Any>? = null
+    ) {
+        if (BuildConfig.DEBUG) {
+            val logEntry = LogEntry(
+                timestamp = System.currentTimeMillis(),
+                level = LogLevel.INFO,
+                tag = tag,
+                message = message,
+                context = context,
+                additionalData = additionalData
+            )
+            
+            addToLogQueue(logEntry)
+            logToLogcat(logEntry)
+        }
+    }
+    
+    /**
+     * Log debug
+     */
+    fun logDebug(
+        tag: String,
+        message: String,
+        context: String? = null,
+        additionalData: Map<String, Any>? = null
+    ) {
+        if (BuildConfig.DEBUG) {
+            val logEntry = LogEntry(
+                timestamp = System.currentTimeMillis(),
+                level = LogLevel.DEBUG,
+                tag = tag,
+                message = message,
+                context = context,
+                additionalData = additionalData
+            )
+            
+            addToLogQueue(logEntry)
+            logToLogcat(logEntry)
+        }
+    }
+    
+    /**
+     * Log API request/response
+     */
+    fun logApiCall(
+        method: String,
+        url: String,
+        statusCode: Int,
+        responseTime: Long,
+        requestSize: Long = 0,
+        responseSize: Long = 0,
+        error: Throwable? = null,
+        userId: String? = null
+    ) {
+        val message = buildString {
+            append("API Call: $method $url")
+            append(" | Status: $statusCode")
+            append(" | Response Time: ${responseTime}ms")
+            if (requestSize > 0) append(" | Request Size: ${requestSize}B")
+            if (responseSize > 0) append(" | Response Size: ${responseSize}B")
+            if (error != null) append(" | Error: ${error.message}")
+        }
+        
+        val level = if (error != null || statusCode >= 400) LogLevel.ERROR else LogLevel.INFO
+        
+        val logEntry = LogEntry(
+            timestamp = System.currentTimeMillis(),
+            level = level,
+            tag = "API",
+            message = message,
+            throwable = error,
+            userId = userId,
+            additionalData = mapOf(
+                "method" to method,
+                "url" to url,
+                "statusCode" to statusCode,
+                "responseTime" to responseTime,
+                "requestSize" to requestSize,
+                "responseSize" to responseSize
+            )
+        )
+        
+        addToLogQueue(logEntry)
+        logToLogcat(logEntry)
+    }
+    
+    /**
+     * Log user action
+     */
+    fun logUserAction(
+        action: String,
+        screen: String,
+        userId: String? = null,
+        additionalData: Map<String, Any>? = null
+    ) {
+        val logEntry = LogEntry(
+            timestamp = System.currentTimeMillis(),
+            level = LogLevel.INFO,
+            tag = "USER_ACTION",
+            message = "User Action: $action on $screen",
+            userId = userId,
+            additionalData = additionalData + mapOf(
+                "action" to action,
+                "screen" to screen
+            )
+        )
+        
+        addToLogQueue(logEntry)
+        logToLogcat(logEntry)
+    }
+    
+    /**
+     * Log performance metrics
+     */
+    fun logPerformance(
+        operation: String,
+        duration: Long,
+        memoryUsed: Long? = null,
+        additionalData: Map<String, Any>? = null
+    ) {
+        val message = buildString {
+            append("Performance: $operation took ${duration}ms")
+            memoryUsed?.let { append(" | Memory: ${it}B") }
+        }
+        
+        val logEntry = LogEntry(
+            timestamp = System.currentTimeMillis(),
+            level = LogLevel.INFO,
+            tag = "PERFORMANCE",
+            message = message,
+            additionalData = additionalData + mapOf(
+                "operation" to operation,
+                "duration" to duration,
+                "memoryUsed" to (memoryUsed ?: 0)
+            )
+        )
+        
+        addToLogQueue(logEntry)
+        logToLogcat(logEntry)
+    }
+    
+    /**
+     * Log crash
+     */
+    fun logCrash(
+        thread: Thread,
+        throwable: Throwable,
+        userId: String? = null,
+        sessionId: String? = null
+    ) {
+        val crashEntry = LogEntry(
+            timestamp = System.currentTimeMillis(),
+            level = LogLevel.CRASH,
+            tag = "CRASH",
+            message = "Application crashed in thread: ${thread.name}",
+            throwable = throwable,
+            userId = userId,
+            sessionId = sessionId,
+            additionalData = mapOf(
+                "threadName" to thread.name,
+                "threadId" to thread.id
+            )
+        )
+        
+        addToLogQueue(crashEntry)
+        logToLogcat(crashEntry)
+        writeCrashToFile(crashEntry)
+    }
+    
+    /**
+     * Add log entry to queue
+     */
+    private fun addToLogQueue(logEntry: LogEntry) {
+        logQueue.offer(logEntry)
+        
+        // Start logging if not already running
+        if (isLogging.compareAndSet(false, true)) {
+            processLogQueue()
+        }
+    }
+    
+    /**
+     * Process log queue in background
+     */
+    private fun processLogQueue() {
+        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+            try {
+                while (logQueue.isNotEmpty()) {
+                    val entry = logQueue.poll()
+                    if (entry != null) {
+                        writeToFile(entry)
+                    }
+                }
+            } finally {
+                isLogging.set(false)
+                
+                // If more entries were added while processing, start again
+                if (logQueue.isNotEmpty()) {
+                    processLogQueue()
+                }
+            }
+        }
+    }
+    
+    /**
+     * Write log entry to file
+     */
+    private fun writeToFile(logEntry: LogEntry) {
+        try {
+            // Check file size and rotate if necessary
+            if (logFile.exists() && logFile.length() > MAX_LOG_FILE_SIZE) {
+                rotateLogFile()
+            }
+            
+            FileWriter(logFile, true).use { writer ->
+                PrintWriter(writer).use { printer ->
+                    printer.println(formatLogEntry(logEntry))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG_PREFIX, "Failed to write log to file", e)
+        }
+    }
+    
+    /**
+     * Write crash to file
+     */
+    private fun writeCrashToFile(logEntry: LogEntry) {
+        try {
+            FileWriter(crashFile, true).use { writer ->
+                PrintWriter(writer).use { printer ->
+                    printer.println("=== CRASH REPORT ===")
+                    printer.println(formatLogEntry(logEntry))
+                    
+                    // Write stack trace
+                    logEntry.throwable?.let { throwable ->
+                        printer.println("Stack Trace:")
+                        throwable.printStackTrace(printer)
+                    }
+                    
+                    printer.println("=== END CRASH REPORT ===")
+                    printer.println()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG_PREFIX, "Failed to write crash to file", e)
+        }
+    }
+    
+    /**
+     * Format log entry for file
+     */
+    private fun formatLogEntry(logEntry: LogEntry): String {
+        val formattedDate = dateFormat.format(Date(logEntry.timestamp))
+        
+        return buildString {
+            append("[$formattedDate] ")
+            append("[${logEntry.level.name}] ")
+            append("[${logEntry.tag}] ")
+            append(logEntry.message)
+            
+            if (logEntry.context != null) {
+                append(" | Context: ${logEntry.context}")
+            }
+            
+            if (logEntry.userId != null) {
+                append(" | User: ${logEntry.userId}")
+            }
+            
+            if (logEntry.sessionId != null) {
+                append(" | Session: ${logEntry.sessionId}")
+            }
+            
+            if (logEntry.additionalData.isNotEmpty()) {
+                append(" | Data: ${logEntry.additionalData}")
+            }
+        }
+    }
+    
+    /**
+     * Log to Logcat
+     */
+    private fun logToLogcat(logEntry: LogEntry) {
+        val tag = "$TAG_PREFIX:${logEntry.tag}"
+        val message = buildString {
+            append(logEntry.message)
+            if (logEntry.context != null) append(" | Context: ${logEntry.context}")
+            if (logEntry.additionalData.isNotEmpty()) append(" | Data: ${logEntry.additionalData}")
+        }
+        
+        when (logEntry.level) {
+            LogLevel.DEBUG -> Log.d(tag, message, logEntry.throwable)
+            LogLevel.INFO -> Log.i(tag, message, logEntry.throwable)
+            LogLevel.WARNING -> Log.w(tag, message, logEntry.throwable)
+            LogLevel.ERROR, LogLevel.CRASH -> Log.e(tag, message, logEntry.throwable)
+        }
+    }
+    
+    /**
+     * Rotate log file
+     */
+    private fun rotateLogFile() {
+        try {
+            val backupFile = File(context.filesDir, "${LOG_FILE_NAME}.old")
+            if (backupFile.exists()) {
+                backupFile.delete()
+            }
+            logFile.renameTo(backupFile)
+        } catch (e: Exception) {
+            Log.e(TAG_PREFIX, "Failed to rotate log file", e)
+        }
+    }
+    
+    /**
+     * Get recent logs
+     */
+    fun getRecentLogs(limit: Int = 100): List<String> {
+        return try {
+            if (!logFile.exists()) return emptyList()
+            
+            logFile.readLines().takeLast(limit)
+        } catch (e: Exception) {
+            Log.e(TAG_PREFIX, "Failed to read recent logs", e)
+            emptyList()
+        }
+    }
+    
+    /**
+     * Get crash logs
+     */
+    fun getCrashLogs(): List<String> {
+        return try {
+            if (!crashFile.exists()) return emptyList()
+            crashFile.readLines()
+        } catch (e: Exception) {
+            Log.e(TAG_PREFIX, "Failed to read crash logs", e)
+            emptyList()
+        }
+    }
+    
+    /**
+     * Clear all logs
+     */
+    fun clearLogs() {
+        try {
+            logFile.delete()
+            crashFile.delete()
+            logQueue.clear()
+        } catch (e: Exception) {
+            Log.e(TAG_PREFIX, "Failed to clear logs", e)
+        }
+    }
+    
+    /**
+     * Export logs to string
+     */
+    fun exportLogs(): String {
+        return buildString {
+            appendLine("=== Edham Logistics Error Logs ===")
+            appendLine("Generated: ${dateFormat.format(Date())}")
+            appendLine("Build: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+            appendLine()
+            
+            appendLine("=== Recent Logs ===")
+            getRecentLogs().forEach { appendLine(it) }
+            
+            appendLine()
+            appendLine("=== Crash Logs ===")
+            getCrashLogs().forEach { appendLine(it) }
+            
+            appendLine()
+            appendLine("=== End of Logs ===")
+        }
+    }
+}
+
+/**
+ * Log Entry
+ */
+data class LogEntry(
+    val timestamp: Long,
+    val level: LogLevel,
+    val tag: String,
+    val message: String,
+    val throwable: Throwable? = null,
+    val context: String? = null,
+    val userId: String? = null,
+    val sessionId: String? = null,
+    val additionalData: Map<String, Any> = emptyMap()
+)
+
+/**
+ * Log Level
+ */
+enum class LogLevel {
+    DEBUG,
+    INFO,
+    WARNING,
+    ERROR,
+    CRASH
+}

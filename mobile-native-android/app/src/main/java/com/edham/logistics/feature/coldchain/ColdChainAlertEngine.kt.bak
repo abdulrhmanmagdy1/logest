@@ -1,0 +1,582 @@
+package com.edham.logistics.feature.coldchain
+
+import android.content.Context
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import com.edham.logistics.utils.VoiceAlertManager
+import kotlinx.coroutines.*
+import timber.log.Timber
+import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
+
+/**
+ * Cold Chain Alert Engine
+ * Professional alert management with priority queuing and intelligent escalation
+ */
+class ColdChainAlertEngine(private val context: Context) {
+    
+    private val engineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val voiceAlertManager = VoiceAlertManager(context)
+    
+    // Alert queues and management
+    private val alertQueue = ConcurrentLinkedQueue<ColdChainAlert>()
+    private val activeAlerts = mutableMapOf<String, ColdChainAlert>()
+    private val alertHistory = mutableListOf<ColdChainAlert>()
+    
+    // LiveData for UI updates
+    private val _criticalAlerts = MutableLiveData<List<ColdChainAlert>>()
+    val criticalAlerts: LiveData<List<ColdChainAlert>> = _criticalAlerts
+    
+    private val _warningAlerts = MutableLiveData<List<ColdChainAlert>>()
+    val warningAlerts: LiveData<List<ColdChainAlert>> = _warningAlerts
+    
+    private val _infoAlerts = MutableLiveData<List<ColdChainAlert>>()
+    val infoAlerts: LiveData<List<ColdChainAlert>> = _infoAlerts
+    
+    // Alert processing
+    private var isProcessing = false
+    private val alertCooldowns = mutableMapOf<AlertType, Long>()
+    private val escalationRules = mutableMapOf<AlertType, EscalationRule>()
+    
+    companion object {
+        private const val ALERT_COOLDOWN_PERIOD = 60000L // 1 minute
+        private const val MAX_ALERT_HISTORY = 1000
+        private const val ESCALATION_CHECK_INTERVAL = 300000L // 5 minutes
+        private const val CRITICAL_ALERT_THRESHOLD = 3 // Number of warnings before escalation
+    }
+    
+    init {
+        setupEscalationRules()
+        startAlertProcessor()
+        startEscalationChecker()
+    }
+    
+    /**
+     * Process new alert
+     */
+    fun processAlert(alert: ColdChainAlert) {
+        engineScope.launch {
+            try {
+                // Check cooldown period
+                if (isInCooldown(alert.type)) {
+                    Timber.d("Alert ${alert.type} is in cooldown period")
+                    return@launch
+                }
+                
+                // Check for duplicate alerts
+                if (isDuplicateAlert(alert)) {
+                    Timber.d("Duplicate alert detected: ${alert.type}")
+                    return@launch
+                }
+                
+                // Add to queue
+                alertQueue.offer(alert)
+                
+                // Update cooldown
+                updateCooldown(alert.type)
+                
+                // Add to history
+                addToHistory(alert)
+                
+                Timber.i("Alert queued: ${alert.type} - ${alert.severity}")
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error processing alert")
+            }
+        }
+    }
+    
+    /**
+     * Start alert processor
+     */
+    private fun startAlertProcessor() {
+        engineScope.launch {
+            while (true) {
+                try {
+                    if (!isProcessing && alertQueue.isNotEmpty()) {
+                        isProcessing = true
+                        
+                        val alert = alertQueue.poll()
+                        alert?.let { processAlertInternal(it) }
+                        
+                        isProcessing = false
+                    }
+                    
+                    delay(1000) // Check every second
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in alert processor")
+                    isProcessing = false
+                    delay(5000) // Wait before retrying
+                }
+            }
+        }
+    }
+    
+    /**
+     * Process alert internally
+     */
+    private suspend fun processAlertInternal(alert: ColdChainAlert) {
+        try {
+            // Add to active alerts
+            activeAlerts[alert.id] = alert
+            
+            // Update LiveData
+            updateAlertLiveData()
+            
+            // Send notifications
+            sendNotifications(alert)
+            
+            // Voice alert for critical alerts
+            if (alert.severity == AlertSeverity.CRITICAL) {
+                voiceAlertManager.speak(getVoiceMessage(alert))
+            }
+            
+            // Check for escalation
+            checkEscalation(alert)
+            
+            Timber.i("Alert processed: ${alert.type}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error processing alert internally")
+        }
+    }
+    
+    /**
+     * Send notifications for alert
+     */
+    private suspend fun sendNotifications(alert: ColdChainAlert) {
+        try {
+            when (alert.severity) {
+                AlertSeverity.CRITICAL -> {
+                    sendCriticalNotification(alert)
+                    sendEmailAlert(alert)
+                    sendSMSAlert(alert)
+                }
+                AlertSeverity.WARNING -> {
+                    sendWarningNotification(alert)
+                }
+                AlertSeverity.INFO -> {
+                    sendInfoNotification(alert)
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending notifications")
+        }
+    }
+    
+    /**
+     * Send critical notification
+     */
+    private fun sendCriticalNotification(alert: ColdChainAlert) {
+        // Implementation would use Android NotificationManager
+        Timber.w("CRITICAL: ${alert.type.name} - ${alert.sensorId}")
+    }
+    
+    /**
+     * Send warning notification
+     */
+    private fun sendWarningNotification(alert: ColdChainAlert) {
+        // Implementation would use Android NotificationManager
+        Timber.w("WARNING: ${alert.type.name} - ${alert.sensorId}")
+    }
+    
+    /**
+     * Send info notification
+     */
+    private fun sendInfoNotification(alert: ColdChainAlert) {
+        // Implementation would use Android NotificationManager
+        Timber.i("INFO: ${alert.type.name} - ${alert.sensorId}")
+    }
+    
+    /**
+     * Send email alert
+     */
+    private suspend fun sendEmailAlert(alert: ColdChainAlert) {
+        try {
+            // Implementation would send email via API
+            Timber.i("Email alert sent for: ${alert.type}")
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending email alert")
+        }
+    }
+    
+    /**
+     * Send SMS alert
+     */
+    private suspend fun sendSMSAlert(alert: ColdChainAlert) {
+        try {
+            // Implementation would send SMS via API
+            Timber.i("SMS alert sent for: ${alert.type}")
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending SMS alert")
+        }
+    }
+    
+    /**
+     * Check if alert is in cooldown period
+     */
+    private fun isInCooldown(alertType: AlertType): Boolean {
+        val lastAlertTime = alertCooldowns[alertType] ?: 0L
+        val currentTime = System.currentTimeMillis()
+        return (currentTime - lastAlertTime) < ALERT_COOLDOWN_PERIOD
+    }
+    
+    /**
+     * Update cooldown for alert type
+     */
+    private fun updateCooldown(alertType: AlertType) {
+        alertCooldowns[alertType] = System.currentTimeMillis()
+    }
+    
+    /**
+     * Check if alert is duplicate
+     */
+    private fun isDuplicateAlert(newAlert: ColdChainAlert): Boolean {
+        return activeAlerts.values.any { existing ->
+            existing.type == newAlert.type &&
+            existing.sensorId == newAlert.sensorId &&
+            !existing.resolved &&
+            existing.severity == newAlert.severity
+        }
+    }
+    
+    /**
+     * Add alert to history
+     */
+    private fun addToHistory(alert: ColdChainAlert) {
+        alertHistory.add(alert)
+        
+        // Maintain history size limit
+        if (alertHistory.size > MAX_ALERT_HISTORY) {
+            alertHistory.removeAt(0)
+        }
+    }
+    
+    /**
+     * Update LiveData based on alert severity
+     */
+    private fun updateAlertLiveData() {
+        val active = activeAlerts.values.filter { !it.resolved }
+        
+        _criticalAlerts.postValue(active.filter { it.severity == AlertSeverity.CRITICAL })
+        _warningAlerts.postValue(active.filter { it.severity == AlertSeverity.WARNING })
+        _infoAlerts.postValue(active.filter { it.severity == AlertSeverity.INFO })
+    }
+    
+    /**
+     * Setup escalation rules
+     */
+    private fun setupEscalationRules() {
+        escalationRules[AlertType.TEMPERATURE_LOW] = EscalationRule(
+            thresholdCount = CRITICAL_ALERT_THRESHOLD,
+            timeWindow = 1800000L, // 30 minutes
+            escalationAction = EscalationAction.EMERGENCY_CALL
+        )
+        
+        escalationRules[AlertType.TEMPERATURE_HIGH] = EscalationRule(
+            thresholdCount = CRITICAL_ALERT_THRESHOLD,
+            timeWindow = 1800000L, // 30 minutes
+            escalationAction = EscalationAction.EMERGENCY_CALL
+        )
+        
+        escalationRules[AlertType.SENSOR_DISCONNECTED] = EscalationRule(
+            thresholdCount = 1, // Immediate escalation
+            timeWindow = 0L,
+            escalationAction = EscalationAction.MANAGER_NOTIFICATION
+        )
+        
+        escalationRules[AlertType.COOLING_FAILURE] = EscalationRule(
+            thresholdCount = 1, // Immediate escalation
+            timeWindow = 0L,
+            escalationAction = EscalationAction.EMERGENCY_CALL
+        )
+    }
+    
+    /**
+     * Start escalation checker
+     */
+    private fun startEscalationChecker() {
+        engineScope.launch {
+            while (true) {
+                try {
+                    checkAllEscalations()
+                    delay(ESCALATION_CHECK_INTERVAL)
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in escalation checker")
+                    delay(60000) // Wait before retrying
+                }
+            }
+        }
+    }
+    
+    /**
+     * Check escalation for specific alert
+     */
+    private fun checkEscalation(alert: ColdChainAlert) {
+        val rule = escalationRules[alert.type] ?: return
+        
+        engineScope.launch {
+            try {
+                val recentAlerts = alertHistory.filter {
+                    it.type == alert.type &&
+                    it.sensorId == alert.sensorId &&
+                    (System.currentTimeMillis() - it.timestamp) <= rule.timeWindow
+                }
+                
+                if (recentAlerts.size >= rule.thresholdCount) {
+                    executeEscalation(rule, alert)
+                }
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error checking escalation")
+            }
+        }
+    }
+    
+    /**
+     * Check all escalations
+     */
+    private fun checkAllEscalations() {
+        escalationRules.forEach { (alertType, rule) ->
+            val recentAlerts = alertHistory.filter {
+                it.type == alertType &&
+                (System.currentTimeMillis() - it.timestamp) <= rule.timeWindow
+            }
+            
+            if (recentAlerts.size >= rule.thresholdCount) {
+                val latestAlert = recentAlerts.maxByOrNull { it.timestamp }
+                latestAlert?.let { executeEscalation(rule, it) }
+            }
+        }
+    }
+    
+    /**
+     * Execute escalation action
+     */
+    private suspend fun executeEscalation(rule: EscalationRule, alert: ColdChainAlert) {
+        try {
+            when (rule.escalationAction) {
+                EscalationAction.EMERGENCY_CALL -> {
+                    triggerEmergencyCall(alert)
+                }
+                EscalationAction.MANAGER_NOTIFICATION -> {
+                    notifyManager(alert)
+                }
+                EscalationAction.AUTO_SHUTDOWN -> {
+                    initiateAutoShutdown(alert)
+                }
+            }
+            
+            Timber.w("Escalation triggered: ${rule.escalationAction} for ${alert.type}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error executing escalation")
+        }
+    }
+    
+    /**
+     * Trigger emergency call
+     */
+    private suspend fun triggerEmergencyCall(alert: ColdChainAlert) {
+        try {
+            // Implementation would trigger emergency call to designated contacts
+            Timber.e("EMERGENCY CALL TRIGGERED for: ${alert.type}")
+            
+            // Create escalated alert
+            val escalatedAlert = alert.copy(
+                severity = AlertSeverity.CRITICAL,
+                escalated = true,
+                escalatedAt = System.currentTimeMillis()
+            )
+            
+            activeAlerts[alert.id] = escalatedAlert
+            updateAlertLiveData()
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error triggering emergency call")
+        }
+    }
+    
+    /**
+     * Notify manager
+     */
+    private suspend fun notifyManager(alert: ColdChainAlert) {
+        try {
+            // Implementation would send high-priority notification to manager
+            Timber.w("MANAGER NOTIFICATION for: ${alert.type}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error notifying manager")
+        }
+    }
+    
+    /**
+     * Initiate auto shutdown
+     */
+    private suspend fun initiateAutoShutdown(alert: ColdChainAlert) {
+        try {
+            // Implementation would initiate safe shutdown procedures
+            Timber.e("AUTO SHUTDOWN initiated for: ${alert.type}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error initiating auto shutdown")
+        }
+    }
+    
+    /**
+     * Acknowledge alert
+     */
+    fun acknowledgeAlert(alertId: String) {
+        engineScope.launch {
+            try {
+                activeAlerts[alertId]?.let { alert ->
+                    alert.acknowledged = true
+                    alert.acknowledgedAt = System.currentTimeMillis()
+                    
+                    updateAlertLiveData()
+                    
+                    Timber.i("Alert acknowledged: $alertId")
+                }
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error acknowledging alert")
+            }
+        }
+    }
+    
+    /**
+     * Resolve alert
+     */
+    fun resolveAlert(alertId: String) {
+        engineScope.launch {
+            try {
+                activeAlerts[alertId]?.let { alert ->
+                    alert.resolved = true
+                    alert.resolvedAt = System.currentTimeMillis()
+                    
+                    // Remove from active alerts
+                    activeAlerts.remove(alertId)
+                    
+                    updateAlertLiveData()
+                    
+                    Timber.i("Alert resolved: $alertId")
+                }
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error resolving alert")
+            }
+        }
+    }
+    
+    /**
+     * Get alert statistics
+     */
+    fun getAlertStatistics(): AlertStatistics {
+        val now = System.currentTimeMillis()
+        val last24Hours = now - (24 * 60 * 60 * 1000)
+        val last7Days = now - (7 * 24 * 60 * 60 * 1000)
+        
+        val last24HourAlerts = alertHistory.filter { it.timestamp >= last24Hours }
+        val last7DayAlerts = alertHistory.filter { it.timestamp >= last7Days }
+        
+        return AlertStatistics(
+            totalAlerts = alertHistory.size,
+            last24HourAlerts = last24HourAlerts.size,
+            last7DayAlerts = last7DayAlerts.size,
+            criticalAlerts = alertHistory.count { it.severity == AlertSeverity.CRITICAL },
+            warningAlerts = alertHistory.count { it.severity == AlertSeverity.WARNING },
+            infoAlerts = alertHistory.count { it.severity == AlertSeverity.INFO },
+            resolvedAlerts = alertHistory.count { it.resolved },
+            acknowledgedAlerts = alertHistory.count { it.acknowledged },
+            escalatedAlerts = alertHistory.count { it.escalated },
+            averageResolutionTime = calculateAverageResolutionTime()
+        )
+    }
+    
+    /**
+     * Calculate average resolution time
+     */
+    private fun calculateAverageResolutionTime(): Long {
+        val resolvedAlerts = alertHistory.filter { it.resolved && it.resolvedAt != null }
+        
+        if (resolvedAlerts.isEmpty()) return 0L
+        
+        val totalResolutionTime = resolvedAlerts.sumOf { alert ->
+            (alert.resolvedAt ?: 0L) - alert.timestamp
+        }
+        
+        return totalResolutionTime / resolvedAlerts.size
+    }
+    
+    /**
+     * Get voice message for alert
+     */
+    private fun getVoiceMessage(alert: ColdChainAlert): String {
+        return when (alert.type) {
+            AlertType.TEMPERATURE_LOW -> "Temperature too low: ${String.format("%.1f", alert.value)} degrees"
+            AlertType.TEMPERATURE_HIGH -> "Temperature too high: ${String.format("%.1f", alert.value)} degrees"
+            AlertType.TEMPERATURE_LOW_WARNING -> "Temperature warning: ${String.format("%.1f", alert.value)} degrees"
+            AlertType.TEMPERATURE_HIGH_WARNING -> "Temperature warning: ${String.format("%.1f", alert.value)} degrees"
+            AlertType.HUMIDITY_LOW -> "Humidity too low: ${String.format("%.1f", alert.value)} percent"
+            AlertType.HUMIDITY_HIGH -> "Humidity too high: ${String.format("%.1f", alert.value)} percent"
+            AlertType.SENSOR_BATTERY_LOW -> "Sensor battery low: ${String.format("%.1f", alert.value)} percent"
+            AlertType.SENSOR_DISCONNECTED -> "Sensor disconnected"
+            AlertType.SENSOR_STALE_DATA -> "Sensor data stale"
+            AlertType.COOLING_FAILURE -> "Cooling system failure"
+        }
+    }
+    
+    /**
+     * Cleanup old alerts
+     */
+    fun cleanupOldAlerts() {
+        engineScope.launch {
+            try {
+                val cutoffDate = System.currentTimeMillis() - (30 * 24 * 60 * 60 * 1000L) // 30 days
+                
+                alertHistory.removeAll { it.timestamp < cutoffDate }
+                
+                Timber.d("Cleaned up old alerts")
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error cleaning up old alerts")
+            }
+        }
+    }
+    
+    /**
+     * Shutdown alert engine
+     */
+    fun shutdown() {
+        engineScope.cancel()
+        voiceAlertManager.cleanup()
+        
+        Timber.d("Cold chain alert engine shutdown")
+    }
+}
+
+// Data classes
+data class EscalationRule(
+    val thresholdCount: Int,
+    val timeWindow: Long,
+    val escalationAction: EscalationAction
+)
+
+data class AlertStatistics(
+    val totalAlerts: Int,
+    val last24HourAlerts: Int,
+    val last7DayAlerts: Int,
+    val criticalAlerts: Int,
+    val warningAlerts: Int,
+    val infoAlerts: Int,
+    val resolvedAlerts: Int,
+    val acknowledgedAlerts: Int,
+    val escalatedAlerts: Int,
+    val averageResolutionTime: Long
+)
+
+// Enums
+enum class EscalationAction {
+    EMERGENCY_CALL, MANAGER_NOTIFICATION, AUTO_SHUTDOWN
+}

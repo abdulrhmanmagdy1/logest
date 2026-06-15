@@ -1,0 +1,214 @@
+package com.edham.logistics.feature.customer.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.databinding.FragmentCustomerDashboardBinding
+import com.edham.logistics.feature.customer.presentation.ui.CustomerDashboardViewModel
+import com.edham.logistics.feature.customer.presentation.adapter.RecentShipmentsAdapter
+import com.edham.logistics.feature.customer.presentation.adapter.ActiveShipmentsAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class CustomerDashboardFragment : Fragment() {
+
+    private var _binding: FragmentCustomerDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: CustomerDashboardViewModel by viewModels()
+    
+    @Inject
+    lateinit var recentShipmentsAdapter: RecentShipmentsAdapter
+    
+    @Inject
+    lateinit var activeShipmentsAdapter: ActiveShipmentsAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentCustomerDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerViews()
+        observeViewModel()
+        setupClickListeners()
+    }
+
+    private fun setupRecyclerViews() {
+        // Recent shipments
+        binding.recyclerViewRecentShipments.apply {
+            adapter = recentShipmentsAdapter
+            layoutManager = LinearLayoutManager(requireContext())
+        }
+        
+        recentShipmentsAdapter.setOnItemClickListener { shipment ->
+            navigateToShipmentTracking(shipment.trackingNumber)
+        }
+        
+        // Active shipments
+        binding.recyclerViewActiveShipments.apply {
+            adapter = activeShipmentsAdapter
+            layoutManager = LinearLayoutManager(requireContext())
+        }
+        
+        activeShipmentsAdapter.setOnItemClickListener { shipment ->
+            navigateToShipmentTracking(shipment.trackingNumber)
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonCreateShipment.setOnClickListener {
+            navigateToShipmentCreation()
+        }
+        
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refreshDashboard()
+        }
+        
+        binding.swipeRefreshLayout.setOnRefreshListener {
+            viewModel.refreshDashboard()
+        }
+        
+        binding.textViewViewAllActive.setOnClickListener {
+            navigateToAllActiveShipments()
+        }
+        
+        binding.textViewViewAllCompleted.setOnClickListener {
+            navigateToAllCompletedShipments()
+        }
+    }
+
+    private fun updateUI(uiState: CustomerDashboardViewModel.CustomerDashboardUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.gone()
+        binding.layoutError.gone()
+        binding.swipeRefreshLayout.isRefreshing = false
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.gone()
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.swipeRefreshLayout.isRefreshing = false
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refreshDashboard()
+        }
+    }
+
+    private fun showContent(uiState: CustomerDashboardViewModel.CustomerDashboardUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        binding.swipeRefreshLayout.isRefreshing = false
+        
+        uiState.dashboardData?.let { dashboardData ->
+            updateDashboardCards(dashboardData)
+            updateShipmentsLists(dashboardData)
+        }
+        
+        // Handle shipment creation success
+        uiState.createdShipment?.let { shipment ->
+            showSnackbar("تم إنشاء الشحنة بنجاح")
+            navigateToShipmentTracking(shipment.trackingNumber)
+            viewModel.onShipmentCreatedHandled()
+        }
+        
+        // Handle tracking data
+        uiState.trackingData?.let { trackingData ->
+            navigateToShipmentTracking(trackingData.shipment.trackingNumber)
+            viewModel.onTrackingHandled()
+        }
+    }
+
+    private fun updateDashboardCards(dashboardData: com.edham.logistics.feature.customer.domain.model.CustomerDashboardData) {
+        binding.textTotalShipments.text = dashboardData.totalShipments.toString()
+        binding.textActiveShipments.text = dashboardData.activeShipments.toString()
+        binding.textCompletedShipments.text = dashboardData.completedShipments.toString()
+        binding.textPendingShipments.text = dashboardData.pendingShipments.toString()
+    }
+
+    private fun updateShipmentsLists(dashboardData: com.edham.logistics.feature.customer.domain.model.CustomerDashboardData) {
+        // Update recent shipments
+        if (dashboardData.recentShipments.isEmpty()) {
+            binding.layoutEmptyRecentShipments.visible()
+            binding.recyclerViewRecentShipments.gone()
+        } else {
+            binding.layoutEmptyRecentShipments.gone()
+            binding.recyclerViewRecentShipments.visible()
+            recentShipmentsAdapter.submitList(dashboardData.recentShipments)
+        }
+        
+        // Update active shipments
+        if (dashboardData.activeShipmentsList.isEmpty()) {
+            binding.layoutEmptyActiveShipments.visible()
+            binding.recyclerViewActiveShipments.gone()
+        } else {
+            binding.layoutEmptyActiveShipments.gone()
+            binding.recyclerViewActiveShipments.visible()
+            activeShipmentsAdapter.submitList(dashboardData.activeShipmentsList)
+        }
+    }
+
+    private fun navigateToShipmentCreation() {
+        findNavController().navigate(R.id.action_customerDashboardFragment_to_createShipmentFragment)
+    }
+
+    private fun navigateToShipmentTracking(trackingNumber: String) {
+        val action = CustomerDashboardFragmentDirections
+            .actionCustomerDashboardFragment_to_trackingFragment(trackingNumber)
+        findNavController().navigate(action)
+    }
+
+    private fun navigateToAllActiveShipments() {
+        findNavController().navigate(R.id.action_customerDashboardFragment_to_activeShipmentsFragment)
+    }
+
+    private fun navigateToAllCompletedShipments() {
+        findNavController().navigate(R.id.action_customerDashboardFragment_to_completedShipmentsFragment)
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

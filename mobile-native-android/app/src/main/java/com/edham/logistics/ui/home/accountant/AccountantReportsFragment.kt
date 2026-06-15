@@ -32,7 +32,6 @@ class AccountantReportsFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         
         observeViewModel(view)
-        setupChart(view)
         viewModel.loadDashboardData()
     }
 
@@ -43,15 +42,14 @@ class AccountantReportsFragment : Fragment() {
             view.findViewById<TextView>(R.id.tvSalaryExp).text = "${String.format("%,.0f", stats.monthly_expenses * 0.3)} ج"
             view.findViewById<TextView>(R.id.tvMaintExp).text = "${String.format("%,.0f", stats.monthly_expenses * 0.3)} ج"
             view.findViewById<TextView>(R.id.tvNetProfitDetail).text = "${String.format("%,.0f", stats.net_profit)} ج"
+            
+            setupChart(view, stats.profit_history)
         }
     }
 
-    private fun setupChart(view: View) {
+    private fun setupChart(view: View, chartData: List<com.edham.logistics.core.network.api.ChartData>) {
         val chart = view.findViewById<LineChart>(R.id.profitLineChart)
-        val entries = listOf(
-            Entry(0f, 32000f), Entry(1f, 35000f), Entry(2f, 31000f),
-            Entry(3f, 38000f), Entry(4f, 40000f), Entry(5f, 42600f)
-        )
+        val entries = chartData.mapIndexed { index, item -> Entry(index.toFloat(), item.value.toFloat()) }
         
         val dataSet = LineDataSet(entries, "صافي الربح")
         dataSet.color = requireContext().getColor(R.color.acc_sky)
@@ -62,7 +60,7 @@ class AccountantReportsFragment : Fragment() {
         dataSet.mode = LineDataSet.Mode.CUBIC_BEZIER
         
         chart.apply {
-            data = LineData(dataSet)
+            this.data = LineData(dataSet)
             description.isEnabled = false
             legend.isEnabled = false
             xAxis.isEnabled = false

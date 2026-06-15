@@ -1,0 +1,484 @@
+package com.edham.logistics.offline.sync
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Auto Sync Manager - Handles automatic synchronization when network reconnects
+ * Implements intelligent sync strategies and batch processing
+ */
+
+// Temporarily disabled due to missing dependencies
+// @Singleton
+// class AutoSyncManager @Inject constructor(
+//     private val networkMonitor: NetworkMonitor,
+//     private val syncQueue: SyncQueue,
+//     private val offlineDatabase: OfflineDatabase,
+//     private val conflictResolver: ConflictResolver,
+//     private val retryManager: RetryManager
+// ) 
+class AutoSyncManager {
+
+    private val syncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var isAutoSyncEnabled = true
+    private var autoSyncJob: Job? = null
+    private var isSyncing = false
+    
+    // Sync configuration
+    private val maxConcurrentSyncs = 5
+    private val syncBatchSize = 10
+    private val syncTimeout = 30000L // 30 seconds per batch
+    
+    // Sync statistics
+    private val _syncStats = MutableStateFlow(AutoSyncStats())
+    val syncStats: StateFlow<AutoSyncStats> = _syncStats.asStateFlow()
+
+    init {
+        startAutoSyncMonitoring()
+    }
+
+    /**
+     * Start auto sync monitoring
+     */
+    private fun startAutoSyncMonitoring() {
+        autoSyncJob = syncScope.launch {
+            networkMonitor.observeNetworkStatus()
+                .distinctUntilChanged()
+                .collect { networkStatus ->
+                    when (networkStatus) {
+                        NetworkStatus.ONLINE -> {
+                            if (isAutoSyncEnabled && !isSyncing) {
+                                Timber.d("Network available, starting auto sync")
+                                startAutoSync()
+                            }
+                        }
+                        NetworkStatus.OFFLINE -> {
+                            Timber.d("Network unavailable, pausing auto sync")
+                            pauseAutoSync()
+                        }
+                        NetworkStatus.CONNECTING -> {
+                            Timber.d("Network connecting, preparing for auto sync")
+                            prepareForAutoSync()
+                        }
+                    }
+                }
+        }
+    }
+
+    /**
+     * Start automatic synchronization
+     */
+    private suspend fun startAutoSync() {
+        if (isSyncing) return
+        
+        isSyncing = true
+        updateSyncStatus("Syncing...")
+        
+        try {
+            // Get all pending operations
+            val pendingOperations = syncQueue.getPendingOperations()
+            val retryableOperations = retryManager.getRetryableOperations()
+            
+            val allOperations = (pendingOperations + retryableOperations)
+                .sortedBy { it.timestamp } // Process oldest first
+            
+            if (allOperations.isEmpty()) {
+                Timber.d("No pending operations to sync")
+                updateSyncStatus("Up to date")
+                isSyncing = false
+                return
+            }
+            
+            Timber.d("Starting auto sync with ${allOperations.size} operations")
+            
+            // Process operations in batches
+            val batches = allOperations.chunked(syncBatchSize)
+            var successCount = 0
+            var failureCount = 0
+            
+            for (batch in batches) {
+                if (!networkMonitor.isOnline()) {
+                    Timber.d("Network lost during sync, pausing")
+                    break
+                }
+                
+                val batchResult = processSyncBatch(batch)
+                successCount += batchResult.successCount
+                failureCount += batchResult.failureCount
+                
+                // Update progress
+                val progress = ((successCount + failureCount) * 100) / allOperations.size
+                updateSyncStatus("Syncing... $progress%")
+                
+                // Small delay between batches to avoid overwhelming the server
+                delay(1000)
+            }
+            
+            // Final sync status
+            if (failureCount == 0) {
+                updateSyncStatus("Sync completed successfully")
+                Timber.d("Auto sync completed successfully: $successCount operations")
+            } else {
+                updateSyncStatus("Sync completed with $failureCount errors")
+                Timber.w("Auto sync completed with errors: $successCount success, $failureCount failed")
+            }
+            
+            // Update statistics
+            updateSyncStats(successCount, failureCount)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error during auto sync")
+            updateSyncStatus("Sync failed: ${e.message}")
+            handleSyncError(e)
+        } finally {
+            isSyncing = false
+        }
+    }
+
+    /**
+     * Process a batch of sync operations
+     */
+    private suspend fun processSyncBatch(operations: List<SyncOperation>): SyncBatchResult {
+        val results = mutableListOf<SyncOperationResult>()
+        
+        // Process operations concurrently with limit
+        operations.chunked(maxConcurrentSyncs).forEach { chunk ->
+            val chunkResults = chunk.map { operation ->
+                async {
+                    try {
+                        when (operation.type) {
+                            OperationType.CREATE_SHIPMENT -> syncCreateShipment(operation)
+                            OperationType.UPDATE_SHIPMENT -> syncUpdateShipment(operation)
+                            OperationType.DELETE_SHIPMENT -> syncDeleteShipment(operation)
+                            OperationType.UPDATE_LOCATION -> syncUpdateLocation(operation)
+                            OperationType.UPDATE_STATUS -> syncUpdateStatus(operation)
+                            OperationType.UPLOAD_PROOF -> syncUploadProof(operation)
+                            OperationType.SYNC_SHIPMENTS -> syncShipments(operation)
+                            OperationType.SYNC_MAPS_DATA -> syncMapsData(operation)
+                        }
+                    } catch (e: Exception) {
+                        Timber.e(e, "Error syncing operation ${operation.id}")
+                        SyncOperationResult(operation.id, false, e.message)
+                    }
+                }
+            }.awaitAll()
+            
+            results.addAll(chunkResults)
+        }
+        
+        val successCount = results.count { it.success }
+        val failureCount = results.count { !it.success }
+        
+        // Update sync queue based on results
+        results.forEach { result ->
+            if (result.success) {
+                syncQueue.markCompleted(result.operationId)
+            } else {
+                syncQueue.markFailed(result.operationId, result.error ?: "Unknown error")
+            }
+        }
+        
+        return SyncBatchResult(successCount, failureCount, results)
+    }
+
+    /**
+     * Pause auto sync
+     */
+    private fun pauseAutoSync() {
+        isSyncing = false
+        updateSyncStatus("Paused - Waiting for connection")
+    }
+
+    /**
+     * Prepare for auto sync
+     */
+    private suspend fun prepareForAutoSync() {
+        try {
+            // Pre-validate pending operations
+            val pendingOperations = syncQueue.getPendingOperations()
+            val validOperations = pendingOperations.filter { isValidOperation(it) }
+            
+            // Remove invalid operations
+            pendingOperations.filter { !isValidOperation(it) }.forEach { operation ->
+                syncQueue.markFailed(operation.id, "Invalid operation")
+            }
+            
+            Timber.d("Prepared for auto sync: ${validOperations.size} valid operations")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error preparing for auto sync")
+        }
+    }
+
+    /**
+     * Handle sync errors
+     */
+    private suspend fun handleSyncError(error: Exception) {
+        try {
+            // Schedule retry for failed operations
+            val failedOperations = syncQueue.getPendingOperations().filter { 
+                it.status == SyncStatus.FAILED 
+            }
+            
+            for (operation in failedOperations) {
+                retryManager.scheduleRetry(
+                    operation.id,
+                    operation.type,
+                    error.message ?: "Sync error",
+                    operation.retryCount
+                )
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error handling sync error")
+        }
+    }
+
+    // Sync operation implementations
+
+    private suspend fun syncCreateShipment(operation: SyncOperation): SyncOperationResult {
+        return try {
+            // Simulate API call
+            delay(500)
+            
+            // Mark as completed
+            syncQueue.markCompleted(operation.id)
+            
+            SyncOperationResult(operation.id, true, null)
+        } catch (e: Exception) {
+            SyncOperationResult(operation.id, false, e.message)
+        }
+    }
+
+    private suspend fun syncUpdateShipment(operation: SyncOperation): SyncOperationResult {
+        return try {
+            // Check for conflicts
+            val localData = operation.data
+            val serverData = getServerShipmentData(extractShipmentId(operation))
+            
+            if (serverData != null) {
+                val resolution = conflictResolver.resolveConflict(localData, serverData)
+                
+                // Apply resolution
+                applyShipmentResolution(resolution)
+            }
+            
+            delay(300)
+            syncQueue.markCompleted(operation.id)
+            
+            SyncOperationResult(operation.id, true, null)
+        } catch (e: Exception) {
+            SyncOperationResult(operation.id, false, e.message)
+        }
+    }
+
+    private suspend fun syncDeleteShipment(operation: SyncOperation): SyncOperationResult {
+        return try {
+            delay(200)
+            syncQueue.markCompleted(operation.id)
+            
+            SyncOperationResult(operation.id, true, null)
+        } catch (e: Exception) {
+            SyncOperationResult(operation.id, false, e.message)
+        }
+    }
+
+    private suspend fun syncUpdateLocation(operation: SyncOperation): SyncOperationResult {
+        return try {
+            // Batch location updates for efficiency
+            delay(100)
+            syncQueue.markCompleted(operation.id)
+            
+            SyncOperationResult(operation.id, true, null)
+        } catch (e: Exception) {
+            SyncOperationResult(operation.id, false, e.message)
+        }
+    }
+
+    private suspend fun syncUpdateStatus(operation: SyncOperation): SyncOperationResult {
+        return try {
+            delay(150)
+            syncQueue.markCompleted(operation.id)
+            
+            SyncOperationResult(operation.id, true, null)
+        } catch (e: Exception) {
+            SyncOperationResult(operation.id, false, e.message)
+        }
+    }
+
+    private suspend fun syncUploadProof(operation: SyncOperation): SyncOperationResult {
+        return try {
+            // Upload proof files
+            delay(2000) // Longer delay for file upload
+            syncQueue.markCompleted(operation.id)
+            
+            SyncOperationResult(operation.id, true, null)
+        } catch (e: Exception) {
+            SyncOperationResult(operation.id, false, e.message)
+        }
+    }
+
+    private suspend fun syncShipments(operation: SyncOperation): SyncOperationResult {
+        return try {
+            // Sync shipments data
+            delay(1000)
+            syncQueue.markCompleted(operation.id)
+            
+            SyncOperationResult(operation.id, true, null)
+        } catch (e: Exception) {
+            SyncOperationResult(operation.id, false, e.message)
+        }
+    }
+
+    private suspend fun syncMapsData(operation: SyncOperation): SyncOperationResult {
+        return try {
+            // Sync maps data
+            delay(800)
+            syncQueue.markCompleted(operation.id)
+            
+            SyncOperationResult(operation.id, true, null)
+        } catch (e: Exception) {
+            SyncOperationResult(operation.id, false, e.message)
+        }
+    }
+
+    // Helper methods
+
+    private fun isValidOperation(operation: SyncOperation): Boolean {
+        return try {
+            operation.id.isNotEmpty() &&
+            operation.timestamp > 0 &&
+            operation.retryCount <= 5 // Max 5 retries
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private suspend fun getServerShipmentData(shipmentId: String): Any? {
+        // Simulate getting server data
+        return null
+    }
+
+    private suspend fun applyShipmentResolution(resolution: ConflictResolution) {
+        // Apply the resolved data
+        try {
+            // This would update the local database with resolved data
+            Timber.d("Applied shipment resolution: ${resolution.resolution}")
+        } catch (e: Exception) {
+            Timber.e(e, "Error applying shipment resolution")
+        }
+    }
+
+    private fun extractShipmentId(operation: SyncOperation): String {
+        // Extract shipment ID from operation data
+        return operation.id.split("_").firstOrNull() ?: ""
+    }
+
+    private fun updateSyncStatus(status: String) {
+        _syncStats.value = _syncStats.value.copy(status = status)
+    }
+
+    private fun updateSyncStats(successCount: Int, failureCount: Int) {
+        val currentStats = _syncStats.value
+        _syncStats.value = currentStats.copy(
+            totalSynced = currentStats.totalSynced + successCount,
+            totalFailed = currentStats.totalFailed + failureCount,
+            lastSyncTime = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * Enable/disable auto sync
+     */
+    fun setAutoSyncEnabled(enabled: Boolean) {
+        isAutoSyncEnabled = enabled
+        Timber.d("Auto sync ${if (enabled) "enabled" else "disabled"}")
+    }
+
+    /**
+     * Trigger manual sync
+     */
+    suspend fun triggerManualSync() {
+        if (networkMonitor.isOnline()) {
+            startAutoSync()
+        } else {
+            Timber.d("Network unavailable for manual sync")
+        }
+    }
+
+    /**
+     * Get sync queue status
+     */
+    suspend fun getSyncQueueStatus(): SyncQueueStatus {
+        return try {
+            val pendingOperations = syncQueue.getPendingOperations()
+            val retryableOperations = retryManager.getRetryableOperations()
+            
+            SyncQueueStatus(
+                pendingCount = pendingOperations.size,
+                retryableCount = retryableOperations.size,
+                isSyncing = isSyncing,
+                lastSyncTime = _syncStats.value.lastSyncTime
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting sync queue status")
+            SyncQueueStatus(0, 0, false, 0)
+        }
+    }
+
+    /**
+     * Clear sync history
+     */
+    suspend fun clearSyncHistory() {
+        try {
+            // Clear completed operations older than 7 days
+            val sevenDaysAgo = System.currentTimeMillis() - (7 * 24 * 60 * 60 * 1000L)
+            syncQueue.clearCompletedOperations(sevenDaysAgo)
+            
+            Timber.d("Sync history cleared")
+        } catch (e: Exception) {
+            Timber.e(e, "Error clearing sync history")
+        }
+    }
+
+    /**
+     * Stop auto sync manager
+     */
+    fun stop() {
+        autoSyncJob?.cancel()
+        syncScope.cancel()
+        Timber.d("Auto sync manager stopped")
+    }
+}
+
+// Data classes for auto sync
+
+data class AutoSyncStats(
+    val status: String = "Idle",
+    val totalSynced: Int = 0,
+    val totalFailed: Int = 0,
+    val lastSyncTime: Long = 0,
+    val averageSyncTime: Long = 0
+)
+
+data class SyncBatchResult(
+    val successCount: Int,
+    val failureCount: Int,
+    val results: List<SyncOperationResult>
+)
+
+data class SyncOperationResult(
+    val operationId: String,
+    val success: Boolean,
+    val error: String?
+)
+
+data class SyncQueueStatus(
+    val pendingCount: Int,
+    val retryableCount: Int,
+    val isSyncing: Boolean,
+    val lastSyncTime: Long
+)

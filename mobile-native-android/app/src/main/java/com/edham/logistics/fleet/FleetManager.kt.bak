@@ -1,0 +1,813 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.FleetAssignmentEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Fleet Manager - Comprehensive fleet management system
+ * 
+ * Features:
+ * - Vehicle profiles management
+ * - Vehicle status tracking
+ * - Vehicle assignment and scheduling
+ * - Live fleet monitoring
+ * - Fuel tracking and analytics
+ * - Tire management
+ * - Insurance and license tracking
+ * - Document management
+ * - Fleet utilization analytics
+ * - Driver-vehicle mapping
+ */
+@Singleton
+class FleetManager @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils,
+    private val fleetAnalyticsEngine: FleetAnalyticsEngine,
+    private val vehicleMonitoringService: VehicleMonitoringService,
+    private val predictiveAlertsSystem: PredictiveAlertsSystem
+) {
+    
+    private val _fleetState = MutableStateFlow<FleetState>(FleetState.Idle)
+    val fleetState: StateFlow<FleetState> = _fleetState.asStateFlow()
+    
+    private val _vehicles = MutableStateFlow<List<VehicleEntity>>(emptyList())
+    val vehicles: StateFlow<List<VehicleEntity>> = _vehicles.asStateFlow()
+    
+    private val _activeVehicles = MutableStateFlow<List<VehicleEntity>>(emptyList())
+    val activeVehicles: StateFlow<List<VehicleEntity>> = _activeVehicles.asStateFlow()
+    
+    private val _fleetStats = MutableStateFlow<FleetStats?>(null)
+    val fleetStats: StateFlow<FleetStats?> = _fleetStats.asStateFlow()
+    
+    private val _fleetAlerts = MutableStateFlow<List<FleetAlert>>(emptyList())
+    val fleetAlerts: StateFlow<List<FleetAlert>> = _fleetAlerts.asStateFlow()
+    
+    private val _assignments = MutableStateFlow<List<FleetAssignmentEntity>>(emptyList())
+    val assignments: StateFlow<List<FleetAssignmentEntity>> = _assignments.asStateFlow()
+    
+    private var isMonitoring = false
+    private val monitoringInterval = 30000L // 30 seconds
+    
+    companion object {
+        private const val TAG = "FleetManager"
+        private const val VEHICLE_ID_PREFIX = "VH"
+        private const val MAX_VEHICLES_PER_PAGE = 50
+    }
+    
+    /**
+     * Initialize fleet management system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _fleetState.value = FleetState.Initializing
+                
+                // Load vehicles
+                loadVehicles()
+                
+                // Load assignments
+                loadAssignments()
+                
+                // Start monitoring
+                startFleetMonitoring()
+                
+                // Initialize analytics
+                fleetAnalyticsEngine.initialize()
+                
+                // Start predictive alerts
+                predictiveAlertsSystem.start()
+                
+                _fleetState.value = FleetState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _fleetState.value = FleetState.Error("Failed to initialize fleet: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create vehicle profile
+     */
+    suspend fun createVehicle(request: CreateVehicleRequest): Result<VehicleEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _fleetState.value = FleetState.CreatingVehicle
+                
+                // Validate request
+                validateVehicleRequest(request)
+                
+                // Generate vehicle ID
+                val vehicleId = generateVehicleId()
+                
+                // Create vehicle entity
+                val vehicle = VehicleEntity(
+                    id = 0,
+                    vehicleId = vehicleId,
+                    make = request.make,
+                    model = request.model,
+                    year = request.year,
+                    vin = request.vin,
+                    licensePlate = request.licensePlate,
+                    vehicleType = request.vehicleType,
+                    category = request.category,
+                    status = VehicleStatus.AVAILABLE,
+                    currentLocation = request.currentLocation,
+                    currentLatitude = request.currentLatitude,
+                    currentLongitude = request.currentLongitude,
+                    fuelLevel = request.fuelLevel,
+                    mileage = request.mileage,
+                    lastMaintenance = request.lastMaintenance,
+                    nextMaintenance = calculateNextMaintenance(request.lastMaintenance, request.mileage),
+                    insuranceExpiry = request.insuranceExpiry,
+                    licenseExpiry = request.licenseExpiry,
+                    registrationExpiry = request.registrationExpiry,
+                    capacity = request.capacity,
+                    features = request.features,
+                    documents = request.documents,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    createdBy = request.createdBy
+                )
+                
+                // Save to database
+                val vehicleIdLong = database.vehicleDao().insertVehicle(vehicle)
+                val savedVehicle = vehicle.copy(id = vehicleIdLong)
+                
+                // Sync with server
+                if (networkUtils.isNetworkAvailable()) {
+                    syncVehicleWithServer(savedVehicle)
+                }
+                
+                // Update vehicles list
+                updateVehicles()
+                
+                // Update fleet stats
+                updateFleetStats()
+                
+                _fleetState.value = FleetState.VehicleCreated
+                Result.success(savedVehicle)
+                
+            } catch (e: Exception) {
+                _fleetState.value = FleetState.Error("Failed to create vehicle: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update vehicle profile
+     */
+    suspend fun updateVehicle(vehicleId: Long, request: UpdateVehicleRequest): Result<VehicleEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _fleetState.value = FleetState.UpdatingVehicle
+                
+                // Get existing vehicle
+                val existingVehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Validate update
+                validateVehicleUpdate(existingVehicle, request)
+                
+                // Update vehicle
+                val updatedVehicle = existingVehicle.copy(
+                    make = request.make ?: existingVehicle.make,
+                    model = request.model ?: existingVehicle.model,
+                    year = request.year ?: existingVehicle.year,
+                    licensePlate = request.licensePlate ?: existingVehicle.licensePlate,
+                    vehicleType = request.vehicleType ?: existingVehicle.vehicleType,
+                    category = request.category ?: existingVehicle.category,
+                    currentLocation = request.currentLocation ?: existingVehicle.currentLocation,
+                    currentLatitude = request.currentLatitude ?: existingVehicle.currentLatitude,
+                    currentLongitude = request.currentLongitude ?: existingVehicle.currentLongitude,
+                    fuelLevel = request.fuelLevel ?: existingVehicle.fuelLevel,
+                    mileage = request.mileage ?: existingVehicle.mileage,
+                    lastMaintenance = request.lastMaintenance ?: existingVehicle.lastMaintenance,
+                    nextMaintenance = if (request.lastMaintenance != null) {
+                        calculateNextMaintenance(request.lastMaintenance, request.mileage ?: existingVehicle.mileage)
+                    } else existingVehicle.nextMaintenance,
+                    insuranceExpiry = request.insuranceExpiry ?: existingVehicle.insuranceExpiry,
+                    licenseExpiry = request.licenseExpiry ?: existingVehicle.licenseExpiry,
+                    registrationExpiry = request.registrationExpiry ?: existingVehicle.registrationExpiry,
+                    capacity = request.capacity ?: existingVehicle.capacity,
+                    features = request.features ?: existingVehicle.features,
+                    documents = request.documents ?: existingVehicle.documents,
+                    updatedAt = Date(),
+                    updatedBy = request.updatedBy
+                )
+                
+                // Save to database
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Sync with server
+                if (networkUtils.isNetworkAvailable()) {
+                    syncVehicleUpdateWithServer(updatedVehicle)
+                }
+                
+                // Update vehicles list
+                updateVehicles()
+                
+                // Update fleet stats
+                updateFleetStats()
+                
+                _fleetState.value = FleetState.VehicleUpdated
+                Result.success(updatedVehicle)
+                
+            } catch (e: Exception) {
+                _fleetState.value = FleetState.Error("Failed to update vehicle: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update vehicle status
+     */
+    suspend fun updateVehicleStatus(vehicleId: Long, status: VehicleStatus, reason: String, updatedBy: String): Result<VehicleEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Validate status transition
+                if (!isValidStatusTransition(vehicle.status, status)) {
+                    throw Exception("Invalid status transition from ${vehicle.status} to $status")
+                }
+                
+                // Update status
+                val updatedVehicle = vehicle.copy(
+                    status = status,
+                    updatedAt = Date(),
+                    updatedBy = updatedBy
+                )
+                
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Handle status-specific actions
+                when (status) {
+                    VehicleStatus.IN_USE -> {
+                        startVehicleMonitoring(vehicleId)
+                    }
+                    VehicleStatus.MAINTENANCE -> {
+                        stopVehicleMonitoring(vehicleId)
+                        scheduleMaintenance(vehicleId)
+                    }
+                    VehicleStatus.OUT_OF_SERVICE -> {
+                        stopVehicleMonitoring(vehicleId)
+                    }
+                    VehicleStatus.AVAILABLE -> {
+                        if (vehicle.status == VehicleStatus.MAINTENANCE) {
+                            completeMaintenance(vehicleId)
+                        }
+                    }
+                    else -> {
+                        // No specific actions
+                    }
+                }
+                
+                // Update vehicles list
+                updateVehicles()
+                
+                // Update fleet stats
+                updateFleetStats()
+                
+                Result.success(updatedVehicle)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Assign vehicle to driver
+     */
+    suspend fun assignVehicle(vehicleId: Long, driverId: String, assignmentType: AssignmentType, assignedBy: String): Result<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _fleetState.value = FleetState.AssigningVehicle
+                
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Check if vehicle is available
+                if (vehicle.status != VehicleStatus.AVAILABLE) {
+                    throw Exception("Vehicle is not available for assignment")
+                }
+                
+                // Create assignment
+                val assignment = FleetAssignmentEntity(
+                    id = 0,
+                    vehicleId = vehicleId,
+                    driverId = driverId,
+                    assignmentType = assignmentType,
+                    status = AssignmentStatus.ACTIVE,
+                    assignedAt = Date(),
+                    startedAt = null,
+                    endedAt = null,
+                    startMileage = vehicle.mileage,
+                    endMileage = null,
+                    startFuelLevel = vehicle.fuelLevel,
+                    endFuelLevel = null,
+                    route = null,
+                    notes = null,
+                    assignedBy = assignedBy,
+                    createdAt = Date()
+                )
+                
+                // Save assignment
+                val assignmentId = database.fleetAssignmentDao().insertAssignment(assignment)
+                val savedAssignment = assignment.copy(id = assignmentId)
+                
+                // Update vehicle status
+                updateVehicleStatus(vehicleId, VehicleStatus.IN_USE, "Assigned to driver", assignedBy)
+                
+                // Update assignments list
+                updateAssignments()
+                
+                // Start tracking
+                liveTrackingManager.startTracking(vehicle.vehicleId)
+                
+                _fleetState.value = FleetState.VehicleAssigned
+                Result.success(savedAssignment)
+                
+            } catch (e: Exception) {
+                _fleetState.value = FleetState.Error("Failed to assign vehicle: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Unassign vehicle
+     */
+    suspend fun unassignVehicle(vehicleId: Long, endMileage: Float, endFuelLevel: Float, notes: String, unassignedBy: String): Result<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get active assignment
+                val activeAssignment = database.fleetAssignmentDao().getActiveAssignmentByVehicle(vehicleId)
+                    ?: throw Exception("No active assignment found")
+                
+                // Get vehicle
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Complete assignment
+                val completedAssignment = activeAssignment.copy(
+                    status = AssignmentStatus.COMPLETED,
+                    endedAt = Date(),
+                    endMileage = endMileage,
+                    endFuelLevel = endFuelLevel,
+                    notes = notes
+                )
+                
+                database.fleetAssignmentDao().updateAssignment(completedAssignment)
+                
+                // Update vehicle
+                val updatedVehicle = vehicle.copy(
+                    status = VehicleStatus.AVAILABLE,
+                    mileage = endMileage,
+                    fuelLevel = endFuelLevel,
+                    updatedAt = Date(),
+                    updatedBy = unassignedBy
+                )
+                
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Stop tracking
+                liveTrackingManager.stopTracking()
+                
+                // Update assignments list
+                updateAssignments()
+                
+                // Update vehicles list
+                updateVehicles()
+                
+                Result.success(completedAssignment)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get vehicles by status
+     */
+    suspend fun getVehiclesByStatus(status: VehicleStatus): List<VehicleEntity> {
+        return withContext(Dispatchers.IO) {
+            database.vehicleDao().getVehiclesByStatus(status)
+        }
+    }
+    
+    /**
+     * Get vehicles by type
+     */
+    suspend fun getVehiclesByType(vehicleType: VehicleType): List<VehicleEntity> {
+        return withContext(Dispatchers.IO) {
+            database.vehicleDao().getVehiclesByType(vehicleType)
+        }
+    }
+    
+    /**
+     * Get available vehicles
+     */
+    suspend fun getAvailableVehicles(): List<VehicleEntity> {
+        return withContext(Dispatchers.IO) {
+            database.vehicleDao().getVehiclesByStatus(VehicleStatus.AVAILABLE)
+        }
+    }
+    
+    /**
+     * Get vehicle assignments
+     */
+    suspend fun getVehicleAssignments(vehicleId: Long): List<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            database.fleetAssignmentDao().getAssignmentsByVehicle(vehicleId)
+        }
+    }
+    
+    /**
+     * Get driver assignments
+     */
+    suspend fun getDriverAssignments(driverId: String): List<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            database.fleetAssignmentDao().getAssignmentsByDriver(driverId)
+        }
+    }
+    
+    /**
+     * Get fleet statistics
+     */
+    suspend fun getFleetStats(): FleetStats {
+        return withContext(Dispatchers.IO) {
+            val allVehicles = database.vehicleDao().getAllVehicles()
+            val activeAssignments = database.fleetAssignmentDao().getActiveAssignments()
+            
+            val totalVehicles = allVehicles.size
+            val availableVehicles = allVehicles.count { it.status == VehicleStatus.AVAILABLE }
+            val inUseVehicles = allVehicles.count { it.status == VehicleStatus.IN_USE }
+            val maintenanceVehicles = allVehicles.count { it.status == VehicleStatus.MAINTENANCE }
+            val outOfServiceVehicles = allVehicles.count { it.status == VehicleStatus.OUT_OF_SERVICE }
+            
+            val utilizationRate = if (totalVehicles > 0) {
+                inUseVehicles.toFloat() / totalVehicles
+            } else 0f
+            
+            val averageMileage = if (allVehicles.isNotEmpty()) {
+                allVehicles.map { it.mileage }.average().toFloat()
+            } else 0f
+            
+            val averageFuelLevel = if (allVehicles.isNotEmpty()) {
+                allVehicles.map { it.fuelLevel }.average().toFloat()
+            } else 0f
+            
+            val vehiclesNeedingMaintenance = allVehicles.count { 
+                it.nextMaintenance.before(Date()) 
+            }
+            
+            val expiredDocuments = allVehicles.count { vehicle ->
+                vehicle.insuranceExpiry.before(Date()) ||
+                vehicle.licenseExpiry.before(Date()) ||
+                vehicle.registrationExpiry.before(Date())
+            }
+            
+            FleetStats(
+                totalVehicles = totalVehicles,
+                availableVehicles = availableVehicles,
+                inUseVehicles = inUseVehicles,
+                maintenanceVehicles = maintenanceVehicles,
+                outOfServiceVehicles = outOfServiceVehicles,
+                utilizationRate = utilizationRate,
+                averageMileage = averageMileage,
+                averageFuelLevel = averageFuelLevel,
+                vehiclesNeedingMaintenance = vehiclesNeedingMaintenance,
+                expiredDocuments = expiredDocuments,
+                activeAssignments = activeAssignments.size
+            )
+        }
+    }
+    
+    /**
+     * Search vehicles
+     */
+    suspend fun searchVehicles(query: String, filters: VehicleFilters = VehicleFilters()): List<VehicleEntity> {
+        return withContext(Dispatchers.IO) {
+            var vehicles = database.vehicleDao().getAllVehicles()
+            
+            // Apply search query
+            if (query.isNotBlank()) {
+                vehicles = vehicles.filter { vehicle ->
+                    vehicle.make.contains(query, ignoreCase = true) ||
+                    vehicle.model.contains(query, ignoreCase = true) ||
+                    vehicle.licensePlate.contains(query, ignoreCase = true) ||
+                    vehicle.vehicleId.contains(query, ignoreCase = true)
+                }
+            }
+            
+            // Apply filters
+            if (filters.status.isNotEmpty()) {
+                vehicles = vehicles.filter { it.status in filters.status }
+            }
+            
+            if (filters.vehicleType.isNotEmpty()) {
+                vehicles = vehicles.filter { it.vehicleType in filters.vehicleType }
+            }
+            
+            if (filters.category.isNotEmpty()) {
+                vehicles = vehicles.filter { it.category in filters.category }
+            }
+            
+            vehicles
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadVehicles() {
+        val vehicles = database.vehicleDao().getAllVehicles()
+        _vehicles.value = vehicles
+        _activeVehicles.value = vehicles.filter { it.status == VehicleStatus.IN_USE }
+    }
+    
+    private suspend fun loadAssignments() {
+        val assignments = database.fleetAssignmentDao().getAllAssignments()
+        _assignments.value = assignments
+    }
+    
+    private fun startFleetMonitoring() {
+        isMonitoring = true
+        // Implementation would start periodic monitoring
+    }
+    
+    private fun stopFleetMonitoring() {
+        isMonitoring = false
+        // Implementation would stop monitoring
+    }
+    
+    private suspend fun updateVehicles() {
+        loadVehicles()
+    }
+    
+    private suspend fun updateAssignments() {
+        loadAssignments()
+    }
+    
+    private suspend fun updateFleetStats() {
+        val stats = getFleetStats()
+        _fleetStats.value = stats
+    }
+    
+    private fun generateVehicleId(): String {
+        val timestamp = System.currentTimeMillis()
+        val random = (1000..9999).random()
+        return "$VEHICLE_ID_PREFIX-$timestamp-$random"
+    }
+    
+    private fun validateVehicleRequest(request: CreateVehicleRequest) {
+        if (request.make.isBlank()) throw Exception("Vehicle make is required")
+        if (request.model.isBlank()) throw Exception("Vehicle model is required")
+        if (request.year < 1900 || request.year > Calendar.getInstance().get(Calendar.YEAR) + 1) {
+            throw Exception("Invalid vehicle year")
+        }
+        if (request.licensePlate.isBlank()) throw Exception("License plate is required")
+        if (request.vin.isBlank()) throw Exception("VIN is required")
+    }
+    
+    private fun validateVehicleUpdate(vehicle: VehicleEntity, request: UpdateVehicleRequest) {
+        // Validate update constraints
+        if (request.year != null && (request.year < 1900 || request.year > Calendar.getInstance().get(Calendar.YEAR) + 1)) {
+            throw Exception("Invalid vehicle year")
+        }
+    }
+    
+    private fun isValidStatusTransition(from: VehicleStatus, to: VehicleStatus): Boolean {
+        val validTransitions = mapOf(
+            VehicleStatus.AVAILABLE to setOf(VehicleStatus.IN_USE, VehicleStatus.MAINTENANCE, VehicleStatus.OUT_OF_SERVICE),
+            VehicleStatus.IN_USE to setOf(VehicleStatus.AVAILABLE, VehicleStatus.MAINTENANCE, VehicleStatus.OUT_OF_SERVICE),
+            VehicleStatus.MAINTENANCE to setOf(VehicleStatus.AVAILABLE, VehicleStatus.OUT_OF_SERVICE),
+            VehicleStatus.OUT_OF_SERVICE to setOf(VehicleStatus.AVAILABLE, VehicleStatus.MAINTENANCE)
+        )
+        
+        return validTransitions[from]?.contains(to) == true
+    }
+    
+    private fun calculateNextMaintenance(lastMaintenance: Date?, mileage: Float): Date {
+        val calendar = Calendar.getInstance()
+        calendar.time = lastMaintenance ?: Date()
+        
+        // Schedule maintenance every 6 months or 10,000 miles, whichever comes first
+        calendar.add(Calendar.MONTH, 6)
+        
+        return calendar.time
+    }
+    
+    private suspend fun syncVehicleWithServer(vehicle: VehicleEntity) {
+        // Implementation would sync with server
+    }
+    
+    private suspend fun syncVehicleUpdateWithServer(vehicle: VehicleEntity) {
+        // Implementation would sync update with server
+    }
+    
+    private fun startVehicleMonitoring(vehicleId: Long) {
+        vehicleMonitoringService.startMonitoring(vehicleId)
+    }
+    
+    private fun stopVehicleMonitoring(vehicleId: Long) {
+        vehicleMonitoringService.stopMonitoring(vehicleId)
+    }
+    
+    private fun scheduleMaintenance(vehicleId: Long) {
+        // Implementation would schedule maintenance
+    }
+    
+    private fun completeMaintenance(vehicleId: Long) {
+        // Implementation would complete maintenance
+    }
+    
+    /**
+     * Get monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+}
+
+/**
+ * Data classes
+ */
+data class FleetStats(
+    val totalVehicles: Int,
+    val availableVehicles: Int,
+    val inUseVehicles: Int,
+    val maintenanceVehicles: Int,
+    val outOfServiceVehicles: Int,
+    val utilizationRate: Float,
+    val averageMileage: Float,
+    val averageFuelLevel: Float,
+    val vehiclesNeedingMaintenance: Int,
+    val expiredDocuments: Int,
+    val activeAssignments: Int
+)
+
+data class CreateVehicleRequest(
+    val make: String,
+    val model: String,
+    val year: Int,
+    val vin: String,
+    val licensePlate: String,
+    val vehicleType: VehicleType,
+    val category: VehicleCategory,
+    val currentLocation: String,
+    val currentLatitude: Double,
+    val currentLongitude: Double,
+    val fuelLevel: Float,
+    val mileage: Float,
+    val lastMaintenance: Date?,
+    val insuranceExpiry: Date,
+    val licenseExpiry: Date,
+    val registrationExpiry: Date,
+    val capacity: Float,
+    val features: List<String>,
+    val documents: List<String>,
+    val createdBy: String
+)
+
+data class UpdateVehicleRequest(
+    val make: String? = null,
+    val model: String? = null,
+    val year: Int? = null,
+    val licensePlate: String? = null,
+    val vehicleType: VehicleType? = null,
+    val category: VehicleCategory? = null,
+    val currentLocation: String? = null,
+    val currentLatitude: Double? = null,
+    val currentLongitude: Double? = null,
+    val fuelLevel: Float? = null,
+    val mileage: Float? = null,
+    val lastMaintenance: Date? = null,
+    val insuranceExpiry: Date? = null,
+    val licenseExpiry: Date? = null,
+    val registrationExpiry: Date? = null,
+    val capacity: Float? = null,
+    val features: List<String>? = null,
+    val documents: List<String>? = null,
+    val updatedBy: String
+)
+
+data class VehicleFilters(
+    val status: Set<VehicleStatus> = emptySet(),
+    val vehicleType: Set<VehicleType> = emptySet(),
+    val category: Set<VehicleCategory> = emptySet(),
+    val minFuelLevel: Float? = null,
+    val maxFuelLevel: Float? = null,
+    val minMileage: Float? = null,
+    val maxMileage: Float? = null
+)
+
+data class FleetAlert(
+    val id: Long,
+    val vehicleId: Long,
+    val type: FleetAlertType,
+    val message: String,
+    val severity: AlertSeverity,
+    val timestamp: Date,
+    val resolved: Boolean,
+    val resolvedAt: Date?,
+    val resolvedBy: String?
+)
+
+/**
+ * Enums
+ */
+enum class FleetState {
+    Idle,
+    Initializing,
+    Ready,
+    CreatingVehicle,
+    VehicleCreated,
+    UpdatingVehicle,
+    VehicleUpdated,
+    AssigningVehicle,
+    VehicleAssigned,
+    Error
+}
+
+enum class VehicleStatus {
+    AVAILABLE,
+    IN_USE,
+    MAINTENANCE,
+    OUT_OF_SERVICE,
+    RETIRED
+}
+
+enum class VehicleType {
+    TRUCK,
+    VAN,
+    MOTORCYCLE,
+    CAR,
+    BUS,
+    TRAILER,
+    SPECIAL_EQUIPMENT
+}
+
+enum class VehicleCategory {
+    LIGHT_DUTY,
+    MEDIUM_DUTY,
+    HEAVY_DUTY,
+    SPECIALIZED,
+    EMERGENCY
+}
+
+enum class AssignmentType {
+    REGULAR,
+    TEMPORARY,
+    EMERGENCY,
+    MAINTENANCE,
+    TRAINING
+}
+
+enum class AssignmentStatus {
+    ACTIVE,
+    COMPLETED,
+    CANCELLED,
+    SUSPENDED
+}
+
+enum class FleetAlertType {
+    LOW_FUEL,
+    MAINTENANCE_DUE,
+    INSURANCE_EXPIRING,
+    LICENSE_EXPIRING,
+    REGISTRATION_EXPIRING,
+    HIGH_MILEAGE,
+    ABNORMAL_FUEL_CONSUMPTION,
+    GEOFENCE_VIOLATION,
+    UNAUTHORIZED_USE,
+    SYSTEM_ERROR
+}
+
+enum class AlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

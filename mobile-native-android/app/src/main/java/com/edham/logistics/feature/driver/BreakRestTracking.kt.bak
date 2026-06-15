@@ -1,0 +1,331 @@
+package com.edham.logistics.feature.driver
+
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.os.CountDownTimer
+import androidx.fragment.app.Fragment
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentBreakRestTrackingBinding
+import com.edham.logistics.utils.VoiceAlertManager
+import timber.log.Timber
+import java.text.SimpleDateFormat
+import java.util.*
+
+class BreakRestTrackingFragment : Fragment() {
+    
+    private var _binding: FragmentBreakRestTrackingBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var voiceAlertManager: VoiceAlertManager
+    private var countDownTimer: CountDownTimer? = null
+    private var isOnBreak = false
+    private var breakStartTime: Long = 0
+    private var totalBreakTimeToday: Long = 0
+    private val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    
+    companion object {
+        private const val BREAK_DURATION = 15 * 60 * 1000L // 15 minutes in milliseconds
+        private const val MAX_BREAK_TIME_PER_DAY = 8 * 60 * 60 * 1000L // 8 hours per day
+        private const val BREAK_REMINDER_REQUEST_CODE = 1001
+    }
+    
+    override fun onCreateView(
+        inflater: android.view.LayoutInflater,
+        container: android.view.ViewGroup?,
+        savedInstanceState: Bundle?
+    ): android.view.View {
+        _binding = FragmentBreakRestTrackingBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: android.view.View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        voiceAlertManager = VoiceAlertManager(requireContext())
+        setupUI()
+        setupClickListeners()
+        loadBreakData()
+        
+        voiceAlertManager.speak("Break and rest tracking screen opened")
+    }
+    
+    private fun setupUI() {
+        // Large touch targets for one-hand usage
+        binding.btnStartBreak.minimumHeight = 80.dp
+        binding.btnStartBreak.minimumWidth = 160.dp
+        
+        binding.btnEndBreak.minimumHeight = 80.dp
+        binding.btnEndBreak.minimumWidth = 160.dp
+        
+        binding.btnSetReminder.minimumHeight = 72.dp
+        binding.btnSetReminder.minimumWidth = 120.dp
+        
+        // Dark mode optimized colors
+        binding.cardBreakStatus.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        // High visibility status colors
+        updateBreakStatusUI()
+    }
+    
+    private fun setupClickListeners() {
+        binding.btnStartBreak.setOnClickListener {
+            startBreak()
+        }
+        
+        binding.btnEndBreak.setOnClickListener {
+            endBreak()
+        }
+        
+        binding.btnSetReminder.setOnClickListener {
+            setBreakReminder()
+        }
+        
+        binding.btnViewHistory.setOnClickListener {
+            viewBreakHistory()
+        }
+    }
+    
+    private fun startBreak() {
+        if (isOnBreak) {
+            voiceAlertManager.speak("You are already on break")
+            return
+        }
+        
+        // Check if daily break time limit reached
+        if (totalBreakTimeToday >= MAX_BREAK_TIME_PER_DAY) {
+            voiceAlertManager.speak("Daily break time limit reached")
+            Toast.makeText(requireContext(), "Daily break time limit reached", Toast.LENGTH_LONG).show()
+            return
+        }
+        
+        isOnBreak = true
+        breakStartTime = System.currentTimeMillis()
+        
+        // Update UI
+        updateBreakStatusUI()
+        binding.btnStartBreak.isEnabled = false
+        binding.btnEndBreak.isEnabled = true
+        
+        // Start countdown timer
+        startCountdownTimer()
+        
+        // Voice alert
+        voiceAlertManager.speak("Break started. You have 15 minutes")
+        
+        // Log break start
+        logBreakEvent("BREAK_STARTED")
+    }
+    
+    private fun endBreak() {
+        if (!isOnBreak) {
+            voiceAlertManager.speak("You are not currently on break")
+            return
+        }
+        
+        val breakEndTime = System.currentTimeMillis()
+        val breakDuration = breakEndTime - breakStartTime
+        
+        // Update total break time
+        totalBreakTimeToday += breakDuration
+        
+        // Cancel countdown timer
+        countDownTimer?.cancel()
+        
+        // Update state
+        isOnBreak = false
+        
+        // Update UI
+        updateBreakStatusUI()
+        binding.btnStartBreak.isEnabled = true
+        binding.btnEndBreak.isEnabled = false
+        binding.tvCountdown.text = "00:00:00"
+        
+        // Voice alert
+        val minutes = (breakDuration / 1000 / 60).toInt()
+        voiceAlertManager.speak("Break ended. Total break time: $minutes minutes")
+        
+        // Show break summary
+        showBreakSummary(breakDuration)
+        
+        // Log break end
+        logBreakEvent("BREAK_ENDED")
+    }
+    
+    private fun startCountdownTimer() {
+        countDownTimer = object : CountDownTimer(BREAK_DURATION, 1000) {
+            override fun onTick(millisUntilFinished: Long) {
+                val hours = millisUntilFinished / (1000 * 60 * 60)
+                val minutes = (millisUntilFinished % (1000 * 60 * 60)) / (1000 * 60)
+                val seconds = (millisUntilFinished % (1000 * 60)) / 1000
+                
+                val timeString = String.format("%02d:%02d:%02d", hours, minutes, seconds)
+                binding.tvCountdown.text = timeString
+                
+                // Voice alerts at specific intervals
+                when {
+                    millisUntilFinished == 5 * 60 * 1000L -> { // 5 minutes remaining
+                        voiceAlertManager.speak("5 minutes remaining")
+                    }
+                    millisUntilFinished == 2 * 60 * 1000L -> { // 2 minutes remaining
+                        voiceAlertManager.speak("2 minutes remaining")
+                    }
+                    millisUntilFinished == 30 * 1000L -> { // 30 seconds remaining
+                        voiceAlertManager.speak("30 seconds remaining")
+                    }
+                }
+            }
+            
+            override fun onFinish() {
+                binding.tvCountdown.text = "00:00:00"
+                voiceAlertManager.speak("Break time is over. Please resume work")
+                
+                // Auto-end break
+                endBreak()
+            }
+        }
+        
+        countDownTimer?.start()
+    }
+    
+    private fun setBreakReminder() {
+        val alarmManager = requireContext().getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(requireContext(), BreakReminderReceiver::class.java)
+        val pendingIntent = PendingIntent.getBroadcast(
+            requireContext(),
+            BREAK_REMINDER_REQUEST_CODE,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        
+        // Set reminder for 2 hours from now
+        val reminderTime = System.currentTimeMillis() + (2 * 60 * 60 * 1000)
+        alarmManager.setExact(AlarmManager.RTC_WAKEUP, reminderTime, pendingIntent)
+        
+        voiceAlertManager.speak("Break reminder set for 2 hours from now")
+        Toast.makeText(requireContext(), "Break reminder set", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun viewBreakHistory() {
+        // Navigate to break history screen
+        voiceAlertManager.speak("Viewing break history")
+        // Implementation would navigate to break history screen
+    }
+    
+    private fun updateBreakStatusUI() {
+        val status = when {
+            isOnBreak -> "ON_BREAK"
+            totalBreakTimeToday >= MAX_BREAK_TIME_PER_DAY -> "LIMIT_REACHED"
+            else -> "AVAILABLE"
+        }
+        
+        binding.tvBreakStatus.text = status
+        
+        val color = when (status) {
+            "ON_BREAK" -> requireContext().getColor(R.color.status_active)
+            "LIMIT_REACHED" -> requireContext().getColor(R.color.status_error)
+            else -> requireContext().getColor(R.color.status_idle)
+        }
+        
+        binding.viewStatusIndicator.setBackgroundColor(color)
+        
+        // Update button states
+        binding.btnStartBreak.isEnabled = !isOnBreak && totalBreakTimeToday < MAX_BREAK_TIME_PER_DAY
+        binding.btnEndBreak.isEnabled = isOnBreak
+        
+        // Update break time display
+        val totalHours = totalBreakTimeToday / (1000 * 60 * 60)
+        val totalMinutes = (totalBreakTimeToday % (1000 * 60 * 60)) / (1000 * 60)
+        binding.tvTotalBreakTime.text = String.format("Total today: %02d:%02d", totalHours.toInt(), totalMinutes.toInt())
+    }
+    
+    private fun showBreakSummary(breakDuration: Long) {
+        val minutes = (breakDuration / 1000 / 60).toInt()
+        val seconds = ((breakDuration % (1000 * 60)) / 1000).toInt()
+        
+        val summary = "Break completed!\nDuration: ${minutes}m ${seconds}s"
+        
+        // Show summary dialog or toast
+        Toast.makeText(requireContext(), summary, Toast.LENGTH_LONG).show()
+    }
+    
+    private fun loadBreakData() {
+        // Load today's break data from local storage or API
+        // For now, simulate with zero
+        totalBreakTimeToday = 0L
+        updateBreakStatusUI()
+    }
+    
+    private fun logBreakEvent(eventType: String) {
+        val timestamp = System.currentTimeMillis()
+        val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        
+        // Log break event
+        Timber.d("Break event: $eventType at $timestamp")
+        
+        // This would typically save to local database or send to API
+        // saveBreakEventToDatabase(eventType, timestamp, date)
+    }
+    
+    override fun onPause() {
+        super.onPause()
+        
+        // Cancel countdown timer if on break
+        if (isOnBreak) {
+            countDownTimer?.cancel()
+            
+            // Show notification that break is still active
+            showBreakNotification()
+        }
+    }
+    
+    override fun onResume() {
+        super.onResume()
+        
+        // Load current break data
+        loadBreakData()
+        
+        // Resume countdown timer if on break
+        if (isOnBreak) {
+            val remainingTime = BREAK_DURATION - (System.currentTimeMillis() - breakStartTime)
+            if (remainingTime > 0) {
+                startCountdownTimer()
+            } else {
+                endBreak()
+            }
+        }
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        
+        // Cancel countdown timer
+        countDownTimer?.cancel()
+        voiceAlertManager.cleanup()
+        _binding = null
+    }
+    
+    private fun showBreakNotification() {
+        // Show notification that break is still active
+        // Implementation would use NotificationManager
+    }
+    
+    // Extension for dp to pixels
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+}
+
+/**
+ * Break reminder broadcast receiver
+ */
+class BreakReminderReceiver : android.content.BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+        // Show break reminder notification
+        // Implementation would show notification
+        Timber.d("Break reminder triggered")
+    }
+}

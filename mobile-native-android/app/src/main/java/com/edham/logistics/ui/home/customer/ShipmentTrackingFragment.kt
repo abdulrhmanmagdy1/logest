@@ -47,16 +47,25 @@ class ShipmentTrackingFragment : Fragment() {
         viewModel.trackingData.observe(viewLifecycleOwner) { load ->
             if (load != null) {
                 view.findViewById<TextView>(R.id.tvTrackingNumber).text = load.id
-                view.findViewById<TextView>(R.id.tvStatus).text = load.status
+                view.findViewById<TextView>(R.id.tvStatus).text = mapStatusToArabic(load.status)
                 view.findViewById<TextView>(R.id.tvEstimatedDelivery).text = load.date
-                view.findViewById<TextView>(R.id.tvDriverName).text = load.driverName ?: "جاري التعيين..."
-                view.findViewById<TextView>(R.id.tvVehicleInfo).text = load.truckId ?: "---"
+                view.findViewById<TextView>(R.id.tvDriverName).text = load.driverName ?: "جاري البحث عن كابتن..."
+                view.findViewById<TextView>(R.id.tvVehicleInfo).text = load.truckNumber ?: "---"
             }
         }
 
         viewModel.error.observe(viewLifecycleOwner) { error ->
             error?.let { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() }
         }
+    }
+
+    private fun mapStatusToArabic(status: String): String = when(status.lowercase()) {
+        "pending" -> "قيد الانتظار"
+        "assigned" -> "تم تعيين الكابتن"
+        "picked_up" -> "تم التحميل"
+        "on_the_way" -> "في الطريق إليك"
+        "delivered" -> "تم التسليم بنجاح"
+        else -> status
     }
 
     companion object {

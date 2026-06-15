@@ -1,0 +1,464 @@
+package com.edham.logistics.presentation.backup
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.core.backup.*
+import com.edham.logistics.databinding.FragmentAdminBackupBinding
+import com.edham.logistics.domain.backup.*
+import com.edham.logistics.data.backup.*
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * Admin Backup Fragment - Admin interface for backup management
+ * Provides comprehensive backup and restore functionality for administrators
+ */
+@AndroidEntryPoint
+class AdminBackupFragment : Fragment() {
+
+    private var _binding: FragmentAdminBackupBinding? = null
+    private val binding get() = _binding!!
+    
+    private val backupViewModel: BackupViewModel by viewModels()
+    private lateinit var backupAdapter: BackupAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentAdminBackupBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupRecyclerView()
+        setupClickListeners()
+        observeViewModel()
+        
+        // Load backup data
+        backupViewModel.loadBackupHistory()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
+    /**
+     * Setup recycler view for backup list
+     */
+    private fun setupRecyclerView() {
+        backupAdapter = BackupAdapter { backupInfo, action ->
+            handleBackupAction(backupInfo, action)
+        }
+        
+        binding.recyclerBackups.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = backupAdapter
+        }
+    }
+
+    /**
+     * Setup click listeners
+     */
+    private fun setupClickListeners() {
+        // Create backup button
+        binding.buttonCreateBackup.setOnClickListener {
+            showCreateBackupDialog()
+        }
+        
+        // Auto backup toggle
+        binding.switchAutoBackup.setOnCheckedChangeListener { _, isChecked ->
+            backupViewModel.toggleAutoBackup(isChecked)
+        }
+        
+        // Schedule backup
+        binding.buttonScheduleBackup.setOnClickListener {
+            showScheduleBackupDialog()
+        }
+        
+        // Export data
+        binding.buttonExportData.setOnClickListener {
+            showExportDataDialog()
+        }
+        
+        // Cleanup old backups
+        binding.buttonCleanupBackups.setOnClickListener {
+            showCleanupDialog()
+        }
+        
+        // Refresh
+        binding.swipeRefresh.setOnRefreshListener {
+            backupViewModel.loadBackupHistory()
+        }
+    }
+
+    /**
+     * Observe ViewModel
+     */
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Backup history
+            backupViewModel.backupHistory.collect { backups ->
+                backupAdapter.submitList(backups)
+                binding.swipeRefresh.isRefreshing = false
+                updateEmptyState(backups.isEmpty())
+            }
+            
+            // Backup state
+            backupViewModel.backupState.collect { state ->
+                updateBackupState(state)
+            }
+            
+            // Backup statistics
+            backupViewModel.backupStatistics.collect { stats ->
+                updateStatisticsDisplay(stats)
+            }
+        }
+    }
+
+    /**
+     * Handle backup action
+     */
+    private fun handleBackupAction(backupInfo: BackupInfo, action: BackupAction) {
+        when (action) {
+            BackupAction.RESTORE -> {
+                showRestoreDialog(backupInfo)
+            }
+            BackupAction.DELETE -> {
+                showDeleteDialog(backupInfo)
+            }
+            BackupAction.DOWNLOAD -> {
+                downloadBackup(backupInfo)
+            }
+            BackupAction.DETAILS -> {
+                showBackupDetails(backupInfo)
+            }
+        }
+    }
+
+    /**
+     * Show create backup dialog
+     */
+    private fun showCreateBackupDialog() {
+        val dialog = CreateBackupDialog { name, includeFiles, includeDatabase, encrypt ->
+            createBackup(name, includeFiles, includeDatabase, encrypt)
+        }
+        dialog.show(childFragmentManager, "CreateBackupDialog")
+    }
+
+    /**
+     * Show schedule backup dialog
+     */
+    private fun showScheduleBackupDialog() {
+        val dialog = ScheduleBackupDialog { backupTime ->
+            scheduleBackup(backupTime)
+        }
+        dialog.show(childFragmentManager, "ScheduleBackupDialog")
+    }
+
+    /**
+     * Show export data dialog
+     */
+    private fun showExportDataDialog() {
+        val dialog = ExportDataDialog { exportType, dateRange, includeFiles ->
+            exportData(exportType, dateRange, includeFiles)
+        }
+        dialog.show(childFragmentManager, "ExportDataDialog")
+    }
+
+    /**
+     * Show restore dialog
+     */
+    private fun showRestoreDialog(backupInfo: BackupInfo) {
+        val dialog = RestoreBackupDialog(backupInfo) { restoreOptions ->
+            restoreBackup(backupInfo.id, restoreOptions)
+        }
+        dialog.show(childFragmentManager, "RestoreBackupDialog")
+    }
+
+    /**
+     * Show delete dialog
+     */
+    private fun showDeleteDialog(backupInfo: BackupInfo) {
+        val dialog = com.edham.logistics.core.ui.DialogManager.showConfirmationDialog(
+            screenId = "admin_backup",
+            fragmentManager = childFragmentManager,
+            title = "حذف النسخة الاحتياطية",
+            message = "هل أنت متأكد من حذف نسخة '${backupInfo.name}'؟ لا يمكن التراجع عن هذا الإجراء.",
+            confirmText = "حذف",
+            cancelText = "إلغاء",
+            onConfirm = { deleteBackup(backupInfo.id) }
+        )
+    }
+
+    /**
+     * Show cleanup dialog
+     */
+    private fun showCleanupDialog() {
+        val dialog = CleanupBackupsDialog { retentionDays ->
+            cleanupOldBackups(retentionDays)
+        }
+        dialog.show(childFragmentManager, "CleanupBackupsDialog")
+    }
+
+    /**
+     * Show backup details
+     */
+    private fun showBackupDetails(backupInfo: BackupInfo) {
+        val dialog = BackupDetailsDialog(backupInfo)
+        dialog.show(childFragmentManager, "BackupDetailsDialog")
+    }
+
+    /**
+     * Create backup
+     */
+    private fun createBackup(
+        name: String?,
+        includeFiles: Boolean,
+        includeDatabase: Boolean,
+        encrypt: Boolean
+    ) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            binding.progressBarBackup.visibility = View.VISIBLE
+            
+            val result = backupViewModel.createManualBackup(
+                name = name,
+                includeFiles = includeFiles,
+                includeDatabase = includeDatabase,
+                encryptionEnabled = encrypt
+            )
+            
+            binding.progressBarBackup.visibility = View.GONE
+            
+            result.onSuccess {
+                showMessage("تم إنشاء النسخة الاحتياطية بنجاح")
+            }.onFailure { error ->
+                showError("فشل في إنشاء النسخة الاحتياطية: ${error.message}")
+            }
+        }
+    }
+
+    /**
+     * Schedule backup
+     */
+    private fun scheduleBackup(backupTime: String) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = backupViewModel.scheduleBackup(backupTime)
+            
+            result.onSuccess {
+                showMessage("تم جدولة النسخة الاحتياطية بنجاح")
+            }.onFailure { error ->
+                showError("فشل في جدولة النسخة الاحتياطية: ${error.message}")
+            }
+        }
+    }
+
+    /**
+     * Export data
+     */
+    private fun exportData(
+        exportType: ExportType,
+        dateRange: DateRange?,
+        includeFiles: Boolean
+    ) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            binding.progressBarExport.visibility = View.VISIBLE
+            
+            val result = backupViewModel.exportSystemData(
+                exportType = exportType,
+                dateRange = dateRange,
+                includeFiles = includeFiles
+            )
+            
+            binding.progressBarExport.visibility = View.GONE
+            
+            result.onSuccess { exportResult ->
+                showMessage("تم تصدير البيانات بنجاح: ${exportResult.filePath}")
+            }.onFailure { error ->
+                showError("فشل في تصدير البيانات: ${error.message}")
+            }
+        }
+    }
+
+    /**
+     * Restore backup
+     */
+    private fun restoreBackup(backupId: String, restoreOptions: RestoreOptions) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            binding.progressBarRestore.visibility = View.VISIBLE
+            
+            val result = backupViewModel.restoreBackup(backupId, restoreOptions)
+            
+            binding.progressBarRestore.visibility = View.GONE
+            
+            result.onSuccess { restoreResult ->
+                if (restoreResult.success) {
+                    showMessage("تم استعادة النسخة الاحتياطية بنجاح")
+                } else {
+                    showError("فشل في استعادة النسخة الاحتياطية")
+                }
+            }.onFailure { error ->
+                showError("فشل في استعادة النسخة الاحتياطية: ${error.message}")
+            }
+        }
+    }
+
+    /**
+     * Delete backup
+     */
+    private fun deleteBackup(backupId: String) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = backupViewModel.deleteBackup(backupId)
+            
+            result.onSuccess {
+                showMessage("تم حذف النسخة الاحتياطية بنجاح")
+            }.onFailure { error ->
+                showError("فشل في حذف النسخة الاحتياطية: ${error.message}")
+            }
+        }
+    }
+
+    /**
+     * Cleanup old backups
+     */
+    private fun cleanupOldBackups(retentionDays: Int) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            binding.progressBarCleanup.visibility = View.VISIBLE
+            
+            val result = backupViewModel.cleanupOldBackups(retentionDays)
+            
+            binding.progressBarCleanup.visibility = View.GONE
+            
+            result.onSuccess { deletedCount ->
+                showMessage("تم حذف $deletedCount نسخة احتياطية قديمة")
+            }.onFailure { error ->
+                showError("فشل في تنظيف النسخ الاحتياطية: ${error.message}")
+            }
+        }
+    }
+
+    /**
+     * Download backup
+     */
+    private fun downloadBackup(backupInfo: BackupInfo) {
+        // Implementation would download backup file to device storage
+        showMessage("جاري تحميل النسخة الاحتياطية...")
+    }
+
+    /**
+     * Update backup state
+     */
+    private fun updateBackupState(state: BackupState) {
+        when (state) {
+            BackupState.IDLE -> {
+                binding.progressBarBackup.visibility = View.GONE
+                binding.progressBarRestore.visibility = View.GONE
+            }
+            BackupState.BACKING_UP -> {
+                binding.progressBarBackup.visibility = View.VISIBLE
+            }
+            BackupState.RESTORING -> {
+                binding.progressBarRestore.visibility = View.VISIBLE
+            }
+            BackupState.ERROR -> {
+                binding.progressBarBackup.visibility = View.GONE
+                binding.progressBarRestore.visibility = View.GONE
+            }
+            else -> {}
+        }
+    }
+
+    /**
+     * Update statistics display
+     */
+    private fun updateStatisticsDisplay(stats: BackupStatistics) {
+        binding.textTotalBackups.text = stats.totalBackups.toString()
+        binding.textTotalSize.text = formatFileSize(stats.totalSize)
+        
+        stats.latestBackup?.let { latest ->
+            binding.textLatestBackup.text = formatDate(latest.timestamp)
+        } ?: run {
+            binding.textLatestBackup.text = "لا توجد نسخ احتياطية"
+        }
+        
+        binding.textAutoBackupStatus.text = if (stats.autoBackupsEnabled) {
+            "مفعل"
+        } else {
+            "معطل"
+        }
+    }
+
+    /**
+     * Update empty state
+     */
+    private fun updateEmptyState(isEmpty: Boolean) {
+        if (isEmpty) {
+            binding.recyclerBackups.visibility = View.GONE
+            binding.layoutEmptyState.visibility = View.VISIBLE
+        } else {
+            binding.recyclerBackups.visibility = View.VISIBLE
+            binding.layoutEmptyState.visibility = View.GONE
+        }
+    }
+
+    /**
+     * Show message
+     */
+    private fun showMessage(message: String) {
+        // Implementation would show success message
+    }
+
+    /**
+     * Show error
+     */
+    private fun showError(error: String) {
+        // Implementation would show error message
+    }
+
+    /**
+     * Format file size
+     */
+    private fun formatFileSize(bytes: Long): String {
+        val kb = bytes / 1024.0
+        val mb = kb / 1024.0
+        val gb = mb / 1024.0
+        
+        return when {
+            gb >= 1 -> "%.1f GB".format(gb)
+            mb >= 1 -> "%.1f MB".format(mb)
+            kb >= 1 -> "%.1f KB".format(kb)
+            else -> "$bytes B"
+        }
+    }
+
+    /**
+     * Format date
+     */
+    private fun formatDate(timestamp: Long): String {
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+        return dateFormat.format(Date(timestamp))
+    }
+}
+
+/**
+ * Backup actions enum
+ */
+enum class BackupAction {
+    RESTORE,
+    DELETE,
+    DOWNLOAD,
+    DETAILS
+}

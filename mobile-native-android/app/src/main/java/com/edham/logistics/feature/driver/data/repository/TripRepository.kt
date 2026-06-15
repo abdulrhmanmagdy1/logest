@@ -66,6 +66,40 @@ class TripRepository @Inject constructor(
         }
     }
 
+    suspend fun getTripPath(tripId: String): Flow<Resource<List<Waypoint>>> = flow {
+        emit(Resource.Loading())
+        try {
+            val response = api.getTripPath(tripId)
+            if (response.isSuccessful && response.body()?.success == true) {
+                emit(Resource.Success(response.body()?.data ?: emptyList()))
+            } else {
+                emit(Resource.Error(response.message()))
+            }
+        } catch (e: Exception) {
+            emit(Resource.Error(e.message ?: "Network error"))
+        }
+    }
+
+    suspend fun acceptTrip(tripId: String): Resource<Unit> {
+        return try {
+            val response = api.acceptTrip(tripId)
+            if (response.isSuccessful) Resource.Success(Unit)
+            else Resource.Error(response.message())
+        } catch (e: Exception) {
+            Resource.Error(e.message ?: "Network error")
+        }
+    }
+
+    suspend fun rejectTrip(tripId: String, reason: String): Resource<Unit> {
+        return try {
+            val response = api.rejectTrip(tripId, reason)
+            if (response.isSuccessful) Resource.Success(Unit)
+            else Resource.Error(response.message())
+        } catch (e: Exception) {
+            Resource.Error(e.message ?: "Network error")
+        }
+    }
+
     private fun TripEntity.toDomain() = Trip(
         id = id, tripId = tripId, status = status, startTime = startTime, endTime = endTime,
         distance = distance, routeSummary = routeSummary, earnings = earnings,

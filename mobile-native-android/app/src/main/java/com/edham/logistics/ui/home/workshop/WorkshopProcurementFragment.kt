@@ -9,12 +9,15 @@ import androidx.fragment.app.viewModels
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.edham.logistics.R
+import com.edham.logistics.ui.home.workshop.adapter.ProcurementOrder
+import com.edham.logistics.ui.home.workshop.adapter.ProcurementOrderAdapter
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
 class WorkshopProcurementFragment : Fragment() {
 
     private val viewModel: WorkshopViewModel by viewModels()
+    private lateinit var adapter: ProcurementOrderAdapter
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -29,5 +32,17 @@ class WorkshopProcurementFragment : Fragment() {
         
         val rv = view.findViewById<RecyclerView>(R.id.rvProcurementOrders)
         rv.layoutManager = LinearLayoutManager(requireContext())
+        adapter = ProcurementOrderAdapter(emptyList())
+        rv.adapter = adapter
+
+        loadMockOrders()
+    }
+
+    private fun loadMockOrders() {
+        val list = listOf(
+            ProcurementOrder("PR-882", "كمبروسور ثرمو كينج", "المبلغ: 3,400 ج.م · الكمية: 1", "WAIT"),
+            ProcurementOrder("PR-880", "طقم فلاتر زيت", "المبلغ: 1,100 ج.م · الكمية: 6 طقم", "SHIP")
+        )
+        adapter.updateData(list)
     }
 }

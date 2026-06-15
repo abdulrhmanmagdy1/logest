@@ -1,0 +1,256 @@
+package com.edham.logistics.offline.conflict
+
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import timber.log.Timber
+import java.util.concurrent.ConcurrentLinkedQueue
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Conflict Logger - Tracks and analyzes conflict resolution patterns
+ * Provides insights for improving conflict resolution strategies
+ */
+
+@Singleton
+class ConflictLogger @Inject constructor() {
+
+    private val conflictHistory = ConcurrentLinkedQueue<ConflictResolution>()
+    private val maxHistorySize = 1000
+    private val _recentConflicts = MutableStateFlow<List<ConflictResolution>>(emptyList())
+    val recentConflicts: Flow<List<ConflictResolution>> = _recentConflicts.asStateFlow()
+
+    /**
+     * Log a conflict resolution
+     */
+    fun logConflict(resolution: ConflictResolution) {
+        try {
+            // Add to history
+            conflictHistory.offer(resolution)
+            
+            // Maintain history size
+            while (conflictHistory.size > maxHistorySize) {
+                conflictHistory.poll()
+            }
+            
+            // Update recent conflicts flow
+            updateRecentConflicts()
+            
+            // Log to Timber
+            Timber.d("Conflict logged: ${resolution.resolution} for ${resolution.conflictType}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error logging conflict")
+        }
+    }
+
+    /**
+     * Get recent conflicts
+     */
+    fun getRecentConflicts(limit: Int = 100): List<ConflictResolution> {
+        return conflictHistory.takeLast(limit)
+    }
+
+    /**
+     * Get conflicts by type
+     */
+    fun getConflictsByType(type: ConflictType): List<ConflictResolution> {
+        return conflictHistory.filter { it.conflictType == type }
+    }
+
+    /**
+     * Get conflicts by strategy
+     */
+    fun getConflictsByStrategy(strategy: ConflictStrategy): List<ConflictResolution> {
+        return conflictHistory.filter { it.resolution == strategy }
+    }
+
+    /**
+     * Get conflicts in time range
+     */
+    fun getConflictsInTimeRange(startTime: Long, endTime: Long): List<ConflictResolution> {
+        return conflictHistory.filter { 
+            it.timestamp >= startTime && it.timestamp <= endTime 
+        }
+    }
+
+    /**
+     * Get conflict patterns
+     */
+    fun getConflictPatterns(): ConflictPatterns {
+        val conflicts = conflictHistory.toList()
+        
+        val typeDistribution = conflicts.groupBy { it.conflictType }
+            .mapValues { it.value.size }
+        
+        val strategyDistribution = conflicts.groupBy { it.resolution }
+            .mapValues { it.value.size }
+        
+        val hourlyConflicts = conflicts.groupBy { 
+            (it.timestamp / 3600000) % 24 // Hour of day
+        }.mapValues { it.value.size }
+        
+        val dailyConflicts = conflicts.groupBy { 
+            it.timestamp / 86400000 // Day
+        }.mapValues { it.value.size }
+        
+        return ConflictPatterns(
+            typeDistribution = typeDistribution,
+            strategyDistribution = strategyDistribution,
+            hourlyDistribution = hourlyConflicts,
+            dailyDistribution = dailyConflicts,
+            totalConflicts = conflicts.size,
+            averageConflictsPerHour = if (conflicts.isNotEmpty()) {
+                conflicts.size.toDouble() / ((System.currentTimeMillis() - conflicts.first().timestamp) / 3600000.0)
+            } else 0.0
+        )
+    }
+
+    /**
+     * Get recommendations for conflict resolution
+     */
+    fun getRecommendations(): List<ConflictRecommendation> {
+        val patterns = getConflictPatterns()
+        val recommendations = mutableListOf<ConflictRecommendation>()
+        
+        // Analyze type distribution
+        patterns.typeDistribution.forEach { (type, count) ->
+            when (type) {
+                ConflictType.VERSION_CONFLICT -> {
+                    if (count > patterns.totalConflicts * 0.3) {
+                        recommendations.add(
+                            ConflictRecommendation(
+                                type = RecommendationType.VERSION_STRATEGY,
+                                priority = RecommendationPriority.HIGH,
+                                message = "High number of version conflicts detected. Consider implementing better version synchronization.",
+                                action = "Review version control strategy and implement optimistic locking."
+                            )
+                        )
+                    }
+                }
+                ConflictType.DATA_CONFLICT -> {
+                    if (count > patterns.totalConflicts * 0.4) {
+                        recommendations.add(
+                            ConflictRecommendation(
+                                type = RecommendationType.DATA_MERGE,
+                                priority = RecommendationPriority.MEDIUM,
+                                message = "Frequent data conflicts detected. Consider improving merge logic.",
+                                action = "Enhance data merge algorithms and implement field-level conflict detection."
+                            )
+                        )
+                    }
+                }
+                ConflictType.TIMESTAMP_CONFLICT -> {
+                    recommendations.add(
+                        ConflictRecommendation(
+                            type = RecommendationType.TIMESTAMP_SYNC,
+                            priority = RecommendationPriority.LOW,
+                            message = "Timestamp conflicts detected. Consider clock synchronization.",
+                            action = "Implement NTP synchronization and improve timestamp handling."
+                        )
+                    )
+                }
+                else -> {}
+            }
+        }
+        
+        // Analyze strategy distribution
+        val manualConflicts = patterns.strategyDistribution[ConflictStrategy.MANUAL] ?: 0
+        if (manualConflicts > patterns.totalConflicts * 0.2) {
+            recommendations.add(
+                ConflictRecommendation(
+                    type = RecommendationType.AUTOMATION,
+                    priority = RecommendationPriority.HIGH,
+                    message = "High number of manual resolutions detected. Consider improving automation.",
+                    action = "Implement smarter conflict resolution algorithms and reduce manual intervention."
+                )
+            )
+        }
+        
+        // Analyze time patterns
+        val peakHours = patterns.hourlyDistribution.filter { it.value > patterns.averageConflictsPerHour * 1.5 }
+        if (peakHours.isNotEmpty()) {
+            recommendations.add(
+                ConflictRecommendation(
+                    type = RecommendationType.PEAK_OPTIMIZATION,
+                    priority = RecommendationPriority.MEDIUM,
+                    message = "Conflict peaks detected during certain hours. Consider load balancing.",
+                    action = "Optimize sync scheduling and implement adaptive retry intervals."
+                )
+            )
+        }
+        
+        return recommendations.sortedBy { it.priority.ordinal }
+    }
+
+    /**
+     * Clear conflict history
+     */
+    fun clearHistory() {
+        conflictHistory.clear()
+        updateRecentConflicts()
+        Timber.d("Conflict history cleared")
+    }
+
+    /**
+     * Export conflict data
+     */
+    fun exportConflictData(): ConflictExportData {
+        val conflicts = conflictHistory.toList()
+        val patterns = getConflictPatterns()
+        val recommendations = getRecommendations()
+        
+        return ConflictExportData(
+            exportTime = System.currentTimeMillis(),
+            totalConflicts = conflicts.size,
+            conflicts = conflicts,
+            patterns = patterns,
+            recommendations = recommendations
+        )
+    }
+
+    private fun updateRecentConflicts() {
+        _recentConflicts.value = conflictHistory.takeLast(50)
+    }
+}
+
+// Data classes for conflict logging
+
+data class ConflictPatterns(
+    val typeDistribution: Map<ConflictType, Int>,
+    val strategyDistribution: Map<ConflictStrategy, Int>,
+    val hourlyDistribution: Map<Int, Int>,
+    val dailyDistribution: Map<Long, Int>,
+    val totalConflicts: Int,
+    val averageConflictsPerHour: Double
+)
+
+data class ConflictRecommendation(
+    val type: RecommendationType,
+    val priority: RecommendationPriority,
+    val message: String,
+    val action: String,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+enum class RecommendationType {
+    VERSION_STRATEGY,
+    DATA_MERGE,
+    TIMESTAMP_SYNC,
+    AUTOMATION,
+    PEAK_OPTIMIZATION,
+    CACHE_OPTIMIZATION
+}
+
+enum class RecommendationPriority {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+data class ConflictExportData(
+    val exportTime: Long,
+    val totalConflicts: Int,
+    val conflicts: List<ConflictResolution>,
+    val patterns: ConflictPatterns,
+    val recommendations: List<ConflictRecommendation>
+)

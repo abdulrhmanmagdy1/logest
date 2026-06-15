@@ -1,0 +1,422 @@
+package com.edham.logistics.feature.driver.viewmodels
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.data.local.entity.DriverTripEntity
+import com.edham.logistics.data.repository.DriverRepository
+import com.edham.logistics.data.repository.LocationRepository
+import com.edham.logistics.data.repository.EmergencyRepository
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.OfflineManager
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import java.util.*
+
+/**
+ * Driver Dashboard ViewModel
+ * Handles driver-specific business logic and data management
+ */
+class DriverDashboardViewModel(application: Application) : AndroidViewModel(application) {
+    
+    private val driverRepository = DriverRepository(application)
+    private val locationRepository = LocationRepository(application)
+    private val emergencyRepository = EmergencyRepository(application)
+    private val offlineManager = OfflineManager(application)
+    
+    // LiveData for UI updates
+    private val _todayTrips = MutableLiveData<List<DriverTrip>>()
+    val todayTrips: LiveData<List<DriverTrip>> = _todayTrips
+    
+    private val _currentTrip = MutableLiveData<DriverTrip?>()
+    val currentTrip: LiveData<DriverTrip?> = _currentTrip
+    
+    private val _driverStatus = MutableLiveData<String>()
+    val driverStatus: LiveData<String> = _driverStatus
+    
+    private val _todayEarnings = MutableLiveData<Double>()
+    val todayEarnings: LiveData<Double> = _todayEarnings
+    
+    private val _isLoading = MutableLiveData<Boolean>()
+    val isLoading: LiveData<Boolean> = _isLoading
+    
+    private val _errorMessage = MutableLiveData<String>()
+    val errorMessage: LiveData<String> = _errorMessage
+    
+    private val _successMessage = MutableLiveData<String>()
+    val successMessage: LiveData<String> = _successMessage
+    
+    // Driver state
+    private var currentTripId: String? = null
+    private var isOnBreak = false
+    private var currentStatus = "IDLE"
+    
+    init {
+        initializeDriverData()
+    }
+    
+    private fun initializeDriverData() {
+        viewModelScope.launch {
+            try {
+                _isLoading.value = true
+                loadTodayTrips()
+                loadCurrentStatus()
+                loadTodayEarnings()
+                _isLoading.value = false
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to initialize driver data")
+                _errorMessage.value = "Failed to load driver data"
+                _isLoading.value = false
+            }
+        }
+    }
+    
+    fun refreshTodayTrips() {
+        viewModelScope.launch {
+            try {
+                loadTodayTrips()
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to refresh today's trips")
+                _errorMessage.value = "Failed to refresh trips"
+            }
+        }
+    }
+    
+    private suspend fun loadTodayTrips() {
+        val today = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.time
+        
+        val trips = if (NetworkUtils.isNetworkAvailable(getApplication())) {
+            // Load from API
+            driverRepository.getTodayTripsFromAPI(today).also { trips ->
+                // Cache locally
+                driverRepository.cacheTripsLocally(trips)
+            }
+        } else {
+            // Load from local cache
+            driverRepository.getTodayTripsFromLocal(today)
+        }
+        
+        _todayTrips.value = trips.map { entity ->
+            DriverTrip(
+                id = entity.id,
+                destinationAddress = entity.destinationAddress,
+                status = entity.status,
+                startTime = entity.startTime,
+                estimatedDuration = entity.estimatedDuration,
+                priority = entity.priority,
+                customerName = entity.customerName,
+                phoneNumber = entity.phoneNumber
+            )
+        }
+        
+        // Check for current active trip
+        val activeTrip = trips.find { it.status == "ACTIVE" }
+        if (activeTrip != null) {
+            currentTripId = activeTrip.id
+            _currentTrip.value = trips.find { it.id == currentTripId }
+            currentStatus = "ACTIVE"
+            _driverStatus.value = currentStatus
+        }
+    }
+    
+    private suspend fun loadCurrentStatus() {
+        // Load driver status from local storage or API
+        val status = driverRepository.getDriverStatus()
+        currentStatus = status
+        _driverStatus.value = status
+    }
+    
+    private suspend fun loadTodayEarnings() {
+        val earnings = if (NetworkUtils.isNetworkAvailable(getApplication())) {
+            driverRepository.getTodayEarningsFromAPI().also { earnings ->
+                driverRepository.cacheEarningsLocally(earnings)
+            }
+        } else {
+            driverRepository.getTodayEarningsFromLocal()
+        }
+        
+        _todayEarnings.value = earnings
+    }
+    
+    fun startNewTrip(
+        onSuccess: (String) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                _isLoading.value = true
+                
+                // Get current location
+                val currentLocation = locationRepository.getCurrentLocation()
+                
+                // Create new trip
+                val tripId = if (NetworkUtils.isNetworkAvailable(getApplication())) {
+                    driverRepository.startNewTripAPI(
+                        currentLocation = currentLocation,
+                        startTime = System.currentTimeMillis()
+                    ).also { id ->
+                        // Cache locally
+                        offlineManager.cacheTripStart(id, currentLocation)
+                    }
+                } else {
+                    // Create offline trip
+                    offlineManager.createOfflineTrip(currentLocation)
+                }
+                
+                currentTripId = tripId
+                currentStatus = "ACTIVE"
+                _driverStatus.value = currentStatus
+                
+                // Refresh trips
+                loadTodayTrips()
+                
+                _isLoading.value = false
+                onSuccess(tripId)
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to start new trip")
+                _isLoading.value = false
+                onError(e.message ?: "Failed to start trip")
+            }
+        }
+    }
+    
+    fun endTrip(
+        tripId: String,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                _isLoading.value = true
+                
+                // Get final location
+                val finalLocation = locationRepository.getCurrentLocation()
+                
+                if (NetworkUtils.isNetworkAvailable(getApplication())) {
+                    // End trip via API
+                    driverRepository.endTripAPI(
+                        tripId = tripId,
+                        endTime = System.currentTimeMillis(),
+                        finalLocation = finalLocation
+                    )
+                    
+                    // Sync any offline data
+                    offlineManager.syncOfflineData()
+                } else {
+                    // Cache trip end locally
+                    offlineManager.cacheTripEnd(tripId, finalLocation)
+                }
+                
+                currentTripId = null
+                currentStatus = if (isOnBreak) "BREAK" else "IDLE"
+                _driverStatus.value = currentStatus
+                _currentTrip.value = null
+                
+                // Refresh trips and earnings
+                loadTodayTrips()
+                loadTodayEarnings()
+                
+                _isLoading.value = false
+                onSuccess()
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to end trip")
+                _isLoading.value = false
+                onError(e.message ?: "Failed to end trip")
+            }
+        }
+    }
+    
+    fun toggleBreakMode(): Boolean {
+        isOnBreak = !isOnBreak
+        
+        currentStatus = when {
+            currentTripId != null -> "ACTIVE"
+            isOnBreak -> "BREAK"
+            else -> "IDLE"
+        }
+        
+        _driverStatus.value = currentStatus
+        
+        // Save preference
+        driverRepository.saveBreakMode(isOnBreak)
+        
+        return isOnBreak
+    }
+    
+    fun triggerEmergencySOS(
+        currentLocation: com.edham.logistics.data.model.Location,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                _isLoading.value = true
+                
+                val emergencyData = EmergencyData(
+                    driverId = driverRepository.getCurrentDriverId(),
+                    location = currentLocation,
+                    timestamp = System.currentTimeMillis(),
+                    tripId = currentTripId,
+                    status = "ACTIVE"
+                )
+                
+                if (NetworkUtils.isNetworkAvailable(getApplication())) {
+                    emergencyRepository.sendEmergencySOSAPI(emergencyData)
+                } else {
+                    // Cache emergency data locally
+                    offlineManager.cacheEmergencyData(emergencyData)
+                }
+                
+                _isLoading.value = false
+                onSuccess()
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to send emergency SOS")
+                _isLoading.value = false
+                onError(e.message ?: "Failed to send SOS")
+            }
+        }
+    }
+    
+    fun getCurrentStatus(): String {
+        return currentStatus
+    }
+    
+    fun getCurrentTripDetails(tripId: String): DriverTrip? {
+        return _todayTrips.value?.find { it.id == tripId }
+    }
+    
+    fun logFuel(
+        amount: Double,
+        price: Double,
+        location: String,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                val fuelLog = FuelLog(
+                    id = UUID.randomUUID().toString(),
+                    amount = amount,
+                    price = price,
+                    location = location,
+                    timestamp = System.currentTimeMillis(),
+                    tripId = currentTripId
+                )
+                
+                if (NetworkUtils.isNetworkAvailable(getApplication())) {
+                    driverRepository.logFuelAPI(fuelLog)
+                } else {
+                    offlineManager.cacheFuelLog(fuelLog)
+                }
+                
+                onSuccess()
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to log fuel")
+                onError(e.message ?: "Failed to log fuel")
+            }
+        }
+    }
+    
+    fun reportIncident(
+        type: String,
+        description: String,
+        location: com.edham.logistics.data.model.Location,
+        photos: List<String>,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                val incident = Incident(
+                    id = UUID.randomUUID().toString(),
+                    type = type,
+                    description = description,
+                    location = location,
+                    photos = photos,
+                    timestamp = System.currentTimeMillis(),
+                    tripId = currentTripId,
+                    status = "REPORTED"
+                )
+                
+                if (NetworkUtils.isNetworkAvailable(getApplication())) {
+                    driverRepository.reportIncidentAPI(incident)
+                } else {
+                    offlineManager.cacheIncident(incident)
+                }
+                
+                onSuccess()
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to report incident")
+                onError(e.message ?: "Failed to report incident")
+            }
+        }
+    }
+    
+    fun syncOfflineData() {
+        viewModelScope.launch {
+            try {
+                if (NetworkUtils.isNetworkAvailable(getApplication())) {
+                    offlineManager.syncOfflineData()
+                    _successMessage.value = "Offline data synced successfully"
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to sync offline data")
+                _errorMessage.value = "Failed to sync offline data"
+            }
+        }
+    }
+}
+
+/**
+ * Data classes for driver operations
+ */
+data class DriverTrip(
+    val id: String,
+    val destinationAddress: String,
+    val status: String,
+    val startTime: String,
+    val estimatedDuration: String,
+    val priority: String,
+    val customerName: String,
+    val phoneNumber: String
+)
+
+data class EmergencyData(
+    val driverId: String,
+    val location: com.edham.logistics.data.model.Location,
+    val timestamp: Long,
+    val tripId: String?,
+    val status: String
+)
+
+data class FuelLog(
+    val id: String,
+    val amount: Double,
+    val price: Double,
+    val location: String,
+    val timestamp: Long,
+    val tripId: String?
+)
+
+data class Incident(
+    val id: String,
+    val type: String,
+    val description: String,
+    val location: com.edham.logistics.data.model.Location,
+    val photos: List<String>,
+    val timestamp: Long,
+    val tripId: String?,
+    val status: String
+)

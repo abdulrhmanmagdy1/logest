@@ -1,0 +1,332 @@
+package com.edham.logistics.notification
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.ArrayAdapter
+import androidx.core.view.isVisible
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentNotificationCenterBinding
+import com.edham.logistics.notification.adapter.NotificationAdapter
+import com.edham.logistics.notification.adapter.NotificationClickListener
+import com.edham.logistics.notification.model.Notification
+import com.edham.logistics.notification.viewmodel.NotificationCenterViewModel
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+
+/**
+ * Notification Center Fragment - Displays and manages all notifications
+ * 
+ * Features:
+ * - Notification list with filtering and search
+ * - Read/unread status management
+ * - Bulk actions (mark all read, clear all)
+ * - Category filtering
+ * - Sort options
+ * - Real-time updates
+ * - Empty and error states
+ */
+@AndroidEntryPoint
+class NotificationCenterFragment : Fragment(), NotificationClickListener {
+
+    private var _binding: FragmentNotificationCenterBinding? = null
+    private val binding get() = _binding!!
+
+    private val viewModel: NotificationCenterViewModel by viewModels()
+    private lateinit var notificationAdapter: NotificationAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentNotificationCenterBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupUI()
+        setupRecyclerView()
+        setupObservers()
+        setupClickListeners()
+        
+        // Load notifications
+        viewModel.loadNotifications()
+    }
+
+    private fun setupUI() {
+        // Setup toolbar
+        binding.toolbar.setNavigationOnClickListener {
+            requireActivity().onBackPressed()
+        }
+
+        // Setup sort spinner
+        val sortOptions = arrayOf("الأحدث أولاً", "الأقدم أولاً", "الأهمية", "الفئة")
+        val adapter = ArrayAdapter(requireContext(), android.R.layout.simple_spinner_item, sortOptions)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        binding.spinnerSortOptions.adapter = adapter
+
+        // Setup search functionality
+        setupSearchListener()
+    }
+
+    private fun setupRecyclerView() {
+        notificationAdapter = NotificationAdapter(this)
+        binding.rvNotifications.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = notificationAdapter
+        }
+    }
+
+    private fun setupObservers() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.notifications.collect { notifications ->
+                notificationAdapter.submitList(notifications)
+                updateEmptyState(notifications.isEmpty())
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.notificationStats.collect { stats ->
+                updateNotificationStats(stats)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.isLoading.collect { isLoading ->
+                binding.layoutLoadingState.isVisible = isLoading
+                binding.rvNotifications.isVisible = !isLoading
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.errorMessage.collect { errorMessage ->
+                if (errorMessage != null) {
+                    showErrorState(errorMessage)
+                } else {
+                    hideErrorState()
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.selectedCategory.collect { category ->
+                updateCategoryChips(category)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        // Mark all as read
+        binding.btnMarkAllRead.setOnClickListener {
+            viewModel.markAllAsRead()
+        }
+
+        // Clear all notifications
+        binding.btnClearAll.setOnClickListener {
+            viewModel.clearAllNotifications()
+        }
+
+        // Category chips
+        binding.chipAll.setOnClickListener {
+            viewModel.filterByCategory(null)
+        }
+
+        binding.chipShipment.setOnClickListener {
+            viewModel.filterByCategory(NotificationCategory.SHIPMENT)
+        }
+
+        binding.chipMaintenance.setOnClickListener {
+            viewModel.filterByCategory(NotificationCategory.MAINTENANCE)
+        }
+
+        binding.chipPayment.setOnClickListener {
+            viewModel.filterByCategory(NotificationCategory.PAYMENT)
+        }
+
+        binding.chipDriver.setOnClickListener {
+            viewModel.filterByCategory(NotificationCategory.DRIVER)
+        }
+
+        binding.chipEmergency.setOnClickListener {
+            viewModel.filterByCategory(NotificationCategory.EMERGENCY)
+        }
+
+        // Sort spinner
+        binding.spinnerSortOptions.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val sortOption = when (position) {
+                    0 -> SortOption.NEWEST_FIRST
+                    1 -> SortOption.OLDEST_FIRST
+                    2 -> SortOption.PRIORITY
+                    3 -> SortOption.CATEGORY
+                    else -> SortOption.NEWEST_FIRST
+                }
+                viewModel.sortNotifications(sortOption)
+            }
+
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+
+        // Refresh FAB
+        binding.fabRefresh.setOnClickListener {
+            viewModel.refreshNotifications()
+        }
+
+        // Preferences FAB
+        binding.fabPreferences.setOnClickListener {
+            navigateToNotificationPreferences()
+        }
+
+        // Retry button
+        binding.btnRetry.setOnClickListener {
+            viewModel.loadNotifications()
+        }
+    }
+
+    private fun setupSearchListener() {
+        binding.etSearchNotifications.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                val query = s?.toString()?.trim() ?: ""
+                viewModel.searchNotifications(query)
+                binding.ivClearSearch.isVisible = query.isNotEmpty()
+            }
+
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+
+        binding.ivClearSearch.setOnClickListener {
+            binding.etSearchNotifications.text?.clear()
+        }
+    }
+
+    private fun updateNotificationStats(stats: NotificationStats) {
+        binding.tvTotalNotifications.text = stats.total.toString()
+        binding.tvUnreadNotifications.text = stats.unread.toString()
+        binding.tvEmergencyNotifications.text = stats.emergency.toString()
+    }
+
+    private fun updateEmptyState(isEmpty: Boolean) {
+        binding.layoutEmptyState.isVisible = isEmpty && binding.etSearchNotifications.text?.isEmpty() == true
+        binding.rvNotifications.isVisible = !isEmpty
+    }
+
+    private fun showErrorState(message: String) {
+        binding.layoutErrorState.isVisible = true
+        binding.tvErrorMessage.text = message
+        binding.rvNotifications.isVisible = false
+        binding.layoutEmptyState.isVisible = false
+    }
+
+    private fun hideErrorState() {
+        binding.layoutErrorState.isVisible = false
+    }
+
+    private fun updateCategoryChips(selectedCategory: NotificationCategory?) {
+        // Reset all chips
+        binding.chipAll.isChecked = false
+        binding.chipShipment.isChecked = false
+        binding.chipMaintenance.isChecked = false
+        binding.chipPayment.isChecked = false
+        binding.chipDriver.isChecked = false
+        binding.chipEmergency.isChecked = false
+
+        // Check selected chip
+        when (selectedCategory) {
+            null -> binding.chipAll.isChecked = true
+            NotificationCategory.SHIPMENT -> binding.chipShipment.isChecked = true
+            NotificationCategory.MAINTENANCE -> binding.chipMaintenance.isChecked = true
+            NotificationCategory.PAYMENT -> binding.chipPayment.isChecked = true
+            NotificationCategory.DRIVER -> binding.chipDriver.isChecked = true
+            NotificationCategory.EMERGENCY -> binding.chipEmergency.isChecked = true
+            else -> binding.chipAll.isChecked = true
+        }
+    }
+
+    // NotificationClickListener implementation
+    override fun onNotificationClicked(notification: Notification) {
+        // Mark as read if unread
+        if (!notification.isRead) {
+            viewModel.markAsRead(notification.id)
+        }
+
+        // Navigate to relevant screen based on notification category
+        when (notification.category) {
+            NotificationCategory.SHIPMENT -> navigateToShipmentDetails(notification.data["shipmentId"])
+            NotificationCategory.MAINTENANCE -> navigateToMaintenanceDetails(notification.data["maintenanceId"])
+            NotificationCategory.PAYMENT -> navigateToPaymentDetails(notification.data["paymentId"])
+            NotificationCategory.DRIVER -> navigateToDriverDetails(notification.data["driverId"])
+            else -> showNotificationDetails(notification)
+        }
+    }
+
+    override fun onNotificationLongClicked(notification: Notification): Boolean {
+        showNotificationOptions(notification)
+        return true
+    }
+
+    override fun onMarkAsReadClicked(notification: Notification) {
+        viewModel.markAsRead(notification.id)
+    }
+
+    override fun onDeleteClicked(notification: Notification) {
+        viewModel.deleteNotification(notification.id)
+    }
+
+    private fun navigateToShipmentDetails(shipmentId: String?) {
+        // Navigate to shipment details screen
+        shipmentId?.let {
+            // Implementation depends on navigation structure
+        }
+    }
+
+    private fun navigateToMaintenanceDetails(maintenanceId: String?) {
+        // Navigate to maintenance details screen
+        maintenanceId?.let {
+            // Implementation depends on navigation structure
+        }
+    }
+
+    private fun navigateToPaymentDetails(paymentId: String?) {
+        // Navigate to payment details screen
+        paymentId?.let {
+            // Implementation depends on navigation structure
+        }
+    }
+
+    private fun navigateToDriverDetails(driverId: String?) {
+        // Navigate to driver details screen
+        driverId?.let {
+            // Implementation depends on navigation structure
+        }
+    }
+
+    private fun showNotificationDetails(notification: Notification) {
+        // Show notification details dialog or bottom sheet
+        // Implementation depends on UI requirements
+    }
+
+    private fun showNotificationOptions(notification: Notification) {
+        // Show options dialog (mark as read, delete, etc.)
+        // Implementation depends on UI requirements
+    }
+
+    private fun navigateToNotificationPreferences() {
+        // Navigate to notification preferences screen
+        // Implementation depends on navigation structure
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

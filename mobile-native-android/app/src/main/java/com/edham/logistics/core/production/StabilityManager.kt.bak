@@ -1,0 +1,540 @@
+package com.edham.logistics.core.production
+
+import android.content.Context
+import android.util.Log
+import com.edham.logistics.BuildConfig
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Stability Manager
+ * Handles application stability monitoring and scalability
+ */
+@Singleton
+class StabilityManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val productionConfig: ProductionConfig
+) {
+    
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    companion object {
+        private const val TAG = "StabilityManager"
+        
+        // Stability thresholds
+        const val MEMORY_WARNING_THRESHOLD_MB = 150
+        const val MEMORY_CRITICAL_THRESHOLD_MB = 200
+        const val CPU_WARNING_THRESHOLD = 80.0
+        const val CPU_CRITICAL_THRESHOLD = 90.0
+        const val DISK_SPACE_WARNING_THRESHOLD_MB = 500
+        const val DISK_SPACE_CRITICAL_THRESHOLD_MB = 200
+        
+        // Performance monitoring intervals
+        const val MONITORING_INTERVAL_MS = 30000L // 30 seconds
+        const val HEALTH_CHECK_INTERVAL_MS = 60000L // 1 minute
+        
+        // Stability metrics
+        const val STABILITY_SCORE_EXCELLENT = 100
+        const val STABILITY_SCORE_GOOD = 80
+        const val STABILITY_SCORE_FAIR = 60
+        const val STABILITY_SCORE_POOR = 40
+        const val STABILITY_SCORE_CRITICAL = 20
+    }
+    
+    // Stability state
+    private val _stabilityScore = MutableStateFlow(STABILITY_SCORE_EXCELLENT)
+    val stabilityScore: StateFlow<Int> = _stabilityScore
+    
+    private val _isStable = MutableStateFlow(true)
+    val isStable: StateFlow<Boolean> = _isStable
+    
+    private val _systemMetrics = MutableStateFlow(SystemMetrics())
+    val systemMetrics: StateFlow<SystemMetrics> = _systemMetrics
+    
+    private val _stabilityIssues = MutableStateFlow<List<StabilityIssue>>(emptyList())
+    val stabilityIssues: StateFlow<List<StabilityIssue>> = _stabilityIssues
+    
+    data class SystemMetrics(
+        val memoryUsageMB: Long = 0L,
+        val availableMemoryMB: Long = 0L,
+        val cpuUsage: Double = 0.0,
+        val diskSpaceAvailableMB: Long = 0L,
+        val networkLatency: Long = 0L,
+        val activeConnections: Int = 0,
+        val batteryLevel: Float = 0f,
+        val thermalState: String = "normal"
+    )
+    
+    data class StabilityIssue(
+        val type: String,
+        val severity: String,
+        val message: String,
+        val timestamp: Long = System.currentTimeMillis(),
+        val resolved: Boolean = false
+    )
+    
+    /**
+     * Initialize stability monitoring
+     */
+    fun initializeStabilityMonitoring() {
+        if (productionConfig.isProductionMode()) {
+            scope.launch {
+                while (true) {
+                    try {
+                        monitorSystemStability()
+                        delay(MONITORING_INTERVAL_MS)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error in stability monitoring", e)
+                    }
+                }
+            }
+            
+            scope.launch {
+                while (true) {
+                    try {
+                        performHealthCheck()
+                        delay(HEALTH_CHECK_INTERVAL_MS)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error in health check", e)
+                    }
+                }
+            }
+            
+            Log.i(TAG, "Stability monitoring initialized")
+        }
+    }
+    
+    /**
+     * Monitor system stability
+     */
+    private fun monitorSystemStability() {
+        val metrics = collectSystemMetrics()
+        _systemMetrics.value = metrics
+        
+        val issues = detectStabilityIssues(metrics)
+        _stabilityIssues.value = issues
+        
+        val score = calculateStabilityScore(metrics, issues)
+        _stabilityScore.value = score
+        
+        val isStable = score >= STABILITY_SCORE_GOOD
+        _isStable.value = isStable
+        
+        if (!isStable) {
+            Log.w(TAG, "System stability degraded: score=$score, issues=${issues.size}")
+        }
+    }
+    
+    /**
+     * Collect system metrics
+     */
+    private fun collectSystemMetrics(): SystemMetrics {
+        return try {
+            val runtime = Runtime.getRuntime()
+            val totalMemory = runtime.totalMemory() / (1024 * 1024)
+            val freeMemory = runtime.freeMemory() / (1024 * 1024)
+            val usedMemory = totalMemory - freeMemory
+            
+            val diskSpace = getAvailableDiskSpace()
+            val networkLatency = measureNetworkLatency()
+            val batteryLevel = getBatteryLevel()
+            val thermalState = getThermalState()
+            
+            SystemMetrics(
+                memoryUsageMB = usedMemory,
+                availableMemoryMB = freeMemory,
+                cpuUsage = getCpuUsage(),
+                diskSpaceAvailableMB = diskSpace,
+                networkLatency = networkLatency,
+                activeConnections = getActiveConnections(),
+                batteryLevel = batteryLevel,
+                thermalState = thermalState
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to collect system metrics", e)
+            SystemMetrics()
+        }
+    }
+    
+    /**
+     * Detect stability issues
+     */
+    private fun detectStabilityIssues(metrics: SystemMetrics): List<StabilityIssue> {
+        val issues = mutableListOf<StabilityIssue>()
+        
+        // Memory issues
+        if (metrics.memoryUsageMB > MEMORY_CRITICAL_THRESHOLD_MB) {
+            issues.add(StabilityIssue(
+                type = "memory",
+                severity = "critical",
+                message = "Critical memory usage: ${metrics.memoryUsageMB}MB"
+            ))
+        } else if (metrics.memoryUsageMB > MEMORY_WARNING_THRESHOLD_MB) {
+            issues.add(StabilityIssue(
+                type = "memory",
+                severity = "warning",
+                message = "High memory usage: ${metrics.memoryUsageMB}MB"
+            ))
+        }
+        
+        // CPU issues
+        if (metrics.cpuUsage > CPU_CRITICAL_THRESHOLD) {
+            issues.add(StabilityIssue(
+                type = "cpu",
+                severity = "critical",
+                message = "Critical CPU usage: ${metrics.cpuUsage}%"
+            ))
+        } else if (metrics.cpuUsage > CPU_WARNING_THRESHOLD) {
+            issues.add(StabilityIssue(
+                type = "cpu",
+                severity = "warning",
+                message = "High CPU usage: ${metrics.cpuUsage}%"
+            ))
+        }
+        
+        // Disk space issues
+        if (metrics.diskSpaceAvailableMB < DISK_SPACE_CRITICAL_THRESHOLD_MB) {
+            issues.add(StabilityIssue(
+                type = "disk",
+                severity = "critical",
+                message = "Critical disk space: ${metrics.diskSpaceAvailableMB}MB available"
+            ))
+        } else if (metrics.diskSpaceAvailableMB < DISK_SPACE_WARNING_THRESHOLD_MB) {
+            issues.add(StabilityIssue(
+                type = "disk",
+                severity = "warning",
+                message = "Low disk space: ${metrics.diskSpaceAvailableMB}MB available"
+            ))
+        }
+        
+        // Network issues
+        if (metrics.networkLatency > 5000) {
+            issues.add(StabilityIssue(
+                type = "network",
+                severity = "warning",
+                message = "High network latency: ${metrics.networkLatency}ms"
+            ))
+        }
+        
+        // Battery issues
+        if (metrics.batteryLevel < 15f) {
+            issues.add(StabilityIssue(
+                type = "battery",
+                severity = "critical",
+                message = "Critical battery level: ${metrics.batteryLevel}%"
+            ))
+        } else if (metrics.batteryLevel < 30f) {
+            issues.add(StabilityIssue(
+                type = "battery",
+                severity = "warning",
+                message = "Low battery level: ${metrics.batteryLevel}%"
+            ))
+        }
+        
+        // Thermal issues
+        if (metrics.thermalState != "normal") {
+            issues.add(StabilityIssue(
+                type = "thermal",
+                severity = "warning",
+                message = "Thermal throttling: ${metrics.thermalState}"
+            ))
+        }
+        
+        return issues
+    }
+    
+    /**
+     * Calculate stability score
+     */
+    private fun calculateStabilityScore(metrics: SystemMetrics, issues: List<StabilityIssue>): Int {
+        var score = STABILITY_SCORE_EXCELLENT
+        
+        // Memory impact
+        val memoryImpact = when {
+            metrics.memoryUsageMB > MEMORY_CRITICAL_THRESHOLD_MB -> 30
+            metrics.memoryUsageMB > MEMORY_WARNING_THRESHOLD_MB -> 15
+            else -> 0
+        }
+        score -= memoryImpact
+        
+        // CPU impact
+        val cpuImpact = when {
+            metrics.cpuUsage > CPU_CRITICAL_THRESHOLD -> 30
+            metrics.cpuUsage > CPU_WARNING_THRESHOLD -> 15
+            else -> 0
+        }
+        score -= cpuImpact
+        
+        // Disk impact
+        val diskImpact = when {
+            metrics.diskSpaceAvailableMB < DISK_SPACE_CRITICAL_THRESHOLD_MB -> 25
+            metrics.diskSpaceAvailableMB < DISK_SPACE_WARNING_THRESHOLD_MB -> 10
+            else -> 0
+        }
+        score -= diskImpact
+        
+        // Issue impact
+        issues.forEach { issue ->
+            when (issue.severity) {
+                "critical" -> score -= 20
+                "warning" -> score -= 10
+            }
+        }
+        
+        return score.coerceAtLeast(0)
+    }
+    
+    /**
+     * Perform health check
+     */
+    private fun performHealthCheck() {
+        try {
+            // Check database connectivity
+            val dbHealthy = checkDatabaseHealth()
+            
+            // Check network connectivity
+            val networkHealthy = checkNetworkHealth()
+            
+            // Check storage health
+            val storageHealthy = checkStorageHealth()
+            
+            // Check memory health
+            val memoryHealthy = checkMemoryHealth()
+            
+            val overallHealthy = dbHealthy && networkHealthy && storageHealthy && memoryHealthy
+            
+            if (!overallHealthy) {
+                Log.w(TAG, "Health check failed: db=$dbHealthy, network=$networkHealthy, storage=$storageHealthy, memory=$memoryHealthy")
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Health check failed", e)
+        }
+    }
+    
+    /**
+     * Check database health
+     */
+    private fun checkDatabaseHealth(): Boolean {
+        return try {
+            // Check database connectivity and performance
+            // This would be implemented with actual database health checks
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Database health check failed", e)
+            false
+        }
+    }
+    
+    /**
+     * Check network health
+     */
+    private fun checkNetworkHealth(): Boolean {
+        return try {
+            // Check network connectivity and performance
+            val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val activeNetwork = connectivityManager.activeNetworkInfo
+            activeNetwork?.isConnectedOrConnecting == true
+        } catch (e: Exception) {
+            Log.e(TAG, "Network health check failed", e)
+            false
+        }
+    }
+    
+    /**
+     * Check storage health
+     */
+    private fun checkStorageHealth(): Boolean {
+        return try {
+            val diskSpace = getAvailableDiskSpace()
+            diskSpace > DISK_SPACE_CRITICAL_THRESHOLD_MB
+        } catch (e: Exception) {
+            Log.e(TAG, "Storage health check failed", e)
+            false
+        }
+    }
+    
+    /**
+     * Check memory health
+     */
+    private fun checkMemoryHealth(): Boolean {
+        return try {
+            val runtime = Runtime.getRuntime()
+            val freeMemory = runtime.freeMemory() / (1024 * 1024)
+            freeMemory > 50 // At least 50MB free
+        } catch (e: Exception) {
+            Log.e(TAG, "Memory health check failed", e)
+            false
+        }
+    }
+    
+    /**
+     * Get available disk space
+     */
+    private fun getAvailableDiskSpace(): Long {
+        return try {
+            val stat = android.os.StatFs(context.filesDir.path)
+            stat.availableBlocksLong * stat.blockSizeLong / (1024 * 1024)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get disk space", e)
+            0L
+        }
+    }
+    
+    /**
+     * Measure network latency
+     */
+    private fun measureNetworkLatency(): Long {
+        return try {
+            val startTime = System.currentTimeMillis()
+            // Simple ping to a reliable server
+            java.net.URL("https://www.google.com").openConnection().getInputStream().close()
+            System.currentTimeMillis() - startTime
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to measure network latency", e)
+            0L
+        }
+    }
+    
+    /**
+     * Get CPU usage
+     */
+    private fun getCpuUsage(): Double {
+        return try {
+            // Simple CPU usage estimation
+            val runtime = Runtime.getRuntime()
+            val totalProcessors = runtime.availableProcessors()
+            val loadAverage = runtime.totalMemory() - runtime.freeMemory()
+            (loadAverage.toDouble() / runtime.maxMemory().toDouble()) * 100.0 / totalProcessors
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get CPU usage", e)
+            0.0
+        }
+    }
+    
+    /**
+     * Get active connections
+     */
+    private fun getActiveConnections(): Int {
+        return try {
+            val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val activeNetworkInfo = connectivityManager.activeNetworkInfo
+            if (activeNetworkInfo?.isConnected == true) 1 else 0
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get active connections", e)
+            0
+        }
+    }
+    
+    /**
+     * Get battery level
+     */
+    private fun getBatteryLevel(): Float {
+        return try {
+            val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as android.os.BatteryManager
+            batteryManager.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY).toFloat()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get battery level", e)
+            100f
+        }
+    }
+    
+    /**
+     * Get thermal state
+     */
+    private fun getThermalState(): String {
+        return try {
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            when {
+                powerManager.isDeviceIdleMode -> "idle"
+                powerManager.isPowerSaveMode -> "power_save"
+                else -> "normal"
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get thermal state", e)
+            "normal"
+        }
+    }
+    
+    /**
+     * Get stability report
+     */
+    fun getStabilityReport(): Map<String, Any> {
+        return mapOf(
+            "stabilityScore" to stabilityScore.value,
+            "isStable" to isStable.value,
+            "systemMetrics" to systemMetrics.value,
+            "stabilityIssues" to stabilityIssues.value,
+            "isProduction" to productionConfig.isProductionMode(),
+            "monitoringActive" to true,
+            "lastHealthCheck" to System.currentTimeMillis(),
+            "recommendations" to getStabilityRecommendations()
+        )
+    }
+    
+    /**
+     * Get stability recommendations
+     */
+    private fun getStabilityRecommendations(): List<String> {
+        val recommendations = mutableListOf<String>()
+        val issues = stabilityIssues.value
+        
+        if (issues.any { it.type == "memory" }) {
+            recommendations.add("Consider implementing memory optimization strategies")
+            recommendations.add("Clear cache and unused data")
+        }
+        
+        if (issues.any { it.type == "cpu" }) {
+            recommendations.add("Optimize background processing")
+            recommendations.add("Reduce CPU-intensive operations")
+        }
+        
+        if (issues.any { it.type == "disk" }) {
+            recommendations.add("Clear unnecessary files and cache")
+            recommendations.add("Implement data cleanup policies")
+        }
+        
+        if (issues.any { it.type == "network" }) {
+            recommendations.add("Check network connectivity")
+            recommendations.add("Implement offline mode capabilities")
+        }
+        
+        if (issues.any { it.type == "battery" }) {
+            recommendations.add("Optimize battery usage")
+            recommendations.add("Implement power-saving features")
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Check if system is scalable
+     */
+    fun isSystemScalable(): Boolean {
+        val metrics = systemMetrics.value
+        val issues = stabilityIssues.value
+        
+        return metrics.memoryUsageMB < MEMORY_WARNING_THRESHOLD_MB &&
+               metrics.cpuUsage < CPU_WARNING_THRESHOLD &&
+               metrics.diskSpaceAvailableMB > DISK_SPACE_WARNING_THRESHOLD_MB &&
+               issues.none { it.severity == "critical" }
+    }
+    
+    /**
+     * Force stability check
+     */
+    fun forceStabilityCheck() {
+        scope.launch {
+            monitorSystemStability()
+            performHealthCheck()
+        }
+    }
+}

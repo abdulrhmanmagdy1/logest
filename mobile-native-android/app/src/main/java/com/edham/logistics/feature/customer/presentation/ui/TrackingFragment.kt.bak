@@ -1,0 +1,294 @@
+package com.edham.logistics.feature.customer.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.databinding.FragmentTrackingBinding
+import com.edham.logistics.feature.customer.presentation.ui.TrackingViewModel
+import com.edham.logistics.feature.customer.presentation.adapter.TrackingTimelineAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class TrackingFragment : Fragment() {
+
+    private var _binding: FragmentTrackingBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: TrackingViewModel by viewModels()
+    
+    @Inject
+    lateinit var trackingTimelineAdapter: TrackingTimelineAdapter
+
+    private var trackingNumber: String? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        arguments?.let {
+            trackingNumber = it.getString("trackingNumber")
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentTrackingBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerView()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Start tracking if tracking number is available
+        trackingNumber?.let { number ->
+            viewModel.trackShipment(number)
+        }
+    }
+
+    private fun setupRecyclerView() {
+        binding.recyclerViewTrackingTimeline.apply {
+            adapter = trackingTimelineAdapter
+            layoutManager = LinearLayoutManager(requireContext())
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            trackingNumber?.let { number ->
+                viewModel.refreshTracking(number)
+            }
+        }
+        
+        binding.buttonShareTracking.setOnClickListener {
+            shareTrackingInfo()
+        }
+        
+        binding.buttonCallDriver.setOnClickListener {
+            callDriver()
+        }
+        
+        binding.swipeRefreshLayout.setOnRefreshListener {
+            trackingNumber?.let { number ->
+                viewModel.refreshTracking(number)
+            }
+        }
+    }
+
+    private fun updateUI(uiState: TrackingViewModel.TrackingUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.gone()
+        binding.layoutError.gone()
+        binding.swipeRefreshLayout.isRefreshing = false
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.gone()
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.swipeRefreshLayout.isRefreshing = false
+        
+        binding.buttonRetry.setOnClickListener {
+            trackingNumber?.let { number ->
+                viewModel.refreshTracking(number)
+            }
+        }
+    }
+
+    private fun showContent(uiState: TrackingViewModel.TrackingUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        binding.swipeRefreshLayout.isRefreshing = false
+        
+        uiState.trackingData?.let { trackingData ->
+            updateShipmentInfo(trackingData)
+            updateTrackingTimeline(trackingData)
+            updateMap(trackingData)
+            updateDriverInfo(trackingData)
+        }
+    }
+
+    private fun updateShipmentInfo(trackingData: com.edham.logistics.feature.customer.domain.model.ShipmentTrackingData) {
+        val shipment = trackingData.shipment
+        
+        binding.textTrackingNumber.text = shipment.trackingNumber
+        binding.textCargoType.text = formatCargoType(shipment.cargoType)
+        binding.textWeight.text = "${shipment.weight} كجم"
+        binding.textStatus.text = formatStatus(shipment.status)
+        binding.textEstimatedDelivery.text = formatDateTime(trackingData.estimatedArrivalTime)
+        
+        // Update status color
+        binding.textStatus.setTextColor(getStatusColor(shipment.status))
+        
+        // Show temperature if refrigerated
+        if (trackingData.isRefrigerated) {
+            binding.layoutTemperature.visible()
+            binding.textCurrentTemperature.text = 
+                if (trackingData.currentTemperature != null) {
+                    "${trackingData.currentTemperature}°C"
+                } else {
+                    "غير متوفر"
+                }
+        } else {
+            binding.layoutTemperature.gone()
+        }
+    }
+
+    private fun updateTrackingTimeline(trackingData: com.edham.logistics.feature.customer.domain.model.ShipmentTrackingData) {
+        trackingTimelineAdapter.submitList(trackingData.trackingHistory)
+        
+        if (trackingData.trackingHistory.isEmpty()) {
+            binding.layoutEmptyTimeline.visible()
+            binding.recyclerViewTrackingTimeline.gone()
+        } else {
+            binding.layoutEmptyTimeline.gone()
+            binding.recyclerViewTrackingTimeline.visible()
+        }
+    }
+
+    private fun updateMap(trackingData: com.edham.logistics.feature.customer.domain.model.ShipmentTrackingData) {
+        // In a real app, this would show Google Maps with current location
+        // For now, we'll show a placeholder
+        trackingData.currentLocation?.let { location ->
+            binding.textCurrentLocation.text = location.address
+            binding.textLastUpdate.text = formatDateTime(location.timestamp)
+        } ?: run {
+            binding.textCurrentLocation.text = "غير متوفر"
+            binding.textLastUpdate.text = "غير متوفر"
+        }
+    }
+
+    private fun updateDriverInfo(trackingData: com.edham.logistics.feature.customer.domain.model.ShipmentTrackingData) {
+        val shipment = trackingData.shipment
+        
+        if (shipment.driverName != null && shipment.driverPhone != null) {
+            binding.layoutDriverInfo.visible()
+            binding.textDriverName.text = shipment.driverName
+            binding.textDriverPhone.text = shipment.driverPhone
+            binding.textVehicleName.text = shipment.vehicleName ?: "غير محدد"
+        } else {
+            binding.layoutDriverInfo.gone()
+        }
+    }
+
+    private fun formatCargoType(cargoType: String): String {
+        return when (cargoType) {
+            "general" -> "بضائع عامة"
+            "refrigerated" -> "بضائع مبردة"
+            "fragile" -> "بضائع قابلة للكسر"
+            "heavy" -> "بضائع ثقيلة"
+            "urgent" -> "بضائع عاجلة"
+            "documents" -> "مستندات"
+            "electronics" -> "إلكترونيات"
+            "food" -> "مواد غذائية"
+            "medical" -> "معدات طبية"
+            "chemicals" -> "مواد كيميائية"
+            "livestock" -> "مواشي"
+            "vehicles" -> "مركبات"
+            else -> cargoType
+        }
+    }
+
+    private fun formatStatus(status: String): String {
+        return when (status) {
+            "pending" -> "في انتظار"
+            "received" -> "تم الاستلام"
+            "preparing" -> "قيد التحضير"
+            "loaded" -> "تم التحميل"
+            "in_transit" -> "قيد النقل"
+            "out_for_delivery" -> "خارج للتسليم"
+            "delivered" -> "تم التسليم"
+            "cancelled" -> "ملغي"
+            "delayed" -> "متأخر"
+            else -> status
+        }
+    }
+
+    private fun getStatusColor(status: String): Int {
+        return when (status) {
+            "pending" -> android.graphics.Color.parseColor("#FF9800")
+            "received" -> android.graphics.Color.parseColor("#2196F3")
+            "preparing" -> android.graphics.Color.parseColor("#673AB7")
+            "loaded" -> android.graphics.Color.parseColor("#4CAF50")
+            "in_transit" -> android.graphics.Color.parseColor("#2196F3")
+            "out_for_delivery" -> android.graphics.Color.parseColor("#9C27B0")
+            "delivered" -> android.graphics.Color.parseColor("#4CAF50")
+            "cancelled" -> android.graphics.Color.parseColor("#F44336")
+            "delayed" -> android.graphics.Color.parseColor("#FF5722")
+            else -> android.graphics.Color.parseColor("#9E9E9E")
+        }
+    }
+
+    private fun formatDateTime(dateTime: String): String {
+        // In a real app, this would format the date time properly
+        // For now, we'll return the string as is
+        return dateTime
+    }
+
+    private fun shareTrackingInfo() {
+        trackingNumber?.let { number ->
+            val shareText = "تتبع شحنة إدهام: $number"
+            val shareIntent = android.content.Intent().apply {
+                action = android.content.Intent.ACTION_SEND
+                type = "text/plain"
+                putExtra(android.content.Intent.EXTRA_TEXT, shareText)
+            }
+            startActivity(android.content.Intent.createChooser(shareIntent, "مشاركة معلومات التتبع"))
+        }
+    }
+
+    private fun callDriver() {
+        val trackingData = viewModel.uiState.value.trackingData
+        trackingData?.let { data ->
+            data.shipment.driverPhone?.let { phone ->
+                val callIntent = android.content.Intent(android.content.Intent.ACTION_DIAL).apply {
+                    data = android.net.Uri.parse("tel:$phone")
+                }
+                startActivity(callIntent)
+            }
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

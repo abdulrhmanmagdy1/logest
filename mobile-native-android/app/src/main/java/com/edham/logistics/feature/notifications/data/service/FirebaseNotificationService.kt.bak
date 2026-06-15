@@ -1,0 +1,412 @@
+package com.edham.logistics.feature.notifications.data.service
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.edham.logistics.R
+import com.edham.logistics.core.utils.TokenManager
+import com.edham.logistics.feature.notifications.domain.model.*
+import com.google.firebase.messaging.FirebaseMessagingService
+import com.google.firebase.messaging.RemoteMessage
+import com.google.gson.Gson
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class FirebaseNotificationService : FirebaseMessagingService() {
+
+    @Inject
+    lateinit var notificationRepository: com.edham.logistics.feature.notifications.domain.repository.NotificationRepository
+    
+    @Inject
+    lateinit var tokenManager: TokenManager
+    
+    @Inject
+    lateinit var gson: Gson
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    companion object {
+        private const val TAG = "FirebaseNotification"
+        private const val NOTIFICATION_CHANNEL_ID = "edham_notifications"
+        private const val NOTIFICATION_CHANNEL_NAME = "Edham Logistics Notifications"
+        private const val NOTIFICATION_CHANNEL_DESCRIPTION = "Notifications for shipments, deliveries, and system updates"
+    }
+
+    override fun onNewToken(token: String) {
+        super.onNewToken(token)
+        Log.d(TAG, "FCM Token refreshed: $token")
+        
+        // Save token to local storage
+        tokenManager.saveFcmToken(token)
+        
+        // Register token with backend
+        registerTokenWithBackend(token)
+    }
+
+    override fun onMessageReceived(remoteMessage: RemoteMessage) {
+        super.onMessageReceived(remoteMessage)
+        Log.d(TAG, "Message received from: ${remoteMessage.from}")
+        
+        try {
+            // Handle different message types
+            when {
+                remoteMessage.data.isNotEmpty() -> {
+                    // Handle data message
+                    handleDataMessage(remoteMessage.data)
+                }
+                remoteMessage.notification != null -> {
+                    // Handle notification message
+                    handleNotificationMessage(remoteMessage.notification!!)
+                }
+                else -> {
+                    Log.w(TAG, "Received empty message")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing message", e)
+        }
+    }
+
+    override fun onMessageSent(messageId: String) {
+        super.onMessageSent(messageId)
+        Log.d(TAG, "Message sent successfully: $messageId")
+        
+        // Track delivery
+        trackMessageDelivery(messageId, "sent")
+    }
+
+    override fun onSendError(messageId: String, exception: Exception) {
+        super.onSendError(messageId, exception)
+        Log.e(TAG, "Message send error: $messageId", exception)
+        
+        // Track delivery failure
+        trackMessageDelivery(messageId, "failed")
+    }
+
+    private fun handleDataMessage(data: Map<String, String>) {
+        Log.d(TAG, "Handling data message: $data")
+        
+        try {
+            // Parse notification data
+            val notificationData = gson.fromJson(data["notification"], Notification::class.java)
+            
+            // Save notification to local database
+            saveNotificationLocally(notificationData)
+            
+            // Show notification if user has enabled it
+            if (shouldShowNotification(notificationData)) {
+                showNotification(notificationData)
+            }
+            
+            // Track delivery
+            trackMessageDelivery(notificationData.id, "delivered")
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling data message", e)
+        }
+    }
+
+    private fun handleNotificationMessage(notification: RemoteMessage.Notification) {
+        Log.d(TAG, "Handling notification message: ${notification.title}")
+        
+        try {
+            // Create notification from RemoteMessage
+            val notificationData = Notification(
+                id = generateNotificationId(),
+                title = notification.title ?: "Edham Logistics",
+                message = notification.body ?: "You have a new notification",
+                type = NotificationType.GENERAL_ANNOUNCEMENT,
+                category = NotificationCategory.GENERAL,
+                priority = NotificationPriority.NORMAL,
+                userId = getCurrentUserId(),
+                userRole = getCurrentUserRole(),
+                shipmentId = null,
+                driverId = null,
+                customerId = null,
+                data = null,
+                imageUrl = notification.imageUrl,
+                actionUrl = notification.clickAction,
+                isRead = false,
+                isPush = true,
+                timestamp = System.currentTimeMillis(),
+                expiresAt = null,
+                sound = "default",
+                vibration = true,
+                badge = null,
+                deepLink = null
+            )
+            
+            // Save notification to local database
+            saveNotificationLocally(notificationData)
+            
+            // Show notification
+            showNotification(notificationData)
+            
+            // Track delivery
+            trackMessageDelivery(notificationData.id, "delivered")
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling notification message", e)
+        }
+    }
+
+    private fun showNotification(notification: Notification) {
+        createNotificationChannel()
+        
+        // Create intent for when notification is clicked
+        val intent = createNotificationIntent(notification)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        
+        // Build notification
+        val notificationBuilder = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(getNotificationIcon(notification.type))
+            .setContentTitle(notification.title)
+            .setContentText(notification.message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(notification.message))
+            .setPriority(getNotificationPriority(notification.priority))
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION))
+            .setVibrate(getVibrationPattern(notification.vibration))
+            .setDefaults(NotificationCompat.DEFAULT_LIGHTS)
+        
+        // Add large icon if image URL is provided
+        notification.imageUrl?.let { imageUrl ->
+            if (imageUrl.isNotEmpty()) {
+                // In a real implementation, you would load this image using Glide or Coil
+                // For now, we'll use a placeholder
+                notificationBuilder.setLargeIcon(android.graphics.BitmapFactory.decodeResource(resources, R.drawable.ic_notification_large))
+            }
+        }
+        
+        // Add action buttons if action URL is provided
+        notification.actionUrl?.let { actionUrl ->
+            val actionIntent = createActionIntent(notification, actionUrl)
+            val actionPendingIntent = PendingIntent.getActivity(
+                this,
+                1,
+                actionIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            
+            notificationBuilder.addAction(
+                R.drawable.ic_action,
+                "View",
+                actionPendingIntent
+            )
+        }
+        
+        // Show notification
+        try {
+            val notificationManager = NotificationManagerCompat.from(this)
+            notificationManager.notify(notification.id.hashCode(), notificationBuilder.build())
+            
+            Log.d(TAG, "Notification shown: ${notification.title}")
+            
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Permission denied to show notification", e)
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                NOTIFICATION_CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = NOTIFICATION_CHANNEL_DESCRIPTION
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lockscreenVisibility = NotificationCompat.VISIBILITY_PUBLIC
+            }
+            
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun createNotificationIntent(notification: Notification): Intent {
+        return Intent(this, com.edham.logistics.MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("notification_id", notification.id)
+            putExtra("notification_type", notification.type.name)
+            putExtra("shipment_id", notification.shipmentId)
+            putExtra("deep_link", notification.deepLink)
+        }
+    }
+
+    private fun createActionIntent(notification: Notification, actionUrl: String): Intent {
+        return Intent(this, com.edham.logistics.MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("notification_id", notification.id)
+            putExtra("action_url", actionUrl)
+            putExtra("shipment_id", notification.shipmentId)
+        }
+    }
+
+    private fun getNotificationIcon(type: NotificationType): Int {
+        return when (type) {
+            NotificationType.SHIPMENT_CREATED,
+            NotificationType.SHIPMENT_ASSIGNED,
+            NotificationType.SHIPMENT_PICKED_UP,
+            NotificationType.SHIPMENT_IN_TRANSIT,
+            NotificationType.SHIPMENT_DELIVERED -> R.drawable.ic_shipment
+            NotificationType.SHIPMENT_CANCELLED,
+            NotificationType.SHIPMENT_DELAYED,
+            NotificationType.SHIPMENT_STATUS_UPDATED -> R.drawable.ic_warning
+            NotificationType.DRIVER_ASSIGNED,
+            NotificationType.DRIVER_LOCATION_UPDATED,
+            NotificationType.DRIVER_ARRIVED,
+            NotificationType.DRIVER_DEPARTED,
+            NotificationType.DRIVER_COMPLETED_TRIP,
+            NotificationType.DRIVER_STATUS_CHANGED -> R.drawable.ic_driver
+            NotificationType.TEMPERATURE_ALERT,
+            NotificationType.TEMPERATURE_NORMAL,
+            NotificationType.SENSOR_OFFLINE,
+            NotificationType.SENSOR_BATTERY_LOW,
+            NotificationType.SENSOR_CALIBRATION_REQUIRED -> R.drawable.ic_temperature
+            NotificationType.PAYMENT_RECEIVED,
+            NotificationType.PAYMENT_FAILED,
+            NotificationType.PAYMENT_PENDING,
+            NotificationType.PAYMENT_OVERDUE,
+            NotificationType.INVOICE_GENERATED,
+            NotificationType.INVOICE_OVERDUE -> R.drawable.ic_payment
+            NotificationType.SYSTEM_MAINTENANCE,
+            NotificationType.SYSTEM_UPDATE,
+            NotificationType.SYSTEM_ALERT,
+            NotificationType.SYSTEM_ERROR -> R.drawable.ic_system
+            NotificationType.USER_LOGIN,
+            NotificationType.USER_LOGOUT -> R.drawable.ic_user
+            NotificationType.GENERAL_ANNOUNCEMENT,
+            NotificationType.PROMOTION,
+            NotificationType.REMINDER,
+            NotificationType.WARNING,
+            NotificationType.ERROR -> R.drawable.ic_notification
+        }
+    }
+
+    private fun getNotificationPriority(priority: NotificationPriority): Int {
+        return when (priority) {
+            NotificationPriority.LOW -> NotificationCompat.PRIORITY_LOW
+            NotificationPriority.NORMAL -> NotificationCompat.PRIORITY_DEFAULT
+            NotificationPriority.HIGH -> NotificationCompat.PRIORITY_HIGH
+            NotificationPriority.URGENT -> NotificationCompat.PRIORITY_MAX
+        }
+    }
+
+    private fun getVibrationPattern(vibration: Boolean): LongArray {
+        return if (vibration) {
+            longArrayOf(0, 500, 200, 500)
+        } else {
+            longArrayOf(0)
+        }
+    }
+
+    private fun shouldShowNotification(notification: Notification): Boolean {
+        // Check user's notification settings
+        return serviceScope.launch {
+            try {
+                val settings = notificationRepository.getNotificationSettings(notification.userId)
+                when (settings) {
+                    is com.edham.logistics.core.utils.Result.Success -> {
+                        // Check if notifications are enabled for this category
+                        val categorySettings = settings.data.categories[notification.category]
+                        categorySettings?.enabled ?: true
+                    }
+                    else -> true // Default to showing notifications if settings can't be retrieved
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error checking notification settings", e)
+                true
+            }
+        }
+    }
+
+    private fun saveNotificationLocally(notification: Notification) {
+        serviceScope.launch {
+            try {
+                // In a real implementation, you would save to local database
+                // For now, we'll just log it
+                Log.d(TAG, "Saving notification locally: ${notification.title}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error saving notification locally", e)
+            }
+        }
+    }
+
+    private fun registerTokenWithBackend(token: String) {
+        serviceScope.launch {
+            try {
+                val userId = getCurrentUserId()
+                if (userId != null) {
+                    notificationRepository.registerDevice(userId, token, getDeviceId())
+                    Log.d(TAG, "FCM token registered successfully")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error registering FCM token", e)
+            }
+        }
+    }
+
+    private fun trackMessageDelivery(messageId: String, status: String) {
+        serviceScope.launch {
+            try {
+                // Track delivery event
+                val eventData = mapOf(
+                    "message_id" to messageId,
+                    "status" to status,
+                    "timestamp" to System.currentTimeMillis(),
+                    "device_id" to getDeviceId()
+                )
+                
+                notificationRepository.trackNotificationEvent(messageId, "delivery", eventData)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error tracking message delivery", e)
+            }
+        }
+    }
+
+    private fun getCurrentUserId(): String? {
+        // In a real implementation, you would get this from user session
+        return tokenManager.getUserId()
+    }
+
+    private fun getCurrentUserRole(): UserRole {
+        // In a real implementation, you would get this from user session
+        return when (tokenManager.getUserRole()) {
+            "admin" -> UserRole.ADMIN
+            "driver" -> UserRole.DRIVER
+            "accountant" -> UserRole.ACCOUNTANT
+            else -> UserRole.CUSTOMER
+        }
+    }
+
+    private fun getDeviceId(): String {
+        return android.provider.Settings.Secure.getString(
+            contentResolver,
+            android.provider.Settings.Secure.ANDROID_ID
+        )
+    }
+
+    private fun generateNotificationId(): String {
+        return "notif_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    }
+}

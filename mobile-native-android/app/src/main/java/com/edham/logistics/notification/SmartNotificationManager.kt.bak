@@ -1,0 +1,1323 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.NotificationApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Smart Notification Manager - Advanced notification management system
+ * 
+ * Features:
+ * - Multi-channel notifications (Push, In-app, SMS, Email)
+ * - Real-time alerts and notifications
+ * - Notification categorization and prioritization
+ * - User preferences and silent mode
+ * - Emergency alerts handling
+ * - Notification queue and retry mechanism
+ * - Scheduled notifications
+ * - Notification analytics and tracking
+ */
+@Singleton
+class SmartNotificationManager @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val notificationApi: NotificationApi,
+    private val networkUtils: NetworkUtils,
+    private val pushNotificationService: PushNotificationService,
+    private val smsNotificationService: SMSNotificationService,
+    private val emailNotificationService: EmailNotificationService,
+    private val notificationQueue: NotificationQueue,
+    private val notificationScheduler: NotificationScheduler
+) {
+    
+    private val _notificationState = MutableStateFlow<NotificationState>(NotificationState.Idle)
+    val notificationState: StateFlow<NotificationState> = _notificationState.asStateFlow()
+    
+    private val _notificationCenter = MutableStateFlow<NotificationCenter>(NotificationCenter())
+    val notificationCenter: StateFlow<NotificationCenter> = _notificationCenter.asStateFlow()
+    
+    private val _notificationPreferences = MutableStateFlow<NotificationPreferences>(NotificationPreferences())
+    val notificationPreferences: StateFlow<NotificationPreferences> = _notificationPreferences.asStateFlow()
+    
+    private val _notificationAnalytics = MutableStateFlow<NotificationAnalytics>(NotificationAnalytics())
+    val notificationAnalytics: StateFlow<NotificationAnalytics> = _notificationAnalytics.asStateFlow()
+    
+    private var isInitialized = false
+    private val notificationListeners = mutableListOf<NotificationListener>()
+    
+    companion object {
+        private const val TAG = "SmartNotificationManager"
+        private const val MAX_RETRY_ATTEMPTS = 3
+        private const val RETRY_DELAY_MS = 5000L
+        private const val EMERGENCY_PRIORITY_THRESHOLD = 8
+        private const val BATCH_SIZE = 50
+    }
+    
+    /**
+     * Initialize notification system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _notificationState.value = NotificationState.Initializing
+                
+                // Load notification preferences
+                loadNotificationPreferences()
+                
+                // Initialize notification services
+                initializeNotificationServices()
+                
+                // Load existing notifications
+                loadNotificationCenter()
+                
+                // Start notification queue processor
+                startNotificationQueueProcessor()
+                
+                // Initialize notification scheduler
+                notificationScheduler.initialize()
+                
+                // Load notification analytics
+                loadNotificationAnalytics()
+                
+                isInitialized = true
+                _notificationState.value = NotificationState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _notificationState.value = NotificationState.Error("Failed to initialize notification system: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Send notification with multiple channels
+     */
+    suspend fun sendNotification(
+        request: NotificationRequest
+    ): Result<NotificationResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Notification system not initialized")
+                }
+                
+                _notificationState.value = NotificationState.Sending
+                
+                // Validate notification request
+                validateNotificationRequest(request)
+                
+                // Check user preferences
+                if (!shouldSendNotification(request)) {
+                    _notificationState.value = NotificationState.Skipped
+                    return@withContext Result.success(
+                        NotificationResult(
+                            id = UUID.randomUUID().toString(),
+                            status = NotificationStatus.SKIPPED,
+                            message = "Notification skipped due to user preferences"
+                        )
+                    )
+                }
+                
+                // Create notification record
+                val notification = createNotificationRecord(request)
+                
+                // Save notification to database
+                val notificationId = database.notificationDao().insertNotification(notification.toEntity())
+                val savedNotification = notification.copy(id = notificationId)
+                
+                // Determine notification channels
+                val channels = determineNotificationChannels(request)
+                
+                // Send notifications through channels
+                val results = mutableListOf<ChannelResult>()
+                
+                channels.forEach { channel ->
+                    val result = when (channel) {
+                        NotificationChannel.PUSH -> sendPushNotification(savedNotification, request)
+                        NotificationChannel.IN_APP -> sendInAppNotification(savedNotification, request)
+                        NotificationChannel.SMS -> sendSMSNotification(savedNotification, request)
+                        NotificationChannel.EMAIL -> sendEmailNotification(savedNotification, request)
+                    }
+                    results.add(result)
+                }
+                
+                // Update notification status
+                val finalStatus = determineFinalStatus(results)
+                updateNotificationStatus(savedNotification.id, finalStatus)
+                
+                // Update analytics
+                updateNotificationAnalytics(savedNotification, results)
+                
+                // Update notification center
+                updateNotificationCenter(savedNotification)
+                
+                // Notify listeners
+                notifyNotificationSent(savedNotification, results)
+                
+                _notificationState.value = NotificationState.Sent
+                Result.success(
+                    NotificationResult(
+                        id = savedNotification.id.toString(),
+                        status = finalStatus,
+                        channels = results,
+                        timestamp = Date()
+                    )
+                )
+                
+            } catch (e: Exception) {
+                _notificationState.value = NotificationState.Error("Failed to send notification: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Send emergency alert
+     */
+    suspend fun sendEmergencyAlert(
+        alertRequest: EmergencyAlertRequest
+    ): Result<NotificationResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _notificationState.value = NotificationState.SendingEmergency
+                
+                // Validate emergency alert
+                validateEmergencyAlert(alertRequest)
+                
+                // Create emergency notification
+                val emergencyNotification = createEmergencyNotification(alertRequest)
+                
+                // Save emergency notification
+                val notificationId = database.notificationDao().insertNotification(emergencyNotification.toEntity())
+                val savedNotification = emergencyNotification.copy(id = notificationId)
+                
+                // Send through all available channels immediately
+                val channels = listOf(
+                    NotificationChannel.PUSH,
+                    NotificationChannel.IN_APP,
+                    NotificationChannel.SMS,
+                    NotificationChannel.EMAIL
+                )
+                
+                val results = mutableListOf<ChannelResult>()
+                
+                channels.forEach { channel ->
+                    val result = when (channel) {
+                        NotificationChannel.PUSH -> sendPushNotification(savedNotification, alertRequest.toNotificationRequest(), isEmergency = true)
+                        NotificationChannel.IN_APP -> sendInAppNotification(savedNotification, alertRequest.toNotificationRequest(), isEmergency = true)
+                        NotificationChannel.SMS -> sendSMSNotification(savedNotification, alertRequest.toNotificationRequest(), isEmergency = true)
+                        NotificationChannel.EMAIL -> sendEmailNotification(savedNotification, alertRequest.toNotificationRequest(), isEmergency = true)
+                    }
+                    results.add(result)
+                }
+                
+                // Update notification center with emergency alert
+                updateEmergencyAlertCenter(savedNotification)
+                
+                // Notify emergency listeners
+                notifyEmergencyAlertSent(savedNotification, results)
+                
+                _notificationState.value = NotificationState.EmergencySent
+                Result.success(
+                    NotificationResult(
+                        id = savedNotification.id.toString(),
+                        status = NotificationStatus.SENT,
+                        channels = results,
+                        timestamp = Date()
+                    )
+                )
+                
+            } catch (e: Exception) {
+                _notificationState.value = NotificationState.Error("Failed to send emergency alert: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Send shipment alert
+     */
+    suspend fun sendShipmentAlert(
+        shipmentId: String,
+        alertType: ShipmentAlertType,
+        data: ShipmentAlertData
+    ): Result<NotificationResult> {
+        val request = NotificationRequest(
+            title = getShipmentAlertTitle(alertType),
+            message = getShipmentAlertMessage(alertType, data),
+            category = NotificationCategory.SHIPMENT,
+            priority = getShipmentAlertPriority(alertType),
+            recipients = data.recipients,
+            data = mapOf(
+                "shipmentId" to shipmentId,
+                "alertType" to alertType.name,
+                "shipmentData" to data.toString()
+            ),
+            channels = getDefaultShipmentChannels(alertType)
+        )
+        
+        return sendNotification(request)
+    }
+    
+    /**
+     * Send delay alert
+     */
+    suspend fun sendDelayAlert(
+        shipmentId: String,
+        delayData: DelayAlertData
+    ): Result<NotificationResult> {
+        val request = NotificationRequest(
+            title = "تأخير في الشحنة",
+            message = "الشحنة $shipmentId متأخرة ${delayData.delayMinutes} دقيقة. السبب: ${delayData.reason}",
+            category = NotificationCategory.DELAY,
+            priority = NotificationPriority.HIGH,
+            recipients = delayData.recipients,
+            data = mapOf(
+                "shipmentId" to shipmentId,
+                "delayMinutes" to delayData.delayMinutes,
+                "reason" to delayData.reason,
+                "estimatedNewArrival" to delayData.estimatedNewArrival.toString()
+            ),
+            channels = listOf(NotificationChannel.PUSH, NotificationChannel.SMS, NotificationChannel.EMAIL)
+        )
+        
+        return sendNotification(request)
+    }
+    
+    /**
+     * Send temperature alert
+     */
+    suspend fun sendTemperatureAlert(
+        sensorId: String,
+        temperatureData: TemperatureAlertData
+    ): Result<NotificationResult> {
+        val request = NotificationRequest(
+            title = "تنبيه درجة الحرارة",
+            message = "درجة الحرارة ${temperatureData.currentTemperature}°${temperatureData.unit} في ${temperatureData.location}. الحد: ${temperatureData.threshold}°${temperatureData.unit}",
+            category = NotificationCategory.TEMPERATURE,
+            priority = if (temperatureData.isCritical) NotificationPriority.EMERGENCY else NotificationPriority.HIGH,
+            recipients = temperatureData.recipients,
+            data = mapOf(
+                "sensorId" to sensorId,
+                "currentTemperature" to temperatureData.currentTemperature,
+                "threshold" to temperatureData.threshold,
+                "unit" to temperatureData.unit,
+                "location" to temperatureData.location,
+                "isCritical" to temperatureData.isCritical
+            ),
+            channels = if (temperatureData.isCritical) {
+                listOf(NotificationChannel.PUSH, NotificationChannel.SMS, NotificationChannel.EMAIL)
+            } else {
+                listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP)
+            }
+        )
+        
+        return sendNotification(request)
+    }
+    
+    /**
+     * Send maintenance alert
+     */
+    suspend fun sendMaintenanceAlert(
+        vehicleId: String,
+        maintenanceData: MaintenanceAlertData
+    ): Result<NotificationResult> {
+        val request = NotificationRequest(
+            title = "تنبيه الصيانة",
+            message = "المركبة $vehicleId تحتاج ${maintenanceData.maintenanceType}. ${maintenanceData.description}",
+            category = NotificationCategory.MAINTENANCE,
+            priority = maintenanceData.priority,
+            recipients = maintenanceData.recipients,
+            data = mapOf(
+                "vehicleId" to vehicleId,
+                "maintenanceType" to maintenanceData.maintenanceType,
+                "scheduledDate" to maintenanceData.scheduledDate.toString(),
+                "estimatedCost" to maintenanceData.estimatedCost.toString()
+            ),
+            channels = listOf(NotificationChannel.PUSH, NotificationChannel.EMAIL)
+        )
+        
+        return sendNotification(request)
+    }
+    
+    /**
+     * Send payment alert
+     */
+    suspend fun sendPaymentAlert(
+        paymentData: PaymentAlertData
+    ): Result<NotificationResult> {
+        val request = NotificationRequest(
+            title = "تنبيه الدفع",
+            message = getPaymentAlertMessage(paymentData),
+            category = NotificationCategory.PAYMENT,
+            priority = paymentData.priority,
+            recipients = paymentData.recipients,
+            data = mapOf(
+                "paymentId" to paymentData.paymentId,
+                "amount" to paymentData.amount.toString(),
+                "dueDate" to paymentData.dueDate.toString(),
+                "status" to paymentData.status.name
+            ),
+            channels = listOf(NotificationChannel.PUSH, NotificationChannel.EMAIL)
+        )
+        
+        return sendNotification(request)
+    }
+    
+    /**
+     * Send driver alert
+     */
+    suspend fun sendDriverAlert(
+        driverId: String,
+        alertData: DriverAlertData
+    ): Result<NotificationResult> {
+        val request = NotificationRequest(
+            title = getDriverAlertTitle(alertData.alertType),
+            message = getDriverAlertMessage(alertData),
+            category = NotificationCategory.DRIVER,
+            priority = alertData.priority,
+            recipients = alertData.recipients,
+            data = mapOf(
+                "driverId" to driverId,
+                "alertType" to alertData.alertType.name,
+                "location" to alertData.location.toString(),
+                "timestamp" to alertData.timestamp.toString()
+            ),
+            channels = listOf(NotificationChannel.PUSH, NotificationChannel.SMS)
+        )
+        
+        return sendNotification(request)
+    }
+    
+    /**
+     * Update notification preferences
+     */
+    suspend fun updateNotificationPreferences(
+        preferences: NotificationPreferences
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Validate preferences
+                validateNotificationPreferences(preferences)
+                
+                // Save preferences to database
+                database.notificationPreferenceDao().updatePreferences(preferences.toEntity())
+                
+                // Update state
+                _notificationPreferences.value = preferences
+                
+                // Notify listeners
+                notifyPreferencesUpdated(preferences)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Mark notification as read
+     */
+    suspend fun markNotificationAsRead(
+        notificationId: Long
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Update notification in database
+                database.notificationDao().markAsRead(notificationId)
+                
+                // Update notification center
+                updateNotificationCenterReadStatus(notificationId)
+                
+                // Notify listeners
+                notifyNotificationRead(notificationId)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Mark all notifications as read
+     */
+    suspend fun markAllNotificationsAsRead(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Update all notifications in database
+                database.notificationDao().markAllAsRead()
+                
+                // Update notification center
+                updateAllNotificationsReadStatus()
+                
+                // Notify listeners
+                notifyAllNotificationsRead()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Delete notification
+     */
+    suspend fun deleteNotification(
+        notificationId: Long
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Delete from database
+                database.notificationDao().deleteNotification(notificationId)
+                
+                // Update notification center
+                updateNotificationCenterAfterDeletion(notificationId)
+                
+                // Notify listeners
+                notifyNotificationDeleted(notificationId)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule notification
+     */
+    suspend fun scheduleNotification(
+        scheduledRequest: ScheduledNotificationRequest
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Validate scheduled request
+                validateScheduledNotificationRequest(scheduledRequest)
+                
+                // Schedule notification
+                val scheduleId = notificationScheduler.scheduleNotification(scheduledRequest)
+                
+                // Notify listeners
+                notifyNotificationScheduled(scheduleId, scheduledRequest)
+                
+                Result.success(scheduleId)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Cancel scheduled notification
+     */
+    suspend fun cancelScheduledNotification(
+        scheduleId: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Cancel scheduled notification
+                notificationScheduler.cancelNotification(scheduleId)
+                
+                // Notify listeners
+                notifyScheduledNotificationCancelled(scheduleId)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add notification listener
+     */
+    fun addNotificationListener(listener: NotificationListener) {
+        notificationListeners.add(listener)
+    }
+    
+    /**
+     * Remove notification listener
+     */
+    fun removeNotificationListener(listener: NotificationListener) {
+        notificationListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadNotificationPreferences() {
+        val preferences = database.notificationPreferenceDao().getPreferences()
+        _notificationPreferences.value = preferences?.toDomainModel() ?: NotificationPreferences()
+    }
+    
+    private suspend fun initializeNotificationServices() {
+        pushNotificationService.initialize()
+        smsNotificationService.initialize()
+        emailNotificationService.initialize()
+    }
+    
+    private suspend fun loadNotificationCenter() {
+        val notifications = database.notificationDao().getAllNotifications()
+        val center = NotificationCenter(
+            notifications = notifications.map { it.toDomainModel() },
+            unreadCount = notifications.count { !it.isRead },
+            totalCount = notifications.size
+        )
+        _notificationCenter.value = center
+    }
+    
+    private suspend fun startNotificationQueueProcessor() {
+        notificationQueue.startProcessing()
+    }
+    
+    private suspend fun loadNotificationAnalytics() {
+        // Load notification analytics
+        val analytics = NotificationAnalytics()
+        _notificationAnalytics.value = analytics
+    }
+    
+    private fun validateNotificationRequest(request: NotificationRequest) {
+        if (request.title.isBlank()) throw Exception("Notification title cannot be empty")
+        if (request.message.isBlank()) throw Exception("Notification message cannot be empty")
+        if (request.recipients.isEmpty()) throw Exception("Notification must have at least one recipient")
+    }
+    
+    private fun shouldSendNotification(request: NotificationRequest): Boolean {
+        val preferences = _notificationPreferences.value
+        
+        // Check if silent mode is enabled
+        if (preferences.silentMode && request.priority != NotificationPriority.EMERGENCY) {
+            return false
+        }
+        
+        // Check category preferences
+        val categoryPreference = preferences.categoryPreferences[request.category]
+        if (categoryPreference?.enabled == false) {
+            return false
+        }
+        
+        // Check time-based preferences
+        if (preferences.doNotDisturbMode && isWithinDoNotDisturbHours()) {
+            return request.priority == NotificationPriority.EMERGENCY
+        }
+        
+        return true
+    }
+    
+    private fun isWithinDoNotDisturbHours(): Boolean {
+        val preferences = _notificationPreferences.value
+        val currentTime = Calendar.getInstance()
+        val currentHour = currentTime.get(Calendar.HOUR_OF_DAY)
+        
+        return currentHour >= preferences.doNotDisturbStartHour && 
+               currentHour < preferences.doNotDisturbEndHour
+    }
+    
+    private fun createNotificationRecord(request: NotificationRequest): Notification {
+        return Notification(
+            id = 0,
+            title = request.title,
+            message = request.message,
+            category = request.category,
+            priority = request.priority,
+            status = NotificationStatus.PENDING,
+            recipients = request.recipients,
+            channels = request.channels,
+            data = request.data,
+            isRead = false,
+            createdAt = Date(),
+            updatedAt = Date()
+        )
+    }
+    
+    private fun createEmergencyNotification(request: EmergencyAlertRequest): Notification {
+        return Notification(
+            id = 0,
+            title = "🚨 ${request.title}",
+            message = request.message,
+            category = NotificationCategory.EMERGENCY,
+            priority = NotificationPriority.EMERGENCY,
+            status = NotificationStatus.PENDING,
+            recipients = request.recipients,
+            channels = listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP, NotificationChannel.SMS, NotificationChannel.EMAIL),
+            data = request.data + ("isEmergency" to "true"),
+            isRead = false,
+            createdAt = Date(),
+            updatedAt = Date()
+        )
+    }
+    
+    private fun determineNotificationChannels(request: NotificationRequest): List<NotificationChannel> {
+        val preferences = _notificationPreferences.value
+        
+        // Use requested channels if available
+        if (request.channels.isNotEmpty()) {
+            return request.channels.filter { channel ->
+                preferences.channelPreferences[channel]?.enabled != false
+            }
+        }
+        
+        // Use default channels based on category and priority
+        return getDefaultChannels(request.category, request.priority)
+    }
+    
+    private fun getDefaultChannels(category: NotificationCategory, priority: NotificationPriority): List<NotificationChannel> {
+        return when (category) {
+            NotificationCategory.EMERGENCY -> listOf(NotificationChannel.PUSH, NotificationChannel.SMS, NotificationChannel.EMAIL)
+            NotificationCategory.SHIPMENT -> listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP)
+            NotificationCategory.DELAY -> listOf(NotificationChannel.PUSH, NotificationChannel.SMS)
+            NotificationCategory.TEMPERATURE -> listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP)
+            NotificationCategory.MAINTENANCE -> listOf(NotificationChannel.PUSH, NotificationChannel.EMAIL)
+            NotificationCategory.PAYMENT -> listOf(NotificationChannel.PUSH, NotificationChannel.EMAIL)
+            NotificationCategory.DRIVER -> listOf(NotificationChannel.PUSH, NotificationChannel.SMS)
+            else -> listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP)
+        }
+    }
+    
+    private fun getDefaultShipmentChannels(alertType: ShipmentAlertType): List<NotificationChannel> {
+        return when (alertType) {
+            ShipmentAlertType.DELIVERED -> listOf(NotificationChannel.PUSH, NotificationChannel.EMAIL)
+            ShipmentAlertType.OUT_FOR_DELIVERY -> listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP)
+            ShipmentAlertType.DELAYED -> listOf(NotificationChannel.PUSH, NotificationChannel.SMS)
+            ShipmentAlertType.CANCELLED -> listOf(NotificationChannel.PUSH, NotificationChannel.SMS, NotificationChannel.EMAIL)
+            ShipmentAlertType.RETURNED -> listOf(NotificationChannel.PUSH, NotificationChannel.EMAIL)
+            else -> listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP)
+        }
+    }
+    
+    private suspend fun sendPushNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean = false
+    ): ChannelResult {
+        return try {
+            val result = pushNotificationService.sendNotification(notification, request, isEmergency)
+            ChannelResult(
+                channel = NotificationChannel.PUSH,
+                status = if (result.isSuccess) NotificationStatus.SENT else NotificationStatus.FAILED,
+                message = result.message,
+                timestamp = Date()
+            )
+        } catch (e: Exception) {
+            ChannelResult(
+                channel = NotificationChannel.PUSH,
+                status = NotificationStatus.FAILED,
+                message = e.message ?: "Unknown error",
+                timestamp = Date()
+            )
+        }
+    }
+    
+    private suspend fun sendInAppNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean = false
+    ): ChannelResult {
+        return try {
+            val result = pushNotificationService.sendInAppNotification(notification, request, isEmergency)
+            ChannelResult(
+                channel = NotificationChannel.IN_APP,
+                status = if (result.isSuccess) NotificationStatus.SENT else NotificationStatus.FAILED,
+                message = result.message,
+                timestamp = Date()
+            )
+        } catch (e: Exception) {
+            ChannelResult(
+                channel = NotificationChannel.IN_APP,
+                status = NotificationStatus.FAILED,
+                message = e.message ?: "Unknown error",
+                timestamp = Date()
+            )
+        }
+    }
+    
+    private suspend fun sendSMSNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean = false
+    ): ChannelResult {
+        return try {
+            val result = smsNotificationService.sendNotification(notification, request, isEmergency)
+            ChannelResult(
+                channel = NotificationChannel.SMS,
+                status = if (result.isSuccess) NotificationStatus.SENT else NotificationStatus.FAILED,
+                message = result.message,
+                timestamp = Date()
+            )
+        } catch (e: Exception) {
+            ChannelResult(
+                channel = NotificationChannel.SMS,
+                status = NotificationStatus.FAILED,
+                message = e.message ?: "Unknown error",
+                timestamp = Date()
+            )
+        }
+    }
+    
+    private suspend fun sendEmailNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean = false
+    ): ChannelResult {
+        return try {
+            val result = emailNotificationService.sendNotification(notification, request, isEmergency)
+            ChannelResult(
+                channel = NotificationChannel.EMAIL,
+                status = if (result.isSuccess) NotificationStatus.SENT else NotificationStatus.FAILED,
+                message = result.message,
+                timestamp = Date()
+            )
+        } catch (e: Exception) {
+            ChannelResult(
+                channel = NotificationChannel.EMAIL,
+                status = NotificationStatus.FAILED,
+                message = e.message ?: "Unknown error",
+                timestamp = Date()
+            )
+        }
+    }
+    
+    private fun determineFinalStatus(results: List<ChannelResult>): NotificationStatus {
+        val hasSuccess = results.any { it.status == NotificationStatus.SENT }
+        val hasFailure = results.any { it.status == NotificationStatus.FAILED }
+        
+        return when {
+            hasSuccess && !hasFailure -> NotificationStatus.SENT
+            hasSuccess && hasFailure -> NotificationStatus.PARTIALLY_SENT
+            !hasSuccess -> NotificationStatus.FAILED
+            else -> NotificationStatus.FAILED
+        }
+    }
+    
+    private suspend fun updateNotificationStatus(notificationId: Long, status: NotificationStatus) {
+        database.notificationDao().updateStatus(notificationId, status)
+    }
+    
+    private suspend fun updateNotificationAnalytics(notification: Notification, results: List<ChannelResult>) {
+        // Update notification analytics
+    }
+    
+    private suspend fun updateNotificationCenter(notification: Notification) {
+        val currentCenter = _notificationCenter.value
+        val updatedCenter = currentCenter.copy(
+            notifications = listOf(notification) + currentCenter.notifications,
+            unreadCount = currentCenter.unreadCount + 1,
+            totalCount = currentCenter.totalCount + 1
+        )
+        _notificationCenter.value = updatedCenter
+    }
+    
+    private suspend fun updateEmergencyAlertCenter(notification: Notification) {
+        val currentCenter = _notificationCenter.value
+        val updatedCenter = currentCenter.copy(
+            emergencyAlerts = listOf(notification) + currentCenter.emergencyAlerts,
+            unreadCount = currentCenter.unreadCount + 1,
+            totalCount = currentCenter.totalCount + 1
+        )
+        _notificationCenter.value = updatedCenter
+    }
+    
+    private suspend fun updateNotificationCenterReadStatus(notificationId: Long) {
+        val currentCenter = _notificationCenter.value
+        val updatedNotifications = currentCenter.notifications.map { notification ->
+            if (notification.id == notificationId) {
+                notification.copy(isRead = true)
+            } else {
+                notification
+            }
+        }
+        
+        val updatedCenter = currentCenter.copy(
+            notifications = updatedNotifications,
+            unreadCount = (currentCenter.unreadCount - 1).coerceAtLeast(0)
+        )
+        _notificationCenter.value = updatedCenter
+    }
+    
+    private suspend fun updateAllNotificationsReadStatus() {
+        val currentCenter = _notificationCenter.value
+        val updatedCenter = currentCenter.copy(
+            notifications = currentCenter.notifications.map { it.copy(isRead = true) },
+            unreadCount = 0
+        )
+        _notificationCenter.value = updatedCenter
+    }
+    
+    private suspend fun updateNotificationCenterAfterDeletion(notificationId: Long) {
+        val currentCenter = _notificationCenter.value
+        val updatedNotifications = currentCenter.notifications.filter { it.id != notificationId }
+        val deletedNotification = currentCenter.notifications.find { it.id == notificationId }
+        
+        val updatedCenter = currentCenter.copy(
+            notifications = updatedNotifications,
+            unreadCount = if (deletedNotification?.isRead == false) {
+                (currentCenter.unreadCount - 1).coerceAtLeast(0)
+            } else {
+                currentCenter.unreadCount
+            },
+            totalCount = (currentCenter.totalCount - 1).coerceAtLeast(0)
+        )
+        _notificationCenter.value = updatedCenter
+    }
+    
+    private fun validateEmergencyAlert(request: EmergencyAlertRequest) {
+        if (request.title.isBlank()) throw Exception("Emergency alert title cannot be empty")
+        if (request.message.isBlank()) throw Exception("Emergency alert message cannot be empty")
+        if (request.recipients.isEmpty()) throw Exception("Emergency alert must have at least one recipient")
+    }
+    
+    private fun validateNotificationPreferences(preferences: NotificationPreferences) {
+        // Validate notification preferences
+    }
+    
+    private fun validateScheduledNotificationRequest(request: ScheduledNotificationRequest) {
+        if (request.title.isBlank()) throw Exception("Scheduled notification title cannot be empty")
+        if (request.message.isBlank()) throw Exception("Scheduled notification message cannot be empty")
+        if (request.recipients.isEmpty()) throw Exception("Scheduled notification must have at least one recipient")
+        if (request.scheduledTime.before(Date())) throw Exception("Scheduled time cannot be in the past")
+    }
+    
+    private fun getShipmentAlertTitle(alertType: ShipmentAlertType): String {
+        return when (alertType) {
+            ShipmentAlertType.CREATED -> "شحنة جديدة"
+            ShipmentAlertType.PICKED_UP -> "تم استلام الشحنة"
+            ShipmentAlertType.IN_TRANSIT -> "الشحنة في الطريق"
+            ShipmentAlertType.OUT_FOR_DELIVERY -> "الشحنة خرجت للتسليم"
+            ShipmentAlertType.DELIVERED -> "تم تسليم الشحنة"
+            ShipmentAlertType.DELAYED -> "تأخير الشحنة"
+            ShipmentAlertType.CANCELLED -> "إلغاء الشحنة"
+            ShipmentAlertType.RETURNED -> "إرجاع الشحنة"
+            ShipmentAlertType.LOST -> "فقدان الشحنة"
+            ShipmentAlertType.DAMAGED -> "تلف الشحنة"
+        }
+    }
+    
+    private fun getShipmentAlertMessage(alertType: ShipmentAlertType, data: ShipmentAlertData): String {
+        return when (alertType) {
+            ShipmentAlertType.CREATED -> "تم إنشاء شحنة جديدة: ${data.shipmentId}"
+            ShipmentAlertType.PICKED_UP -> "تم استلام الشحنة ${data.shipmentId} من ${data.pickupLocation}"
+            ShipmentAlertType.IN_TRANSIT -> "الشحنة ${data.shipmentId} حالياً في الطريق إلى ${data.destination}"
+            ShipmentAlertType.OUT_FOR_DELIVERY -> "الشحنة ${data.shipmentId} خرجت للتسليم إلى ${data.destination}"
+            ShipmentAlertType.DELIVERED -> "تم تسليم الشحنة ${data.shipmentId} بنجاح"
+            ShipmentAlertType.DELAYED -> "الشحنة ${data.shipmentId} متأخرة. التوصيل المتوقع: ${data.estimatedDelivery}"
+            ShipmentAlertType.CANCELLED -> "تم إلغاء الشحنة ${data.shipmentId}. السبب: ${data.reason}"
+            ShipmentAlertType.RETURNED -> "تم إرجاع الشحنة ${data.shipmentId}. السبب: ${data.reason}"
+            ShipmentAlertType.LOST -> "فُقدت الشحنة ${data.shipmentId}. يرجى التواصل مع الدعم"
+            ShipmentAlertType.DAMAGED -> "تعرضت الشحنة ${data.shipmentId} للتلف. يرجى التواصل مع الدعم"
+        }
+    }
+    
+    private fun getShipmentAlertPriority(alertType: ShipmentAlertType): NotificationPriority {
+        return when (alertType) {
+            ShipmentAlertType.CREATED -> NotificationPriority.NORMAL
+            ShipmentAlertType.PICKED_UP -> NotificationPriority.NORMAL
+            ShipmentAlertType.IN_TRANSIT -> NotificationPriority.NORMAL
+            ShipmentAlertType.OUT_FOR_DELIVERY -> NotificationPriority.HIGH
+            ShipmentAlertType.DELIVERED -> NotificationPriority.NORMAL
+            ShipmentAlertType.DELAYED -> NotificationPriority.HIGH
+            ShipmentAlertType.CANCELLED -> NotificationPriority.HIGH
+            ShipmentAlertType.RETURNED -> NotificationPriority.HIGH
+            ShipmentAlertType.LOST -> NotificationPriority.EMERGENCY
+            ShipmentAlertType.DAMAGED -> NotificationPriority.EMERGENCY
+        }
+    }
+    
+    private fun getPaymentAlertMessage(paymentData: PaymentAlertData): String {
+        return when (paymentData.status) {
+            PaymentStatus.PENDING -> "دفع بقيمة ${paymentData.amount} ريال مستحق بتاريخ ${paymentData.dueDate}"
+            PaymentStatus.OVERDUE -> "دفع بقيمة ${paymentData.amount} ريال متأخر منذ ${paymentData.daysOverdue} يوم"
+            PaymentStatus.PAID -> "تم استلام دفع بقيمة ${paymentData.amount} ريال بنجاح"
+            PaymentStatus.FAILED -> "فشل عملية الدفع بقيمة ${paymentData.amount} ريال. يرجى المحاولة مرة أخرى"
+            PaymentStatus.CANCELLED -> "تم إلغاء الدفع بقيمة ${paymentData.amount} ريال"
+        }
+    }
+    
+    private fun getDriverAlertTitle(alertType: DriverAlertType): String {
+        return when (alertType) {
+            DriverAlertType.SPEEDING -> "تنبيه السرعة الزائدة"
+            DriverAlertType.HARSH_BRAKING -> "تنبيه الكبح المفاجئ"
+            DriverAlertType.RAPID_ACCELERATION -> "تنبيه التسارع المفاجئ"
+            DriverAlertType.IDLING -> "تنبيه التوقف الطويل"
+            DriverAlertType.FATIGUE -> "تنبيه الإرهاق"
+            DriverAlertType.OFF_ROUTE -> "انحراف عن المسار"
+            DriverAlertType.LOW_FUEL -> "مستوى الوقود منخفض"
+            DriverAlertType.EMERGENCY -> "طوارئ السائق"
+        }
+    }
+    
+    private fun getDriverAlertMessage(alertData: DriverAlertData): String {
+        return when (alertData.alertType) {
+            DriverAlertType.SPEEDING -> "السائق يتجاوز السرعة المسموح بها (${alertData.details} كم/ساعة)"
+            DriverAlertType.HARSH_BRAKING -> "تم اكتشاف كبح مفاجئ في ${alertData.location}"
+            DriverAlertType.RAPID_ACCELERATION -> "تم اكتشاف تسارع مفاجئ في ${alertData.location}"
+            DriverAlertType.IDLING -> "السائق متوقف لمدة ${alertData.details} دقيقة"
+            DriverAlertType.FATIGUE -> "علامات إرهاق detected. يرجى أخذ استراحة"
+            DriverAlertType.OFF_ROUTE -> "السائق انحرف عن المسار المحدد (${alertData.details} كم)"
+            DriverAlertType.LOW_FUEL -> "مستوى الوقود منخفض (${alertData.details}%)"
+            DriverAlertType.EMERGENCY -> "حالة طوارئ: ${alertData.details}"
+        }
+    }
+    
+    private fun notifyNotificationSent(notification: Notification, results: List<ChannelResult>) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationSent(notification, results)
+        }
+    }
+    
+    private fun notifyEmergencyAlertSent(notification: Notification, results: List<ChannelResult>) {
+        notificationListeners.forEach { listener ->
+            listener.onEmergencyAlertSent(notification, results)
+        }
+    }
+    
+    private fun notifyPreferencesUpdated(preferences: NotificationPreferences) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationPreferencesUpdated(preferences)
+        }
+    }
+    
+    private fun notifyNotificationRead(notificationId: Long) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationRead(notificationId)
+        }
+    }
+    
+    private fun notifyAllNotificationsRead() {
+        notificationListeners.forEach { listener ->
+            listener.onAllNotificationsRead()
+        }
+    }
+    
+    private fun notifyNotificationDeleted(notificationId: Long) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationDeleted(notificationId)
+        }
+    }
+    
+    private fun notifyNotificationScheduled(scheduleId: String, request: ScheduledNotificationRequest) {
+        notificationListeners.forEach { listener ->
+            listener.onNotificationScheduled(scheduleId, request)
+        }
+    }
+    
+    private fun notifyScheduledNotificationCancelled(scheduleId: String) {
+        notificationListeners.forEach { listener ->
+            listener.onScheduledNotificationCancelled(scheduleId)
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class NotificationRequest(
+    val title: String,
+    val message: String,
+    val category: NotificationCategory,
+    val priority: NotificationPriority,
+    val recipients: List<NotificationRecipient>,
+    val data: Map<String, String> = emptyMap(),
+    val channels: List<NotificationChannel> = emptyList(),
+    val scheduledTime: Date? = null
+)
+
+data class EmergencyAlertRequest(
+    val title: String,
+    val message: String,
+    val recipients: List<NotificationRecipient>,
+    val data: Map<String, String> = emptyMap(),
+    val severity: EmergencySeverity = EmergencySeverity.HIGH
+)
+
+data class ScheduledNotificationRequest(
+    val title: String,
+    val message: String,
+    val category: NotificationCategory,
+    val priority: NotificationPriority,
+    val recipients: List<NotificationRecipient>,
+    val data: Map<String, String> = emptyMap(),
+    val channels: List<NotificationChannel>,
+    val scheduledTime: Date,
+    val repeatInterval: Long? = null
+)
+
+data class ShipmentAlertData(
+    val shipmentId: String,
+    val pickupLocation: String,
+    val destination: String,
+    val estimatedDelivery: Date,
+    val recipients: List<NotificationRecipient>,
+    val reason: String? = null
+)
+
+data class DelayAlertData(
+    val recipients: List<NotificationRecipient>,
+    val delayMinutes: Int,
+    val reason: String,
+    val estimatedNewArrival: Date
+)
+
+data class TemperatureAlertData(
+    val currentTemperature: Double,
+    val threshold: Double,
+    val unit: String,
+    val location: String,
+    val isCritical: Boolean,
+    val recipients: List<NotificationRecipient>
+)
+
+data class MaintenanceAlertData(
+    val maintenanceType: String,
+    val description: String,
+    val scheduledDate: Date,
+    val estimatedCost: Float,
+    val priority: NotificationPriority,
+    val recipients: List<NotificationRecipient>
+)
+
+data class PaymentAlertData(
+    val paymentId: String,
+    val amount: Float,
+    val dueDate: Date,
+    val status: PaymentStatus,
+    val daysOverdue: Int = 0,
+    val recipients: List<NotificationRecipient>,
+    val priority: NotificationPriority = NotificationPriority.NORMAL
+)
+
+data class DriverAlertData(
+    val alertType: DriverAlertType,
+    val location: String,
+    val timestamp: Date,
+    val details: String,
+    val recipients: List<NotificationRecipient>,
+    val priority: NotificationPriority = NotificationPriority.HIGH
+)
+
+data class Notification(
+    val id: Long,
+    val title: String,
+    val message: String,
+    val category: NotificationCategory,
+    val priority: NotificationPriority,
+    val status: NotificationStatus,
+    val recipients: List<NotificationRecipient>,
+    val channels: List<NotificationChannel>,
+    val data: Map<String, String>,
+    val isRead: Boolean,
+    val createdAt: Date,
+    val updatedAt: Date
+)
+
+data class NotificationCenter(
+    val notifications: List<Notification> = emptyList(),
+    val emergencyAlerts: List<Notification> = emptyList(),
+    val unreadCount: Int = 0,
+    val totalCount: Int = 0
+)
+
+data class NotificationPreferences(
+    val silentMode: Boolean = false,
+    val doNotDisturbMode: Boolean = false,
+    val doNotDisturbStartHour: Int = 22,
+    val doNotDisturbEndHour: Int = 7,
+    val categoryPreferences: Map<NotificationCategory, CategoryPreference> = emptyMap(),
+    val channelPreferences: Map<NotificationChannel, ChannelPreference> = emptyMap()
+)
+
+data class CategoryPreference(
+    val enabled: Boolean = true,
+    val priority: NotificationPriority = NotificationPriority.NORMAL,
+    val channels: List<NotificationChannel> = listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP)
+)
+
+data class ChannelPreference(
+    val enabled: Boolean = true,
+    val priority: NotificationPriority = NotificationPriority.NORMAL
+)
+
+data class NotificationAnalytics(
+    val totalSent: Int = 0,
+    val totalDelivered: Int = 0,
+    val totalRead: Int = 0,
+    val deliveryRate: Float = 0f,
+    val readRate: Float = 0f,
+    val categoryStats: Map<NotificationCategory, CategoryStats> = emptyMap(),
+    val channelStats: Map<NotificationChannel, ChannelStats> = emptyMap()
+)
+
+data class CategoryStats(
+    val sent: Int = 0,
+    val delivered: Int = 0,
+    val read: Int = 0,
+    val deliveryRate: Float = 0f,
+    val readRate: Float = 0f
+)
+
+data class ChannelStats(
+    val sent: Int = 0,
+    val delivered: Int = 0,
+    val read: Int = 0,
+    val deliveryRate: Float = 0f,
+    val readRate: Float = 0f
+)
+
+data class NotificationResult(
+    val id: String,
+    val status: NotificationStatus,
+    val channels: List<ChannelResult>? = null,
+    val message: String? = null,
+    val timestamp: Date
+)
+
+data class ChannelResult(
+    val channel: NotificationChannel,
+    val status: NotificationStatus,
+    val message: String,
+    val timestamp: Date
+)
+
+data class NotificationRecipient(
+    val id: String,
+    val type: RecipientType,
+    val address: String,
+    val name: String? = null
+)
+
+/**
+ * Interfaces
+ */
+interface NotificationListener {
+    fun onNotificationSent(notification: Notification, results: List<ChannelResult>)
+    fun onEmergencyAlertSent(notification: Notification, results: List<ChannelResult>)
+    fun onNotificationPreferencesUpdated(preferences: NotificationPreferences)
+    fun onNotificationRead(notificationId: Long)
+    fun onAllNotificationsRead()
+    fun onNotificationDeleted(notificationId: Long)
+    fun onNotificationScheduled(scheduleId: String, request: ScheduledNotificationRequest)
+    fun onScheduledNotificationCancelled(scheduleId: String)
+}
+
+/**
+ * Enums
+ */
+enum class NotificationState {
+    Idle,
+    Initializing,
+    Ready,
+    Sending,
+    SendingEmergency,
+    Sent,
+    EmergencySent,
+    Skipped,
+    Error
+}
+
+enum class NotificationChannel {
+    PUSH,
+    IN_APP,
+    SMS,
+    EMAIL
+}
+
+enum class NotificationCategory {
+    SHIPMENT,
+    DELAY,
+    TEMPERATURE,
+    MAINTENANCE,
+    PAYMENT,
+    DRIVER,
+    EMERGENCY,
+    SYSTEM,
+    MARKETING,
+    GENERAL
+}
+
+enum class NotificationPriority {
+    LOW,
+    NORMAL,
+    HIGH,
+    EMERGENCY
+}
+
+enum class NotificationStatus {
+    PENDING,
+    SENT,
+    DELIVERED,
+    READ,
+    FAILED,
+    PARTIALLY_SENT,
+    SKIPPED,
+    CANCELLED
+}
+
+enum class ShipmentAlertType {
+    CREATED,
+    PICKED_UP,
+    IN_TRANSIT,
+    OUT_FOR_DELIVERY,
+    DELIVERED,
+    DELAYED,
+    CANCELLED,
+    RETURNED,
+    LOST,
+    DAMAGED
+}
+
+enum class PaymentStatus {
+    PENDING,
+    OVERDUE,
+    PAID,
+    FAILED,
+    CANCELLED
+}
+
+enum class DriverAlertType {
+    SPEEDING,
+    HARSH_BRAKING,
+    RAPID_ACCELERATION,
+    IDLING,
+    FATIGUE,
+    OFF_ROUTE,
+    LOW_FUEL,
+    EMERGENCY
+}
+
+enum class RecipientType {
+    USER,
+    DRIVER,
+    CUSTOMER,
+    ADMIN,
+    SYSTEM
+}
+
+enum class EmergencySeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

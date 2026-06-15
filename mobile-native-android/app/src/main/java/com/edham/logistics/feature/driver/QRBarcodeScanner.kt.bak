@@ -1,0 +1,364 @@
+package com.edham.logistics.feature.driver
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.util.SparseArray
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentQrScannerBinding
+import com.edham.logistics.utils.VoiceAlertManager
+import com.google.android.gms.vision.CameraSource
+import com.google.android.gms.vision.Detector
+import com.google.android.gms.vision.barcode.Barcode
+import com.google.android.gms.vision.barcode.BarcodeDetector
+import timber.log.Timber
+import java.io.IOException
+
+class QRBarcodeScannerFragment : Fragment() {
+    
+    private var _binding: FragmentQrScannerBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var voiceAlertManager: VoiceAlertManager
+    private var cameraSource: CameraSource? = null
+    private var barcodeDetector: BarcodeDetector? = null
+    private var isScanning = false
+    
+    companion object {
+        private const val CAMERA_PERMISSION_REQUEST_CODE = 1001
+        private const val FLASH_ON = "Flash On"
+        private const val FLASH_OFF = "Flash Off"
+    }
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentQrScannerBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        voiceAlertManager = VoiceAlertManager(requireContext())
+        setupUI()
+        setupClickListeners()
+        
+        if (hasCameraPermission()) {
+            startScanning()
+        } else {
+            requestCameraPermission()
+        }
+    }
+    
+    private fun setupUI() {
+        // Large touch targets for one-hand usage
+        binding.btnToggleFlash.minimumHeight = 72.dp
+        binding.btnToggleFlash.minimumWidth = 120.dp
+        
+        binding.btnScanManual.minimumHeight = 72.dp
+        binding.btnScanManual.minimumWidth = 120.dp
+        
+        binding.btnCancel.minimumHeight = 72.dp
+        binding.btnCancel.minimumWidth = 120.dp
+        
+        // Dark mode optimized colors
+        binding.cardScannerInfo.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        // High visibility status colors
+        binding.viewScannerStatus.setBackgroundColor(
+            requireContext().getColor(R.color.status_idle)
+        )
+    }
+    
+    private fun setupClickListeners() {
+        binding.btnToggleFlash.setOnClickListener {
+            toggleFlash()
+        }
+        
+        binding.btnScanManual.setOnClickListener {
+            showManualInputDialog()
+        }
+        
+        binding.btnCancel.setOnClickListener {
+            requireActivity().onBackPressed()
+        }
+    }
+    
+    private fun startScanning() {
+        try {
+            barcodeDetector = BarcodeDetector.Builder(requireContext())
+                .setBarcodeFormats(Barcode.ALL_FORMATS)
+                .build()
+            
+            cameraSource = CameraSource.Builder(requireContext(), barcodeDetector!!)
+                .setRequestedPreviewSize(1920, 1080)
+                .setAutoFocusEnabled(true)
+                .build()
+            
+            barcodeDetector!!.setProcessor(object : Detector.Processor<Barcode> {
+                override fun release() {
+                    // Release resources
+                }
+                
+                override fun receiveDetections(detections: Detector.Detections<Barcode>) {
+                    val barcodes: SparseArray<Barcode> = detections.detectedItems
+                    
+                    if (barcodes.size() > 0 && !isScanning) {
+                        isScanning = true
+                        val barcode = barcodes.valueAt(0)
+                        
+                        // Handle scanned barcode
+                        handleScannedBarcode(barcode)
+                        
+                        // Stop scanning temporarily to prevent multiple scans
+                        binding.root.postDelayed({
+                            isScanning = false
+                        }, 2000)
+                    }
+                }
+            })
+            
+            binding.cameraPreview.holder.addCallback(object : android.view.SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: android.view.SurfaceHolder) {
+                    try {
+                        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.CAMERA) 
+                            == PackageManager.PERMISSION_GRANTED) {
+                            cameraSource?.start(holder)
+                            isScanning = true
+                            updateScannerStatus("SCANNING")
+                            voiceAlertManager.speak("Scanner ready. Please position barcode in frame")
+                        }
+                    } catch (e: IOException) {
+                        Timber.e(e, "Error starting camera")
+                        updateScannerStatus("ERROR")
+                    }
+                }
+                
+                override fun surfaceChanged(
+                    holder: android.view.SurfaceHolder,
+                    format: Int,
+                    width: Int,
+                    height: Int
+                ) {
+                    // Handle surface changes
+                }
+                
+                override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {
+                    cameraSource?.stop()
+                    isScanning = false
+                    updateScannerStatus("STOPPED")
+                }
+            })
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error setting up scanner")
+            updateScannerStatus("ERROR")
+        }
+    }
+    
+    private fun handleScannedBarcode(barcode: Barcode) {
+        val scannedData = barcode.rawValue ?: barcode.displayValue
+        
+        if (scannedData != null) {
+            // Process scanned data
+            processScannedData(scannedData)
+            
+            // Voice feedback
+            voiceAlertManager.speak("Barcode scanned successfully")
+            
+            // Vibration feedback
+            vibrateDevice()
+            
+            // Update UI
+            updateScannerStatus("SCANNED")
+            binding.tvScanResult.text = "Scanned: $scannedData"
+            
+            // Auto-dismiss after successful scan
+            binding.root.postDelayed({
+                requireActivity().onBackPressed()
+            }, 1500)
+        }
+    }
+    
+    private fun processScannedData(data: String) {
+        // Determine the type of scanned data and process accordingly
+        when {
+            data.startsWith("SHIPMENT:") -> {
+                val shipmentId = data.substringAfter("SHIPMENT:")
+                processShipmentScan(shipmentId)
+            }
+            data.startsWith("DELIVERY:") -> {
+                val deliveryId = data.substringAfter("DELIVERY:")
+                processDeliveryScan(deliveryId)
+            }
+            data.startsWith("PACKAGE:") -> {
+                val packageId = data.substringAfter("PACKAGE:")
+                processPackageScan(packageId)
+            }
+            else -> {
+                // Generic scan
+                processGenericScan(data)
+            }
+        }
+    }
+    
+    private fun processShipmentScan(shipmentId: String) {
+        // Process shipment scan - update status, location, etc.
+        Timber.d("Shipment scanned: $shipmentId")
+    }
+    
+    private fun processDeliveryScan(deliveryId: String) {
+        // Process delivery scan - confirm delivery, capture proof
+        Timber.d("Delivery scanned: $deliveryId")
+    }
+    
+    private fun processPackageScan(packageId: String) {
+        // Process package scan - track package movement
+        Timber.d("Package scanned: $packageId")
+    }
+    
+    private fun processGenericScan(data: String) {
+        // Process generic scan
+        Timber.d("Generic scan: $data")
+    }
+    
+    private fun toggleFlash() {
+        try {
+            if (cameraSource != null) {
+                val hasFlash = requireContext().packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH)
+                
+                if (hasFlash) {
+                    // Toggle flash (implementation depends on camera source)
+                    val isFlashOn = binding.btnToggleFlash.text.toString() == FLASH_ON
+                    
+                    if (isFlashOn) {
+                        // Turn off flash
+                        binding.btnToggleFlash.text = FLASH_OFF
+                        binding.btnToggleFlash.setBackgroundColor(
+                            requireContext().getColor(R.color.flash_off)
+                        )
+                        voiceAlertManager.speak("Flash turned off")
+                    } else {
+                        // Turn on flash
+                        binding.btnToggleFlash.text = FLASH_ON
+                        binding.btnToggleFlash.setBackgroundColor(
+                            requireContext().getColor(R.color.flash_on)
+                        )
+                        voiceAlertManager.speak("Flash turned on")
+                    }
+                } else {
+                    Toast.makeText(requireContext(), "Flash not available", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error toggling flash")
+        }
+    }
+    
+    private fun showManualInputDialog() {
+        // Show dialog for manual input of barcode/QR code
+        voiceAlertManager.speak("Manual input mode")
+        // Implementation would show a dialog with text input
+    }
+    
+    private fun updateScannerStatus(status: String) {
+        binding.tvScannerStatus.text = status
+        
+        val color = when (status) {
+            "SCANNING" -> requireContext().getColor(R.color.status_active)
+            "SCANNED" -> requireContext().getColor(R.color.status_completed)
+            "ERROR" -> requireContext().getColor(R.color.status_error)
+            "STOPPED" -> requireContext().getColor(R.color.status_offline)
+            else -> requireContext().getColor(R.color.status_idle)
+        }
+        
+        binding.viewScannerStatus.setBackgroundColor(color)
+    }
+    
+    private fun vibrateDevice() {
+        // Vibrate for haptic feedback
+        try {
+            val vibrator = requireContext().getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                vibrator.vibrate(android.os.VibrationEffect.createOneShot(200, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(200)
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error vibrating device")
+        }
+    }
+    
+    private fun hasCameraPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            requireContext(),
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+    
+    private fun requestCameraPermission() {
+        ActivityCompat.requestPermissions(
+            requireActivity(),
+            arrayOf(Manifest.permission.CAMERA),
+            CAMERA_PERMISSION_REQUEST_CODE
+        )
+    }
+    
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        
+        when (requestCode) {
+            CAMERA_PERMISSION_REQUEST_CODE -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    startScanning()
+                } else {
+                    Toast.makeText(requireContext(), "Camera permission required for scanning", Toast.LENGTH_LONG).show()
+                    updateScannerStatus("NO_PERMISSION")
+                }
+            }
+        }
+    }
+    
+    override fun onPause() {
+        super.onPause()
+        cameraSource?.stop()
+        isScanning = false
+    }
+    
+    override fun onResume() {
+        super.onResume()
+        if (hasCameraPermission() && !isScanning) {
+            startScanning()
+        }
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        
+        cameraSource?.release()
+        barcodeDetector?.release()
+        voiceAlertManager.cleanup()
+        _binding = null
+    }
+    
+    // Extension for dp to pixels
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+}

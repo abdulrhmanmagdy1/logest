@@ -20,11 +20,26 @@ interface AccountantApi {
     @GET("accountant/debts")
     suspend fun getDebtAgingReport(): Response<ApiResponse<DebtAgingReport>>
 
+    @POST("accountant/debts/{id}/collect")
+    suspend fun collectPayment(
+        @Path("id") clientId: String,
+        @Query("amount") amount: Double,
+        @Query("method") method: String,
+        @Query("notes") notes: String? = null
+    ): Response<Unit>
+
     @GET("accountant/workshop-requests")
     suspend fun getWorkshopRequests(): Response<ApiResponse<List<WorkshopFinancialRequest>>>
 
     @POST("accountant/workshop-requests/{id}/approve")
     suspend fun approveWorkshopRequest(@Path("id") requestId: String): Response<Unit>
+
+    @POST("accountant/receipt-vouchers")
+    suspend fun submitReceiptVoucher(
+        @Query("clientName") clientName: String,
+        @Query("amount") amount: Double,
+        @Query("method") method: String
+    ): Response<Unit>
 
     @GET("accountant/client/{id}/statement")
     suspend fun getStatementOfAccount(@Path("id") clientId: String): Response<ApiResponse<StatementOfAccount>>
@@ -36,7 +51,8 @@ data class AccountantDashboardStats(
     val monthly_expenses: Double,
     val net_profit: Double,
     val revenue_history: List<ChartData>,
-    val expense_distribution: List<ChartData>
+    val expense_distribution: List<ChartData>,
+    val profit_history: List<ChartData>
 )
 
 data class DriverSettlement(

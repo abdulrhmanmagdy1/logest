@@ -1,0 +1,516 @@
+package com.edham.logistics.offline.sync
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+
+/**
+ * Background Sync Service
+ * Handles automatic data synchronization in the background
+ * Works with WorkManager for reliable background processing
+ */
+
+// @AndroidEntryPoint
+// Temporarily disabled due to missing dependencies
+// @Singleton
+class BackgroundSyncService {
+
+    // @Inject
+    // lateinit var syncManager: SyncManager
+
+    // @Inject
+    // lateinit var networkMonitor: NetworkMonitor
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var syncJob: Job? = null
+    private var isServiceRunning = false
+
+    companion object {
+        const val NOTIFICATION_CHANNEL_ID = "edham_sync_channel"
+        const val NOTIFICATION_ID = 1001
+        const val ACTION_START_SYNC = "com.edham.logistics.START_SYNC"
+        const val ACTION_STOP_SYNC = "com.edham.logistics.STOP_SYNC"
+        const val ACTION_SYNC_NOW = "com.edham.logistics.SYNC_NOW"
+
+        fun startSyncService(context: Context) {
+            val intent = Intent(context, BackgroundSyncService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun stopSyncService(context: Context) {
+            val intent = Intent(context, BackgroundSyncService::class.java)
+            context.stopService(intent)
+        }
+
+        fun triggerSyncNow(context: Context) {
+            val intent = Intent(context, BackgroundSyncService::class.java).apply {
+                action = ACTION_SYNC_NOW
+            }
+            context.startService(intent)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        Timber.d("BackgroundSyncService created")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        return when (intent?.action) {
+            ACTION_START_SYNC -> {
+                startForegroundSync()
+                START_STICKY
+            }
+            ACTION_STOP_SYNC -> {
+                stopSyncService()
+                START_NOT_STICKY
+            }
+            ACTION_SYNC_NOW -> {
+                triggerImmediateSync()
+                START_STICKY
+            }
+            else -> {
+                startForegroundSync()
+                START_STICKY
+            }
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startForegroundSync() {
+        if (isServiceRunning) return
+
+        isServiceRunning = true
+        startForeground(NOTIFICATION_ID, createSyncNotification())
+
+        syncJob = serviceScope.launch {
+            try {
+                // Monitor network status and sync when online
+                networkMonitor.observeNetworkStatus()
+                    .distinctUntilChanged()
+                    .collect { networkStatus ->
+                        when (networkStatus) {
+                            NetworkStatus.ONLINE -> {
+                                Timber.d("Network available, starting sync process")
+                                performSync()
+                            }
+                            NetworkStatus.OFFLINE -> {
+                                Timber.d("Network unavailable, pausing sync")
+                                updateNotification("Offline - Waiting for connection")
+                            }
+                            NetworkStatus.CONNECTING -> {
+                                Timber.d("Network connecting, preparing for sync")
+                                updateNotification("Connecting...")
+                            }
+                        }
+                    }
+            } catch (e: Exception) {
+                Timber.e(e, "Error in sync service")
+                handleSyncError(e)
+            }
+        }
+    }
+
+    private suspend fun performSync() {
+        try {
+            updateNotification("Syncing data...")
+            
+            // Perform different types of sync operations
+            val syncResults = listOf(
+                syncManager.syncPendingOperations(),
+                syncManager.syncShipments(),
+                syncManager.syncDrivers(),
+                syncManager.syncVehicles(),
+                syncManager.syncLocations(),
+                syncManager.syncMapsData()
+            )
+
+            val allSuccessful = syncResults.all { it.isSuccess }
+            
+            if (allSuccessful) {
+                updateNotification("Sync completed successfully")
+                delay(3000) // Show success message for 3 seconds
+                updateNotification("Sync active - Monitoring for changes")
+            } else {
+                updateNotification("Sync completed with some errors")
+                delay(5000) // Show error message longer
+                updateNotification("Sync active - Monitoring for changes")
+            }
+
+            // Schedule next sync
+            scheduleNextSync()
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error during sync")
+            handleSyncError(e)
+        }
+    }
+
+    private fun triggerImmediateSync() {
+        if (isServiceRunning) {
+            serviceScope.launch {
+                try {
+                    updateNotification("Immediate sync started...")
+                    val result = syncManager.syncAllData()
+                    
+                    if (result.isSuccess) {
+                        updateNotification("Immediate sync completed")
+                    } else {
+                        updateNotification("Immediate sync failed")
+                    }
+                    
+                    delay(3000)
+                    updateNotification("Sync active - Monitoring for changes")
+                } catch (e: Exception) {
+                    Timber.e(e, "Error during immediate sync")
+                    handleSyncError(e)
+                }
+            }
+        }
+    }
+
+    private fun scheduleNextSync() {
+        serviceScope.launch {
+            try {
+                // Wait for next sync interval (configurable, default 15 minutes)
+                val syncInterval = getSyncInterval()
+                delay(syncInterval)
+                
+                if (networkMonitor.isOnline()) {
+                    performSync()
+                } else {
+                    Timber.d("Network unavailable, skipping scheduled sync")
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Error scheduling next sync")
+            }
+        }
+    }
+
+    private fun getSyncInterval(): Long {
+        // Return sync interval in milliseconds
+        // Could be configurable based on user settings or network conditions
+        return when (networkMonitor.getNetworkQuality()) {
+            NetworkQuality.EXCELLENT -> TimeUnit.MINUTES.toMillis(5)
+            NetworkQuality.GOOD -> TimeUnit.MINUTES.toMillis(10)
+            NetworkQuality.FAIR -> TimeUnit.MINUTES.toMillis(15)
+            NetworkQuality.POOR -> TimeUnit.MINUTES.toMillis(30)
+        }
+    }
+
+    private fun handleSyncError(error: Exception) {
+        Timber.e(error, "Sync error occurred")
+        updateNotification("Sync error - Will retry")
+        
+        // Schedule retry with exponential backoff
+        serviceScope.launch {
+            val retryDelay = calculateRetryDelay()
+            delay(retryDelay)
+            
+            if (networkMonitor.isOnline()) {
+                performSync()
+            }
+        }
+    }
+
+    private fun calculateRetryDelay(): Long {
+        // Exponential backoff: 30s, 1min, 2min, 4min, 8min, max 15min
+        return TimeUnit.SECONDS.toMillis(30).coerceAtMost(TimeUnit.MINUTES.toMillis(15))
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "Edham Sync Service",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Handles data synchronization for Edham Logistics"
+                setShowBadge(false)
+                enableVibration(false)
+                setSound(null, null)
+            }
+            
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun createSyncNotification(): Notification {
+        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("Edham Logistics")
+            .setContentText("Sync active - Monitoring for changes")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+    }
+
+    private fun updateNotification(text: String) {
+        val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("Edham Logistics")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+        
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun stopSyncService() {
+        isServiceRunning = false
+        syncJob?.cancel()
+        stopForeground(true)
+        stopSelf()
+        Timber.d("BackgroundSyncService stopped")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isServiceRunning = false
+        syncJob?.cancel()
+        serviceScope.cancel()
+        Timber.d("BackgroundSyncService destroyed")
+    }
+}
+
+/**
+ * Sync Manager - Core sync logic
+ */
+class SyncManager @Inject constructor(
+    private val syncQueue: SyncQueue,
+    private val conflictResolver: ConflictResolver,
+    private val offlineRepository: OfflineRepository,
+    private val networkMonitor: NetworkMonitor
+) {
+
+    suspend fun syncPendingOperations(): Result<Unit> {
+        return try {
+            val operations = syncQueue.getPendingOperations()
+            
+            for (operation in operations) {
+                when (operation.type) {
+                    OperationType.CREATE_SHIPMENT -> syncCreateShipment(operation)
+                    OperationType.UPDATE_SHIPMENT -> syncUpdateShipment(operation)
+                    OperationType.DELETE_SHIPMENT -> syncDeleteShipment(operation)
+                    OperationType.UPDATE_LOCATION -> syncUpdateLocation(operation)
+                    OperationType.UPDATE_STATUS -> syncUpdateStatus(operation)
+                    OperationType.UPLOAD_PROOF -> syncUploadProof(operation)
+                    else -> Timber.w("Unknown operation type: ${operation.type}")
+                }
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing pending operations")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun syncShipments(): Result<Unit> {
+        return try {
+            // Get server data and sync with local
+            val serverShipments = fetchServerShipments()
+            val localShipments = offlineRepository.getAllShipments()
+            
+            // Handle conflicts and update local data
+            for (serverShipment in serverShipments) {
+                val localShipment = localShipments.find { it.id == serverShipment.id }
+                
+                if (localShipment == null) {
+                    // New shipment from server
+                    offlineRepository.saveShipment(serverShipment)
+                } else if (localShipment.updatedAt < serverShipment.updatedAt) {
+                    // Server data is newer
+                    val resolution = conflictResolver.resolveConflict(localShipment, serverShipment)
+                    offlineRepository.saveShipment(resolution.resolvedData)
+                }
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing shipments")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun syncDrivers(): Result<Unit> {
+        return try {
+            val serverDrivers = fetchServerDrivers()
+            val localDrivers = offlineRepository.getAllDrivers()
+            
+            for (serverDriver in serverDrivers) {
+                val localDriver = localDrivers.find { it.id == serverDriver.id }
+                
+                if (localDriver == null) {
+                    offlineRepository.saveDriver(serverDriver)
+                } else if (localDriver.lastSyncTime < serverDriver.lastSyncTime) {
+                    offlineRepository.saveDriver(serverDriver)
+                }
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing drivers")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun syncVehicles(): Result<Unit> {
+        return try {
+            val serverVehicles = fetchServerVehicles()
+            val localVehicles = offlineRepository.getAllVehicles()
+            
+            for (serverVehicle in serverVehicles) {
+                val localVehicle = localVehicles.find { it.id == serverVehicle.id }
+                
+                if (localVehicle == null) {
+                    offlineRepository.saveVehicle(serverVehicle)
+                } else if (localVehicle.lastSyncTime < serverVehicle.lastSyncTime) {
+                    offlineRepository.saveVehicle(serverVehicle)
+                }
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing vehicles")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun syncLocations(): Result<Unit> {
+        return try {
+            // Sync pending location updates
+            val pendingLocations = offlineRepository.getPendingLocations()
+            
+            for (location in pendingLocations) {
+                val result = uploadLocationToServer(location)
+                if (result.isSuccess) {
+                    offlineRepository.markLocationSynced(location.id)
+                }
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing locations")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun syncMapsData(): Result<Unit> {
+        return try {
+            // Sync cached maps data that needs updating
+            val expiredCache = offlineRepository.getExpiredMapsData()
+            
+            for (cacheItem in expiredCache) {
+                val freshData = fetchMapsDataFromServer(cacheItem.cacheKey)
+                if (freshData != null) {
+                    offlineRepository.updateMapsCache(cacheItem.cacheKey, freshData)
+                }
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing maps data")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun syncAllData(): Result<Unit> {
+        return try {
+            val results = listOf(
+                syncPendingOperations(),
+                syncShipments(),
+                syncDrivers(),
+                syncVehicles(),
+                syncLocations(),
+                syncMapsData()
+            )
+            
+            if (results.all { it.isSuccess }) {
+                Result.success(Unit)
+            } else {
+                val failures = results.filter { it.isFailure }
+                Result.failure(Exception("Some sync operations failed: ${failures.size} failures"))
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error during full sync")
+            Result.failure(e)
+        }
+    }
+
+    // Private helper methods
+    private suspend fun fetchServerShipments(): List<Any> {
+        // Implementation would call actual API
+        return emptyList()
+    }
+
+    private suspend fun fetchServerDrivers(): List<Any> {
+        // Implementation would call actual API
+        return emptyList()
+    }
+
+    private suspend fun fetchServerVehicles(): List<Any> {
+        // Implementation would call actual API
+        return emptyList()
+    }
+
+    private suspend fun uploadLocationToServer(location: Any): Result<Unit> {
+        // Implementation would call actual API
+        return Result.success(Unit)
+    }
+
+    private suspend fun fetchMapsDataFromServer(cacheKey: String): String? {
+        // Implementation would call actual API
+        return null
+    }
+
+    private suspend fun syncCreateShipment(operation: SyncOperation): Result<Unit> {
+        // Implementation for creating shipment on server
+        return Result.success(Unit)
+    }
+
+    private suspend fun syncUpdateShipment(operation: SyncOperation): Result<Unit> {
+        // Implementation for updating shipment on server
+        return Result.success(Unit)
+    }
+
+    private suspend fun syncDeleteShipment(operation: SyncOperation): Result<Unit> {
+        // Implementation for deleting shipment on server
+        return Result.success(Unit)
+    }
+
+    private suspend fun syncUpdateLocation(operation: SyncOperation): Result<Unit> {
+        // Implementation for updating location on server
+        return Result.success(Unit)
+    }
+
+    private suspend fun syncUpdateStatus(operation: SyncOperation): Result<Unit> {
+        // Implementation for updating status on server
+        return Result.success(Unit)
+    }
+
+    private suspend fun syncUploadProof(operation: SyncOperation): Result<Unit> {
+        // Implementation for uploading proof to server
+        return Result.success(Unit)
+    }
+}

@@ -1,0 +1,530 @@
+package com.edham.logistics.audit
+
+import kotlinx.coroutines.runBlocking
+
+/**
+ * User Audit Logger - Specialized audit logging for user operations
+ */
+class UserAuditLogger private constructor() {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: UserAuditLogger? = null
+        
+        fun getInstance(): UserAuditLogger {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: UserAuditLogger().also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private var auditSystem: AuditLogSystem? = null
+    
+    /**
+     * Initialize with audit system
+     */
+    fun initialize(auditSystem: AuditLogSystem) {
+        this.auditSystem = auditSystem
+    }
+    
+    /**
+     * Log user creation
+     */
+    fun logUserCreation(
+        adminUserId: String,
+        newUser: Map<String, Any>
+    ) {
+        auditSystem?.logUserOperation(
+            userId = adminUserId,
+            targetUserId = newUser["id"].toString(),
+            operation = AuditOperation.USER_CREATE,
+            description = "User created: ${newUser["name"]} (${newUser["email"]})",
+            beforeUser = null,
+            afterUser = newUser,
+            metadata = mapOf(
+                "userName" to newUser["name"],
+                "userEmail" to newUser["email"],
+                "userRole" to newUser["role"],
+                "userType" to newUser["userType"]
+            )
+        )
+    }
+    
+    /**
+     * Log user update
+     */
+    fun logUserUpdate(
+        userId: String,
+        targetUserId: String,
+        beforeUser: Map<String, Any>,
+        afterUser: Map<String, Any>,
+        changedFields: List<String>
+    ) {
+        val description = buildString {
+            append("User updated: ${afterUser["name"]}")
+            if (changedFields.isNotEmpty()) {
+                append(" - Changed fields: ${changedFields.joinToString(", ")}")
+            }
+        }
+        
+        auditSystem?.logUserOperation(
+            userId = userId,
+            targetUserId = targetUserId,
+            operation = AuditOperation.USER_UPDATE,
+            description = description,
+            beforeUser = beforeUser,
+            afterUser = afterUser,
+            metadata = mapOf(
+                "userName" to afterUser["name"],
+                "userEmail" to afterUser["email"],
+                "changedFields" to changedFields,
+                "updateType" to "PROFILE_UPDATE"
+            )
+        )
+    }
+    
+    /**
+     * Log user deletion
+     */
+    fun logUserDeletion(
+        adminUserId: String,
+        deletedUser: Map<String, Any>,
+        reason: String
+    ) {
+        auditSystem?.logUserOperation(
+            userId = adminUserId,
+            targetUserId = deletedUser["id"].toString(),
+            operation = AuditOperation.USER_DELETE,
+            description = "User deleted: ${deletedUser["name"]} - $reason",
+            beforeUser = deletedUser,
+            afterUser = null,
+            metadata = mapOf(
+                "userName" to deletedUser["name"],
+                "userEmail" to deletedUser["email"],
+                "userRole" to deletedUser["role"],
+                "deletionReason" to reason,
+                "deletedBy" to adminUserId
+            )
+        )
+    }
+    
+    /**
+     * Log user login
+     */
+    fun logUserLogin(
+        userId: String,
+        loginMethod: String,
+        ipAddress: String,
+        success: Boolean,
+        failureReason: String? = null
+    ) {
+        val description = if (success) {
+            "User login successful: $loginMethod"
+        } else {
+            "User login failed: $loginMethod - ${failureReason ?: "Unknown reason"}"
+        }
+        
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "USER",
+            entityId = userId,
+            operation = AuditOperation.LOGIN,
+            description = description,
+            beforeData = null,
+            afterData = mapOf(
+                "loginSuccess" to success,
+                "loginMethod" to loginMethod,
+                "loginTimestamp" to System.currentTimeMillis()
+            ),
+            metadata = mapOf(
+                "loginMethod" to loginMethod,
+                "loginSuccess" to success,
+                "failureReason" to failureReason,
+                "ipAddress" to ipAddress,
+                "loginTimestamp" to System.currentTimeMillis()
+            ),
+            logLevel = if (success) AuditLogLevel.INFO else AuditLogLevel.WARNING
+        )
+    }
+    
+    /**
+     * Log user logout
+     */
+    fun logUserLogout(
+        userId: String,
+        sessionDuration: Long,
+        logoutReason: String = "USER_INITIATED"
+    ) {
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "USER",
+            entityId = userId,
+            operation = AuditOperation.LOGOUT,
+            description = "User logged out - $logoutReason",
+            beforeData = mapOf("sessionActive" to true),
+            afterData = mapOf("sessionActive" to false),
+            metadata = mapOf(
+                "logoutReason" to logoutReason,
+                "sessionDuration" to sessionDuration,
+                "logoutTimestamp" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    /**
+     * Log user role change
+     */
+    fun logUserRoleChange(
+        adminUserId: String,
+        targetUserId: String,
+        userName: String,
+        oldRole: String,
+        newRole: String,
+        reason: String
+    ) {
+        auditSystem?.logUserOperation(
+            userId = adminUserId,
+            targetUserId = targetUserId,
+            operation = AuditOperation.USER_UPDATE,
+            description = "User role changed: $userName from $oldRole to $newRole",
+            beforeUser = mapOf("role" to oldRole),
+            afterUser = mapOf("role" to newRole),
+            metadata = mapOf(
+                "userName" to userName,
+                "oldRole" to oldRole,
+                "newRole" to newRole,
+                "roleChangeReason" to reason,
+                "changedBy" to adminUserId
+            )
+        )
+    }
+    
+    /**
+     * Log user permission change
+     */
+    fun logUserPermissionChange(
+        adminUserId: String,
+        targetUserId: String,
+        userName: String,
+        oldPermissions: List<String>,
+        newPermissions: List<String>,
+        reason: String
+    ) {
+        val description = "User permissions changed: $userName"
+        
+        auditSystem?.logUserOperation(
+            userId = adminUserId,
+            targetUserId = targetUserId,
+            operation = AuditOperation.USER_UPDATE,
+            description = description,
+            beforeUser = mapOf("permissions" to oldPermissions),
+            afterUser = mapOf("permissions" to newPermissions),
+            metadata = mapOf(
+                "userName" to userName,
+                "oldPermissions" to oldPermissions,
+                "newPermissions" to newPermissions,
+                "permissionChangeReason" to reason,
+                "changedBy" to adminUserId,
+                "addedPermissions" to (newPermissions - oldPermissions),
+                "removedPermissions" to (oldPermissions - newPermissions)
+            )
+        )
+    }
+    
+    /**
+     * Log user status change
+     */
+    fun logUserStatusChange(
+        adminUserId: String,
+        targetUserId: String,
+        userName: String,
+        oldStatus: String,
+        newStatus: String,
+        reason: String
+    ) {
+        auditSystem?.logUserOperation(
+            userId = adminUserId,
+            targetUserId = targetUserId,
+            operation = AuditOperation.USER_UPDATE,
+            description = "User status changed: $userName from $oldStatus to $newStatus",
+            beforeUser = mapOf("status" to oldStatus),
+            afterUser = mapOf("status" to newStatus),
+            metadata = mapOf(
+                "userName" to userName,
+                "oldStatus" to oldStatus,
+                "newStatus" to newStatus,
+                "statusChangeReason" to reason,
+                "changedBy" to adminUserId
+            )
+        )
+    }
+    
+    /**
+     * Log user password change
+     */
+    fun logUserPasswordChange(
+        userId: String,
+        changeMethod: String,
+        ipAddress: String,
+        success: Boolean,
+        failureReason: String? = null
+    ) {
+        val description = if (success) {
+            "Password changed successfully: $changeMethod"
+        } else {
+            "Password change failed: $changeMethod - ${failureReason ?: "Unknown reason"}"
+        }
+        
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "USER",
+            entityId = userId,
+            operation = AuditOperation.USER_UPDATE,
+            description = description,
+            beforeData = mapOf("passwordChanged" to false),
+            afterData = if (success) mapOf("passwordChanged" to true) else null,
+            metadata = mapOf(
+                "changeMethod" to changeMethod,
+                "changeSuccess" to success,
+                "failureReason" to failureReason,
+                "ipAddress" to ipAddress,
+                "changeTimestamp" to System.currentTimeMillis()
+            ),
+            logLevel = if (success) AuditLogLevel.INFO else AuditLogLevel.WARNING
+        )
+    }
+    
+    /**
+     * Log user profile update
+     */
+    fun logUserProfileUpdate(
+        userId: String,
+        beforeProfile: Map<String, Any>,
+        afterProfile: Map<String, Any>,
+        changedFields: List<String>
+    ) {
+        val description = "Profile updated - Changed fields: ${changedFields.joinToString(", ")}"
+        
+        auditSystem?.logUserOperation(
+            userId = userId,
+            targetUserId = userId,
+            operation = AuditOperation.USER_UPDATE,
+            description = description,
+            beforeUser = beforeProfile,
+            afterUser = afterProfile,
+            metadata = mapOf(
+                "userName" to afterProfile["name"],
+                "changedFields" to changedFields,
+                "updateType" to "PROFILE_UPDATE",
+                "selfUpdate" to true
+            )
+        )
+    }
+    
+    /**
+     * Log user access attempt
+     */
+    fun logUserAccessAttempt(
+        userId: String,
+        resource: String,
+        accessType: String,
+        success: Boolean,
+        denialReason: String? = null
+    ) {
+        val description = if (success) {
+            "Access granted: $resource - $accessType"
+        } else {
+            "Access denied: $resource - $accessType - ${denialReason ?: "Unknown reason"}"
+        }
+        
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "USER_ACCESS",
+            entityId = userId,
+            operation = if (success) AuditOperation.VIEW else AuditOperation.UPDATE,
+            description = description,
+            beforeData = null,
+            afterData = mapOf(
+                "accessGranted" to success,
+                "resource" to resource,
+                "accessType" to accessType
+            ),
+            metadata = mapOf(
+                "resource" to resource,
+                "accessType" to accessType,
+                "accessGranted" to success,
+                "denialReason" to denialReason,
+                "accessTimestamp" to System.currentTimeMillis()
+            ),
+            logLevel = if (success) AuditLogLevel.INFO else AuditLogLevel.WARNING
+        )
+    }
+    
+    /**
+     * Log user session start
+     */
+    fun logUserSessionStart(
+        userId: String,
+        sessionId: String,
+        loginMethod: String,
+        deviceInfo: Map<String, String>
+    ) {
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "USER_SESSION",
+            entityId = sessionId,
+            operation = AuditOperation.CREATE,
+            description = "User session started: $loginMethod",
+            beforeData = null,
+            afterData = mapOf(
+                "sessionActive" to true,
+                "loginMethod" to loginMethod
+            ),
+            metadata = mapOf(
+                "sessionId" to sessionId,
+                "loginMethod" to loginMethod,
+                "deviceInfo" to deviceInfo,
+                "sessionStart" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    /**
+     * Log user session end
+     */
+    fun logUserSessionEnd(
+        userId: String,
+        sessionId: String,
+        sessionDuration: Long,
+        endReason: String
+    ) {
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "USER_SESSION",
+            entityId = sessionId,
+            operation = AuditOperation.UPDATE,
+            description = "User session ended: $endReason",
+            beforeData = mapOf("sessionActive" to true),
+            afterData = mapOf("sessionActive" to false),
+            metadata = mapOf(
+                "sessionId" to sessionId,
+                "sessionDuration" to sessionDuration,
+                "endReason" to endReason,
+                "sessionEnd" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    /**
+     * Log user security event
+     */
+    fun logUserSecurityEvent(
+        userId: String,
+        eventType: String,
+        eventDescription: String,
+        severity: AuditLogLevel,
+        additionalData: Map<String, Any>? = null
+    ) {
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "USER_SECURITY",
+            entityId = userId,
+            operation = AuditOperation.UPDATE,
+            description = "Security event: $eventType - $eventDescription",
+            beforeData = null,
+            afterData = mapOf(
+                "securityEvent" to eventType,
+                "eventDescription" to eventDescription
+            ),
+            metadata = mapOf(
+                "eventType" to eventType,
+                "eventDescription" to eventDescription,
+                "severity" to severity.name
+            ) + (additionalData ?: emptyMap()),
+            logLevel = severity
+        )
+    }
+    
+    /**
+     * Get user audit history
+     */
+    fun getUserAuditHistory(userId: String): List<Map<String, Any>> {
+        return runBlocking {
+            auditSystem?.getUserAuditHistory(userId, 1000)?.map { log ->
+                mapOf(
+                    "id" to log.id,
+                    "operation" to log.operation.name,
+                    "description" to log.description,
+                    "timestamp" to log.timestamp,
+                    "beforeData" to log.beforeData,
+                    "afterData" to log.afterData,
+                    "metadata" to log.metadata,
+                    "ipAddress" to log.ipAddress
+                )
+            } ?: emptyList()
+        }
+    }
+    
+    /**
+     * Get user statistics
+     */
+    fun getUserStatistics(userId: String): Map<String, Any> {
+        return runBlocking {
+            val userLogs = auditSystem?.getUserAuditHistory(userId, 10000) ?: emptyList()
+            
+            val totalOperations = userLogs.size
+            val operationsByType = userLogs.groupBy { it.operation }.mapValues { it.value.size }
+            val recentActivity = userLogs.filter { 
+                System.currentTimeMillis() - it.timestamp < 24 * 60 * 60 * 1000L 
+            }.size
+            
+            val loginCount = userLogs.count { it.operation == AuditOperation.LOGIN }
+            val logoutCount = userLogs.count { it.operation == AuditOperation.LOGOUT }
+            val failedLogins = userLogs.filter { 
+                it.operation == AuditOperation.LOGIN && 
+                it.metadata?.get("loginSuccess") == false
+            }.size
+            
+            mapOf(
+                "totalOperations" to totalOperations,
+                "operationsByType" to operationsByType,
+                "recentActivity24h" to recentActivity,
+                "loginCount" to loginCount,
+                "logoutCount" to logoutCount,
+                "failedLogins" to failedLogins,
+                "lastActivity" to (userLogs.firstOrNull()?.timestamp ?: 0L)
+            )
+        }
+    }
+    
+    /**
+     * Get all users statistics
+     */
+    fun getAllUsersStatistics(): Map<String, Any> {
+        return runBlocking {
+            val allUserLogs = auditSystem?.getAuditLogs(
+                entityType = "USER",
+                limit = 10000
+            ) ?: emptyList()
+            
+            val totalUserOperations = allUserLogs.size
+            val uniqueUsers = allUserLogs.map { it.userId }.distinct().size
+            val operationsByType = allUserLogs.groupBy { it.operation }.mapValues { it.value.size }
+            val mostActiveUsers = allUserLogs.groupBy { it.userId }.mapValues { it.value.size }
+                .toList().sortedByDescending { it.second }.take(10)
+            
+            val recentLogins = allUserLogs.filter { 
+                it.operation == AuditOperation.LOGIN && 
+                System.currentTimeMillis() - it.timestamp < 24 * 60 * 60 * 1000L 
+            }.size
+            
+            mapOf(
+                "totalUserOperations" to totalUserOperations,
+                "uniqueUsers" to uniqueUsers,
+                "operationsByType" to operationsByType,
+                "mostActiveUsers" to mostActiveUsers,
+                "recentLogins24h" to recentLogins
+            )
+        }
+    }
+}

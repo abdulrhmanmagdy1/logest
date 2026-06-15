@@ -1,0 +1,487 @@
+package com.edham.logistics.core.performance
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicInteger
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Pagination Manager - Efficient pagination for large lists with preloading and caching
+ */
+@Singleton
+class PaginationManager @Inject constructor() {
+
+    private var config: PaginationConfig = PaginationConfig()
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // Pagination state tracking
+    private val paginationStates = ConcurrentHashMap<String, PaginationState<*>>()
+    
+    // Preloading queue
+    private val preloadQueue = Channel<PreloadTask>(capacity = Channel.UNLIMITED)
+    private val preloadExecutor = Executors.newFixedThreadPool(2) as ExecutorService
+    
+    // Metrics
+    private val totalPaginations = AtomicInteger(0)
+    private val preloadedPages = AtomicInteger(0)
+    private val cacheHits = AtomicInteger(0)
+
+    /**
+     * Configure the pagination manager
+     */
+    fun configure(config: PaginationConfig) {
+        this.config = config
+        
+        if (config.enablePreloading) {
+            startPreloadProcessor()
+        }
+    }
+
+    /**
+     * Create paginated result
+     */
+    suspend fun <T> paginate(
+        dataSource: suspend (page: Int, pageSize: Int) -> List<T>,
+        pageSize: Int = config.defaultPageSize,
+        preloadPages: Int = config.preloadPages,
+        cacheKey: String? = null
+    ): PaginatedResult<T> {
+        totalPaginations.incrementAndGet()
+        
+        val stateKey = cacheKey ?: generateStateKey(dataSource)
+        val state = getOrCreateState<T>(stateKey, dataSource, pageSize, preloadPages)
+        
+        return PaginatedResult(
+            items = state.getCurrentPageItems(),
+            currentPage = state.currentPage.get(),
+            pageSize = state.pageSize,
+            totalCount = state.totalCount,
+            hasNextPage = state.hasNextPage(),
+            hasPreviousPage = state.hasPreviousPage(),
+            loadNextPage = { state.loadNextPage() },
+            loadPreviousPage = { state.loadPreviousPage() },
+            jumpToPage = { page -> state.jumpToPage(page) },
+            refresh = { state.refresh() }
+        )
+    }
+
+    /**
+     * Create infinite scroll pagination
+     */
+    suspend fun <T> infiniteScroll(
+        dataSource: suspend (page: Int, pageSize: Int) -> List<T>,
+        pageSize: Int = config.defaultPageSize,
+        preloadPages: config.preloadPages
+    ): InfiniteScrollResult<T> {
+        val state = InfiniteScrollState(
+            dataSource = dataSource,
+            pageSize = pageSize,
+            preloadPages = preloadPages,
+            coroutineScope = coroutineScope
+        )
+        
+        return InfiniteScrollResult(
+            items = state.items,
+            isLoading = state.isLoading,
+            error = state.error,
+            hasMore = state.hasMore,
+            loadMore = { state.loadMore() },
+            refresh = { state.refresh() }
+        )
+    }
+
+    /**
+     * Create virtual pagination for very large datasets
+     */
+    suspend fun <T> virtualPagination(
+        dataSource: suspend (offset: Int, limit: Int) -> List<T>,
+        totalCount: suspend () -> Int,
+        pageSize: Int = config.defaultPageSize
+    ): VirtualPaginationResult<T> {
+        val state = VirtualPaginationState(
+            dataSource = dataSource,
+            totalCountProvider = totalCount,
+            pageSize = pageSize,
+            coroutineScope = coroutineScope
+        )
+        
+        return VirtualPaginationResult(
+            items = state.getCurrentPageItems(),
+            currentPage = state.currentPage.get(),
+            pageSize = state.pageSize,
+            totalCount = state.totalCount,
+            totalPages = state.totalPages,
+            hasNextPage = state.hasNextPage(),
+            hasPreviousPage = state.hasPreviousPage(),
+            jumpToPage = { page -> state.jumpToPage(page) },
+            refresh = { state.refresh() }
+        )
+    }
+
+    /**
+     * Get pagination metrics
+     */
+    fun getMetrics(): PaginationMetrics {
+        return PaginationMetrics(
+            totalPaginations = totalPaginations.get(),
+            preloadedPages = preloadedPages.get(),
+            cacheHits = cacheHits.get(),
+            averagePageSize = config.defaultPageSize,
+            maxPageSize = config.maxPageSize,
+            preloadEfficiency = if (totalPaginations.get() > 0) {
+                preloadedPages.get().toFloat() / totalPaginations.get()
+            } else 0f
+        )
+    }
+
+    /**
+     * Clear all pagination states
+     */
+    fun clearAll() {
+        paginationStates.clear()
+        totalPaginations.set(0)
+        preloadedPages.set(0)
+        cacheHits.set(0)
+    }
+
+    /**
+     * Clear specific pagination state
+     */
+    fun clear(cacheKey: String) {
+        paginationStates.remove(cacheKey)
+    }
+
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+        preloadExecutor.shutdown()
+        preloadQueue.close()
+        clearAll()
+    }
+
+    /**
+     * Get or create pagination state
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> getOrCreateState(
+        key: String,
+        dataSource: suspend (page: Int, pageSize: Int) -> List<T>,
+        pageSize: Int,
+        preloadPages: Int
+    ): PaginationState<T> {
+        return paginationStates.getOrPut(key) {
+            PaginationState(
+                dataSource = dataSource,
+                pageSize = pageSize,
+                preloadPages = preloadPages,
+                coroutineScope = coroutineScope,
+                preloadQueue = preloadQueue,
+                onPreload = { preloadedPages.incrementAndGet() }
+            ) as PaginationState<*>
+        } as PaginationState<T>
+    }
+
+    /**
+     * Generate state key from data source
+     */
+    private fun <T> generateStateKey(dataSource: suspend (page: Int, pageSize: Int) -> List<T>): String {
+        return dataSource.hashCode().toString()
+    }
+
+    /**
+     * Start preload processor
+     */
+    private fun startPreloadProcessor() {
+        coroutineScope.launch {
+            for (task in preloadQueue) {
+                try {
+                    withContext(Dispatchers.IO) {
+                        task.execute()
+                    }
+                } catch (e: Exception) {
+                    // Log error but continue
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Pagination state implementation
+ */
+class PaginationState<T>(
+    private val dataSource: suspend (page: Int, pageSize: Int) -> List<T>,
+    val pageSize: Int,
+    private val preloadPages: Int,
+    private val coroutineScope: CoroutineScope,
+    private val preloadQueue: Channel<PreloadTask>,
+    private val onPreload: () -> Unit
+) {
+    val currentPage = AtomicInteger(1)
+    private val pages = ConcurrentHashMap<Int, List<T>>()
+    private val loadingPages = ConcurrentHashMap<Int, Deferred<List<T>>>()
+    var totalCount: Long = 0
+        private set
+    
+    suspend fun getCurrentPageItems(): List<T> {
+        val page = currentPage.get()
+        return getPage(page)
+    }
+    
+    suspend fun loadNextPage(): Boolean {
+        val nextPage = currentPage.get() + 1
+        return jumpToPage(nextPage)
+    }
+    
+    suspend fun loadPreviousPage(): Boolean {
+        val prevPage = currentPage.get() - 1
+        return jumpToPage(prevPage)
+    }
+    
+    suspend fun jumpToPage(page: Int): Boolean {
+        if (page < 1) return false
+        
+        currentPage.set(page)
+        getPage(page) // Load the page
+        
+        // Trigger preloading for nearby pages
+        if (preloadPages > 0) {
+            triggerPreloading(page)
+        }
+        
+        return true
+    }
+    
+    suspend fun refresh() {
+        pages.clear()
+        loadingPages.clear()
+        totalCount = 0
+        getCurrentPageItems()
+    }
+    
+    fun hasNextPage(): Boolean {
+        return totalCount == 0L || (currentPage.get() * pageSize) < totalCount
+    }
+    
+    fun hasPreviousPage(): Boolean {
+        return currentPage.get() > 1
+    }
+    
+    private suspend fun getPage(page: Int): List<T> {
+        // Return from cache if available
+        pages[page]?.let { return it }
+        
+        // Check if already loading
+        loadingPages[page]?.let { deferred ->
+            return deferred.await()
+        }
+        
+        // Load page
+        val deferred = coroutineScope.async {
+            try {
+                val items = dataSource(page, pageSize)
+                pages[page] = items
+                loadingPages.remove(page)
+                items
+            } catch (e: Exception) {
+                loadingPages.remove(page)
+                throw e
+            }
+        }
+        
+        loadingPages[page] = deferred
+        return deferred.await()
+    }
+    
+    private fun triggerPreloading(currentPage: Int) {
+        val preloadRange = (currentPage - preloadPages)..(currentPage + preloadPages)
+        
+        preloadRange.forEach { page ->
+            if (page > 0 && !pages.containsKey(page) && !loadingPages.containsKey(page)) {
+                val task = PreloadTask(
+                    page = page,
+                    execute = {
+                        coroutineScope.async {
+                            getPage(page)
+                        }
+                    }
+                )
+                
+                try {
+                    preloadQueue.trySend(task)
+                    onPreload()
+                } catch (e: Exception) {
+                    // Queue is full, skip preloading
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Infinite scroll state implementation
+ */
+class InfiniteScrollState<T>(
+    private val dataSource: suspend (page: Int, pageSize: Int) -> List<T>,
+    val pageSize: Int,
+    private val preloadPages: Int,
+    private val coroutineScope: CoroutineScope
+) {
+    private val _items = MutableStateFlow<List<T>>(emptyList())
+    val items: StateFlow<List<T>> = _items.asStateFlow()
+    
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+    
+    private val _error = MutableStateFlow<String?>(null)
+    val error: StateFlow<String?> = _error.asStateFlow()
+    
+    private val _hasMore = MutableStateFlow(true)
+    val hasMore: StateFlow<Boolean> = _hasMore.asStateFlow()
+    
+    private var currentPage = 1
+    private var isLoadingMore = false
+    
+    suspend fun loadMore() {
+        if (isLoadingMore || !_hasMore.value) return
+        
+        isLoadingMore = true
+        _isLoading.value = true
+        _error.value = null
+        
+        try {
+            val newItems = dataSource(currentPage, pageSize)
+            if (newItems.isEmpty()) {
+                _hasMore.value = false
+            } else {
+                val currentItems = _items.value.toMutableList()
+                currentItems.addAll(newItems)
+                _items.value = currentItems
+                currentPage++
+            }
+        } catch (e: Exception) {
+            _error.value = e.message
+        } finally {
+            isLoadingMore = false
+            _isLoading.value = false
+        }
+    }
+    
+    suspend fun refresh() {
+        currentPage = 1
+        _items.value = emptyList()
+        _hasMore.value = true
+        _error.value = null
+        loadMore()
+    }
+}
+
+/**
+ * Virtual pagination state for very large datasets
+ */
+class VirtualPaginationState<T>(
+    private val dataSource: suspend (offset: Int, limit: Int) -> List<T>,
+    private val totalCountProvider: suspend () -> Int,
+    val pageSize: Int,
+    private val coroutineScope: CoroutineScope
+) {
+    val currentPage = AtomicInteger(1)
+    var totalCount: Int = 0
+        private set
+    
+    private val cache = ConcurrentHashMap<Int, List<T>>()
+    
+    val totalPages: Int
+        get() = if (totalCount > 0) (totalCount + pageSize - 1) / pageSize else 0
+    
+    suspend fun getCurrentPageItems(): List<T> {
+        val page = currentPage.get()
+        return getPage(page)
+    }
+    
+    suspend fun jumpToPage(page: Int): Boolean {
+        if (page < 1 || page > totalPages) return false
+        
+        currentPage.set(page)
+        getPage(page) // Load the page
+        return true
+    }
+    
+    suspend fun refresh() {
+        cache.clear()
+        totalCount = totalCountProvider()
+        getCurrentPageItems()
+    }
+    
+    fun hasNextPage(): Boolean {
+        return currentPage.get() < totalPages
+    }
+    
+    fun hasPreviousPage(): Boolean {
+        return currentPage.get() > 1
+    }
+    
+    private suspend fun getPage(page: Int): List<T> {
+        cache[page]?.let { return it }
+        
+        val offset = (page - 1) * pageSize
+        val items = dataSource(offset, pageSize)
+        cache[page] = items
+        return items
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class PaginatedResult<T>(
+    val items: List<T>,
+    val currentPage: Int,
+    val pageSize: Int,
+    val totalCount: Long,
+    val hasNextPage: Boolean,
+    val hasPreviousPage: Boolean,
+    val loadNextPage: suspend () -> Boolean,
+    val loadPreviousPage: suspend () -> Boolean,
+    val jumpToPage: suspend (Int) -> Boolean,
+    val refresh: suspend () -> Unit
+)
+
+data class InfiniteScrollResult<T>(
+    val items: StateFlow<List<T>>,
+    val isLoading: StateFlow<Boolean>,
+    val error: StateFlow<String?>,
+    val hasMore: StateFlow<Boolean>,
+    val loadMore: suspend () -> Unit,
+    val refresh: suspend () -> Unit
+)
+
+data class VirtualPaginationResult<T>(
+    val items: List<T>,
+    val currentPage: Int,
+    val pageSize: Int,
+    val totalCount: Int,
+    val totalPages: Int,
+    val hasNextPage: Boolean,
+    val hasPreviousPage: Boolean,
+    val jumpToPage: suspend (Int) -> Boolean,
+    val refresh: suspend () -> Unit
+)
+
+data class PaginationMetrics(
+    val totalPaginations: Int,
+    val preloadedPages: Int,
+    val cacheHits: Int,
+    val averagePageSize: Int,
+    val maxPageSize: Int,
+    val preloadEfficiency: Float
+)
+
+data class PreloadTask(
+    val page: Int,
+    val execute: suspend () -> Deferred<*>
+)

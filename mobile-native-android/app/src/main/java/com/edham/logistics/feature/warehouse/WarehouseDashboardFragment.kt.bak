@@ -1,0 +1,495 @@
+package com.edham.logistics.feature.warehouse
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.Observer
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentWarehouseDashboardBinding
+import com.edham.logistics.feature.warehouse.adapters.InventoryAdapter
+import com.edham.logistics.feature.warehouse.adapters.StockMovementAdapter
+import com.edham.logistics.utils.VoiceAlertManager
+import timber.log.Timber
+import java.text.SimpleDateFormat
+import java.util.*
+
+class WarehouseDashboardFragment : Fragment() {
+    
+    private var _binding: FragmentWarehouseDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var warehouseService: WarehouseManagementService
+    private lateinit var voiceAlertManager: VoiceAlertManager
+    private lateinit var inventoryAdapter: InventoryAdapter
+    private lateinit var stockMovementAdapter: StockMovementAdapter
+    
+    private val dateFormat = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault())
+    private var currentWarehouseId: String? = null
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentWarehouseDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Initialize services
+        warehouseService = WarehouseManagementService(
+            requireContext(),
+            // api instance,
+            // database instance
+        )
+        
+        voiceAlertManager = VoiceAlertManager(requireContext())
+        
+        setupUI()
+        setupRecyclerViews()
+        setupClickListeners()
+        setupObservers()
+        
+        // Get warehouse ID from arguments
+        currentWarehouseId = arguments?.getString("warehouse_id")
+        
+        // Initialize warehouse
+        currentWarehouseId?.let { warehouseId ->
+            initializeWarehouse(warehouseId)
+        }
+    }
+    
+    private fun setupUI() {
+        // Large touch targets for one-hand usage
+        binding.btnScanBarcode.minimumHeight = 80.dp
+        binding.btnScanBarcode.minimumWidth = 160.dp
+        
+        binding.btnReceiveShipment.minimumHeight = 72.dp
+        binding.btnReceiveShipment.minimumWidth = 120.dp
+        
+        binding.btnDispatchItems.minimumHeight = 72.dp
+        binding.btnDispatchItems.minimumWidth = 120.dp
+        
+        binding.btnPerformAudit.minimumHeight = 72.dp
+        binding.btnPerformAudit.minimumWidth = 120.dp
+        
+        binding.btnGenerateReport.minimumHeight = 72.dp
+        binding.btnGenerateReport.minimumWidth = 120.dp
+        
+        // Dark mode optimized colors
+        binding.cardAnalytics.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        binding.cardInventory.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        binding.cardRecentMovements.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        // High visibility status colors
+        updateSyncStatusUI(SyncStatus.INITIALIZING)
+    }
+    
+    private fun setupRecyclerViews() {
+        // Setup inventory RecyclerView
+        inventoryAdapter = InventoryAdapter { item ->
+            onInventoryItemClicked(item)
+        }
+        
+        binding.recyclerViewInventory.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = inventoryAdapter
+        }
+        
+        // Setup stock movements RecyclerView
+        stockMovementAdapter = StockMovementAdapter()
+        
+        binding.recyclerViewRecentMovements.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = stockMovementAdapter
+        }
+    }
+    
+    private fun setupClickListeners() {
+        binding.btnScanBarcode.setOnClickListener {
+            openBarcodeScanner()
+        }
+        
+        binding.btnReceiveShipment.setOnClickListener {
+            openReceivingScreen()
+        }
+        
+        binding.btnDispatchItems.setOnClickListener {
+            openDispatchScreen()
+        }
+        
+        binding.btnPerformAudit.setOnClickListener {
+            openAuditScreen()
+        }
+        
+        binding.btnGenerateReport.setOnClickListener {
+            generateInventoryReport()
+        }
+        
+        binding.btnRefreshData.setOnClickListener {
+            refreshData()
+        }
+        
+        binding.etSearch.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH) {
+                searchInventory()
+                true
+            } else {
+                false
+            }
+        }
+        
+        binding.btnFilter.setOnClickListener {
+            showFilterDialog()
+        }
+    }
+    
+    private fun setupObservers() {
+        // Observe inventory items
+        warehouseService.inventoryItems.observe(viewLifecycleOwner, Observer { items ->
+            updateInventoryUI(items)
+        })
+        
+        // Observe stock movements
+        warehouseService.stockMovements.observe(viewLifecycleOwner, Observer { movements ->
+            updateStockMovementsUI(movements)
+        })
+        
+        // Observe warehouse zones
+        warehouseService.warehouseZones.observe(viewLifecycleOwner, Observer { zones ->
+            updateZonesUI(zones)
+        })
+        
+        // Observe sync status
+        warehouseService.syncStatus.observe(viewLifecycleOwner, Observer { status ->
+            updateSyncStatusUI(status)
+        })
+    }
+    
+    private fun initializeWarehouse(warehouseId: String) {
+        voiceAlertManager.speak("Initializing warehouse management")
+        
+        binding.root.post {
+            warehouseService.initializeWarehouse(warehouseId)
+        }
+    }
+    
+    private fun updateInventoryUI(items: List<InventoryItem>) {
+        inventoryAdapter.updateItems(items)
+        
+        // Update statistics
+        updateInventoryStatistics(items)
+        
+        // Update search results count
+        val searchQuery = binding.etSearch.text.toString()
+        if (searchQuery.isNotBlank()) {
+            binding.tvSearchResults.text = "${items.size} items found"
+        }
+    }
+    
+    private fun updateInventoryStatistics(items: List<InventoryItem>) {
+        val totalItems = items.size
+        val totalQuantity = items.sumOf { it.quantity }
+        val lowStockItems = items.count { it.quantity <= it.minStockLevel }
+        val outOfStockItems = items.count { it.quantity == 0 }
+        val totalValue = items.sumOf { it.quantity * it.unitPrice }
+        
+        // Update statistics cards
+        binding.tvTotalItems.text = totalItems.toString()
+        binding.tvTotalQuantity.text = totalQuantity.toString()
+        binding.tvLowStockItems.text = lowStockItems.toString()
+        binding.tvOutOfStockItems.text = outOfStockItems.toString()
+        binding.tvTotalValue.text = String.format("$%.2f", totalValue)
+        
+        // Update warning indicators
+        if (lowStockItems > 0) {
+            binding.viewLowStockIndicator.setBackgroundColor(
+                requireContext().getColor(R.color.status_warning)
+            )
+            binding.viewLowStockIndicator.visibility = View.VISIBLE
+        } else {
+            binding.viewLowStockIndicator.visibility = View.GONE
+        }
+        
+        if (outOfStockItems > 0) {
+            binding.viewOutOfStockIndicator.setBackgroundColor(
+                requireContext().getColor(R.color.status_error)
+            )
+            binding.viewOutOfStockIndicator.visibility = View.VISIBLE
+        } else {
+            binding.viewOutOfStockIndicator.visibility = View.GONE
+        }
+    }
+    
+    private fun updateStockMovementsUI(movements: List<StockMovement>) {
+        val recentMovements = movements.takeLast(10).reversed()
+        stockMovementAdapter.updateMovements(recentMovements)
+        
+        // Update movement count
+        binding.tvRecentMovementsCount.text = "${recentMovements.size} recent movements"
+    }
+    
+    private fun updateZonesUI(zones: List<WarehouseZone>) {
+        // Update zone statistics
+        val activeZones = zones.count { it.isActive }
+        binding.tvActiveZones.text = "$activeZones/${zones.size} zones active"
+        
+        // Update zone distribution (if chart is available)
+        updateZoneChart(zones)
+    }
+    
+    private fun updateZoneChart(zones: List<WarehouseZone>) {
+        // Implementation would update zone distribution chart
+        // For now, update text representation
+        val zoneInfo = zones.joinToString(", ") { "${it.name} (${it.capacity})" }
+        binding.tvZoneDistribution.text = zoneInfo
+    }
+    
+    private fun updateSyncStatusUI(status: SyncStatus) {
+        val (statusText, color, icon) = when (status) {
+            SyncStatus.INITIALIZING -> Triple("Initializing...", R.color.status_warning, R.drawable.ic_sync)
+            SyncStatus.SYNCING -> Triple("Syncing...", R.color.status_active, R.drawable.ic_sync)
+            SyncStatus.SYNCED -> Triple("Synced", R.color.status_completed, R.drawable.ic_check_circle)
+            SyncStatus.ERROR -> Triple("Sync Error", R.color.status_error, R.drawable.ic_error)
+            SyncStatus.PROCESSING -> Triple("Processing...", R.color.status_active, R.drawable.ic_processing)
+        }
+        
+        binding.tvSyncStatus.text = statusText
+        binding.viewSyncIndicator.setBackgroundColor(requireContext().getColor(color))
+        binding.ivSyncIcon.setImageResource(icon)
+        
+        // Show/hide refresh button based on status
+        binding.btnRefreshData.isEnabled = status != SyncStatus.PROCESSING
+    }
+    
+    private fun onInventoryItemClicked(item: InventoryItem) {
+        // Show item details dialog
+        voiceAlertManager.speak("Item: ${item.name}")
+        
+        // Implementation would show item details dialog
+        showItemDetailsDialog(item)
+    }
+    
+    private fun openBarcodeScanner() {
+        voiceAlertManager.speak("Opening barcode scanner")
+        
+        // Navigate to barcode scanner screen
+        // Implementation would navigate to BarcodeScannerFragment
+        val scannerFragment = BarcodeScannerFragment()
+        parentFragmentManager.beginTransaction()
+            .replace(R.id.fragment_container, scannerFragment)
+            .addToBackStack(null)
+            .commit()
+    }
+    
+    private fun openReceivingScreen() {
+        voiceAlertManager.speak("Opening receiving screen")
+        
+        // Navigate to receiving screen
+        // Implementation would navigate to ReceivingFragment
+        val receivingFragment = ReceivingFragment()
+        parentFragmentManager.beginTransaction()
+            .replace(R.id.fragment_container, receivingFragment)
+            .addToBackStack(null)
+            .commit()
+    }
+    
+    private fun openDispatchScreen() {
+        voiceAlertManager.speak("Opening dispatch screen")
+        
+        // Navigate to dispatch screen
+        // Implementation would navigate to DispatchFragment
+        val dispatchFragment = DispatchFragment()
+        parentFragmentManager.beginTransaction()
+            .replace(R.id.fragment_container, dispatchFragment)
+            .addToBackStack(null)
+            .commit()
+    }
+    
+    private fun openAuditScreen() {
+        voiceAlertManager.speak("Opening audit screen")
+        
+        // Navigate to audit screen
+        // Implementation would navigate to AuditFragment
+        val auditFragment = AuditFragment()
+        parentFragmentManager.beginTransaction()
+            .replace(R.id.fragment_container, auditFragment)
+            .addToBackStack(null)
+            .commit()
+    }
+    
+    private fun generateInventoryReport() {
+        voiceAlertManager.speak("Generating inventory report")
+        
+        // Generate inventory report
+        currentWarehouseId?.let { warehouseId ->
+            warehouseService.getInventoryAnalytics()
+        }
+        
+        // Implementation would generate and show/share report
+        Toast.makeText(requireContext(), "Inventory report generated", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun refreshData() {
+        voiceAlertManager.speak("Refreshing data")
+        
+        // Refresh warehouse data
+        currentWarehouseId?.let { warehouseId ->
+            warehouseService.initializeWarehouse(warehouseId)
+        }
+        
+        Toast.makeText(requireContext(), "Data refreshed", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun searchInventory() {
+        val query = binding.etSearch.text.toString().trim()
+        
+        if (query.isBlank()) {
+            // Show all items
+            warehouseService.inventoryItems.value?.let { items ->
+                updateInventoryUI(items)
+            }
+            binding.tvSearchResults.text = ""
+            return
+        }
+        
+        // Search inventory
+        warehouseService.searchInventory(query) { results ->
+            updateInventoryUI(results)
+        }
+    }
+    
+    private fun showFilterDialog() {
+        voiceAlertManager.speak("Filter options")
+        
+        // Show filter dialog
+        // Implementation would show filter dialog with options:
+        // - Category filter
+        // - Zone filter
+        // - Stock level filter
+        // - Price range filter
+    }
+    
+    private fun showItemDetailsDialog(item: InventoryItem) {
+        // Show item details in a dialog
+        val details = """
+            SKU: ${item.sku}
+            Name: ${item.name}
+            Description: ${item.description}
+            Quantity: ${item.quantity}
+            Min Stock: ${item.minStockLevel}
+            Max Stock: ${item.maxStockLevel}
+            Unit Price: $${item.unitPrice}
+            Location: ${item.location}
+            Category: ${item.category}
+            Supplier: ${item.supplier}
+            Barcode: ${item.barcode}
+            QR Code: ${item.qrCode}
+            Created: ${dateFormat.format(Date(item.createdAt))}
+            Last Updated: ${dateFormat.format(Date(item.lastUpdated))}
+        """.trimIndent()
+        
+        // Implementation would show this in a dialog
+        Toast.makeText(requireContext(), "Item details: ${item.sku}", Toast.LENGTH_LONG).show()
+    }
+    
+    private fun applyFilters(filters: InventoryFilters) {
+        voiceAlertManager.speak("Applying filters")
+        
+        // Filter inventory
+        warehouseService.filterInventory(filters) { results ->
+            updateInventoryUI(results)
+        }
+        
+        // Update filter indicator
+        if (filters.category != null || filters.zoneId != null || filters.stockLevel != null) {
+            binding.viewFilterIndicator.setBackgroundColor(
+                requireContext().getColor(R.color.status_active)
+            )
+            binding.viewFilterIndicator.visibility = View.VISIBLE
+        } else {
+            binding.viewFilterIndicator.visibility = View.GONE
+        }
+    }
+    
+    private fun clearFilters() {
+        voiceAlertManager.speak("Clearing filters")
+        
+        // Clear search and filters
+        binding.etSearch.text.clear()
+        binding.tvSearchResults.text = ""
+        binding.viewFilterIndicator.visibility = View.GONE
+        
+        // Show all items
+        warehouseService.inventoryItems.value?.let { items ->
+            updateInventoryUI(items)
+        }
+    }
+    
+    private fun exportInventoryData() {
+        voiceAlertManager.speak("Exporting inventory data")
+        
+        // Export inventory data to CSV/Excel
+        // Implementation would generate and share inventory report
+        Toast.makeText(requireContext(), "Inventory data exported", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun performQuickActions() {
+        // Quick action buttons for common operations
+        binding.btnQuickReceive.setOnClickListener {
+            // Quick receive with barcode scan
+            openBarcodeScanner()
+        }
+        
+        binding.btnQuickDispatch.setOnClickListener {
+            // Quick dispatch with recent items
+            openDispatchScreen()
+        }
+        
+        binding.btnQuickAudit.setOnClickListener {
+            // Quick audit for current location
+            openAuditScreen()
+        }
+    }
+    
+    override fun onResume() {
+        super.onResume()
+        
+        // Refresh data when fragment resumes
+        refreshData()
+    }
+    
+    override fun onPause() {
+        super.onPause()
+        
+        // Save current state
+        // Implementation would save current filter and search state
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        
+        // Cleanup resources
+        warehouseService.cleanup()
+        voiceAlertManager.cleanup()
+        _binding = null
+    }
+    
+    // Extension for dp to pixels
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+}

@@ -23,4 +23,24 @@ public class ShipmentRequest {
     private String dimensions;
     private Double value;
     private String specialInstructions;
+
+    // Extended fields for mobile parity
+    private String cargoType;
+    private Double weightKg;
+    private Double temperatureCelsius;
+    private String priority;
+    private String notes;
+    private Double insuranceValue;
+    private String pickupCity;
+    private String dropCity;
+    private String pickupDate;
+    private String pickupTime;
+    private Integer pieceCount;
+    private String vehicleType;
+    private Double estimatedPrice;
+    private Double pickupLat;
+    private Double pickupLng;
+    private Double dropLat;
+    private Double dropLng;
+    private java.util.List<String> photoUris;
 }

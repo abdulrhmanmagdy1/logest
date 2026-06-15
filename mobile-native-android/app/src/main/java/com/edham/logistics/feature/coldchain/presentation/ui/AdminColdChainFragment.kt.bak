@@ -1,0 +1,469 @@
+package com.edham.logistics.feature.coldchain.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.databinding.FragmentAdminColdChainBinding
+import com.edham.logistics.feature.coldchain.presentation.ui.AdminColdChainViewModel
+import com.edham.logistics.feature.coldchain.presentation.adapter.ColdChainShipmentsAdapter
+import com.edham.logistics.feature.coldchain.presentation.adapter.TemperatureAlertsAdapter
+import com.edham.logistics.feature.coldchain.presentation.adapter.TemperatureReadingsAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class AdminColdChainFragment : Fragment() {
+
+    private var _binding: FragmentAdminColdChainBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: AdminColdChainViewModel by viewModels()
+    
+    @Inject
+    lateinit var coldChainShipmentsAdapter: ColdChainShipmentsAdapter
+    
+    @Inject
+    lateinit var temperatureAlertsAdapter: TemperatureAlertsAdapter
+    
+    @Inject
+    lateinit var temperatureReadingsAdapter: TemperatureReadingsAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentAdminColdChainBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerViews()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize cold chain monitoring
+        viewModel.initialize()
+    }
+
+    private fun setupRecyclerViews() {
+        // Shipments list
+        coldChainShipmentsAdapter = ColdChainShipmentsAdapter { shipment, action ->
+            when (action) {
+                "select" -> viewModel.selectShipment(shipment.id)
+                "details" -> navigateToShipmentDetails(shipment.id)
+                "alerts" -> navigateToShipmentAlerts(shipment.id)
+                "calibrate" -> viewModel.calibrateSensor(shipment.sensorInfo.id)
+            }
+        }
+        
+        binding.recyclerViewShipments.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = coldChainShipmentsAdapter
+        }
+        
+        // Alerts list
+        temperatureAlertsAdapter = TemperatureAlertsAdapter { alert, action ->
+            when (action) {
+                "resolve" -> viewModel.resolveAlert(alert.id, null)
+                "details" -> navigateToAlertDetails(alert.id)
+            }
+        }
+        
+        binding.recyclerViewAlerts.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = temperatureAlertsAdapter
+        }
+        
+        // Temperature readings list
+        temperatureReadingsAdapter = TemperatureReadingsAdapter()
+        
+        binding.recyclerViewTemperatureHistory.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = temperatureReadingsAdapter
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refresh()
+        }
+        
+        binding.buttonClearSearch.setOnClickListener {
+            binding.editTextSearch.text.clear()
+            viewModel.searchShipments("")
+        }
+        
+        binding.editTextSearch.setOnEditorActionListener { _, _, _ ->
+            val query = binding.editTextSearch.text.toString()
+            viewModel.searchShipments(query)
+            true
+        }
+        
+        binding.spinnerCargoType.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val cargoType = when (parent?.getItemAtPosition(position).toString()) {
+                    "Food" -> com.edham.logistics.feature.coldchain.domain.model.CargoType.FOOD
+                    "Medical" -> com.edham.logistics.feature.coldchain.domain.model.CargoType.MEDICAL
+                    "Frozen Goods" -> com.edham.logistics.feature.coldchain.domain.model.CargoType.FROZEN_GOODS
+                    "Pharmaceutical" -> com.edham.logistics.feature.coldchain.domain.model.CargoType.PHARMACEUTICAL
+                    "All" -> null
+                    else -> null
+                }
+                viewModel.filterByCargoType(cargoType)
+            }
+            
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        
+        binding.spinnerAlertLevel.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val alertLevel = when (parent?.getItemAtPosition(position).toString()) {
+                    "Warning" -> com.edham.logistics.feature.coldchain.domain.model.AlertLevel.WARNING
+                    "Critical" -> com.edham.logistics.feature.coldchain.domain.model.AlertLevel.CRITICAL
+                    "Emergency" -> com.edham.logistics.feature.coldchain.domain.model.AlertLevel.EMERGENCY
+                    "All" -> null
+                    else -> null
+                }
+                viewModel.filterByAlertLevel(alertLevel)
+            }
+            
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        
+        binding.spinnerStatus.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val status = when (parent?.getItemAtPosition(position).toString()) {
+                    "Normal" -> com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.NORMAL
+                    "Warning" -> com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.WARNING
+                    "Critical" -> com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.CRITICAL
+                    "Offline" -> com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.OFFLINE
+                    "All" -> null
+                    else -> null
+                }
+                viewModel.filterByStatus(status)
+            }
+            
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        
+        binding.buttonCreateAlert.setOnClickListener {
+            createManualAlert()
+        }
+        
+        binding.buttonExportPdf.setOnClickListener {
+            viewModel.exportReport(viewModel.uiState.value.selectedShipment?.id ?: "", com.edham.logistics.feature.coldchain.domain.model.ReportFormat.PDF)
+        }
+        
+        binding.buttonExportExcel.setOnClickListener {
+            viewModel.exportReport(viewModel.uiState.value.selectedShipment?.id ?: "", com.edham.logistics.feature.coldchain.domain.model.ReportFormat.EXCEL)
+        }
+        
+        binding.buttonClearSelection.setOnClickListener {
+            viewModel.clearSelection()
+        }
+    }
+
+    private fun updateUI(uiState: AdminColdChainViewModel.AdminColdChainUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+        
+        // Show success messages
+        uiState.actionSuccess?.let { message ->
+            showSnackbar(message)
+            viewModel.clearSuccess()
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.contentLayout.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refresh()
+        }
+    }
+
+    private fun showContent(uiState: AdminColdChainViewModel.AdminColdChainUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        
+        // Update shipments list
+        coldChainShipmentsAdapter.submitList(uiState.coldChainShipments)
+        
+        // Update selected shipment details
+        uiState.selectedShipment?.let { shipment ->
+            showShipmentDetails(shipment)
+        } ?: run {
+            hideShipmentDetails()
+        }
+        
+        // Update temperature history
+        uiState.temperatureHistory?.let { history ->
+            showTemperatureHistory(history)
+        } ?: run {
+            hideTemperatureHistory()
+        }
+        
+        // Update statistics
+        updateStatistics(uiState.coldChainShipments)
+    }
+
+    private fun showShipmentDetails(shipment: com.edham.logistics.feature.coldchain.domain.model.ColdChainShipment) {
+        binding.layoutShipmentDetails.visible()
+        
+        binding.textShipmentId.text = shipment.id
+        binding.textCargoType.text = formatCargoType(shipment.cargoType)
+        binding.textCurrentTemperature.text = "${shipment.currentTemperature}°C"
+        binding.textCurrentHumidity.text = shipment.currentHumidity?.let { "${it}%" } ?: "N/A"
+        binding.textComplianceRate.text = "${shipment.complianceRate.toInt()}%"
+        binding.textAlertCount.text = "${shipment.alertCount}"
+        binding.textTotalReadings.text = "${shipment.totalReadings}"
+        binding.textLastUpdate.text = formatTimestamp(shipment.lastUpdate)
+        
+        // Set status color
+        binding.textStatus.text = formatColdChainStatus(shipment.status)
+        binding.textStatus.setTextColor(getColdChainStatusColor(shipment.status))
+        
+        // Set temperature color based on status
+        val temperatureColor = when (shipment.status) {
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.NORMAL -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.WARNING -> android.graphics.Color.parseColor("#FF9800")
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.CRITICAL -> android.graphics.Color.parseColor("#F44336")
+            else -> android.graphics.Color.parseColor("#9E9E9E")
+        }
+        binding.textCurrentTemperature.setTextColor(temperatureColor)
+        
+        // Show sensor info
+        binding.textSensorModel.text = shipment.sensorInfo.model
+        binding.textSensorStatus.text = formatSensorStatus(shipment.sensorInfo.status)
+        binding.textSensorBattery.text = "${shipment.sensorInfo.batteryLevel.toInt()}%"
+        
+        // Show alerts
+        shipment.alertCount.let { count ->
+            if (count > 0) {
+                binding.layoutAlertSummary.visible()
+                binding.textActiveAlerts.text = "$count إنذار نشط"
+            } else {
+                binding.layoutAlertSummary.gone()
+            }
+        }
+    }
+
+    private fun hideShipmentDetails() {
+        binding.layoutShipmentDetails.gone()
+    }
+
+    private fun showTemperatureHistory(history: com.edham.logistics.feature.coldchain.domain.model.TemperatureHistory) {
+        binding.layoutTemperatureHistory.visible()
+        
+        // Update temperature readings
+        temperatureReadingsAdapter.submitList(history.readings.takeLast(50)) // Show last 50 readings
+        
+        // Update alerts
+        temperatureAlertsAdapter.submitList(history.alerts.takeLast(20)) // Show last 20 alerts
+        
+        // Update summary
+        history.summary.let { summary ->
+            binding.textAvgTemperature.text = "${summary.averageTemperature}°C"
+            binding.textMinTemperature.text = "${summary.minTemperature}°C"
+            binding.textMaxTemperature.text = "${summary.maxTemperature}°C"
+            binding.textComplianceRate.text = "${summary.complianceRate.toInt()}%"
+            binding.textTimeInOptimal.text = formatDuration(summary.timeInOptimalRange)
+            binding.textTimeInWarning.text = formatDuration(summary.timeInWarningRange)
+            binding.textTimeInCritical.text = formatDuration(summary.timeInCriticalRange)
+        }
+        
+        // Update compliance report
+        history.complianceReport.let { report ->
+            binding.textComplianceGrade.text = formatComplianceGrade(report.grade)
+            binding.textComplianceGrade.setTextColor(getComplianceGradeColor(report.grade))
+            binding.textViolations.text = "${report.violations.size}"
+        }
+    }
+
+    private fun hideTemperatureHistory() {
+        binding.layoutTemperatureHistory.gone()
+    }
+
+    private fun updateStatistics(shipments: List<com.edham.logistics.feature.coldchain.domain.model.ColdChainShipment>) {
+        val totalShipments = shipments.size
+        val normalShipments = shipments.count { it.status == com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.NORMAL }
+        val warningShipments = shipments.count { it.status == com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.WARNING }
+        val criticalShipments = shipments.count { it.status == com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.CRITICAL }
+        val offlineShipments = shipments.count { it.status == com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.OFFLINE }
+        val totalAlerts = shipments.sumOf { it.alertCount }
+        val avgCompliance = if (totalShipments > 0) {
+            shipments.map { it.complianceRate }.average()
+        } else 0.0
+        
+        binding.textTotalShipments.text = totalShipments.toString()
+        binding.textNormalShipments.text = normalShipments.toString()
+        binding.textWarningShipments.text = warningShipments.toString()
+        binding.textCriticalShipments.text = criticalShipments.toString()
+        binding.textOfflineShipments.text = offlineShipments.toString()
+        binding.textTotalAlerts.text = totalAlerts.toString()
+        binding.textAvgCompliance.text = "${avgCompliance.toInt()}%"
+    }
+
+    private fun createManualAlert() {
+        val selectedShipment = viewModel.uiState.value.selectedShipment
+        if (selectedShipment != null) {
+            // Show dialog for creating manual alert
+            // For now, create a default warning alert
+            viewModel.createManualAlert(
+                selectedShipment.id,
+                com.edham.logistics.feature.coldchain.domain.model.AlertType.TEMPERATURE_HIGH,
+                "إنذار يدوي من المشرف"
+            )
+        } else {
+            showSnackbar("يرجى اختيار شحنة أولاً")
+        }
+    }
+
+    private fun formatCargoType(cargoType: com.edham.logistics.feature.coldchain.domain.model.CargoType): String {
+        return when (cargoType) {
+            com.edham.logistics.feature.coldchain.domain.model.CargoType.FOOD -> "مواد غذائية"
+            com.edham.logistics.feature.coldchain.domain.model.CargoType.MEDICAL -> "مواد طبية"
+            com.edham.logistics.feature.coldchain.domain.model.CargoType.FROZEN_GOODS -> "بضائع مجمدة"
+            com.edham.logistics.feature.coldchain.domain.model.CargoType.PHARMACEUTICAL -> "أدوية"
+            com.edham.logistics.feature.coldchain.domain.model.CargoType.DAIRY -> "منتجات ألبان"
+            com.edham.logistics.feature.coldchain.domain.model.CargoType.MEAT -> "لحوم"
+            com.edham.logistics.feature.coldchain.domain.model.CargoType.VEGETABLES -> "خضروات"
+            com.edham.logistics.feature.coldchain.domain.model.CargoType.FRUITS -> "فواكه"
+            else -> cargoType.name
+        }
+    }
+
+    private fun formatColdChainStatus(status: com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus): String {
+        return when (status) {
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.NORMAL -> "طبيعي"
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.WARNING -> "تحذير"
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.CRITICAL -> "حرج"
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.OFFLINE -> "غير متصل"
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.MAINTENANCE -> "صيانة"
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.CALIBRATION_REQUIRED -> "تحتاج معايرة"
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.SENSOR_ERROR -> "خطأ في المستشعر"
+        }
+    }
+
+    private fun formatSensorStatus(status: com.edham.logistics.feature.coldchain.domain.model.SensorStatus): String {
+        return when (status) {
+            com.edham.logistics.feature.coldchain.domain.model.SensorStatus.ONLINE -> "متصل"
+            com.edham.logistics.feature.coldchain.domain.model.SensorStatus.OFFLINE -> "غير متصل"
+            com.edham.logistics.feature.coldchain.domain.model.SensorStatus.LOW_BATTERY -> "بطارية منخفضة"
+            com.edham.logistics.feature.coldchain.domain.model.SensorStatus.CALIBRATION_REQUIRED -> "تحتاج معايرة"
+            com.edham.logistics.feature.coldchain.domain.model.SensorStatus.ERROR -> "خطأ"
+            com.edham.logistics.feature.coldchain.domain.model.SensorStatus.MAINTENANCE -> "صيانة"
+        }
+    }
+
+    private fun formatComplianceGrade(grade: com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade): String {
+        return when (grade) {
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.EXCELLENT -> "ممتاز"
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.GOOD -> "جيد"
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.ACCEPTABLE -> "مقبول"
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.POOR -> "ضعيف"
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.CRITICAL -> "حرج"
+        }
+    }
+
+    private fun formatTimestamp(timestamp: Long): String {
+        return java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+            .format(java.util.Date(timestamp))
+    }
+
+    private fun formatDuration(minutes: Long): String {
+        return when {
+            minutes < 60 -> "${minutes} دقيقة"
+            minutes < 1440 -> "${minutes / 60} ساعة ${minutes % 60} دقيقة"
+            else -> "${minutes / 1440} يوم ${(minutes % 1440) / 60} ساعة"
+        }
+    }
+
+    private fun getColdChainStatusColor(status: com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus): Int {
+        return when (status) {
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.NORMAL -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.WARNING -> android.graphics.Color.parseColor("#FF9800")
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.CRITICAL -> android.graphics.Color.parseColor("#F44336")
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.OFFLINE -> android.graphics.Color.parseColor("#9E9E9E")
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.MAINTENANCE -> android.graphics.Color.parseColor("#2196F3")
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.CALIBRATION_REQUIRED -> android.graphics.Color.parseColor("#FF5722")
+            com.edham.logistics.feature.coldchain.domain.model.ColdChainStatus.SENSOR_ERROR -> android.graphics.Color.parseColor("#F44336")
+        }
+    }
+
+    private fun getComplianceGradeColor(grade: com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade): Int {
+        return when (grade) {
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.EXCELLENT -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.GOOD -> android.graphics.Color.parseColor("#8BC34A")
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.ACCEPTABLE -> android.graphics.Color.parseColor("#FF9800")
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.POOR -> android.graphics.Color.parseColor("#FF5722")
+            com.edham.logistics.feature.coldchain.domain.model.ComplianceGrade.CRITICAL -> android.graphics.Color.parseColor("#F44336")
+        }
+    }
+
+    // Navigation methods
+    private fun navigateToShipmentDetails(shipmentId: String) {
+        val action = AdminColdChainFragmentDirections
+            .actionAdminColdChainFragmentToShipmentColdChainDetailsFragment(shipmentId)
+        findNavController().navigate(action)
+    }
+
+    private fun navigateToShipmentAlerts(shipmentId: String) {
+        val action = AdminColdChainFragmentDirections
+            .actionAdminColdChainFragmentToShipmentAlertsFragment(shipmentId)
+        findNavController().navigate(action)
+    }
+
+    private fun navigateToAlertDetails(alertId: String) {
+        val action = AdminColdChainFragmentDirections
+            .actionAdminColdChainFragmentToAlertDetailsFragment(alertId)
+        findNavController().navigate(action)
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

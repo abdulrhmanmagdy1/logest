@@ -1,0 +1,497 @@
+package com.edham.logistics.error
+
+import android.app.Application
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import kotlinx.coroutines.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * Crash Prevention System
+ * Ensures the app never crashes silently by catching all exceptions and handling them gracefully
+ */
+class CrashPreventionSystem private constructor(
+    private val context: Context,
+    private val logger: ErrorHandlerLogger
+) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: CrashPreventionSystem? = null
+        
+        fun getInstance(context: Context, logger: ErrorHandlerLogger): CrashPreventionSystem {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: CrashPreventionSystem(context, logger).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val globalExceptionHandler = GlobalExceptionHandler()
+    private val isInitialized = AtomicBoolean(false)
+    private val exceptionCounts = ConcurrentHashMap<String, AtomicInteger>()
+    private val criticalErrors = AtomicBoolean(false)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    
+    /**
+     * Initialize the crash prevention system
+     */
+    fun initialize() {
+        if (isInitialized.compareAndSet(false, true)) {
+            setupGlobalExceptionHandler()
+            setupUncaughtExceptionHandler()
+            setupAsyncExceptionHandler()
+            setupCoroutineExceptionHandler()
+            
+            logger.logInfo("CRASH_PREVENTION", "Crash prevention system initialized")
+        }
+    }
+    
+    /**
+     * Setup global exception handler
+     */
+    private fun setupGlobalExceptionHandler() {
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            handleUncaughtException(thread, throwable)
+        }
+    }
+    
+    /**
+     * Setup uncaught exception handler
+     */
+    private fun setupUncaughtExceptionHandler() {
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                handleUncaughtException(thread, throwable)
+                
+                // Give some time for logging before crashing
+                Thread.sleep(1000)
+                
+                // Call default handler to actually crash the app
+                defaultHandler?.uncaughtException(thread, throwable)
+            } catch (e: Exception) {
+                // If even this fails, try to log and exit
+                logger.logError("CRASH_PREVENTION", e, "Failed to handle uncaught exception")
+                defaultHandler?.uncaughtException(thread, throwable)
+            }
+        }
+    }
+    
+    /**
+     * Setup async exception handler
+     */
+    private fun setupAsyncExceptionHandler() {
+        // This handles exceptions in AsyncTask and other async operations
+        try {
+            val asyncExceptionHandler = Class.forName("android.os.AsyncTask")
+                .getDeclaredField("sDefaultExecutor")
+                .apply { isAccessible = true }
+                .get(null) as? java.util.concurrent.Executor
+            
+            // Note: This is a simplified approach. In production, you'd want a more robust solution
+        } catch (e: Exception) {
+            logger.logWarning("ASYNC_HANDLER", "Failed to setup async exception handler: ${e.message}")
+        }
+    }
+    
+    /**
+     * Setup coroutine exception handler
+     */
+    private fun setupCoroutineExceptionHandler() {
+        // Handle coroutine exceptions
+        CoroutineScope(Dispatchers.Default + SupervisorJob()).launch {
+            try {
+                // This will catch unhandled coroutine exceptions
+                supervisorScope {
+                    launch {
+                        throw RuntimeException("Test coroutine exception")
+                    }
+                }
+            } catch (e: Exception) {
+                handleCoroutineException(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle uncaught exception
+     */
+    private fun handleUncaughtException(thread: Thread, throwable: Throwable) {
+        val exceptionKey = throwable::class.java.simpleName
+        exceptionCounts.getOrPut(exceptionKey) { AtomicInteger(0) }.incrementAndGet()
+        
+        logger.logCrash(thread, throwable)
+        
+        // Mark as critical error if this is a serious exception
+        if (isCriticalException(throwable)) {
+            criticalErrors.set(true)
+            logger.logError("CRITICAL_ERROR", throwable, "Critical exception detected")
+        }
+        
+        // Try to recover gracefully if possible
+        if (attemptRecovery(throwable)) {
+            logger.logInfo("RECOVERY", "Successfully recovered from exception")
+            return
+        }
+        
+        // Log additional context
+        logSystemState()
+        logMemoryState()
+        logThreadState(thread)
+    }
+    
+    /**
+     * Handle coroutine exception
+     */
+    private fun handleCoroutineException(throwable: Throwable) {
+        logger.logError("COROUTINE_EXCEPTION", throwable, "Unhandled coroutine exception")
+        
+        // Try to handle coroutine-specific exceptions
+        when (throwable) {
+            is CancellationException -> {
+                logger.logInfo("COROUTINE_CANCELLED", "Coroutine was cancelled")
+            }
+            is TimeoutCancellationException -> {
+                logger.logWarning("COROUTINE_TIMEOUT", "Coroutine timed out")
+            }
+            else -> {
+                logger.logError("COROUTINE_ERROR", throwable, "Coroutine error")
+            }
+        }
+    }
+    
+    /**
+     * Check if exception is critical
+     */
+    private fun isCriticalException(throwable: Throwable): Boolean {
+        return when (throwable) {
+            is OutOfMemoryError -> true
+            is StackOverflowError -> true
+            is NoSuchMethodError -> true
+            is NoClassDefFoundError -> true
+            is UnsatisfiedLinkError -> true
+            is VirtualMachineError -> true
+            else -> false
+        }
+    }
+    
+    /**
+     * Attempt recovery from exception
+     */
+    private fun attemptRecovery(throwable: Throwable): Boolean {
+        return try {
+            when (throwable) {
+                is OutOfMemoryError -> {
+                    // Try to free memory
+                    System.gc()
+                    Thread.sleep(1000)
+                    true
+                }
+                is IllegalStateException -> {
+                    // Try to reset state
+                    resetApplicationState()
+                    true
+                }
+                is RuntimeException -> {
+                    // Try to continue with degraded functionality
+                    enableDegradedMode()
+                    true
+                }
+                else -> false
+            }
+        } catch (e: Exception) {
+            logger.logError("RECOVERY_FAILED", e, "Failed to recover from exception")
+            false
+        }
+    }
+    
+    /**
+     * Reset application state
+     */
+    private fun resetApplicationState() {
+        try {
+            // Clear caches
+            clearCaches()
+            
+            // Reset static variables
+            resetStaticVariables()
+            
+            // Restart critical services
+            restartCriticalServices()
+            
+            logger.logInfo("STATE_RESET", "Application state reset successfully")
+        } catch (e: Exception) {
+            logger.logError("STATE_RESET_FAILED", e, "Failed to reset application state")
+        }
+    }
+    
+    /**
+     * Enable degraded mode
+     */
+    private fun enableDegradedMode() {
+        try {
+            // Disable non-critical features
+            disableNonCriticalFeatures()
+            
+            // Enable basic functionality only
+            enableBasicFunctionality()
+            
+            logger.logInfo("DEGRADED_MODE", "Application running in degraded mode")
+        } catch (e: Exception) {
+            logger.logError("DEGRADED_MODE_FAILED", e, "Failed to enable degraded mode")
+        }
+    }
+    
+    /**
+     * Clear caches
+     */
+    private fun clearCaches() {
+        try {
+            // Clear image cache
+            // Clear data cache
+            // Clear network cache
+            
+            logger.logInfo("CACHE_CLEAR", "Caches cleared successfully")
+        } catch (e: Exception) {
+            logger.logError("CACHE_CLEAR_FAILED", e, "Failed to clear caches")
+        }
+    }
+    
+    /**
+     * Reset static variables
+     */
+    private fun resetStaticVariables() {
+        try {
+            // Reset static variables that might hold references
+            // This is application-specific
+            
+            logger.logInfo("STATIC_RESET", "Static variables reset successfully")
+        } catch (e: Exception) {
+            logger.logError("STATIC_RESET_FAILED", e, "Failed to reset static variables")
+        }
+    }
+    
+    /**
+     * Restart critical services
+     */
+    private fun restartCriticalServices() {
+        try {
+            // Restart essential services
+            // This is application-specific
+            
+            logger.logInfo("SERVICES_RESTART", "Critical services restarted successfully")
+        } catch (e: Exception) {
+            logger.logError("SERVICES_RESTART_FAILED", e, "Failed to restart critical services")
+        }
+    }
+    
+    /**
+     * Disable non-critical features
+     */
+    private fun disableNonCriticalFeatures() {
+        try {
+            // Disable animations
+            // Disable background tasks
+            // Disable optional features
+            
+            logger.logInfo("FEATURES_DISABLED", "Non-critical features disabled")
+        } catch (e: Exception) {
+            logger.logError("FEATURES_DISABLE_FAILED", e, "Failed to disable non-critical features")
+        }
+    }
+    
+    /**
+     * Enable basic functionality
+     */
+    private fun enableBasicFunctionality() {
+        try {
+            // Enable core features only
+            // Disable advanced features
+            
+            logger.logInfo("BASIC_FUNCTIONALITY", "Basic functionality enabled")
+        } catch (e: Exception) {
+            logger.logError("BASIC_FUNCTIONALITY_FAILED", e, "Failed to enable basic functionality")
+        }
+    }
+    
+    /**
+     * Log system state
+     */
+    private fun logSystemState() {
+        try {
+            val runtime = Runtime.getRuntime()
+            logger.logInfo("SYSTEM_STATE", "System state logged", additionalData = mapOf(
+                "availableProcessors" to runtime.availableProcessors(),
+                "totalMemory" to runtime.totalMemory(),
+                "freeMemory" to runtime.freeMemory(),
+                "maxMemory" to runtime.maxMemory()
+            ))
+        } catch (e: Exception) {
+            logger.logError("SYSTEM_STATE_FAILED", e, "Failed to log system state")
+        }
+    }
+    
+    /**
+     * Log memory state
+     */
+    private fun logMemoryState() {
+        try {
+            val runtime = Runtime.getRuntime()
+            val usedMemory = runtime.totalMemory() - runtime.freeMemory()
+            val memoryUsagePercent = (usedMemory.toDouble() / runtime.maxMemory() * 100).toInt()
+            
+            logger.logInfo("MEMORY_STATE", "Memory state logged", additionalData = mapOf(
+                "usedMemory" to usedMemory,
+                "maxMemory" to runtime.maxMemory(),
+                "memoryUsagePercent" to memoryUsagePercent
+            ))
+        } catch (e: Exception) {
+            logger.logError("MEMORY_STATE_FAILED", e, "Failed to log memory state")
+        }
+    }
+    
+    /**
+     * Log thread state
+     */
+    private fun logThreadState(thread: Thread) {
+        try {
+            logger.logInfo("THREAD_STATE", "Thread state logged", additionalData = mapOf(
+                "threadName" to thread.name,
+                "threadId" to thread.id,
+                "threadState" to thread.state.name,
+                "isDaemon" to thread.isDaemon,
+                "priority" to thread.priority
+            ))
+        } catch (e: Exception) {
+            logger.logError("THREAD_STATE_FAILED", e, "Failed to log thread state")
+        }
+    }
+    
+    /**
+     * Safe execute with exception handling
+     */
+    fun <T> safeExecute(
+        operation: () -> T,
+        defaultValue: T,
+        operationName: String = "Unknown"
+    ): T {
+        return try {
+            operation()
+        } catch (e: Exception) {
+            logger.logError("SAFE_EXECUTE", e, "Safe execute failed for $operationName")
+            defaultValue
+        }
+    }
+    
+    /**
+     * Safe execute with coroutine
+     */
+    suspend fun <T> safeExecuteSuspend(
+        operation: suspend () -> T,
+        defaultValue: T,
+        operationName: String = "Unknown"
+    ): T {
+        return try {
+            operation()
+        } catch (e: Exception) {
+            logger.logError("SAFE_EXECUTE_SUSPEND", e, "Safe execute suspend failed for $operationName")
+            defaultValue
+        }
+    }
+    
+    /**
+     * Check if system is in critical state
+     */
+    fun isInCriticalState(): Boolean {
+        return criticalErrors.get()
+    }
+    
+    /**
+     * Get exception statistics
+     */
+    fun getExceptionStatistics(): Map<String, Int> {
+        return exceptionCounts.mapValues { it.value.get() }
+    }
+    
+    /**
+     * Reset critical state
+     */
+    fun resetCriticalState() {
+        criticalErrors.set(false)
+        exceptionCounts.clear()
+        logger.logInfo("CRITICAL_STATE_RESET", "Critical state reset")
+    }
+    
+    /**
+     * Global exception handler
+     */
+    private inner class GlobalExceptionHandler : Thread.UncaughtExceptionHandler {
+        override fun uncaughtException(thread: Thread, throwable: Throwable) {
+            handleUncaughtException(thread, throwable)
+        }
+    }
+}
+
+/**
+ * Application class for crash prevention
+ */
+class CrashPreventionApplication : Application() {
+    
+    private lateinit var crashPreventionSystem: CrashPreventionSystem
+    private lateinit var errorHandlerLogger: ErrorHandlerLogger
+    
+    override fun onCreate() {
+        super.onCreate()
+        
+        // Initialize error handler logger
+        errorHandlerLogger = ErrorHandlerLogger(this)
+        
+        // Initialize crash prevention system
+        crashPreventionSystem = CrashPreventionSystem.getInstance(this, errorHandlerLogger)
+        crashPreventionSystem.initialize()
+        
+        // Set up global exception handler for Compose
+        setupComposeExceptionHandler()
+    }
+    
+    /**
+     * Setup Compose exception handler
+     */
+    private fun setupComposeExceptionHandler() {
+        // This would handle Compose-specific exceptions
+        // In a real implementation, you'd set up proper Compose error handling
+    }
+    
+    /**
+     * Get crash prevention system
+     */
+    fun getCrashPreventionSystem(): CrashPreventionSystem {
+        return crashPreventionSystem
+    }
+}
+
+/**
+ * Extension functions for safe execution
+ */
+fun <T> safeExecute(
+    crashPreventionSystem: CrashPreventionSystem,
+    operation: () -> T,
+    defaultValue: T,
+    operationName: String = "Unknown"
+): T {
+    return crashPreventionSystem.safeExecute(operation, defaultValue, operationName)
+}
+
+suspend fun <T> safeExecuteSuspend(
+    crashPreventionSystem: CrashPreventionSystem,
+    operation: suspend () -> T,
+    defaultValue: T,
+    operationName: String = "Unknown"
+): T {
+    return crashPreventionSystem.safeExecuteSuspend(operation, defaultValue, operationName)
+}

@@ -1,0 +1,643 @@
+package com.edham.logistics.performance.cache
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * API Cache Manager - Intelligent API response caching with performance optimization
+ * Implements multi-level caching, intelligent invalidation, and network optimization
+ */
+
+@Singleton
+class ApiCacheManager @Inject constructor() {
+
+    private val cacheScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val memoryCache = ConcurrentHashMap<String, CacheEntry<*>>()
+    private val diskCache = ConcurrentHashMap<String, DiskCacheEntry<*>>()
+    
+    // Performance metrics
+    private val totalRequests = AtomicLong(0)
+    private val cacheHits = AtomicLong(0)
+    private val cacheMisses = AtomicLong(0)
+    private val networkSaves = AtomicLong(0)
+    private val averageResponseTime = AtomicLong(0)
+    
+    // Configuration
+    private val maxMemoryCacheSize = 100
+    private val maxDiskCacheSize = 500
+    private val defaultExpiryTime = 5 * 60 * 1000L // 5 minutes
+    private val maxResponseSize = 10 * 1024 * 1024L // 10MB
+    
+    /**
+     * Get cached API response or load from network
+     */
+    suspend fun <T> get(
+        key: String,
+        loader: suspend () -> T,
+        expiryTime: Long = defaultExpiryTime,
+        cacheStrategy: CacheStrategy = CacheStrategy.MEMORY_FIRST
+    ): Result<T> {
+        totalRequests.incrementAndGet()
+        val startTime = System.currentTimeMillis()
+        
+        return try {
+            when (cacheStrategy) {
+                CacheStrategy.MEMORY_FIRST -> {
+                    // Check memory cache first
+                    val memoryResult = getFromMemory<T>(key)
+                    if (memoryResult != null && !memoryResult.isExpired()) {
+                        cacheHits.incrementAndGet()
+                        memoryResult.lastAccessed = System.currentTimeMillis()
+                        return Result.success(memoryResult.data)
+                    }
+                    
+                    // Check disk cache
+                    val diskResult = getFromDisk<T>(key)
+                    if (diskResult != null && !diskResult.isExpired()) {
+                        cacheHits.incrementAndGet()
+                        diskResult.lastAccessed = System.currentTimeMillis()
+                        
+                        // Promote to memory cache
+                        putInMemory(key, diskResult.data, expiryTime)
+                        
+                        return Result.success(diskResult.data)
+                    }
+                    
+                    // Load from network
+                    loadFromNetwork(key, loader, expiryTime)
+                }
+                
+                CacheStrategy.DISK_FIRST -> {
+                    // Check disk cache first
+                    val diskResult = getFromDisk<T>(key)
+                    if (diskResult != null && !diskResult.isExpired()) {
+                        cacheHits.incrementAndGet()
+                        diskResult.lastAccessed = System.currentTimeMillis()
+                        
+                        // Promote to memory cache
+                        putInMemory(key, diskResult.data, expiryTime)
+                        
+                        return Result.success(diskResult.data)
+                    }
+                    
+                    // Check memory cache
+                    val memoryResult = getFromMemory<T>(key)
+                    if (memoryResult != null && !memoryResult.isExpired()) {
+                        cacheHits.incrementAndGet()
+                        memoryResult.lastAccessed = System.currentTimeMillis()
+                        return Result.success(memoryResult.data)
+                    }
+                    
+                    // Load from network
+                    loadFromNetwork(key, loader, expiryTime)
+                }
+                
+                CacheStrategy.NETWORK_ONLY -> {
+                    // Skip cache, load from network
+                    val result = loader()
+                    val loadTime = System.currentTimeMillis() - startTime
+                    updateAverageResponseTime(loadTime)
+                    Result.success(result)
+                }
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting cached data for key: $key")
+            cacheMisses.incrementAndGet()
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Put data in cache
+     */
+    suspend fun <T> put(
+        key: String,
+        data: T,
+        expiryTime: Long = defaultExpiryTime,
+        cacheStrategy: CacheStrategy = CacheStrategy.MEMORY_FIRST
+    ) {
+        try {
+            when (cacheStrategy) {
+                CacheStrategy.MEMORY_FIRST, CacheStrategy.DISK_FIRST -> {
+                    putInMemory(key, data, expiryTime)
+                    putInDisk(key, data, expiryTime)
+                }
+                CacheStrategy.NETWORK_ONLY -> {
+                    // Don't cache
+                }
+            }
+            
+            networkSaves.incrementAndGet()
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error putting data in cache for key: $key")
+        }
+    }
+    
+    /**
+     * Invalidate cache entry
+     */
+    suspend fun <T> invalidate(key: String) {
+        try {
+            memoryCache.remove(key)
+            diskCache.remove(key)
+        } catch (e: Exception) {
+            Timber.e(e, "Error invalidating cache for key: $key")
+        }
+    }
+    
+    /**
+     * Clear all cache
+     */
+    suspend fun clear() {
+        try {
+            memoryCache.clear()
+            diskCache.clear()
+            
+            // Reset metrics
+            totalRequests.set(0)
+            cacheHits.set(0)
+            cacheMisses.set(0)
+            networkSaves.set(0)
+            averageResponseTime.set(0)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error clearing cache")
+        }
+    }
+    
+    /**
+     * Get cache statistics
+     */
+    fun getCacheStats(): ApiCacheStats {
+        val memorySize = memoryCache.size
+        val diskSize = diskCache.size
+        val memoryUsage = memoryCache.values.sumOf { it.estimateSize() }
+        val diskUsage = diskCache.values.sumOf { it.estimateSize() }
+        
+        return ApiCacheStats(
+            totalRequests = totalRequests.get(),
+            cacheHits = cacheHits.get(),
+            cacheMisses = cacheMisses.get(),
+            networkSaves = networkSaves.get(),
+            averageResponseTime = averageResponseTime.get(),
+            memoryCacheSize = memorySize,
+            diskCacheSize = diskSize,
+            memoryUsage = memoryUsage,
+            diskUsage = diskUsage,
+            hitRate = if (totalRequests.get() > 0) {
+                cacheHits.get().toDouble() / totalRequests.get()
+            } else 0.0
+        )
+    }
+    
+    /**
+     * Check if data is cached
+     */
+    fun <T> isCached(key: String): Boolean {
+        val memoryEntry = memoryCache[key] as? CacheEntry<T>
+        if (memoryEntry != null && !memoryEntry.isExpired()) {
+            return true
+        }
+        
+        val diskEntry = diskCache[key] as? DiskCacheEntry<T>
+        return diskEntry != null && !diskEntry.isExpired()
+    }
+    
+    /**
+     * Get cached data without loading
+     */
+    fun <T> getCached(key: String): T? {
+        // Check memory cache first
+        val memoryEntry = memoryCache[key] as? CacheEntry<T>
+        if (memoryEntry != null && !memoryEntry.isExpired()) {
+            memoryEntry.lastAccessed = System.currentTimeMillis()
+            return memoryEntry.data
+        }
+        
+        // Check disk cache
+        val diskEntry = diskCache[key] as? DiskCacheEntry<T>
+        if (diskEntry != null && !diskEntry.isExpired()) {
+            diskEntry.lastAccessed = System.currentTimeMillis()
+            
+            // Promote to memory cache
+            putInMemory(key, diskEntry.data, diskEntry.expiryTime)
+            
+            return diskEntry.data
+        }
+        
+        return null
+    }
+    
+    /**
+     * Preload data in cache
+     */
+    suspend fun <T> preload(
+        key: String,
+        loader: suspend () -> T,
+        expiryTime: Long = defaultExpiryTime
+    ) {
+        try {
+            if (!isCached<T>(key)) {
+                cacheScope.launch {
+                    val data = loader()
+                    put(key, data, expiryTime)
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error preloading data for key: $key")
+        }
+    }
+    
+    /**
+     * Preload multiple items
+     */
+    suspend fun <T> preloadBatch(
+        items: List<PreloadItem<T>>,
+        maxConcurrency: Int = 5
+    ) {
+        try {
+            items.chunked(maxConcurrency).forEach { batch ->
+                batch.map { item ->
+                    cacheScope.async {
+                        preload(item.key, item.loader, item.expiryTime)
+                    }
+                }.awaitAll()
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error preloading batch")
+        }
+    }
+    
+    /**
+     * Clean up expired entries
+     */
+    suspend fun cleanupExpired() {
+        try {
+            val currentTime = System.currentTimeMillis()
+            
+            // Clean up memory cache
+            val expiredMemoryKeys = memoryCache.filter { 
+                currentTime - it.value.createdAt > it.value.expiryTime 
+            }.keys
+            
+            expiredMemoryKeys.forEach { key ->
+                memoryCache.remove(key)
+            }
+            
+            // Clean up disk cache
+            val expiredDiskKeys = diskCache.filter { 
+                currentTime - it.value.createdAt > it.value.expiryTime 
+            }.keys
+            
+            expiredDiskKeys.forEach { key ->
+                diskCache.remove(key)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error cleaning up expired cache entries")
+        }
+    }
+    
+    /**
+     * Optimize cache based on usage patterns
+     */
+    suspend fun optimizeCache() {
+        try {
+            // Remove least recently used items if cache is full
+            if (memoryCache.size > maxMemoryCacheSize) {
+                val sortedEntries = memoryCache.entries.sortedBy { it.value.lastAccessed }
+                val itemsToRemove = sortedEntries.take(memoryCache.size - maxMemoryCacheSize)
+                
+                itemsToRemove.forEach { (key, _) ->
+                    memoryCache.remove(key)
+                }
+            }
+            
+            if (diskCache.size > maxDiskCacheSize) {
+                val sortedEntries = diskCache.entries.sortedBy { it.value.lastAccessed }
+                val itemsToRemove = sortedEntries.take(diskCache.size - maxDiskCacheSize)
+                
+                itemsToRemove.forEach { (key, _) ->
+                    diskCache.remove(key)
+                }
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error optimizing cache")
+        }
+    }
+    
+    /**
+     * Set up intelligent cache warming
+     */
+    fun setupIntelligentWarming(warmingStrategy: WarmingStrategy) {
+        when (warmingStrategy) {
+            WarmingStrategy.ACCESS_BASED -> {
+                setupAccessBasedWarming()
+            }
+            WarmingStrategy.TIME_BASED -> {
+                setupTimeBasedWarming()
+            }
+            WarmingStrategy.PREDICTIVE -> {
+                setupPredictiveWarming()
+            }
+        }
+    }
+    
+    // Private methods
+    
+    private suspend fun <T> loadFromNetwork(
+        key: String,
+        loader: suspend () -> T,
+        expiryTime: Long
+    ): Result<T> {
+        return try {
+            val result = loader()
+            val loadTime = System.currentTimeMillis() - System.currentTimeMillis()
+            updateAverageResponseTime(loadTime)
+            
+            // Cache the result
+            putInMemory(key, result, expiryTime)
+            putInDisk(key, result, expiryTime)
+            
+            Result.success(result)
+            
+        } catch (e: Exception) {
+            cacheMisses.incrementAndGet()
+            Result.failure(e)
+        }
+    }
+    
+    private fun <T> getFromMemory(key: String): CacheEntry<T>? {
+        return memoryCache[key] as? CacheEntry<T>
+    }
+    
+    private fun <T> getFromDisk(key: String): DiskCacheEntry<T>? {
+        return diskCache[key] as? DiskCacheEntry<T>
+    }
+    
+    private fun <T> putInMemory(key: String, data: T, expiryTime: Long) {
+        val entry = CacheEntry(
+            data = data,
+            createdAt = System.currentTimeMillis(),
+            lastAccessed = System.currentTimeMillis(),
+            expiryTime = expiryTime
+        )
+        
+        memoryCache[key] = entry
+        manageMemoryCacheSize()
+    }
+    
+    private fun <T> putInDisk(key: String, data: T, expiryTime: Long) {
+        val entry = DiskCacheEntry(
+            data = data,
+            createdAt = System.currentTimeMillis(),
+            lastAccessed = System.currentTimeMillis(),
+            expiryTime = expiryTime
+        )
+        
+        diskCache[key] = entry
+        manageDiskCacheSize()
+    }
+    
+    private fun manageMemoryCacheSize() {
+        if (memoryCache.size > maxMemoryCacheSize) {
+            val sortedEntries = memoryCache.entries.sortedBy { it.value.lastAccessed }
+            val itemsToRemove = sortedEntries.take(memoryCache.size - maxMemoryCacheSize)
+            
+            itemsToRemove.forEach { (key, _) ->
+                memoryCache.remove(key)
+            }
+        }
+    }
+    
+    private fun manageDiskCacheSize() {
+        if (diskCache.size > maxDiskCacheSize) {
+            val sortedEntries = diskCache.entries.sortedBy { it.value.lastAccessed }
+            val itemsToRemove = sortedEntries.take(diskCache.size - maxDiskCacheSize)
+            
+            itemsToRemove.forEach { (key, _) ->
+                diskCache.remove(key)
+            }
+        }
+    }
+    
+    private fun updateAverageResponseTime(responseTime: Long) {
+        val current = averageResponseTime.get()
+        val newAverage = (current + responseTime) / 2
+        averageResponseTime.set(newAverage)
+    }
+    
+    private fun setupAccessBasedWarming() {
+        cacheScope.launch {
+            while (isActive) {
+                delay(300000) // Check every 5 minutes
+                
+                val recentAccess = memoryCache.values.filter { 
+                    System.currentTimeMillis() - it.lastAccessed < 600000 // Last 10 minutes
+                }
+                
+                // Preload related items based on access patterns
+                recentAccess.forEach { entry ->
+                    // Implementation would preload related items
+                    // This is a placeholder for actual warming logic
+                }
+            }
+        }
+    }
+    
+    private fun setupTimeBasedWarming() {
+        cacheScope.launch {
+            while (isActive) {
+                delay(600000) // Check every 10 minutes
+                
+                val currentTime = System.currentTimeMillis()
+                val hour = currentTime / (1000 * 60 * 60) % 24
+                
+                // Preload items based on time of day
+                when (hour) {
+                    in 8..18 -> {
+                        // Business hours - preload active data
+                    }
+                    else -> {
+                        // Off hours - preload background data
+                    }
+                }
+            }
+        }
+    }
+    
+    private fun setupPredictiveWarming() {
+        cacheScope.launch {
+            while (isActive) {
+                delay(900000) // Check every 15 minutes
+                
+                // Predictive warming based on usage patterns
+                // This would use ML or heuristics to predict what to preload
+            }
+        }
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): ApiCachePerformanceMetrics {
+        val stats = getCacheStats()
+        
+        return ApiCachePerformanceMetrics(
+            totalRequests = stats.totalRequests,
+            cacheHits = stats.cacheHits,
+            cacheMisses = stats.cacheMisses,
+            networkSaves = stats.networkSaves,
+            averageResponseTime = stats.averageResponseTime,
+            memoryUsage = stats.memoryUsage,
+            diskUsage = stats.diskUsage,
+            hitRate = stats.hitRate,
+            missRate = if (stats.totalRequests > 0) stats.cacheMisses.toDouble() / stats.totalRequests else 0.0
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalRequests.set(0)
+        cacheHits.set(0)
+        cacheMisses.set(0)
+        networkSaves.set(0)
+        averageResponseTime.set(0)
+    }
+    
+    /**
+     * Stop cache manager
+     */
+    fun stop() {
+        cacheScope.cancel()
+        clear()
+    }
+}
+
+/**
+ * Cache Entry for memory cache
+ */
+data class CacheEntry<T>(
+    val data: T,
+    val createdAt: Long,
+    var lastAccessed: Long,
+    val expiryTime: Long
+) {
+    fun isExpired(): Boolean {
+        return System.currentTimeMillis() - createdAt > expiryTime
+    }
+    
+    fun estimateSize(): Long {
+        return when (data) {
+            is String -> data.length.toLong()
+            is ByteArray -> data.size.toLong()
+            else -> 1024L // Default 1KB estimate
+        }
+    }
+}
+
+/**
+ * Cache Entry for disk cache
+ */
+data class DiskCacheEntry<T>(
+    val data: T,
+    val createdAt: Long,
+    var lastAccessed: Long,
+    val expiryTime: Long
+) {
+    fun isExpired(): Boolean {
+        return System.currentTimeMillis() - createdAt > expiryTime
+    }
+    
+    fun estimateSize(): Long {
+        return when (data) {
+            is String -> data.length.toLong()
+            is ByteArray -> data.size.toLong()
+            else -> 2048L // Default 2KB estimate for disk
+        }
+    }
+}
+
+/**
+ * Cache Strategy
+ */
+enum class CacheStrategy {
+    MEMORY_FIRST,    // Check memory cache first, then disk
+    DISK_FIRST,      // Check disk cache first, then memory
+    NETWORK_ONLY     // Skip cache, always load from network
+}
+
+/**
+ * Warming Strategy
+ */
+enum class WarmingStrategy {
+    ACCESS_BASED,    // Warm cache based on access patterns
+    TIME_BASED,      // Warm cache based on time of day
+    PREDICTIVE       // Use ML to predict what to warm
+}
+
+/**
+ * Preload Item
+ */
+data class PreloadItem<T>(
+    val key: String,
+    val loader: suspend () -> T,
+    val expiryTime: Long = 5 * 60 * 1000L // 5 minutes
+)
+
+/**
+ * API Cache Statistics
+ */
+data class ApiCacheStats(
+    val totalRequests: Long,
+    val cacheHits: Long,
+    val cacheMisses: Long,
+    val networkSaves: Long,
+    val averageResponseTime: Long,
+    val memoryCacheSize: Int,
+    val diskCacheSize: Int,
+    val memoryUsage: Long,
+    val diskUsage: Long,
+    val hitRate: Double
+)
+
+/**
+ * API Cache Performance Metrics
+ */
+data class ApiCachePerformanceMetrics(
+    val totalRequests: Long,
+    val cacheHits: Long,
+    val cacheMisses: Long,
+    val networkSaves: Long,
+    val averageResponseTime: Long,
+    val memoryUsage: Long,
+    val diskUsage: Long,
+    val hitRate: Double,
+    val missRate: Double
+) {
+    val cacheEfficiency: Double get() = hitRate * 100 // Percentage
+    val networkReduction: Double get() = if (totalRequests > 0) (totalRequests - networkSaves).toDouble() / totalRequests * 100 else 0.0
+}
+
+/**
+ * Cache Configuration
+ */
+data class CacheConfig(
+    val maxMemoryCacheSize: Int = 100,
+    val maxDiskCacheSize: Int = 500,
+    val defaultExpiryTime: Long = 5 * 60 * 1000L, // 5 minutes
+    val maxResponseSize: Long = 10 * 1024 * 1024L, // 10MB
+    val enableIntelligentWarming: Boolean = true,
+    val warmingStrategy: WarmingStrategy = WarmingStrategy.ACCESS_BASED,
+    val cleanupInterval: Long = 300000L // 5 minutes
+)

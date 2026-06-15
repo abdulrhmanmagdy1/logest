@@ -1,0 +1,796 @@
+package com.edham.logistics.core.backup
+
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.io.*
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Backup Manager - Comprehensive backup and recovery system
+ * Provides automatic daily backups, manual backups, and data recovery
+ */
+@Singleton
+class BackupManager @Inject constructor(
+    private val context: Context,
+    private val databaseBackupService: DatabaseBackupService,
+    private val fileBackupService: FileBackupService,
+    private val encryptionService: BackupEncryptionService,
+    private val schedulerService: BackupSchedulerService
+) {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // Backup state tracking
+    private val _backupState = MutableStateFlow<BackupState>(BackupState.IDLE)
+    val backupState: StateFlow<BackupState> = _backupState.asStateFlow()
+    
+    // Backup history
+    private val _backupHistory = MutableStateFlow<List<BackupInfo>>(emptyList())
+    val backupHistory: StateFlow<List<BackupInfo>> = _backupHistory.asStateFlow()
+    
+    // Backup configuration
+    private var backupConfig = BackupConfig()
+    
+    // Active backup operations
+    private val activeBackups = ConcurrentHashMap<String, BackupOperation>()
+
+    /**
+     * Initialize backup manager
+     */
+    fun initialize(config: BackupConfig = BackupConfig()) {
+        this.backupConfig = config
+        
+        // Load backup history
+        loadBackupHistory()
+        
+        // Setup automatic backup scheduler
+        if (config.enableAutoBackup) {
+            schedulerService.scheduleDailyBackup(config.backupTime)
+        }
+        
+        // Cleanup old backups
+        cleanupOldBackups()
+    }
+
+    /**
+     * Create manual backup
+     */
+    suspend fun createManualBackup(
+        name: String? = null,
+        includeFiles: Boolean = true,
+        includeDatabase: Boolean = true,
+        encryptionEnabled: Boolean = backupConfig.encryptionEnabled
+    ): Result<BackupInfo> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _backupState.value = BackupState.BACKING_UP
+                
+                val backupName = name ?: generateBackupName()
+                val backupId = UUID.randomUUID().toString()
+                
+                val backupInfo = BackupInfo(
+                    id = backupId,
+                    name = backupName,
+                    timestamp = System.currentTimeMillis(),
+                    type = BackupType.MANUAL,
+                    status = BackupStatus.IN_PROGRESS,
+                    size = 0,
+                    encrypted = encryptionEnabled
+                )
+                
+                // Add to active operations
+                activeBackups[backupId] = BackupOperation(
+                    id = backupId,
+                    type = BackupType.MANUAL,
+                    startTime = System.currentTimeMillis(),
+                    status = BackupStatus.IN_PROGRESS
+                )
+                
+                // Create backup directory
+                val backupDir = File(context.filesDir, "backups")
+                if (!backupDir.exists()) {
+                    backupDir.mkdirs()
+                }
+                
+                val backupFile = File(backupDir, "$backupName.zip")
+                val backupStream = FileOutputStream(backupFile)
+                val zipStream = ZipOutputStream(backupStream)
+                
+                try {
+                    // Backup database
+                    if (includeDatabase) {
+                        backupDatabase(zipStream, backupInfo)
+                    }
+                    
+                    // Backup files
+                    if (includeFiles) {
+                        backupFiles(zipStream, backupInfo)
+                    }
+                    
+                    // Create backup metadata
+                    createBackupMetadata(zipStream, backupInfo)
+                    
+                } finally {
+                    zipStream.close()
+                    backupStream.close()
+                }
+                
+                // Encrypt backup if enabled
+                if (encryptionEnabled) {
+                    encryptBackupFile(backupFile, backupInfo)
+                }
+                
+                // Update backup info
+                val finalBackupInfo = backupInfo.copy(
+                    status = BackupStatus.COMPLETED,
+                    size = backupFile.length(),
+                    filePath = backupFile.absolutePath
+                )
+                
+                // Update history
+                val updatedHistory = _backupHistory.value.toMutableList()
+                updatedHistory.add(0, finalBackupInfo)
+                _backupHistory.value = updatedHistory
+                
+                // Save history
+                saveBackupHistory()
+                
+                // Remove from active operations
+                activeBackups.remove(backupId)
+                
+                _backupState.value = BackupState.IDLE
+                
+                Result.success(finalBackupInfo)
+                
+            } catch (e: Exception) {
+                _backupState.value = BackupState.ERROR
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Create automatic backup
+     */
+    suspend fun createAutoBackup(): Result<BackupInfo> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _backupState.value = BackupState.AUTO_BACKING_UP
+                
+                val backupName = generateBackupName("auto")
+                val backupId = UUID.randomUUID().toString()
+                
+                val backupInfo = BackupInfo(
+                    id = backupId,
+                    name = backupName,
+                    timestamp = System.currentTimeMillis(),
+                    type = BackupType.AUTO,
+                    status = BackupStatus.IN_PROGRESS,
+                    size = 0,
+                    encrypted = backupConfig.encryptionEnabled
+                )
+                
+                // Create backup (similar to manual backup but with auto settings)
+                val result = createBackupInternal(backupInfo, includeFiles = true, includeDatabase = true)
+                
+                _backupState.value = BackupState.IDLE
+                result
+                
+            } catch (e: Exception) {
+                _backupState.value = BackupState.ERROR
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Restore backup
+     */
+    suspend fun restoreBackup(
+        backupId: String,
+        restoreOptions: RestoreOptions = RestoreOptions()
+    ): Result<RestoreResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _backupState.value = BackupState.RESTORING
+                
+                val backupInfo = _backupHistory.value.find { it.id == backupId }
+                    ?: throw IllegalArgumentException("Backup not found")
+                
+                val backupFile = File(backupInfo.filePath ?: throw IllegalArgumentException("Backup file not found"))
+                
+                // Decrypt backup if encrypted
+                val decryptedFile = if (backupInfo.encrypted) {
+                    decryptBackupFile(backupFile, backupInfo)
+                } else {
+                    backupFile
+                }
+                
+                // Restore database
+                var databaseRestored = false
+                var filesRestored = false
+                
+                if (restoreOptions.restoreDatabase) {
+                    databaseRestored = restoreDatabase(decryptedFile, backupInfo)
+                }
+                
+                if (restoreOptions.restoreFiles) {
+                    filesRestored = restoreFiles(decryptedFile, backupInfo)
+                }
+                
+                // Clean up decrypted file
+                if (backupInfo.encrypted && decryptedFile != backupFile) {
+                    decryptedFile.delete()
+                }
+                
+                val restoreResult = RestoreResult(
+                    backupId = backupId,
+                    timestamp = System.currentTimeMillis(),
+                    databaseRestored = databaseRestored,
+                    filesRestored = filesRestored,
+                    success = databaseRestored || filesRestored
+                )
+                
+                _backupState.value = BackupState.IDLE
+                
+                Result.success(restoreResult)
+                
+            } catch (e: Exception) {
+                _backupState.value = BackupState.ERROR
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Export system data
+     */
+    suspend fun exportSystemData(
+        exportType: ExportType,
+        dateRange: DateRange? = null,
+        includeFiles: Boolean = true
+    ): Result<ExportResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _backupState.value = BackupState.EXPORTING
+                
+                val exportName = generateExportName(exportType)
+                val exportFile = File(context.getExternalFilesDir(null), "exports/$exportName")
+                exportFile.parentFile?.mkdirs()
+                
+                val result = when (exportType) {
+                    ExportType.SHIPMENTS -> exportShipments(exportFile, dateRange, includeFiles)
+                    ExportType.USERS -> exportUsers(exportFile, dateRange)
+                    ExportType.INVOICES -> exportInvoices(exportFile, dateRange, includeFiles)
+                    ExportType.ACTIVITY_LOGS -> exportActivityLogs(exportFile, dateRange)
+                    ExportType.FULL_SYSTEM -> exportFullSystem(exportFile, dateRange, includeFiles)
+                }
+                
+                _backupState.value = BackupState.IDLE
+                
+                Result.success(result)
+                
+            } catch (e: Exception) {
+                _backupState.value = BackupState.ERROR
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Delete backup
+     */
+    suspend fun deleteBackup(backupId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val backupInfo = _backupHistory.value.find { it.id == backupId }
+                    ?: throw IllegalArgumentException("Backup not found")
+                
+                val backupFile = File(backupInfo.filePath ?: throw IllegalArgumentException("Backup file not found"))
+                val deleted = backupFile.delete()
+                
+                if (deleted) {
+                    val updatedHistory = _backupHistory.value.filter { it.id != backupId }
+                    _backupHistory.value = updatedHistory
+                    saveBackupHistory()
+                }
+                
+                Result.success(deleted)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Get backup info
+     */
+    fun getBackupInfo(backupId: String): BackupInfo? {
+        return _backupHistory.value.find { it.id == backupId }
+    }
+
+    /**
+     * Get backup statistics
+     */
+    fun getBackupStatistics(): BackupStatistics {
+        val history = _backupHistory.value
+        val successfulBackups = history.filter { it.status == BackupStatus.COMPLETED }
+        val totalSize = successfulBackups.sumOf { it.size }
+        val latestBackup = successfulBackups.maxByOrNull { it.timestamp }
+        
+        return BackupStatistics(
+            totalBackups = successfulBackups.size,
+            totalSize = totalSize,
+            latestBackup = latestBackup,
+            autoBackupsEnabled = backupConfig.enableAutoBackup,
+            nextScheduledBackup = schedulerService.getNextScheduledBackup()
+        )
+    }
+
+    /**
+     * Update backup configuration
+     */
+    fun updateConfig(config: BackupConfig) {
+        this.backupConfig = config
+        
+        // Update scheduler
+        if (config.enableAutoBackup) {
+            schedulerService.scheduleDailyBackup(config.backupTime)
+        } else {
+            schedulerService.cancelScheduledBackup()
+        }
+    }
+
+    /**
+     * Create backup internal
+     */
+    private suspend fun createBackupInternal(
+        backupInfo: BackupInfo,
+        includeFiles: Boolean,
+        includeDatabase: Boolean
+    ): Result<BackupInfo> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val backupDir = File(context.filesDir, "backups")
+                if (!backupDir.exists()) {
+                    backupDir.mkdirs()
+                }
+                
+                val backupFile = File(backupDir, "${backupInfo.name}.zip")
+                val backupStream = FileOutputStream(backupFile)
+                val zipStream = ZipOutputStream(backupStream)
+                
+                try {
+                    if (includeDatabase) {
+                        backupDatabase(zipStream, backupInfo)
+                    }
+                    
+                    if (includeFiles) {
+                        backupFiles(zipStream, backupInfo)
+                    }
+                    
+                    createBackupMetadata(zipStream, backupInfo)
+                    
+                } finally {
+                    zipStream.close()
+                    backupStream.close()
+                }
+                
+                // Encrypt if enabled
+                if (backupConfig.encryptionEnabled) {
+                    encryptBackupFile(backupFile, backupInfo)
+                }
+                
+                val finalBackupInfo = backupInfo.copy(
+                    status = BackupStatus.COMPLETED,
+                    size = backupFile.length(),
+                    filePath = backupFile.absolutePath
+                )
+                
+                // Update history
+                val updatedHistory = _backupHistory.value.toMutableList()
+                updatedHistory.add(0, finalBackupInfo)
+                _backupHistory.value = updatedHistory
+                saveBackupHistory()
+                
+                Result.success(finalBackupInfo)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Backup database
+     */
+    private suspend fun backupDatabase(zipStream: ZipOutputStream, backupInfo: BackupInfo) {
+        val databaseBackup = databaseBackupService.createDatabaseBackup()
+        
+        val entry = ZipEntry("database/${databaseBackup.fileName}")
+        entry.time = backupInfo.timestamp
+        zipStream.putNextEntry(entry)
+        zipStream.write(databaseBackup.data)
+        zipStream.closeEntry()
+    }
+
+    /**
+     * Backup files
+     */
+    private suspend fun backupFiles(zipStream: ZipOutputStream, backupInfo: BackupInfo) {
+        val fileBackups = fileBackupService.createFileBackups()
+        
+        fileBackups.forEach { fileBackup ->
+            val entry = ZipEntry("files/${fileBackup.relativePath}")
+            entry.time = backupInfo.timestamp
+            zipStream.putNextEntry(entry)
+            zipStream.write(fileBackup.data)
+            zipStream.closeEntry()
+        }
+    }
+
+    /**
+     * Create backup metadata
+     */
+    private fun createBackupMetadata(zipStream: ZipOutputStream, backupInfo: BackupInfo) {
+        val metadata = BackupMetadata(
+            version = "1.0",
+            created = backupInfo.timestamp,
+            type = backupInfo.type.name,
+            encrypted = backupInfo.encrypted,
+            appVersion = getAppVersion(),
+            deviceId = getDeviceId()
+        )
+        
+        val metadataJson = kotlinx.serialization.json.encodeToString(metadata)
+        val entry = ZipEntry("metadata.json")
+        entry.time = backupInfo.timestamp
+        zipStream.putNextEntry(entry)
+        zipStream.write(metadataJson.toByteArray())
+        zipStream.closeEntry()
+    }
+
+    /**
+     * Encrypt backup file
+     */
+    private suspend fun encryptBackupFile(backupFile: File, backupInfo: BackupInfo) {
+        val encryptedData = encryptionService.encrypt(backupFile.readBytes())
+        backupFile.writeBytes(encryptedData)
+    }
+
+    /**
+     * Decrypt backup file
+     */
+    private suspend fun decryptBackupFile(backupFile: File, backupInfo: BackupInfo): File {
+        val decryptedData = encryptionService.decrypt(backupFile.readBytes())
+        val decryptedFile = File(backupFile.parent, "${backupFile.name}.decrypted")
+        decryptedFile.writeBytes(decryptedData)
+        return decryptedFile
+    }
+
+    /**
+     * Restore database
+     */
+    private suspend fun restoreDatabase(backupFile: File, backupInfo: BackupInfo): Boolean {
+        return databaseBackupService.restoreDatabaseBackup(backupFile, backupInfo)
+    }
+
+    /**
+     * Restore files
+     */
+    private suspend fun restoreFiles(backupFile: File, backupInfo: BackupInfo): Boolean {
+        return fileBackupService.restoreFileBackups(backupFile, backupInfo)
+    }
+
+    /**
+     * Export shipments
+     */
+    private suspend fun exportShipments(
+        exportFile: File,
+        dateRange: DateRange?,
+        includeFiles: Boolean
+    ): ExportResult {
+        // Implementation for exporting shipments data
+        return ExportResult(
+            type = ExportType.SHIPMENTS,
+            filePath = exportFile.absolutePath,
+            size = exportFile.length(),
+            recordCount = 0,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * Export users
+     */
+    private suspend fun exportUsers(
+        exportFile: File,
+        dateRange: DateRange?
+    ): ExportResult {
+        // Implementation for exporting users data
+        return ExportResult(
+            type = ExportType.USERS,
+            filePath = exportFile.absolutePath,
+            size = exportFile.length(),
+            recordCount = 0,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * Export invoices
+     */
+    private suspend fun exportInvoices(
+        exportFile: File,
+        dateRange: DateRange?,
+        includeFiles: Boolean
+    ): ExportResult {
+        // Implementation for exporting invoices data
+        return ExportResult(
+            type = ExportType.INVOICES,
+            filePath = exportFile.absolutePath,
+            size = exportFile.length(),
+            recordCount = 0,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * Export activity logs
+     */
+    private suspend fun exportActivityLogs(
+        exportFile: File,
+        dateRange: DateRange?
+    ): ExportResult {
+        // Implementation for exporting activity logs
+        return ExportResult(
+            type = ExportType.ACTIVITY_LOGS,
+            filePath = exportFile.absolutePath,
+            size = exportFile.length(),
+            recordCount = 0,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * Export full system
+     */
+    private suspend fun exportFullSystem(
+        exportFile: File,
+        dateRange: DateRange?,
+        includeFiles: Boolean
+    ): ExportResult {
+        // Implementation for exporting full system data
+        return ExportResult(
+            type = ExportType.FULL_SYSTEM,
+            filePath = exportFile.absolutePath,
+            size = exportFile.length(),
+            recordCount = 0,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * Generate backup name
+     */
+    private fun generateBackupName(prefix: String = "backup"): String {
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.getDefault())
+        val timestamp = dateFormat.format(Date())
+        return "${prefix}_${timestamp}"
+    }
+
+    /**
+     * Generate export name
+     */
+    private fun generateExportName(exportType: ExportType): String {
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.getDefault())
+        val timestamp = dateFormat.format(Date())
+        return "${exportType.name.lowercase()}_export_$timestamp.csv"
+    }
+
+    /**
+     * Load backup history
+     */
+    private fun loadBackupHistory() {
+        try {
+            val historyFile = File(context.filesDir, "backup_history.json")
+            if (historyFile.exists()) {
+                val historyJson = historyFile.readText()
+                val history = kotlinx.serialization.json.decodeFromString<List<BackupInfo>>(historyJson)
+                _backupHistory.value = history
+            }
+        } catch (e: Exception) {
+            // Handle error loading history
+        }
+    }
+
+    /**
+     * Save backup history
+     */
+    private fun saveBackupHistory() {
+        try {
+            val historyFile = File(context.filesDir, "backup_history.json")
+            val historyJson = kotlinx.serialization.json.encodeToString(_backupHistory.value)
+            historyFile.writeText(historyJson)
+        } catch (e: Exception) {
+            // Handle error saving history
+        }
+    }
+
+    /**
+     * Cleanup old backups
+     */
+    private suspend fun cleanupOldBackups() {
+        withContext(Dispatchers.IO) {
+            try {
+                val history = _backupHistory.value
+                val cutoffTime = System.currentTimeMillis() - (backupConfig.retentionDays * 24 * 60 * 60 * 1000L)
+                
+                val oldBackups = history.filter { it.timestamp < cutoffTime }
+                
+                oldBackups.forEach { backupInfo ->
+                    backupInfo.filePath?.let { filePath ->
+                        val backupFile = File(filePath)
+                        if (backupFile.exists()) {
+                            backupFile.delete()
+                        }
+                    }
+                }
+                
+                val updatedHistory = history.filter { it.timestamp >= cutoffTime }
+                _backupHistory.value = updatedHistory
+                saveBackupHistory()
+                
+            } catch (e: Exception) {
+                // Handle cleanup error
+            }
+        }
+    }
+
+    /**
+     * Get app version
+     */
+    private fun getAppVersion(): String {
+        return try {
+            val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            "${packageInfo.versionName} (${packageInfo.longVersionCode})"
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+
+    /**
+     * Get device ID
+     */
+    private fun getDeviceId(): String {
+        return android.provider.Settings.Secure.getString(
+            context.contentResolver,
+            android.provider.Settings.Secure.ANDROID_ID
+        ) ?: "Unknown"
+    }
+
+    /**
+     * Cleanup backup manager
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+        schedulerService.cleanup()
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class BackupConfig(
+    val enableAutoBackup: Boolean = true,
+    val backupTime: String = "02:00", // 2 AM
+    val retentionDays: Int = 30,
+    val encryptionEnabled: Boolean = true,
+    val compressionEnabled: Boolean = true,
+    val includeFiles: Boolean = true,
+    val includeDatabase: Boolean = true
+)
+
+data class BackupInfo(
+    val id: String,
+    val name: String,
+    val timestamp: Long,
+    val type: BackupType,
+    val status: BackupStatus,
+    val size: Long,
+    val encrypted: Boolean,
+    val filePath: String? = null,
+    val description: String? = null
+)
+
+data class BackupOperation(
+    val id: String,
+    val type: BackupType,
+    val startTime: Long,
+    val status: BackupStatus,
+    val progress: Float = 0f
+)
+
+data class RestoreResult(
+    val backupId: String,
+    val timestamp: Long,
+    val databaseRestored: Boolean,
+    val filesRestored: Boolean,
+    val success: Boolean,
+    val errorMessage: String? = null
+)
+
+data class ExportResult(
+    val type: ExportType,
+    val filePath: String,
+    val size: Long,
+    val recordCount: Int,
+    val timestamp: Long
+)
+
+data class BackupStatistics(
+    val totalBackups: Int,
+    val totalSize: Long,
+    val latestBackup: BackupInfo?,
+    val autoBackupsEnabled: Boolean,
+    val nextScheduledBackup: Long?
+)
+
+data class RestoreOptions(
+    val restoreDatabase: Boolean = true,
+    val restoreFiles: Boolean = true,
+    val overwriteExisting: Boolean = false
+)
+
+data class DateRange(
+    val startDate: Long,
+    val endDate: Long
+)
+
+data class BackupMetadata(
+    val version: String,
+    val created: Long,
+    val type: String,
+    val encrypted: Boolean,
+    val appVersion: String,
+    val deviceId: String
+)
+
+enum class BackupState {
+    IDLE,
+    BACKING_UP,
+    AUTO_BACKING_UP,
+    RESTORING,
+    EXPORTING,
+    ERROR
+}
+
+enum class BackupType {
+    MANUAL,
+    AUTO,
+    SCHEDULED
+}
+
+enum class BackupStatus {
+    IN_PROGRESS,
+    COMPLETED,
+    FAILED,
+    CANCELLED
+}
+
+enum class ExportType {
+    SHIPMENTS,
+    USERS,
+    INVOICES,
+    ACTIVITY_LOGS,
+    FULL_SYSTEM
+}

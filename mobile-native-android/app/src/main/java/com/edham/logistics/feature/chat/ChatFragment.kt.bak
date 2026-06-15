@@ -1,0 +1,628 @@
+package com.edham.logistics.feature.chat
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.media.MediaRecorder
+import android.os.Bundle
+import android.os.Environment
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.Observer
+import androidx.lifecycle.ViewModelProvider
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentChatBinding
+import com.edham.logistics.feature.chat.adapters.MessageAdapter
+import com.edham.logistics.utils.VoiceAlertManager
+import timber.log.Timber
+import java.io.File
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.*
+
+class ChatFragment : Fragment() {
+    
+    private var _binding: FragmentChatBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var chatService: ChatService
+    private lateinit var voiceAlertManager: VoiceAlertManager
+    private lateinit var messageAdapter: MessageAdapter
+    
+    private var conversationId: String? = null
+    private var currentUserId: String? = null
+    private var currentUserRole: UserRole? = null
+    private var mediaRecorder: MediaRecorder? = null
+    private var isRecording = false
+    private var currentRecordingFile: File? = null
+    
+    private val dateFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+    
+    // Permission launcher for audio recording
+    private val audioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            startVoiceRecording()
+        } else {
+            Toast.makeText(requireContext(), "Audio permission required", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    // Permission launcher for file access
+    private val filePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            openFilePicker()
+        } else {
+            Toast.makeText(requireContext(), "File access permission required", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentChatBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Initialize services
+        chatService = ViewModelProvider(requireActivity())[ChatService::class.java]
+        voiceAlertManager = VoiceAlertManager(requireContext())
+        
+        // Get arguments
+        conversationId = arguments?.getString("conversationId")
+        currentUserId = arguments?.getString("userId") ?: "user_123"
+        currentUserRole = UserRole.valueOf(arguments?.getString("userRole") ?: "DRIVER")
+        
+        setupUI()
+        setupRecyclerView()
+        setupClickListeners()
+        setupObservers()
+        
+        // Initialize chat
+        initializeChat()
+    }
+    
+    private fun setupUI() {
+        // Large touch targets for one-hand usage
+        binding.btnSend.minimumHeight = 72.dp
+        binding.btnSend.minimumWidth = 72.dp
+        
+        binding.btnAttach.minimumHeight = 48.dp
+        binding.btnAttach.minimumWidth = 48.dp
+        
+        binding.btnVoice.minimumHeight = 48.dp
+        binding.btnVoice.minimumWidth = 48.dp
+        
+        binding.btnLocation.minimumHeight = 48.dp
+        binding.btnLocation.minimumWidth = 48.dp
+        
+        // Modern chat interface
+        binding.recyclerViewMessages.setHasFixedSize(true)
+        binding.recyclerViewMessages.itemAnimator = null
+        
+        // Voice recording UI
+        updateVoiceRecordingUI()
+        
+        // Typing indicator
+        binding.typingIndicator.visibility = View.GONE
+        
+        // Online status
+        updateOnlineStatusUI()
+    }
+    
+    private fun setupRecyclerView() {
+        messageAdapter = MessageAdapter { message ->
+            onMessageClicked(message)
+        }
+        
+        binding.recyclerViewMessages.apply {
+            layoutManager = LinearLayoutManager(requireContext()).apply {
+                stackFromEnd = true
+            }
+            adapter = messageAdapter
+        }
+    }
+    
+    private fun setupClickListeners() {
+        // Send message
+        binding.btnSend.setOnClickListener {
+            sendMessage()
+        }
+        
+        // Voice recording
+        binding.btnVoice.setOnClickListener {
+            toggleVoiceRecording()
+        }
+        
+        // File attachment
+        binding.btnAttach.setOnClickListener {
+            checkFilePermissionAndOpenPicker()
+        }
+        
+        // Location sharing
+        binding.btnLocation.setOnClickListener {
+            shareLocation()
+        }
+        
+        // Emergency broadcast
+        binding.btnEmergency.setOnClickListener {
+            sendEmergencyBroadcast()
+        }
+        
+        // Clear chat
+        binding.btnClearChat.setOnClickListener {
+            clearChatHistory()
+        }
+        
+        // Message input
+        binding.etMessage.setOnFocusChangeListener { _, hasFocus ->
+            if (hasFocus) {
+                sendTypingIndicator(true)
+            } else {
+                sendTypingIndicator(false)
+            }
+        }
+        
+        // Back button
+        binding.btnBack.setOnClickListener {
+            parentFragmentManager.popBackStack()
+        }
+    }
+    
+    private fun setupObservers() {
+        // Observe messages
+        chatService.messages.observe(viewLifecycleOwner, Observer { messages ->
+            messageAdapter.updateMessages(messages)
+            binding.recyclerViewMessages.scrollToPosition(messages.size - 1)
+            updateEmptyState(messages.isEmpty())
+        })
+        
+        // Observe typing indicators
+        chatService.typingUsers.observe(viewLifecycleOwner, Observer { typingUsers ->
+            updateTypingIndicator(typingUsers)
+        })
+        
+        // Observe online users
+        chatService.onlineUsers.observe(viewLifecycleOwner, Observer { onlineUsers ->
+            updateOnlineStatusUI(onlineUsers)
+        })
+        
+        // Observe message events
+        viewLifecycleOwner.lifecycleScope.launchWhenStarted {
+            chatService.messageEvents.collect { event ->
+                when (event) {
+                    is MessageEvent.MessageReceived -> {
+                        handleNewMessage(event.message)
+                    }
+                    is MessageEvent.MessageDelivered -> {
+                        handleMessageDelivered(event.messageId)
+                    }
+                    is MessageEvent.EmergencyBroadcast -> {
+                        handleEmergencyBroadcast(event.emergencyMessage)
+                    }
+                }
+            }
+        }
+        
+        // Observe typing events
+        viewLifecycleOwner.lifecycleScope.launchWhenStarted {
+            chatService.typingEvents.collect { event ->
+                when (event) {
+                    is TypingEvent.TypingChanged -> {
+                        handleTypingChanged(event.indicator)
+                    }
+                }
+            }
+        }
+    }
+    
+    private fun initializeChat() {
+        conversationId?.let { convId ->
+            // Load messages for conversation
+            viewLifecycleOwner.lifecycleScope.launch {
+                val messages = chatService.getMessages(convId)
+                messageAdapter.updateMessages(messages)
+                
+                // Mark messages as read
+                val unreadMessages = messages.filter { !it.isRead }
+                if (unreadMessages.isNotEmpty()) {
+                    chatService.markMessagesAsRead(
+                        convId,
+                        unreadMessages.map { it.id },
+                        currentUserId ?: ""
+                    )
+                }
+            }
+        }
+        
+        voiceAlertManager.speak("Chat opened")
+    }
+    
+    private fun sendMessage() {
+        val messageText = binding.etMessage.text.toString().trim()
+        
+        if (messageText.isBlank()) {
+            binding.etMessage.error = "Enter a message"
+            return
+        }
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            val success = chatService.sendMessage(
+                conversationId ?: return@launch,
+                messageText,
+                currentUserId ?: return@launch,
+                currentUserRole ?: return@launch
+            )
+            
+            if (success) {
+                binding.etMessage.text.clear()
+                binding.etMessage.clearFocus()
+                voiceAlertManager.speak("Message sent")
+            } else {
+                Toast.makeText(requireContext(), "Failed to send message", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    
+    private fun toggleVoiceRecording() {
+        if (isRecording) {
+            stopVoiceRecording()
+        } else {
+            checkAudioPermissionAndStartRecording()
+        }
+    }
+    
+    private fun checkAudioPermissionAndStartRecording() {
+        when {
+            ContextCompat.checkSelfPermission(
+                requireContext(),
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED -> {
+                startVoiceRecording()
+            }
+            shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO) -> {
+                Toast.makeText(
+                    requireContext(),
+                    "Audio permission is required for voice notes",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            else -> {
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }
+    }
+    
+    private fun startVoiceRecording() {
+        try {
+            // Create recording file
+            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+            val fileName = "voice_note_$timestamp.3gp"
+            currentRecordingFile = File(requireContext().getExternalFilesDir(Environment.DIRECTORY_MUSIC), fileName)
+            
+            // Initialize media recorder
+            mediaRecorder = MediaRecorder().apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+                setOutputFile(currentRecordingFile?.absolutePath)
+            }
+            
+            mediaRecorder?.prepare()
+            mediaRecorder?.start()
+            
+            isRecording = true
+            updateVoiceRecordingUI()
+            
+            Toast.makeText(requireContext(), "Recording started", Toast.LENGTH_SHORT).show()
+            
+        } catch (e: IOException) {
+            Timber.e(e, "Error starting voice recording")
+            Toast.makeText(requireContext(), "Failed to start recording", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    private fun stopVoiceRecording() {
+        try {
+            mediaRecorder?.apply {
+                stop()
+                release()
+            }
+            
+            mediaRecorder = null
+            isRecording = false
+            updateVoiceRecordingUI()
+            
+            // Send voice note
+            currentRecordingFile?.let { file ->
+                viewLifecycleOwner.lifecycleScope.launch {
+                    val duration = System.currentTimeMillis() - (file.lastModified() ?: 0)
+                    val success = chatService.sendVoiceNote(
+                        conversationId ?: return@launch,
+                        file.absolutePath,
+                        duration,
+                        currentUserId ?: return@launch,
+                        currentUserRole ?: return@launch
+                    )
+                    
+                    if (success) {
+                        Toast.makeText(requireContext(), "Voice note sent", Toast.LENGTH_SHORT).show()
+                        voiceAlertManager.speak("Voice note sent")
+                    } else {
+                        Toast.makeText(requireContext(), "Failed to send voice note", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error stopping voice recording")
+        }
+    }
+    
+    private fun updateVoiceRecordingUI() {
+        if (isRecording) {
+            binding.btnVoice.setImageResource(R.drawable.ic_stop_recording)
+            binding.btnVoice.setBackgroundColor(
+                ContextCompat.getColor(requireContext(), R.color.recording_active)
+            )
+            binding.tvRecordingStatus.visibility = View.VISIBLE
+            binding.tvRecordingStatus.text = "Recording..."
+        } else {
+            binding.btnVoice.setImageResource(R.drawable.ic_mic)
+            binding.btnVoice.setBackgroundColor(
+                ContextCompat.getColor(requireContext(), R.color.chat_button_bg)
+            )
+            binding.tvRecordingStatus.visibility = View.GONE
+        }
+    }
+    
+    private fun checkFilePermissionAndOpenPicker() {
+        when {
+            ContextCompat.checkSelfPermission(
+                requireContext(),
+                Manifest.permission.READ_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED -> {
+                openFilePicker()
+            }
+            shouldShowRequestPermissionRationale(Manifest.permission.READ_EXTERNAL_STORAGE) -> {
+                Toast.makeText(
+                    requireContext(),
+                    "File access permission is required",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            else -> {
+                filePermissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+        }
+    }
+    
+    private fun openFilePicker() {
+        // Implementation would open file picker
+        Toast.makeText(requireContext(), "File picker opened", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun shareLocation() {
+        // Get current location (implementation would use location services)
+        val location = LocationData(
+            latitude = 24.7136, // Example: Riyadh
+            longitude = 46.6753,
+            address = "Riyadh, Saudi Arabia",
+            timestamp = System.currentTimeMillis()
+        )
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            val success = chatService.shareLocation(
+                conversationId ?: return@launch,
+                location.latitude,
+                location.longitude,
+                location.address,
+                currentUserId ?: return@launch,
+                currentUserRole ?: return@launch
+            )
+            
+            if (success) {
+                Toast.makeText(requireContext(), "Location shared", Toast.LENGTH_SHORT).show()
+                voiceAlertManager.speak("Location shared")
+            } else {
+                Toast.makeText(requireContext(), "Failed to share location", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    
+    private fun sendEmergencyBroadcast() {
+        val message = binding.etEmergencyMessage.text.toString().trim()
+        
+        if (message.isBlank()) {
+            binding.etEmergencyMessage.error = "Enter emergency message"
+            return
+        }
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            val success = chatService.sendEmergencyBroadcast(
+                message,
+                EmergencyPriority.HIGH,
+                currentUserId ?: return@launch,
+                currentUserRole ?: return@launch
+            )
+            
+            if (success) {
+                binding.etEmergencyMessage.text.clear()
+                binding.layoutEmergencyMessage.visibility = View.GONE
+                Toast.makeText(requireContext(), "Emergency broadcast sent", Toast.LENGTH_SHORT).show()
+                voiceAlertManager.speak("Emergency broadcast sent")
+            } else {
+                Toast.makeText(requireContext(), "Failed to send emergency broadcast", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    
+    private fun clearChatHistory() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Implementation would clear chat history
+            Toast.makeText(requireContext(), "Chat history cleared", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    private fun sendTypingIndicator(isTyping: Boolean) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            chatService.sendTypingIndicator(
+                conversationId ?: return@launch,
+                currentUserId ?: return@launch,
+                isTyping
+            )
+        }
+    }
+    
+    private fun updateTypingIndicator(typingUsers: Map<String, TypingIndicator>) {
+        val conversationTypingUsers = typingUsers.filter { 
+            it.value.conversationId == conversationId && it.value.isTyping 
+        }
+        
+        if (conversationTypingUsers.isNotEmpty()) {
+            val typingNames = conversationTypingUsers.values.joinToString(", ") { "Someone is typing" }
+            binding.typingIndicator.text = typingNames
+            binding.typingIndicator.visibility = View.VISIBLE
+        } else {
+            binding.typingIndicator.visibility = View.GONE
+        }
+    }
+    
+    private fun updateOnlineStatusUI(onlineUsers: Set<String> = emptySet()) {
+        val isOnline = currentUserId?.let { userId ->
+            onlineUsers.contains(userId)
+        } ?: false
+        
+        if (isOnline) {
+            binding.viewOnlineStatus.setBackgroundColor(
+                ContextCompat.getColor(requireContext(), R.color.online_status)
+            )
+            binding.tvOnlineStatus.text = "Online"
+        } else {
+            binding.viewOnlineStatus.setBackgroundColor(
+                ContextCompat.getColor(requireContext(), R.color.offline_status)
+            )
+            binding.tvOnlineStatus.text = "Offline"
+        }
+    }
+    
+    private fun updateEmptyState(isEmpty: Boolean) {
+        if (isEmpty) {
+            binding.recyclerViewMessages.visibility = View.GONE
+            binding.layoutEmptyState.visibility = View.VISIBLE
+        } else {
+            binding.recyclerViewMessages.visibility = View.VISIBLE
+            binding.layoutEmptyState.visibility = View.GONE
+        }
+    }
+    
+    private fun onMessageClicked(message: ChatMessage) {
+        when (message.messageType) {
+            MessageType.IMAGE, MessageType.VIDEO -> {
+                // Open media viewer
+                Toast.makeText(requireContext(), "Opening media", Toast.LENGTH_SHORT).show()
+            }
+            MessageType.FILE -> {
+                // Open file
+                Toast.makeText(requireContext(), "Opening file", Toast.LENGTH_SHORT).show()
+            }
+            MessageType.VOICE_NOTE -> {
+                // Play voice note
+                Toast.makeText(requireContext(), "Playing voice note", Toast.LENGTH_SHORT).show()
+            }
+            MessageType.LOCATION -> {
+                // Open map
+                Toast.makeText(requireContext(), "Opening location", Toast.LENGTH_SHORT).show()
+            }
+            else -> {
+                // Show message options
+                showMessageOptions(message)
+            }
+        }
+    }
+    
+    private fun showMessageOptions(message: ChatMessage) {
+        // Implementation would show message options dialog
+        Toast.makeText(requireContext(), "Message options", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun handleNewMessage(message: ChatMessage) {
+        if (message.conversationId == conversationId) {
+            // Add message to adapter
+            messageAdapter.addMessage(message)
+            
+            // Scroll to bottom
+            binding.recyclerViewMessages.scrollToPosition(messageAdapter.itemCount - 1)
+            
+            // Play notification sound
+            voiceAlertManager.speak("New message received")
+            
+            // Mark as read if from current user
+            if (message.senderId == currentUserId) {
+                viewLifecycleOwner.lifecycleScope.launch {
+                    chatService.markMessagesAsRead(
+                        message.conversationId,
+                        listOf(message.id),
+                        currentUserId ?: ""
+                    )
+                }
+            }
+        }
+    }
+    
+    private fun handleMessageDelivered(messageId: String) {
+        // Update message delivery status
+        messageAdapter.updateMessageDeliveryStatus(messageId)
+    }
+    
+    private fun handleEmergencyBroadcast(emergencyMessage: EmergencyMessage) {
+        // Show emergency dialog
+        voiceAlertManager.speak("Emergency broadcast received")
+        
+        // Implementation would show emergency dialog with message details
+        Toast.makeText(
+            requireContext(),
+            "Emergency: ${emergencyMessage.message}",
+            Toast.LENGTH_LONG
+        ).show()
+    }
+    
+    private fun handleTypingChanged(indicator: TypingIndicator) {
+        if (indicator.conversationId == conversationId) {
+            updateTypingIndicator(mapOf(indicator.userId to indicator))
+        }
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        
+        // Stop recording if active
+        if (isRecording) {
+            stopVoiceRecording()
+        }
+        
+        // Cleanup
+        mediaRecorder?.release()
+        mediaRecorder = null
+        
+        voiceAlertManager.cleanup()
+        _binding = null
+    }
+    
+    // Extension for dp to pixels
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+}

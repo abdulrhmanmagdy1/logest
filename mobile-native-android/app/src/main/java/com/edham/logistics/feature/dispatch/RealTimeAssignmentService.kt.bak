@@ -1,0 +1,621 @@
+package com.edham.logistics.feature.dispatch
+
+import android.util.Log
+import com.edham.logistics.data.model.Driver
+import com.edham.logistics.data.model.Shipment
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Real-time Assignment Service - Advanced real-time driver assignment
+ * Provides instant, intelligent driver assignments with real-time updates
+ */
+class RealTimeAssignmentService {
+    
+    companion object {
+        private const val TAG = "RealTimeAssignmentService"
+        
+        // Assignment strategies
+        enum class AssignmentStrategy {
+            IMMEDIATE_BEST_MATCH,     // Assign immediately to best available driver
+            REAL_TIME_BIDDING,        // Real-time driver bidding system
+            PRIORITY_BASED,           // Priority-based assignment
+            LOAD_BALANCED,             // Load-balanced assignment
+            PROXIMITY_BASED,          // Proximity-based assignment
+            PERFORMANCE_BASED,         // Performance-based assignment
+            HYBRID_INTELLIGENT        // Hybrid intelligent assignment
+        }
+        
+        // Assignment status
+        enum class AssignmentStatus {
+            PENDING,                   // Assignment pending driver acceptance
+            ACCEPTED,                  // Driver accepted assignment
+            REJECTED,                  // Driver rejected assignment
+            EXPIRED,                   // Assignment expired
+            COMPLETED,                 // Assignment completed
+            CANCELLED                  // Assignment cancelled
+        }
+        
+        // Notification types
+        enum class NotificationType {
+            ASSIGNMENT_OFFER,         // New assignment offer
+            ASSIGNMENT_ACCEPTED,        // Assignment accepted by driver
+            ASSIGNMENT_REJECTED,        // Assignment rejected by driver
+            ASSIGNMENT_EXPIRED,         // Assignment expired
+            ASSIGNMENT_UPDATED,         // Assignment details updated
+            DRIVER_LOCATION_UPDATE      // Driver location update
+        }
+    }
+    
+    /**
+     * Perform real-time assignment
+     */
+    suspend fun performRealTimeAssignment(
+        shipment: Shipment,
+        availableDrivers: List<Driver>,
+        strategy: AssignmentStrategy = AssignmentStrategy.HYBRID_INTELLIGENT,
+        currentTime: LocalDateTime = LocalDateTime.now()
+    ): RealTimeAssignmentResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Performing real-time assignment for shipment ${shipment.id}")
+                
+                // Filter eligible drivers
+                val eligibleDrivers = filterEligibleDrivers(shipment, availableDrivers, currentTime)
+                
+                if (eligibleDrivers.isEmpty()) {
+                    return RealTimeAssignmentResult.createNoDriversAvailable(shipment.id, currentTime)
+                }
+                
+                // Apply assignment strategy
+                val assignmentCandidates = when (strategy) {
+                    AssignmentStrategy.IMMEDIATE_BEST_MATCH -> findImmediateBestMatch(shipment, eligibleDrivers, currentTime)
+                    AssignmentStrategy.REAL_TIME_BIDDING -> initiateRealTimeBidding(shipment, eligibleDrivers, currentTime)
+                    AssignmentStrategy.PRIORITY_BASED -> performPriorityBasedAssignment(shipment, eligibleDrivers, currentTime)
+                    AssignmentStrategy.LOAD_BALANCED -> performLoadBalancedAssignment(shipment, eligibleDrivers, currentTime)
+                    AssignmentStrategy.PROXIMITY_BASED -> performProximityBasedAssignment(shipment, eligibleDrivers, currentTime)
+                    AssignmentStrategy.PERFORMANCE_BASED -> performPerformanceBasedAssignment(shipment, eligibleDrivers, currentTime)
+                    AssignmentStrategy.HYBRID_INTELLIGENT -> performHybridIntelligentAssignment(shipment, eligibleDrivers, currentTime)
+                }
+                
+                // Send assignment notifications
+                val notifications = sendAssignmentNotifications(assignmentCandidates, shipment, currentTime)
+                
+                // Create assignment result
+                val result = RealTimeAssignmentResult(
+                    shipmentId = shipment.id,
+                    assignmentCandidates = assignmentCandidates,
+                    strategy = strategy,
+                    notifications = notifications,
+                    totalDriversContacted = assignmentCandidates.size,
+                    estimatedResponseTime = calculateEstimatedResponseTime(assignmentCandidates, strategy),
+                    requiresManualIntervention = assignmentCandidates.isEmpty(),
+                    assignmentInitiatedAt = currentTime,
+                    status = when {
+                        assignmentCandidates.isNotEmpty() -> AssignmentStatus.PENDING
+                        else -> AssignmentStatus.CANCELLED
+                    }
+                )
+                
+                Log.d(TAG, "Real-time assignment initiated for ${assignmentCandidates.size} drivers")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in real-time assignment", e)
+                RealTimeAssignmentResult.createError(shipment.id, currentTime)
+            }
+        }
+    }
+    
+    /**
+     * Filter eligible drivers for assignment
+     */
+    private fun filterEligibleDrivers(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): List<Driver> {
+        return drivers.filter { driver ->
+            // Check availability
+            driver.status == Driver.Status.AVAILABLE
+            
+            // Check working hours
+            val isWithinWorkingHours = isDriverWithinWorkingHours(driver, currentTime)
+            if (!isWithinWorkingHours) return@filter false
+            
+            // Check capacity
+            val currentLoad = driver.activeShipments ?: 0
+            if (currentLoad >= driver.maxConcurrentShipments) return@filter false
+            
+            // Check vehicle requirements
+            val vehicle = driver.vehicle
+            if (vehicle != null) {
+                // Check weight capacity
+                if (shipment.weight > vehicle.maxWeight) return@filter false
+                
+                // Check volume capacity
+                if (shipment.volume > vehicle.maxVolume) return@filter false
+                
+                // Check special requirements
+                if (shipment.requiresRefrigeration && !vehicle.hasRefrigeration) return@filter false
+                if (shipment.isHazardous && !vehicle.isHazardousCertified) return@filter false
+            }
+            
+            // Check driver skills
+            val requiredSkills = shipment.requiredSkills ?: emptyList()
+            val driverSkills = driver.skills ?: emptyList()
+            val hasRequiredSkills = requiredSkills.all { required ->
+                driverSkills.any { skill -> skill.equals(required, ignoreCase = true) }
+            }
+            if (!hasRequiredSkills) return@filter false
+            
+            // Check experience requirements
+            val requiredExperience = shipment.minExperienceLevel ?: 0
+            if (driver.experienceYears < requiredExperience) return@filter false
+            
+            true
+        }
+    }
+    
+    /**
+     * Find immediate best match
+     */
+    private fun findImmediateBestMatch(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): List<AssignmentCandidate> {
+        val scoredDrivers = drivers.map { driver ->
+            val score = calculateDriverScore(shipment, driver)
+            AssignmentCandidate(
+                driverId = driver.id,
+                driverName = driver.name,
+                score = score,
+                estimatedResponseTime = calculateDriverResponseTime(driver),
+                confidence = calculateAssignmentConfidence(shipment, driver),
+                assignmentOfferSentAt = currentTime,
+                status = AssignmentStatus.PENDING
+            )
+        }
+        
+        // Sort by score (highest first) and return top candidate
+        val bestCandidate = scoredDrivers.maxByOrNull { it.score }
+        
+        return if (bestCandidate != null) {
+            listOf(bestCandidate)
+        } else {
+            emptyList()
+        }
+    }
+    
+    /**
+     * Initiate real-time bidding
+     */
+    private fun initiateRealTimeBidding(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): List<AssignmentCandidate> {
+        return drivers.map { driver ->
+            AssignmentCandidate(
+                driverId = driver.id,
+                driverName = driver.name,
+                score = calculateDriverScore(shipment, driver),
+                estimatedResponseTime = calculateDriverResponseTime(driver),
+                confidence = calculateAssignmentConfidence(shipment, driver),
+                assignmentOfferSentAt = currentTime,
+                status = AssignmentStatus.PENDING,
+                biddingEnabled = true,
+                bidDeadline = currentTime.plusMinutes(15) // 15-minute bidding window
+            )
+        }
+    }
+    
+    /**
+     * Perform priority-based assignment
+     */
+    private fun performPriorityBasedAssignment(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): List<AssignmentCandidate> {
+        val priorityOrder = mapOf(
+            "URGENT" to 4,
+            "HIGH" to 3,
+            "NORMAL" to 2,
+            "LOW" to 1
+        )
+        
+        val shipmentPriority = priorityOrder[shipment.priority.uppercase()] ?: 2
+        
+        return drivers.map { driver ->
+            val driverPriority = when {
+                driver.rating != null && driver.rating >= 4.5 -> 4
+                driver.rating != null && driver.rating >= 4.0 -> 3
+                driver.rating != null && driver.rating >= 3.5 -> 2
+                else -> 1
+            }
+            
+            val score = calculateDriverScore(shipment, driver) * (driverPriority.toDouble() / shipmentPriority)
+            
+            AssignmentCandidate(
+                driverId = driver.id,
+                driverName = driver.name,
+                score = score,
+                estimatedResponseTime = calculateDriverResponseTime(driver),
+                confidence = calculateAssignmentConfidence(shipment, driver),
+                assignmentOfferSentAt = currentTime,
+                status = AssignmentStatus.PENDING
+            )
+        }.sortedByDescending { it.score }.take(3) // Top 3 candidates
+    }
+    
+    /**
+     * Perform load-balanced assignment
+     */
+    private fun performLoadBalancedAssignment(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): List<AssignmentCandidate> {
+        return drivers.map { driver ->
+            val currentLoad = driver.activeShipments ?: 0
+            val maxLoad = driver.maxConcurrentShipments
+            val loadRatio = currentLoad.toDouble() / maxLoad
+            
+            // Lower load ratio gets higher score
+            val loadScore = (1.0 - loadRatio) * 100
+            
+            val totalScore = calculateDriverScore(shipment, driver) + loadScore
+            
+            AssignmentCandidate(
+                driverId = driver.id,
+                driverName = driver.name,
+                score = totalScore,
+                estimatedResponseTime = calculateDriverResponseTime(driver),
+                confidence = calculateAssignmentConfidence(shipment, driver),
+                assignmentOfferSentAt = currentTime,
+                status = AssignmentStatus.PENDING,
+                currentLoad = currentLoad,
+                maxLoad = maxLoad
+            )
+        }.sortedByDescending { it.score }.take(3) // Top 3 candidates
+    }
+    
+    /**
+     * Perform proximity-based assignment
+     */
+    private fun performProximityBasedAssignment(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): List<AssignmentCandidate> {
+        return drivers.map { driver ->
+            val distance = calculateDriverToShipmentDistance(driver, shipment)
+            val proximityScore = maxOf(0, 100 - distance) // Closer is better
+            
+            val totalScore = calculateDriverScore(shipment, driver) + proximityScore
+            
+            AssignmentCandidate(
+                driverId = driver.id,
+                driverName = driver.name,
+                score = totalScore,
+                estimatedResponseTime = calculateDriverResponseTime(driver),
+                confidence = calculateAssignmentConfidence(shipment, driver),
+                assignmentOfferSentAt = currentTime,
+                status = AssignmentStatus.PENDING,
+                distanceToShipment = distance
+            )
+        }.sortedByDescending { it.score }.take(3) // Top 3 candidates
+    }
+    
+    /**
+     * Perform performance-based assignment
+     */
+    private fun performPerformanceBasedAssignment(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): List<AssignmentCandidate> {
+        return drivers.map { driver ->
+            val performanceScore = calculateDriverPerformanceScore(driver)
+            val totalScore = calculateDriverScore(shipment, driver) + performanceScore
+            
+            AssignmentCandidate(
+                driverId = driver.id,
+                driverName = driver.name,
+                score = totalScore,
+                estimatedResponseTime = calculateDriverResponseTime(driver),
+                confidence = calculateAssignmentConfidence(shipment, driver),
+                assignmentOfferSentAt = currentTime,
+                status = AssignmentStatus.PENDING,
+                performanceScore = performanceScore
+            )
+        }.sortedByDescending { it.score }.take(3) // Top 3 candidates
+    }
+    
+    /**
+     * Perform hybrid intelligent assignment
+     */
+    private fun performHybridIntelligentAssignment(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): List<AssignmentCandidate> {
+        return drivers.map { driver ->
+            val baseScore = calculateDriverScore(shipment, driver)
+            val proximityScore = calculateProximityScore(driver, shipment)
+            val performanceScore = calculateDriverPerformanceScore(driver)
+            val loadScore = calculateLoadBalanceScore(driver)
+            
+            // Weighted combination of all factors
+            val hybridScore = (
+                baseScore * 0.4 +      // 40% base compatibility
+                proximityScore * 0.25 +  // 25% proximity
+                performanceScore * 0.2 + // 20% performance
+                loadScore * 0.15          // 15% load balance
+            )
+            
+            AssignmentCandidate(
+                driverId = driver.id,
+                driverName = driver.name,
+                score = hybridScore,
+                estimatedResponseTime = calculateDriverResponseTime(driver),
+                confidence = calculateAssignmentConfidence(shipment, driver),
+                assignmentOfferSentAt = currentTime,
+                status = AssignmentStatus.PENDING,
+                distanceToShipment = calculateDriverToShipmentDistance(driver, shipment),
+                performanceScore = performanceScore,
+                currentLoad = driver.activeShipments ?: 0,
+                maxLoad = driver.maxConcurrentShipments
+            )
+        }.sortedByDescending { it.score }.take(5) // Top 5 candidates
+    }
+    
+    /**
+     * Calculate driver score for shipment
+     */
+    private fun calculateDriverScore(shipment: Shipment, driver: Driver): Double {
+        var score = 50.0 // Base score
+        
+        // Driver rating
+        driver.rating?.let { rating ->
+            score += (rating - 3.0) * 20 // Rating above 3.0 increases score
+        }
+        
+        // Experience
+        score += minOf(20.0, driver.experienceYears * 2.0)
+        
+        // Skills match
+        val requiredSkills = shipment.requiredSkills ?: emptyList()
+        val driverSkills = driver.skills ?: emptyList()
+        val matchedSkills = requiredSkills.count { required ->
+            driverSkills.any { skill -> skill.equals(required, ignoreCase = true) }
+        }
+        score += matchedSkills * 10.0
+        
+        // Vehicle compatibility
+        driver.vehicle?.let { vehicle ->
+            if (shipment.weight <= vehicle.maxWeight) score += 10.0
+            if (shipment.volume <= vehicle.maxVolume) score += 10.0
+            if (shipment.requiresRefrigeration && vehicle.hasRefrigeration) score += 15.0
+            if (shipment.isHazardous && vehicle.isHazardousCertified) score += 15.0
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate driver response time
+     */
+    private fun calculateDriverResponseTime(driver: Driver): Int {
+        // Base response time in minutes
+        var responseTime = 5
+        
+        // Adjust based on driver status
+        when (driver.status) {
+            Driver.Status.AVAILABLE -> responseTime
+            Driver.Status.ON_DUTY -> responseTime + 2
+            Driver.Status.BREAK -> responseTime + 10
+            else -> responseTime + 15
+        }
+        
+        // Adjust based on rating
+        driver.rating?.let { rating ->
+            if (rating >= 4.5) responseTime -= 2
+            else if (rating < 3.5) responseTime += 3
+        }
+        
+        return responseTime.coerceAtLeast(1)
+    }
+    
+    /**
+     * Calculate assignment confidence
+     */
+    private fun calculateAssignmentConfidence(shipment: Shipment, driver: Driver): Double {
+        var confidence = 70.0 // Base confidence
+        
+        // Data completeness
+        if (driver.rating != null) confidence += 10.0
+        if (driver.currentLocation != null) confidence += 10.0
+        if (driver.vehicle != null) confidence += 5.0
+        
+        // Driver quality
+        driver.rating?.let { rating ->
+            if (rating >= 4.0) confidence += 5.0
+        }
+        
+        return confidence.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Send assignment notifications
+     */
+    private fun sendAssignmentNotifications(
+        candidates: List<AssignmentCandidate>,
+        shipment: Shipment,
+        currentTime: LocalDateTime
+    ): List<AssignmentNotification> {
+        return candidates.map { candidate ->
+            AssignmentNotification(
+                driverId = candidate.driverId,
+                shipmentId = shipment.id,
+                notificationType = NotificationType.ASSIGNMENT_OFFER,
+                sentAt = currentTime,
+                message = generateAssignmentMessage(shipment, candidate),
+                requiresResponse = true,
+                responseDeadline = candidate.bidDeadline ?: currentTime.plusMinutes(10)
+            )
+        }
+    }
+    
+    /**
+     * Calculate estimated response time
+     */
+    private fun calculateEstimatedResponseTime(
+        candidates: List<AssignmentCandidate>,
+        strategy: AssignmentStrategy
+    ): Int {
+        return when (strategy) {
+            AssignmentStrategy.IMMEDIATE_BEST_MATCH -> candidates.firstOrNull()?.estimatedResponseTime ?: 10
+            AssignmentStrategy.REAL_TIME_BIDDING -> 15 // Bidding window
+            else -> candidates.map { it.estimatedResponseTime }.average().toInt()
+        }
+    }
+    
+    // Helper methods
+    
+    private fun isDriverWithinWorkingHours(driver: Driver, currentTime: LocalDateTime): Boolean {
+        val now = currentTime
+        val preferredStart = driver.preferredStartTime
+        val preferredEnd = driver.preferredEndTime
+        
+        return if (preferredStart != null && preferredEnd != null) {
+            !now.isBefore(preferredStart) && !now.isAfter(preferredEnd)
+        } else {
+            true // No preferred hours specified
+        }
+    }
+    
+    private fun calculateDriverToShipmentDistance(driver: Driver, shipment: Shipment): Double {
+        // Simplified distance calculation
+        return 20.0 // Placeholder - would use actual distance calculation
+    }
+    
+    private fun calculateProximityScore(driver: Driver, shipment: Shipment): Double {
+        val distance = calculateDriverToShipmentDistance(driver, shipment)
+        return maxOf(0, 100 - distance)
+    }
+    
+    private fun calculateDriverPerformanceScore(driver: Driver): Double {
+        var score = 50.0
+        
+        // Rating contribution
+        driver.rating?.let { rating ->
+            score += (rating - 3.0) * 25
+        }
+        
+        // Experience contribution
+        score += minOf(15.0, driver.experienceYears * 1.5)
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    private fun calculateLoadBalanceScore(driver: Driver): Double {
+        val currentLoad = driver.activeShipments ?: 0
+        val maxLoad = driver.maxConcurrentShipments
+        val loadRatio = currentLoad.toDouble() / maxLoad
+        return (1.0 - loadRatio) * 100
+    }
+    
+    private fun generateAssignmentMessage(shipment: Shipment, candidate: AssignmentCandidate): String {
+        return "New shipment assignment: ${shipment.id}. Estimated completion: ${shipment.estimatedDeliveryTime}. Please respond within ${candidate.estimatedResponseTime} minutes."
+    }
+}
+
+/**
+ * Assignment candidate data class
+ */
+data class AssignmentCandidate(
+    val driverId: String,
+    val driverName: String,
+    val score: Double,
+    val estimatedResponseTime: Int,
+    val confidence: Double,
+    val assignmentOfferSentAt: LocalDateTime,
+    val status: RealTimeAssignmentService.AssignmentStatus,
+    val biddingEnabled: Boolean = false,
+    val bidDeadline: LocalDateTime? = null,
+    val distanceToShipment: Double? = null,
+    val performanceScore: Double? = null,
+    val currentLoad: Int? = null,
+    val maxLoad: Int? = null
+)
+
+/**
+ * Assignment notification data class
+ */
+data class AssignmentNotification(
+    val driverId: String,
+    val shipmentId: String,
+    val notificationType: RealTimeAssignmentService.NotificationType,
+    val sentAt: LocalDateTime,
+    val message: String,
+    val requiresResponse: Boolean,
+    val responseDeadline: LocalDateTime,
+    val respondedAt: LocalDateTime? = null,
+    val response: String? = null
+)
+
+/**
+ * Real-time assignment result data class
+ */
+data class RealTimeAssignmentResult(
+    val shipmentId: String,
+    val assignmentCandidates: List<AssignmentCandidate>,
+    val strategy: RealTimeAssignmentService.AssignmentStrategy,
+    val notifications: List<AssignmentNotification>,
+    val totalDriversContacted: Int,
+    val estimatedResponseTime: Int,
+    val requiresManualIntervention: Boolean,
+    val assignmentInitiatedAt: LocalDateTime,
+    val status: RealTimeAssignmentService.AssignmentStatus,
+    val selectedDriverId: String? = null,
+    val assignmentCompletedAt: LocalDateTime? = null,
+    val errorMessage: String? = null
+) {
+    companion object {
+        fun createNoDriversAvailable(shipmentId: String, currentTime: LocalDateTime): RealTimeAssignmentResult {
+            return RealTimeAssignmentResult(
+                shipmentId = shipmentId,
+                assignmentCandidates = emptyList(),
+                strategy = RealTimeAssignmentService.AssignmentStrategy.HYBRID_INTELLIGENT,
+                notifications = emptyList(),
+                totalDriversContacted = 0,
+                estimatedResponseTime = 0,
+                requiresManualIntervention = true,
+                assignmentInitiatedAt = currentTime,
+                status = RealTimeAssignmentService.AssignmentStatus.CANCELLED,
+                errorMessage = "No eligible drivers available for assignment"
+            )
+        }
+        
+        fun createError(shipmentId: String, currentTime: LocalDateTime): RealTimeAssignmentResult {
+            return RealTimeAssignmentResult(
+                shipmentId = shipmentId,
+                assignmentCandidates = emptyList(),
+                strategy = RealTimeAssignmentService.AssignmentStrategy.HYBRID_INTELLIGENT,
+                notifications = emptyList(),
+                totalDriversContacted = 0,
+                estimatedResponseTime = 0,
+                requiresManualIntervention = true,
+                assignmentInitiatedAt = currentTime,
+                status = RealTimeAssignmentService.AssignmentStatus.CANCELLED,
+                errorMessage = "Error occurred during assignment process"
+            )
+        }
+    }
+}

@@ -1,0 +1,499 @@
+package com.edham.logistics.presentation.notifications
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.notifications.*
+import com.edham.logistics.domain.notifications.*
+import com.edham.logistics.data.notifications.*
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Notification ViewModel - MVVM ViewModel for notification operations
+ * Manages UI state and business logic for notification features
+ */
+@HiltViewModel
+class NotificationViewModel @Inject constructor(
+    private val smartNotificationUseCases: SmartNotificationUseCases,
+    private val smartNotificationRepository: SmartNotificationRepository
+) : ViewModel() {
+
+    // UI State Flows
+    private val _uiState = MutableStateFlow(NotificationUiState())
+    val uiState: StateFlow<NotificationUiState> = _uiState.asStateFlow()
+
+    // Notification Lists
+    val notifications = smartNotificationRepository.getAllNotifications()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    val unreadNotifications = smartNotificationRepository.getUnreadNotifications()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    val notificationGroups = smartNotificationRepository.getNotificationGroups()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyMap()
+        )
+
+    val userPreferences = smartNotificationRepository.getUserPreferences()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = getDefaultPreferences()
+        )
+
+    // Statistics
+    private val _statistics = MutableStateFlow<NotificationStatistics?>(null)
+    val statistics: StateFlow<NotificationStatistics?> = _statistics.asStateFlow()
+
+    private val _insights = MutableStateFlow<NotificationInsights?>(null)
+    val insights: StateFlow<NotificationInsights?> = _insights.asStateFlow()
+
+    // Search and Filter
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
+
+    private val _selectedEvent = MutableStateFlow<NotificationEvent?>(null)
+    val selectedEvent: StateFlow<NotificationEvent?> = _selectedEvent.asStateFlow()
+
+    private val _selectedPriority = MutableStateFlow<NotificationPriority?>(null)
+    val selectedPriority: StateFlow<NotificationPriority?> = _selectedPriority.asStateFlow()
+
+    // Loading and Error States
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    private val _errorMessage = MutableStateFlow<String?>(null)
+    val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+
+    init {
+        loadNotificationData()
+        observeSearchAndFilter()
+    }
+
+    /**
+     * Show delay notification
+     */
+    fun showDelayNotification(
+        shipmentId: String,
+        delayMinutes: Int,
+        estimatedDelivery: java.util.Date
+    ) {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationUseCases.showDelayNotification(
+                shipmentId = shipmentId,
+                delayMinutes = delayMinutes,
+                estimatedDelivery = estimatedDelivery
+            ).fold(
+                onSuccess = { notification ->
+                    clearError()
+                    showMessage("تم إرسال إشعار التأخير بنجاح")
+                },
+                onFailure = { error ->
+                    showError("فشل في إرسال إشعار التأخير: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Show temperature notification
+     */
+    fun showTemperatureNotification(
+        shipmentId: String,
+        currentTemp: Double,
+        minTemp: Double,
+        maxTemp: Double,
+        location: String
+    ) {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationUseCases.showTemperatureNotification(
+                shipmentId = shipmentId,
+                currentTemp = currentTemp,
+                minTemp = minTemp,
+                maxTemp = maxTemp,
+                location = location
+            ).fold(
+                onSuccess = { notification ->
+                    clearError()
+                    showMessage("تم إرسال إشعار درجة الحرارة بنجاح")
+                },
+                onFailure = { error ->
+                    showError("فشل في إرسال إشعار درجة الحرارة: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Show payment overdue notification
+     */
+    fun showPaymentOverdueNotification(
+        invoiceId: String,
+        amount: Double,
+        dueDate: java.util.Date,
+        daysOverdue: Int
+    ) {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationUseCases.showPaymentOverdueNotification(
+                invoiceId = invoiceId,
+                amount = amount,
+                dueDate = dueDate,
+                daysOverdue = daysOverdue
+            ).fold(
+                onSuccess = { notification ->
+                    clearError()
+                    showMessage("تم إرسال إشعار الدفع المتأخر بنجاح")
+                },
+                onFailure = { error ->
+                    showError("فشل في إرسال إشعار الدفع المتأخر: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Mark notification as read
+     */
+    fun markNotificationAsRead(notificationId: String) {
+        viewModelScope.launch {
+            smartNotificationRepository.markNotificationAsRead(notificationId).fold(
+                onSuccess = { success ->
+                    if (success) {
+                        clearError()
+                    } else {
+                        showError("فشل في تحديث حالة الإشعار")
+                    }
+                },
+                onFailure = { error ->
+                    showError("فشل في تحديث حالة الإشعار: ${error.message}")
+                }
+            )
+        }
+    }
+
+    /**
+     * Mark all notifications as read
+     */
+    fun markAllNotificationsAsRead() {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationRepository.markAllNotificationsAsRead().fold(
+                onSuccess = { count ->
+                    clearError()
+                    showMessage("تم تحديث $count إشعار كمقروء")
+                },
+                onFailure = { error ->
+                    showError("فشل في تحديث الإشعارات: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Delete notification
+     */
+    fun deleteNotification(notificationId: String) {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationRepository.deleteNotification(notificationId).fold(
+                onSuccess = { success ->
+                    if (success) {
+                        clearError()
+                        showMessage("تم حذف الإشعار بنجاح")
+                    } else {
+                        showError("فشل في حذف الإشعار")
+                    }
+                },
+                onFailure = { error ->
+                    showError("فشل في حذف الإشعار: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Clear all notifications
+     */
+    fun clearAllNotifications() {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationRepository.clearAllNotifications().fold(
+                onSuccess = {
+                    clearError()
+                    showMessage("تم مسح جميع الإشعارات بنجاح")
+                },
+                onFailure = { error ->
+                    showError("فشل في مسح الإشعارات: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Update user preferences
+     */
+    fun updateUserPreferences(preferences: NotificationPreferences) {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationUseCases.updateUserPreferences(preferences).fold(
+                onSuccess = {
+                    clearError()
+                    showMessage("تم تحديث تفضيلات الإشعارات بنجاح")
+                },
+                onFailure = { error ->
+                    showError("فشل في تحديث التفضيلات: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Update single preference
+     */
+    fun updatePreference(key: String, value: Any) {
+        viewModelScope.launch {
+            smartNotificationRepository.updatePreference(key, value).fold(
+                onSuccess = {
+                    clearError()
+                },
+                onFailure = { error ->
+                    showError("فشل في تحديث التفضيلات: ${error.message}")
+                }
+            )
+        }
+    }
+
+    /**
+     * Search notifications
+     */
+    fun searchNotifications(query: String) {
+        _searchQuery.value = query
+    }
+
+    /**
+     * Filter by event type
+     */
+    fun filterByEvent(event: NotificationEvent?) {
+        _selectedEvent.value = event
+    }
+
+    /**
+     * Filter by priority
+     */
+    fun filterByPriority(priority: NotificationPriority?) {
+        _selectedPriority.value = priority
+    }
+
+    /**
+     * Clear filters
+     */
+    fun clearFilters() {
+        _searchQuery.value = ""
+        _selectedEvent.value = null
+        _selectedPriority.value = null
+    }
+
+    /**
+     * Load notification data
+     */
+    fun loadNotificationData() {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            try {
+                // Load statistics
+                val stats = smartNotificationUseCases.getNotificationStatistics()
+                _statistics.value = stats
+                
+                // Load insights
+                val insights = smartNotificationUseCases.getNotificationInsights()
+                _insights.value = insights
+                
+                clearError()
+            } catch (e: Exception) {
+                showError("فشل في تحميل بيانات الإشعارات: ${e.message}")
+            } finally {
+                setLoading(false)
+            }
+        }
+    }
+
+    /**
+     * Refresh data
+     */
+    fun refresh() {
+        loadNotificationData()
+    }
+
+    /**
+     * Export notifications
+     */
+    fun exportNotifications(format: ExportFormat = ExportFormat.JSON) {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationRepository.exportNotifications(format).fold(
+                onSuccess = { result ->
+                    clearError()
+                    showMessage("تم تصدير ${result.recordCount} إشعار بنجاح")
+                },
+                onFailure = { error ->
+                    showError("فشل في تصدير الإشعارات: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Reset preferences to defaults
+     */
+    fun resetPreferencesToDefaults() {
+        viewModelScope.launch {
+            setLoading(true)
+            
+            smartNotificationUseCases.resetPreferencesToDefaults().fold(
+                onSuccess = {
+                    clearError()
+                    showMessage("تم إعادة تعيين التفضيلات إلى الافتراضية")
+                },
+                onFailure = { error ->
+                    showError("فشل في إعادة تعيين التفضيلات: ${error.message}")
+                }
+            )
+            
+            setLoading(false)
+        }
+    }
+
+    /**
+     * Observe search and filter changes
+     */
+    private fun observeSearchAndFilter() {
+        viewModelScope.launch {
+            combine(
+                _searchQuery,
+                _selectedEvent,
+                _selectedPriority
+            ) { query, event, priority ->
+                // Apply filters to notifications
+                // This would update the filtered notifications list
+            }.collect { }
+        }
+    }
+
+    /**
+     * Set loading state
+     */
+    private fun setLoading(loading: Boolean) {
+        _isLoading.value = loading
+    }
+
+    /**
+     * Show error message
+     */
+    private fun showError(message: String) {
+        _errorMessage.value = message
+        _uiState.value = _uiState.value.copy(
+            hasError = true,
+            errorMessage = message
+        )
+    }
+
+    /**
+     * Clear error
+     */
+    private fun clearError() {
+        _errorMessage.value = null
+        _uiState.value = _uiState.value.copy(
+            hasError = false,
+            errorMessage = null
+        )
+    }
+
+    /**
+     * Show success message
+     */
+    private fun showMessage(message: String) {
+        _uiState.value = _uiState.value.copy(
+            successMessage = message
+        )
+    }
+
+    /**
+     * Get default preferences
+     */
+    private fun getDefaultPreferences(): NotificationPreferences {
+        return NotificationPreferences(
+            shipmentAlerts = true,
+            paymentAlerts = true,
+            temperatureAlerts = true,
+            minDelayMinutes = 30,
+            minPaymentOverdueDays = 7,
+            autoReschedule = false,
+            paymentReminders = true,
+            quietHours = true,
+            quietStartHour = 22,
+            quietEndHour = 8,
+            groupSimilar = true,
+            maxNotificationsPerHour = 10,
+            notificationSound = true,
+            vibration = true,
+            ledIndicator = true,
+            priorityFilter = false,
+            allowedPriorities = setOf(
+                NotificationPriority.NORMAL,
+                NotificationPriority.HIGH,
+                NotificationPriority.CRITICAL
+            ),
+            customRules = emptyList()
+        )
+    }
+}
+
+/**
+ * UI State data class
+ */
+data class NotificationUiState(
+    val hasError: Boolean = false,
+    val errorMessage: String? = null,
+    val successMessage: String? = null,
+    val isRefreshing: Boolean = false
+)

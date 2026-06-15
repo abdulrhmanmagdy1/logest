@@ -10,6 +10,7 @@ class WorkshopRepository @Inject constructor(
 ) {
     suspend fun getWorkshopStats() = api.getWorkshopStats()
     suspend fun getInventory() = api.getInventory()
+    suspend fun getVehicles() = api.getVehicles()
     suspend fun requestPart(id: String, qty: Int, priority: String) = api.requestPart(id, qty, priority)
     suspend fun groundVehicle(id: String, reason: String) = api.groundVehicle(id, reason)
     suspend fun releaseVehicle(id: String) = api.releaseVehicle(id)

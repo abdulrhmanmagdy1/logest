@@ -1,0 +1,459 @@
+package com.edham.logistics.core.backup
+
+import android.content.Context
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import kotlinx.coroutines.*
+import java.io.*
+import java.security.*
+import java.util.*
+import javax.crypto.*
+import javax.crypto.spec.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Backup Encryption Service - Handles encryption and decryption of backup files
+ * Provides secure encryption using Android Keystore
+ */
+@Singleton
+class BackupEncryptionService @Inject constructor(
+    private val context: Context
+) {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // Encryption constants
+    private val KEY_ALIAS = "edham_logistics_backup_key"
+    private val ANDROID_KEYSTORE = "AndroidKeyStore"
+    private val ENCRYPTION_ALGORITHM = KeyProperties.KEY_ALGORITHM_AES
+    private val BLOCK_MODE = KeyProperties.BLOCK_MODE_GCM
+    private val PADDING = KeyProperties.ENCRYPTION_PADDING_PKCS7
+    private val GCM_IV_LENGTH = 12
+    private val GCM_TAG_LENGTH = 16
+
+    /**
+     * Encrypt data
+     */
+    suspend fun encrypt(data: ByteArray): ByteArray {
+        return withContext(Dispatchers.IO) {
+            try {
+                val secretKey = getOrCreateSecretKey()
+                val cipher = Cipher.getInstance("$ENCRYPTION_ALGORITHM/$BLOCK_MODE/$PADDING")
+                
+                cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+                
+                // Generate random IV
+                val iv = cipher.iv
+                
+                // Encrypt data
+                val encryptedData = cipher.doFinal(data)
+                
+                // Combine IV and encrypted data
+                val outputStream = ByteArrayOutputStream()
+                outputStream.write(iv)
+                outputStream.write(encryptedData)
+                
+                outputStream.toByteArray()
+                
+            } catch (e: Exception) {
+                throw BackupEncryptionException("Failed to encrypt data", e)
+            }
+        }
+    }
+
+    /**
+     * Decrypt data
+     */
+    suspend fun decrypt(encryptedData: ByteArray): ByteArray {
+        return withContext(Dispatchers.IO) {
+            try {
+                val secretKey = getOrCreateSecretKey()
+                val cipher = Cipher.getInstance("$ENCRYPTION_ALGORITHM/$BLOCK_MODE/$PADDING")
+                
+                // Extract IV from encrypted data
+                val iv = encryptedData.copyOfRange(0, GCM_IV_LENGTH)
+                val actualEncryptedData = encryptedData.copyOfRange(GCM_IV_LENGTH, encryptedData.size)
+                
+                // Initialize cipher for decryption
+                val gcmSpec = GCMParameterSpec(GCM_TAG_LENGTH * 8, iv)
+                cipher.init(Cipher.DECRYPT_MODE, secretKey, gcmSpec)
+                
+                // Decrypt data
+                cipher.doFinal(actualEncryptedData)
+                
+            } catch (e: Exception) {
+                throw BackupEncryptionException("Failed to decrypt data", e)
+            }
+        }
+    }
+
+    /**
+     * Encrypt file
+     */
+    suspend fun encryptFile(inputFile: File, outputFile: File): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val inputData = inputFile.readBytes()
+                val encryptedData = encrypt(inputData)
+                outputFile.writeBytes(encryptedData)
+                true
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Decrypt file
+     */
+    suspend fun decryptFile(inputFile: File, outputFile: File): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val encryptedData = inputFile.readBytes()
+                val decryptedData = decrypt(encryptedData)
+                outputFile.writeBytes(decryptedData)
+                true
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Encrypt with password
+     */
+    suspend fun encryptWithPassword(
+        data: ByteArray,
+        password: String
+    ): EncryptedData {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Generate salt
+                val salt = generateSalt()
+                
+                // Generate key from password
+                val secretKey = deriveKeyFromPassword(password, salt)
+                
+                // Generate IV
+                val iv = generateIv()
+                
+                // Initialize cipher
+                val cipher = Cipher.getInstance("$ENCRYPTION_ALGORITHM/CBC/PKCS5Padding")
+                val ivSpec = IvParameterSpec(iv)
+                cipher.init(Cipher.ENCRYPT_MODE, secretKey, ivSpec)
+                
+                // Encrypt data
+                val encryptedData = cipher.doFinal(data)
+                
+                EncryptedData(
+                    data = encryptedData,
+                    iv = iv,
+                    salt = salt,
+                    algorithm = ENCRYPTION_ALGORITHM,
+                    mode = "CBC",
+                    padding = "PKCS5Padding"
+                )
+                
+            } catch (e: Exception) {
+                throw BackupEncryptionException("Failed to encrypt data with password", e)
+            }
+        }
+    }
+
+    /**
+     * Decrypt with password
+     */
+    suspend fun decryptWithPassword(
+        encryptedData: EncryptedData,
+        password: String
+    ): ByteArray {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Derive key from password
+                val secretKey = deriveKeyFromPassword(password, encryptedData.salt)
+                
+                // Initialize cipher
+                val cipher = Cipher.getInstance("${encryptedData.algorithm}/${encryptedData.mode}/${encryptedData.padding}")
+                val ivSpec = IvParameterSpec(encryptedData.iv)
+                cipher.init(Cipher.DECRYPT_MODE, secretKey, ivSpec)
+                
+                // Decrypt data
+                cipher.doFinal(encryptedData.data)
+                
+            } catch (e: Exception) {
+                throw BackupEncryptionException("Failed to decrypt data with password", e)
+            }
+        }
+    }
+
+    /**
+     * Generate encryption key
+     */
+    suspend fun generateEncryptionKey(): String {
+        return withContext(Dispatchers.IO) {
+            try {
+                val keyGenerator = KeyGenerator.getInstance(ENCRYPTION_ALGORITHM)
+                keyGenerator.init(256)
+                val secretKey = keyGenerator.generateKey()
+                
+                // Encode key to Base64
+                android.util.Base64.encodeToString(secretKey.encoded, android.util.Base64.NO_WRAP)
+                
+            } catch (e: Exception) {
+                throw BackupEncryptionException("Failed to generate encryption key", e)
+            }
+        }
+    }
+
+    /**
+     * Validate encryption key
+     */
+    suspend fun validateEncryptionKey(keyString: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val keyBytes = android.util.Base64.decode(keyString, android.util.Base64.NO_WRAP)
+                val secretKey = SecretKeySpec(keyBytes, ENCRYPTION_ALGORITHM)
+                
+                // Try to use key for encryption/decryption
+                val cipher = Cipher.getInstance("$ENCRYPTION_ALGORITHM/ECB/PKCS5Padding")
+                cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+                
+                true
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Get or create secret key from Android Keystore
+     */
+    private fun getOrCreateSecretKey(): SecretKey {
+        return try {
+            // Try to get existing key
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+            keyStore.load(null)
+            
+            if (keyStore.containsAlias(KEY_ALIAS)) {
+                keyStore.getKey(KEY_ALIAS, null) as SecretKey
+            } else {
+                // Create new key
+                createSecretKey()
+            }
+            
+        } catch (e: Exception) {
+            throw BackupEncryptionException("Failed to get or create secret key", e)
+        }
+    }
+
+    /**
+     * Create new secret key in Android Keystore
+     */
+    private fun createSecretKey(): SecretKey {
+        return try {
+            val keyGenerator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                ANDROID_KEYSTORE
+            )
+            
+            val keyGenParameterSpec = KeyGenParameterSpec.Builder(
+                KEY_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_PKCS7)
+                .setUserAuthenticationRequired(false)
+                .build()
+            
+            keyGenerator.init(keyGenParameterSpec)
+            keyGenerator.generateKey()
+            
+        } catch (e: Exception) {
+            throw BackupEncryptionException("Failed to create secret key", e)
+        }
+    }
+
+    /**
+     * Derive key from password using PBKDF2
+     */
+    private fun deriveKeyFromPassword(password: String, salt: ByteArray): SecretKey {
+        return try {
+            val spec = PBEKeySpec(password, salt, 100000, 256)
+            val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+            val key = factory.generateSecret(spec)
+            SecretKeySpec(key.encoded, ENCRYPTION_ALGORITHM)
+            
+        } catch (e: Exception) {
+            throw BackupEncryptionException("Failed to derive key from password", e)
+        }
+    }
+
+    /**
+     * Generate random salt
+     */
+    private fun generateSalt(): ByteArray {
+        val salt = ByteArray(16)
+        SecureRandom().nextBytes(salt)
+        return salt
+    }
+
+    /**
+     * Generate random IV
+     */
+    private fun generateIv(): ByteArray {
+        val iv = ByteArray(16)
+        SecureRandom().nextBytes(iv)
+        return iv
+    }
+
+    /**
+     * Check if encryption is available
+     */
+    fun isEncryptionAvailable(): Boolean {
+        return try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+            keyStore.load(null)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Get encryption info
+     */
+    suspend fun getEncryptionInfo(): EncryptionInfo {
+        return withContext(Dispatchers.IO) {
+            EncryptionInfo(
+                algorithm = ENCRYPTION_ALGORITHM,
+                blockMode = BLOCK_MODE,
+                padding = PADDING,
+                keySize = 256,
+                available = isEncryptionAvailable(),
+                keyAlias = KEY_ALIAS,
+                keystore = ANDROID_KEYSTORE
+            )
+        }
+    }
+
+    /**
+     * Delete encryption key
+     */
+    suspend fun deleteEncryptionKey(): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+                keyStore.load(null)
+                
+                if (keyStore.containsAlias(KEY_ALIAS)) {
+                    keyStore.deleteEntry(KEY_ALIAS)
+                    true
+                } else {
+                    false
+                }
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Rotate encryption key
+     */
+    suspend fun rotateEncryptionKey(): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Delete existing key
+                deleteEncryptionKey()
+                
+                // Create new key
+                createSecretKey()
+                
+                true
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Test encryption/decryption
+     */
+    suspend fun testEncryption(): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val testData = "Test encryption data".toByteArray()
+                val encryptedData = encrypt(testData)
+                val decryptedData = decrypt(encryptedData)
+                
+                testData.contentEquals(decryptedData)
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Cleanup service
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Data classes and exceptions
+ */
+data class EncryptedData(
+    val data: ByteArray,
+    val iv: ByteArray,
+    val salt: ByteArray,
+    val algorithm: String,
+    val mode: String,
+    val padding: String
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        
+        other as EncryptedData
+        
+        if (!data.contentEquals(other.data)) return false
+        if (!iv.contentEquals(other.iv)) return false
+        if (!salt.contentEquals(other.salt)) return false
+        if (algorithm != other.algorithm) return false
+        if (mode != other.mode) return false
+        if (padding != other.padding) return false
+        
+        return true
+    }
+    
+    override fun hashCode(): Int {
+        var result = data.contentHashCode()
+        result = 31 * result + iv.contentHashCode()
+        result = 31 * result + salt.contentHashCode()
+        result = 31 * result + algorithm.hashCode()
+        result = 31 * result + mode.hashCode()
+        result = 31 * result + padding.hashCode()
+        return result
+    }
+}
+
+data class EncryptionInfo(
+    val algorithm: String,
+    val blockMode: String,
+    val padding: String,
+    val keySize: Int,
+    val available: Boolean,
+    val keyAlias: String,
+    val keystore: String
+)
+
+class BackupEncryptionException(message: String, cause: Throwable? = null) : Exception(message, cause)

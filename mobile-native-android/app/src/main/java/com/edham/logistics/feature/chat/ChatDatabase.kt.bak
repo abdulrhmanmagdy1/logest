@@ -1,0 +1,424 @@
+package com.edham.logistics.feature.chat
+
+import android.content.Context
+import androidx.room.*
+import androidx.sqlite.db.SupportSQLiteDatabase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+
+@Database(
+    entities = [
+        ChatMessage::class,
+        Conversation::class,
+        TypingIndicator::class,
+        ReadReceipt::class,
+        EmergencyMessage::class,
+        OnlineUser::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(Converters::class)
+abstract class ChatDatabase : RoomDatabase() {
+    
+    abstract fun messageDao(): MessageDao
+    abstract fun conversationDao(): ConversationDao
+    abstract fun typingIndicatorDao(): TypingIndicatorDao
+    abstract fun readReceiptDao(): ReadReceiptDao
+    abstract fun emergencyMessageDao(): EmergencyMessageDao
+    abstract fun onlineUserDao(): OnlineUserDao
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: ChatDatabase? = null
+        
+        fun getDatabase(context: Context): ChatDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    ChatDatabase::class.java,
+                    "chat_database"
+                )
+                .addCallback(DatabaseCallback())
+                .addMigrations(MIGRATION_1_2)
+                .build()
+                INSTANCE = instance
+                instance
+            }
+        }
+        
+        private class DatabaseCallback : RoomDatabase.Callback() {
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                super.onCreate(db)
+                // Create indexes for better performance
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_message_conversation_id ON chat_message (conversation_id)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_message_sender_id ON chat_message (sender_id)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_message_timestamp ON chat_message (timestamp)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_conversation_participant_id ON conversation (participant_ids)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_typing_conversation_id ON typing_indicator (conversation_id)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_read_receipt_message_id ON read_receipt (message_id)")
+            }
+        }
+        
+        // Migration for future schema changes
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                // Add new columns or tables as needed
+                // database.execSQL("ALTER TABLE chat_message ADD COLUMN new_column TEXT")
+            }
+        }
+    }
+    
+    private class Converters {
+        @TypeConverter
+        fun fromStringList(value: List<String>): String {
+            return value.joinToString(",")
+        }
+        
+        @TypeConverter
+        fun toStringList(value: String): List<String> {
+            return if (value.isEmpty()) emptyList() else value.split(",")
+        }
+        
+        @TypeConverter
+        fun fromUserRole(value: UserRole): String {
+            return value.name
+        }
+        
+        @TypeConverter
+        fun toUserRole(value: String): UserRole {
+            return UserRole.valueOf(value)
+        }
+        
+        @TypeConverter
+        fun fromMessageType(value: MessageType): String {
+            return value.name
+        }
+        
+        @TypeConverter
+        fun toMessageType(value: String): MessageType {
+            return MessageType.valueOf(value)
+        }
+        
+        @TypeConverter
+        fun fromConversationType(value: ConversationType): String {
+            return value.name
+        }
+        
+        @TypeConverter
+        fun toConversationType(value: String): ConversationType {
+            return ConversationType.valueOf(value)
+        }
+        
+        @TypeConverter
+        fun fromEmergencyPriority(value: EmergencyPriority): String {
+            return value.name
+        }
+        
+        @TypeConverter
+        fun toEmergencyPriority(value: String): EmergencyPriority {
+            return EmergencyPriority.valueOf(value)
+        }
+        
+        @TypeConverter
+        fun fromMessageMetadata(value: MessageMetadata?): String {
+            return if (value == null) "" else "${value.fileName ?: ""}|${value.fileSize ?: ""}|${value.duration ?: ""}|${value.locationData?.latitude ?: ""}|${value.locationData?.longitude ?: ""}"
+        }
+        
+        @TypeConverter
+        fun toMessageMetadata(value: String): MessageMetadata? {
+            if (value.isEmpty()) return null
+            
+            val parts = value.split("|")
+            return MessageMetadata(
+                fileName = parts.getOrNull(0)?.ifEmpty { null },
+                fileSize = parts.getOrNull(1)?.toLongOrNull(),
+                duration = parts.getOrNull(2)?.toLongOrNull(),
+                locationData = if (parts.size >= 4) {
+                    LocationData(
+                        latitude = parts.getOrNull(3)?.toDoubleOrNull() ?: 0.0,
+                        longitude = parts.getOrNull(4)?.toDoubleOrNull() ?: 0.0,
+                        address = "",
+                        timestamp = System.currentTimeMillis()
+                    )
+                } else null
+            )
+        }
+    }
+}
+
+@Dao
+interface MessageDao {
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertMessage(message: ChatMessage)
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertMessages(messages: List<ChatMessage>)
+    
+    @Query("SELECT * FROM chat_message WHERE conversation_id = :conversationId ORDER BY timestamp ASC")
+    suspend fun getConversationMessages(conversationId: String): List<ChatMessage>
+    
+    @Query("SELECT * FROM chat_message WHERE conversation_id = :conversationId ORDER BY timestamp ASC LIMIT :limit OFFSET :offset")
+    suspend fun getMessagesPaginated(conversationId: String, limit: Int, offset: Int): List<ChatMessage>
+    
+    @Query("SELECT * FROM chat_message WHERE conversation_id = :conversationId AND content LIKE '%' || :query || '%' ORDER BY timestamp ASC")
+    suspend fun searchMessages(conversationId: String, query: String): List<ChatMessage>
+    
+    @Query("SELECT * FROM chat_message WHERE sender_id = :senderId ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getMessagesBySender(senderId: String, limit: Int): List<ChatMessage>
+    
+    @Query("SELECT * FROM chat_message WHERE message_type = :messageType ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getMessagesByType(messageType: MessageType, limit: Int): List<ChatMessage>
+    
+    @Query("SELECT * FROM chat_message WHERE timestamp BETWEEN :startTime AND :endTime ORDER BY timestamp DESC")
+    suspend fun getMessagesByTimeRange(startTime: Long, endTime: Long): List<ChatMessage>
+    
+    @Query("DELETE FROM chat_message WHERE id = :messageId")
+    suspend fun deleteMessage(messageId: String)
+    
+    @Query("DELETE FROM chat_message WHERE conversation_id = :conversationId")
+    suspend fun deleteConversationMessages(conversationId: String)
+    
+    @Query("DELETE FROM chat_message WHERE timestamp < :timestamp")
+    suspend fun deleteOldMessages(timestamp: Long)
+    
+    @Query("UPDATE chat_message SET is_read = 1 WHERE conversation_id = :conversationId AND sender_id != :currentUserId")
+    suspend fun markConversationAsRead(conversationId: String, currentUserId: String)
+    
+    @Query("UPDATE chat_message SET is_delivered = 1 WHERE id = :messageId")
+    suspend fun markMessageAsDelivered(messageId: String)
+    
+    @Query("SELECT COUNT(*) FROM chat_message WHERE conversation_id = :conversationId AND is_read = 0 AND sender_id != :currentUserId")
+    suspend fun getUnreadCount(conversationId: String, currentUserId: String): Int
+    
+    @Query("SELECT COUNT(*) FROM chat_message WHERE conversation_id = :conversationId")
+    suspend fun getMessageCount(conversationId: String): Int
+    
+    @Query("SELECT * FROM chat_message ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getLastMessage(): ChatMessage?
+    
+    @Query("SELECT * FROM chat_message WHERE conversation_id = :conversationId ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getLastConversationMessage(conversationId: String): ChatMessage?
+}
+
+@Dao
+interface ConversationDao {
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertConversation(conversation: Conversation)
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertConversations(conversations: List<Conversation>)
+    
+    @Query("SELECT * FROM conversation WHERE id = :conversationId")
+    suspend fun getConversation(conversationId: String): Conversation?
+    
+    @Query("SELECT * FROM conversation WHERE :userId IN participant_ids ORDER BY last_message_at DESC")
+    suspend fun getUserConversations(userId: String): List<Conversation>
+    
+    @Query("SELECT * FROM conversation WHERE creator_id = :creatorId ORDER BY created_at DESC")
+    suspend fun getCreatedConversations(creatorId: String): List<Conversation>
+    
+    @Query("SELECT * FROM conversation WHERE type = :type ORDER BY last_message_at DESC")
+    suspend fun getConversationsByType(type: ConversationType): List<Conversation>
+    
+    @Query("SELECT * FROM conversation WHERE is_active = 1 ORDER BY last_message_at DESC")
+    suspend fun getActiveConversations(): List<Conversation>
+    
+    @Query("SELECT * FROM conversation WHERE name LIKE '%' || :query || '%' ORDER BY last_message_at DESC")
+    suspend fun searchConversations(query: String): List<Conversation>
+    
+    @Query("UPDATE conversation SET name = :name, description = :description WHERE id = :conversationId")
+    suspend fun updateConversationInfo(conversationId: String, name: String, description: String)
+    
+    @Query("UPDATE conversation SET participant_ids = :participantIds WHERE id = :conversationId")
+    suspend fun updateParticipants(conversationId: String, participantIds: String)
+    
+    @Query("UPDATE conversation SET last_message_at = :timestamp, last_message = :lastMessage WHERE id = :conversationId")
+    suspend fun updateLastMessage(conversationId: String, timestamp: Long, lastMessage: String)
+    
+    @Query("UPDATE conversation SET unread_count = :unreadCount WHERE id = :conversationId")
+    suspend fun updateUnreadCount(conversationId: String, unreadCount: Int)
+    
+    @Query("UPDATE conversation SET is_active = :isActive WHERE id = :conversationId")
+    suspend fun updateConversationStatus(conversationId: String, isActive: Boolean)
+    
+    @Query("DELETE FROM conversation WHERE id = :conversationId")
+    suspend fun deleteConversation(conversationId: String)
+    
+    @Query("DELETE FROM conversation WHERE is_active = 0 AND last_message_at < :timestamp")
+    suspend fun deleteInactiveConversations(timestamp: Long)
+}
+
+@Dao
+interface TypingIndicatorDao {
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTypingIndicator(indicator: TypingIndicator)
+    
+    @Query("SELECT * FROM typing_indicator WHERE conversation_id = :conversationId AND is_typing = 1")
+    suspend fun getTypingUsers(conversationId: String): List<TypingIndicator>
+    
+    @Query("SELECT * FROM typing_indicator WHERE user_id = :userId AND conversation_id = :conversationId")
+    suspend fun getUserTypingIndicator(userId: String, conversationId: String): TypingIndicator?
+    
+    @Query("DELETE FROM typing_indicator WHERE timestamp < :timestamp")
+    suspend fun deleteOldTypingIndicators(timestamp: Long)
+    
+    @Query("DELETE FROM typing_indicator WHERE user_id = :userId AND conversation_id = :conversationId")
+    suspend fun deleteTypingIndicator(userId: String, conversationId: String)
+    
+    @Query("DELETE FROM typing_indicator")
+    suspend fun clearAllTypingIndicators()
+}
+
+@Dao
+interface ReadReceiptDao {
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertReadReceipt(receipt: ReadReceipt)
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertReadReceipts(receipts: List<ReadReceipt>)
+    
+    @Query("SELECT * FROM read_receipt WHERE message_id = :messageId")
+    suspend fun getMessageReadReceipts(messageId: String): List<ReadReceipt>
+    
+    @Query("SELECT * FROM read_receipt WHERE reader_id = :readerId ORDER BY read_at DESC")
+    suspend fun getUserReadReceipts(readerId: String): List<ReadReceipt>
+    
+    @Query("SELECT * FROM read_receipt WHERE read_at BETWEEN :startTime AND :endTime ORDER BY read_at DESC")
+    suspend fun getReadReceiptsByTimeRange(startTime: Long, endTime: Long): List<ReadReceipt>
+    
+    @Query("DELETE FROM read_receipt WHERE read_at < :timestamp")
+    suspend fun deleteOldReadReceipts(timestamp: Long)
+    
+    @Query("DELETE FROM read_receipt WHERE message_id = :messageId")
+    suspend fun deleteMessageReadReceipts(messageId: String)
+}
+
+@Dao
+interface EmergencyMessageDao {
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertEmergencyMessage(message: EmergencyMessage)
+    
+    @Query("SELECT * FROM emergency_message WHERE target_roles LIKE '%' || :userRole || '%' ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getEmergencyMessagesForRole(userRole: String, limit: Int): List<EmergencyMessage>
+    
+    @Query("SELECT * FROM emergency_message WHERE sender_id = :senderId ORDER BY timestamp DESC")
+    suspend fun getSentEmergencyMessages(senderId: String): List<EmergencyMessage>
+    
+    @Query("SELECT * FROM emergency_message WHERE priority = :priority ORDER BY timestamp DESC")
+    suspend fun getEmergencyMessagesByPriority(priority: EmergencyPriority): List<EmergencyMessage>
+    
+    @Query("SELECT * FROM emergency_message WHERE timestamp BETWEEN :startTime AND :endTime ORDER BY timestamp DESC")
+    suspend fun getEmergencyMessagesByTimeRange(startTime: Long, endTime: Long): List<EmergencyMessage>
+    
+    @Query("UPDATE emergency_message SET is_read = 1 WHERE id = :messageId")
+    suspend fun markEmergencyMessageAsRead(messageId: String)
+    
+    @Query("DELETE FROM emergency_message WHERE timestamp < :timestamp")
+    suspend fun deleteOldEmergencyMessages(timestamp: Long)
+    
+    @Query("DELETE FROM emergency_message WHERE id = :messageId")
+    suspend fun deleteEmergencyMessage(messageId: String)
+}
+
+@Dao
+interface OnlineUserDao {
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOnlineUser(user: OnlineUser)
+    
+    @Query("SELECT * FROM online_user WHERE is_active = 1")
+    suspend fun getActiveOnlineUsers(): List<OnlineUser>
+    
+    @Query("SELECT * FROM online_user WHERE user_id = :userId")
+    suspend fun getOnlineUser(userId: String): OnlineUser?
+    
+    @Query("SELECT * FROM online_user WHERE user_role = :userRole AND is_active = 1")
+    suspend fun getOnlineUsersByRole(userRole: String): List<OnlineUser>
+    
+    @Query("UPDATE online_user SET is_active = 0 WHERE last_seen < :timestamp")
+    suspend fun markInactiveUsers(timestamp: Long)
+    
+    @Query("DELETE FROM online_user WHERE is_active = 0 AND last_seen < :timestamp")
+    suspend fun deleteOldOfflineUsers(timestamp: Long)
+    
+    @Query("DELETE FROM online_user WHERE user_id = :userId")
+    suspend fun deleteOnlineUser(userId: String)
+    
+    @Query("DELETE FROM online_user")
+    suspend fun clearAllOnlineUsers()
+}
+
+// Entity definitions for Room database
+@Entity(tableName = "chat_message")
+data class ChatMessageEntity(
+    @PrimaryKey val id: String,
+    val conversationId: String,
+    val senderId: String,
+    val senderRole: UserRole,
+    val content: String,
+    val messageType: MessageType,
+    val timestamp: Long,
+    var isRead: Boolean = false,
+    var isDelivered: Boolean = false,
+    val metadata: MessageMetadata? = null
+)
+
+@Entity(tableName = "conversation")
+data class ConversationEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val description: String,
+    val type: ConversationType,
+    val participantIds: String, // Stored as comma-separated string
+    val creatorId: String,
+    val creatorRole: UserRole,
+    val createdAt: Long,
+    var lastMessageAt: Long,
+    var unreadCount: Int = 0,
+    val lastMessage: String? = null,
+    val isActive: Boolean = true
+)
+
+@Entity(tableName = "typing_indicator")
+data class TypingIndicatorEntity(
+    @PrimaryKey val userId: String,
+    val conversationId: String,
+    val isTyping: Boolean,
+    val timestamp: Long
+)
+
+@Entity(tableName = "read_receipt")
+data class ReadReceiptEntity(
+    @PrimaryKey val id: String,
+    val messageId: String,
+    val readerId: String,
+    val readAt: Long
+)
+
+@Entity(tableName = "emergency_message")
+data class EmergencyMessageEntity(
+    @PrimaryKey val id: String,
+    val senderId: String,
+    val senderRole: UserRole,
+    val message: String,
+    val priority: EmergencyPriority,
+    val targetRoles: String, // Stored as comma-separated string
+    val timestamp: Long,
+    var isRead: Boolean = false
+)
+
+@Entity(tableName = "online_user")
+data class OnlineUserEntity(
+    @PrimaryKey val userId: String,
+    val userName: String,
+    val userRole: String,
+    val lastSeen: Long,
+    val isActive: Boolean = true
+)

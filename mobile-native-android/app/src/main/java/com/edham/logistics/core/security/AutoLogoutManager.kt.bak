@@ -1,0 +1,564 @@
+package com.edham.logistics.core.security
+
+import android.app.Activity
+import android.app.Application
+import android.content.Context
+import android.os.Bundle
+import com.edham.logistics.core.utils.DeviceInfo
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Auto logout manager for automatic logout on token expiry and security events
+ */
+@Singleton
+class AutoLogoutManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val secureTokenManager: SecureTokenManager,
+    private val sessionManager: SessionManager,
+    private val roleBasedAccessControl: RoleBasedAccessControl,
+    private val deviceInfo: DeviceInfo
+) : Application.ActivityLifecycleCallbacks {
+    
+    companion object {
+        private const val AUTO_LOGOUT_CHECK_INTERVAL = 30_000L // 30 seconds
+        private const val WARNING_BEFORE_LOGOUT = 5 * 60_000L // 5 minutes
+        private const val MAX_INACTIVITY_TIME = 30 * 60_000L // 30 minutes
+        private const val MAX_APP_BACKGROUND_TIME = 10 * 60_000L // 10 minutes
+        private const val SECURITY_VIOLATION_LOGOUT_THRESHOLD = 3 // 3 violations
+        private const val FAILED_ATTEMPTS_THRESHOLD = 5 // 5 failed attempts
+    }
+    
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var isMonitoring = false
+    private var lastActivityTime = 0L
+    private var appBackgroundTime = 0L
+    private var isAppInBackground = false
+    private var failedAttempts = 0
+    private var securityViolations = 0
+    
+    private val _autoLogoutState = MutableStateFlow<AutoLogoutState>(AutoLogoutState.Active)
+    val autoLogoutState: StateFlow<AutoLogoutState> = _autoLogoutState.asStateFlow()
+    
+    private val _logoutWarnings = MutableStateFlow<List<LogoutWarning>>(emptyList())
+    val logoutWarnings: StateFlow<List<LogoutWarning>> = _logoutWarnings.asStateFlow()
+    
+    private val _logoutEvents = MutableStateFlow<List<LogoutEvent>>(emptyList())
+    val logoutEvents: StateFlow<List<LogoutEvent>> = _logoutEvents.asStateFlow()
+    
+    init {
+        initializeAutoLogoutManager()
+    }
+    
+    /**
+     * Initialize auto logout manager
+     */
+    private fun initializeAutoLogoutManager() {
+        try {
+            // Register activity lifecycle callbacks
+            (context as Application).registerActivityLifecycleCallbacks(this)
+            
+            // Start monitoring
+            startAutoLogoutMonitoring()
+            
+            // Monitor security events
+            monitorSecurityEvents()
+            
+            // Monitor token changes
+            monitorTokenChanges()
+            
+        } catch (e: Exception) {
+            handleAutoLogoutError("Failed to initialize auto logout manager", e)
+        }
+    }
+    
+    /**
+     * Start auto logout monitoring
+     */
+    private fun startAutoLogoutMonitoring() {
+        if (isMonitoring) return
+        
+        isMonitoring = true
+        scope.launch {
+            while (isMonitoring) {
+                try {
+                    checkAutoLogoutConditions()
+                    delay(AUTO_LOGOUT_CHECK_INTERVAL)
+                } catch (e: Exception) {
+                    delay(AUTO_LOGOUT_CHECK_INTERVAL)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Check auto logout conditions
+     */
+    private suspend fun checkAutoLogoutConditions() {
+        try {
+            val currentTime = System.currentTimeMillis()
+            
+            // Check token expiry
+            if (shouldLogoutDueToTokenExpiry()) {
+                performAutoLogout(LogoutReason.TOKEN_EXPIRED, "Access token expired")
+                return
+            }
+            
+            // Check session timeout
+            if (shouldLogoutDueToSessionTimeout(currentTime)) {
+                performAutoLogout(LogoutReason.SESSION_TIMEOUT, "Session expired")
+                return
+            }
+            
+            // Check inactivity timeout
+            if (shouldLogoutDueToInactivity(currentTime)) {
+                performAutoLogout(LogoutReason.INACTIVITY_TIMEOUT, "Inactive for too long")
+                return
+            }
+            
+            // Check app background timeout
+            if (shouldLogoutDueToBackgroundTime(currentTime)) {
+                performAutoLogout(LogoutReason.APP_BACKGROUND_TIMEOUT, "App in background for too long")
+                return
+            }
+            
+            // Check security violations
+            if (shouldLogoutDueToSecurityViolations()) {
+                performAutoLogout(LogoutReason.SECURITY_VIOLATION, "Too many security violations")
+                return
+            }
+            
+            // Check failed attempts
+            if (shouldLogoutDueToFailedAttempts()) {
+                performAutoLogout(LogoutReason.FAILED_ATTEMPTS, "Too many failed attempts")
+                return
+            }
+            
+            // Check for logout warnings
+            checkLogoutWarnings(currentTime)
+            
+        } catch (e: Exception) {
+            handleAutoLogoutError("Auto logout check failed", e)
+        }
+    }
+    
+    /**
+     * Check if should logout due to token expiry
+     */
+    private suspend fun shouldLogoutDueToTokenExpiry(): Boolean {
+        return try {
+            !secureTokenManager.isAccessTokenValid() && !secureTokenManager.isRefreshTokenValid()
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Check if should logout due to session timeout
+     */
+    private suspend fun shouldLogoutDueToSessionTimeout(currentTime: Long): Boolean {
+        return try {
+            val session = sessionManager.currentSession.value
+            session != null && !session.isActive && currentTime > session.expiryTime
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Check if should logout due to inactivity
+     */
+    private fun shouldLogoutDueToInactivity(currentTime: Long): Boolean {
+        return try {
+            lastActivityTime != 0L && (currentTime - lastActivityTime) > MAX_INACTIVITY_TIME
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Check if should logout due to background time
+     */
+    private fun shouldLogoutDueToBackgroundTime(currentTime: Long): Boolean {
+        return try {
+            isAppInBackground && appBackgroundTime != 0L && 
+            (currentTime - appBackgroundTime) > MAX_APP_BACKGROUND_TIME
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Check if should logout due to security violations
+     */
+    private fun shouldLogoutDueToSecurityViolations(): Boolean {
+        return try {
+            val violations = roleBasedAccessControl.accessViolations.value
+            val recentViolations = violations.filter { 
+                (System.currentTimeMillis() - it.timestamp) < 30 * 60 * 1000L // Last 30 minutes
+            }
+            
+            securityViolations = recentViolations.size
+            securityViolations >= SECURITY_VIOLATION_LOGOUT_THRESHOLD
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Check if should logout due to failed attempts
+     */
+    private fun shouldLogoutDueToFailedAttempts(): Boolean {
+        return failedAttempts >= FAILED_ATTEMPTS_THRESHOLD
+    }
+    
+    /**
+     * Check logout warnings
+     */
+    private suspend fun checkLogoutWarnings(currentTime: Long) {
+        try {
+            // Check token expiry warning
+            val accessTokenExpiry = secureTokenManager.getAccessTokenExpiry()
+            if (accessTokenExpiry != null && (accessTokenExpiry - currentTime) < WARNING_BEFORE_LOGOUT) {
+                addLogoutWarning(LogoutWarning(
+                    type = LogoutWarningType.TOKEN_EXPIRY_WARNING,
+                    message = "Access token will expire soon",
+                    timeUntilLogout = accessTokenExpiry - currentTime,
+                    timestamp = currentTime
+                ))
+            }
+            
+            // Check session timeout warning
+            val session = sessionManager.currentSession.value
+            if (session != null && (session.expiryTime - currentTime) < WARNING_BEFORE_LOGOUT) {
+                addLogoutWarning(LogoutWarning(
+                    type = LogoutWarningType.SESSION_TIMEOUT_WARNING,
+                    message = "Session will expire soon",
+                    timeUntilLogout = session.expiryTime - currentTime,
+                    timestamp = currentTime
+                ))
+            }
+            
+            // Check inactivity warning
+            if (lastActivityTime != 0L && (MAX_INACTIVITY_TIME - (currentTime - lastActivityTime)) < WARNING_BEFORE_LOGOUT) {
+                addLogoutWarning(LogoutWarning(
+                    type = LogoutWarningType.INACTIVITY_WARNING,
+                    message = "Session will expire due to inactivity",
+                    timeUntilLogout = MAX_INACTIVITY_TIME - (currentTime - lastActivityTime),
+                    timestamp = currentTime
+                ))
+            }
+            
+        } catch (e: Exception) {
+            handleAutoLogoutError("Logout warning check failed", e)
+        }
+    }
+    
+    /**
+     * Perform auto logout
+     */
+    private suspend fun performAutoLogout(reason: LogoutReason, details: String) {
+        try {
+            // Record logout event
+            addLogoutEvent(LogoutEvent(
+                reason = reason,
+                details = details,
+                timestamp = System.currentTimeMillis(),
+                userId = secureTokenManager.getUserId(),
+                userRole = secureTokenManager.getUserRole(),
+                sessionId = sessionManager.currentSession.value?.sessionId
+            ))
+            
+            // Clear tokens and sessions
+            secureTokenManager.clearTokens()
+            sessionManager.terminateAllSessions()
+            
+            // Reset counters
+            failedAttempts = 0
+            securityViolations = 0
+            
+            // Update state
+            _autoLogoutState.value = AutoLogoutState.LoggedOut
+            
+            // Log security event
+            logSecurityEvent("AUTO_LOGOUT", mapOf(
+                "reason" to reason.name,
+                "details" to details
+            ))
+            
+        } catch (e: Exception) {
+            handleAutoLogoutError("Auto logout failed", e)
+        }
+    }
+    
+    /**
+     * Monitor security events
+     */
+    private fun monitorSecurityEvents() {
+        scope.launch {
+            roleBasedAccessControl.accessViolations.collect { violations ->
+                if (violations.isNotEmpty()) {
+                    val recentViolations = violations.filter { 
+                        (System.currentTimeMillis() - it.timestamp) < 30 * 60 * 1000L
+                    }
+                    
+                    if (recentViolations.size >= SECURITY_VIOLATION_LOGOUT_THRESHOLD) {
+                        performAutoLogout(LogoutReason.SECURITY_VIOLATION, "Too many security violations")
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Monitor token changes
+     */
+    private fun monitorTokenChanges() {
+        scope.launch {
+            secureTokenManager.authState.collect { authState ->
+                when (authState) {
+                    AuthState.LoggedOut -> {
+                        _autoLogoutState.value = AutoLogoutState.LoggedOut
+                    }
+                    AuthState.LoggedIn -> {
+                        _autoLogoutState.value = AutoLogoutState.Active
+                        lastActivityTime = System.currentTimeMillis()
+                    }
+                    AuthState.TokenExpired -> {
+                        performAutoLogout(LogoutReason.TOKEN_EXPIRED, "Token expired")
+                    }
+                    AuthState.SessionExpired -> {
+                        performAutoLogout(LogoutReason.SESSION_TIMEOUT, "Session expired")
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Add logout warning
+     */
+    private fun addLogoutWarning(warning: LogoutWarning) {
+        val currentWarnings = _logoutWarnings.value.toMutableList()
+        
+        // Remove duplicate warnings
+        currentWarnings.removeAll { it.type == warning.type }
+        currentWarnings.add(warning)
+        
+        // Keep only recent warnings
+        if (currentWarnings.size > 10) {
+            currentWarnings.removeAt(0)
+        }
+        
+        _logoutWarnings.value = currentWarnings
+    }
+    
+    /**
+     * Add logout event
+     */
+    private fun addLogoutEvent(event: LogoutEvent) {
+        val currentEvents = _logoutEvents.value.toMutableList()
+        currentEvents.add(event)
+        
+        // Keep only recent events
+        if (currentEvents.size > 100) {
+            currentEvents.removeAt(0)
+        }
+        
+        _logoutEvents.value = currentEvents
+    }
+    
+    /**
+     * Handle failed attempt
+     */
+    fun handleFailedAttempt() {
+        failedAttempts++
+        
+        if (failedAttempts >= FAILED_ATTEMPTS_THRESHOLD) {
+            scope.launch {
+                performAutoLogout(LogoutReason.FAILED_ATTEMPTS, "Too many failed attempts")
+            }
+        }
+    }
+    
+    /**
+     * Reset failed attempts
+     */
+    fun resetFailedAttempts() {
+        failedAttempts = 0
+    }
+    
+    /**
+     * Update activity time
+     */
+    fun updateActivityTime() {
+        lastActivityTime = System.currentTimeMillis()
+    }
+    
+    /**
+     * Handle auto logout error
+     */
+    private fun handleAutoLogoutError(message: String, error: Exception) {
+        // Log error but don't crash the monitoring system
+        logSecurityEvent("AUTO_LOGOUT_ERROR", mapOf(
+            "message" to message,
+            "error" to error.message
+        ))
+    }
+    
+    /**
+     * Log security event
+     */
+    private fun logSecurityEvent(eventType: String, details: Map<String, Any>) {
+        // Log to security monitoring system
+        // This would integrate with your security infrastructure
+    }
+    
+    /**
+     * Get access token expiry (placeholder method)
+     */
+    private suspend fun getAccessTokenExpiry(): Long? {
+        return try {
+            // This would be implemented in SecureTokenManager
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    /**
+     * Get auto logout status
+     */
+    fun getAutoLogoutStatus(): AutoLogoutStatus {
+        return AutoLogoutStatus(
+            autoLogoutState = _autoLogoutState.value,
+            logoutWarnings = _logoutWarnings.value,
+            logoutEvents = _logoutEvents.value.takeLast(10),
+            lastActivityTime = lastActivityTime,
+            appBackgroundTime = appBackgroundTime,
+            isAppInBackground = isAppInBackground,
+            failedAttempts = failedAttempts,
+            securityViolations = securityViolations
+        )
+    }
+    
+    /**
+     * Clear logout warnings
+     */
+    fun clearLogoutWarnings() {
+        _logoutWarnings.value = emptyList()
+    }
+    
+    /**
+     * Clear logout events
+     */
+    fun clearLogoutEvents() {
+        _logoutEvents.value = emptyList()
+    }
+    
+    /**
+     * Stop auto logout monitoring
+     */
+    fun stopAutoLogoutMonitoring() {
+        isMonitoring = false
+    }
+    
+    // Activity lifecycle callbacks
+    override fun onActivityStarted(activity: Activity) {
+        if (isAppInBackground) {
+            isAppInBackground = false
+            lastActivityTime = System.currentTimeMillis()
+        }
+    }
+    
+    override fun onActivityStopped(activity: Activity) {
+        if (!isAppInBackground) {
+            isAppInBackground = true
+            appBackgroundTime = System.currentTimeMillis()
+        }
+    }
+    
+    override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+    override fun onActivityResumed(activity: Activity) {}
+    override fun onActivityPaused(activity: Activity) {}
+    override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+    override fun onActivityDestroyed(activity: Activity) {}
+}
+
+/**
+ * Auto logout state enum
+ */
+enum class AutoLogoutState {
+    Active,
+    LoggedOut,
+    Suspended
+}
+
+/**
+ * Logout reason enum
+ */
+enum class LogoutReason {
+    TOKEN_EXPIRED,
+    SESSION_TIMEOUT,
+    INACTIVITY_TIMEOUT,
+    APP_BACKGROUND_TIMEOUT,
+    SECURITY_VIOLATION,
+    FAILED_ATTEMPTS,
+    MANUAL_LOGOUT
+}
+
+/**
+ * Logout warning data class
+ */
+data class LogoutWarning(
+    val type: LogoutWarningType,
+    val message: String,
+    val timeUntilLogout: Long,
+    val timestamp: Long
+)
+
+/**
+ * Logout warning types
+ */
+enum class LogoutWarningType {
+    TOKEN_EXPIRY_WARNING,
+    SESSION_TIMEOUT_WARNING,
+    INACTIVITY_WARNING,
+    APP_BACKGROUND_WARNING
+}
+
+/**
+ * Logout event data class
+ */
+data class LogoutEvent(
+    val reason: LogoutReason,
+    val details: String,
+    val timestamp: Long,
+    val userId: String?,
+    val userRole: String?,
+    val sessionId: String?
+)
+
+/**
+ * Auto logout status
+ */
+data class AutoLogoutStatus(
+    val autoLogoutState: AutoLogoutState,
+    val logoutWarnings: List<LogoutWarning>,
+    val logoutEvents: List<LogoutEvent>,
+    val lastActivityTime: Long,
+    val appBackgroundTime: Long,
+    val isAppInBackground: Boolean,
+    val failedAttempts: Int,
+    val securityViolations: Int
+)

@@ -1,0 +1,1035 @@
+package com.edham.logistics.maintenance
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.MaintenanceEntity
+import com.edham.logistics.data.local.entity.RepairEntity
+import com.edham.logistics.data.remote.api.MaintenanceApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Maintenance Cost Tracking - Comprehensive maintenance cost tracking and analysis
+ * 
+ * Features:
+ * - Real-time cost tracking
+ * - Cost categorization and analysis
+ * - Budget management and monitoring
+ * - Cost forecasting and predictions
+ * - Cost optimization recommendations
+ * - Vendor and supplier cost tracking
+ * - ROI analysis
+ * - Cost reporting and analytics
+ */
+@Singleton
+class MaintenanceCostTracking @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val maintenanceApi: MaintenanceApi,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _costTrackingState = MutableStateFlow<CostTrackingState>(CostTrackingState.Idle)
+    val costTrackingState: StateFlow<CostTrackingState> = _costTrackingState.asStateFlow()
+    
+    private val _costAnalysis = MutableStateFlow<CostAnalysis?>(null)
+    val costAnalysis: StateFlow<CostAnalysis?> = _costAnalysis.asStateFlow()
+    
+    private val _budgetTracking = MutableStateFlow<BudgetTracking?>(null)
+    val budgetTracking: StateFlow<BudgetTracking?> = _budgetTracking.asStateFlow()
+    
+    private val _costForecasting = MutableStateFlow<CostForecasting?>(null)
+    val costForecasting: StateFlow<CostForecasting?> = _costForecasting.asStateFlow()
+    
+    private val _vendorCosts = MutableStateFlow<Map<String, VendorCostData>>(emptyMap())
+    val vendorCosts: StateFlow<Map<String, VendorCostData>> = _vendorCosts.asStateFlow()
+    
+    private val _costOptimizations = MutableStateFlow<List<CostOptimization>>(emptyList())
+    val costOptimizations: StateFlow<List<CostOptimization>> = _costOptimizations.asStateFlow()
+    
+    private var isTracking = false
+    private val costTrackingListeners = mutableListOf<CostTrackingListener>()
+    
+    companion object {
+        private const val TAG = "MaintenanceCostTracking"
+        private const val COST_TRACKING_INTERVAL = 86400000L // 24 hours
+        private const val FORECASTING_HORIZON_DAYS = 90
+        private const val BUDGET_WARNING_THRESHOLD = 0.8f
+        private const val COST_OPTIMIZATION_THRESHOLD = 0.1f
+        private const val ROI_CALCULATION_PERIOD_DAYS = 365
+    }
+    
+    /**
+     * Initialize cost tracking system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _costTrackingState.value = CostTrackingState.Initializing
+                
+                // Load historical cost data
+                loadHistoricalCostData()
+                
+                // Initialize budget tracking
+                initializeBudgetTracking()
+                
+                // Load vendor cost data
+                loadVendorCostData()
+                
+                // Generate initial cost analysis
+                generateCostAnalysis()
+                
+                // Start continuous cost tracking
+                startCostTracking()
+                
+                _costTrackingState.value = CostTrackingState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _costTrackingState.value = CostTrackingState.Error("Failed to initialize cost tracking: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Track maintenance cost
+     */
+    suspend fun trackMaintenanceCost(
+        maintenanceId: Long,
+        costData: MaintenanceCostData
+    ): Result<TrackedMaintenanceCost> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _costTrackingState.value = CostTrackingState.TrackingCost
+                
+                // Validate cost data
+                validateCostData(costData)
+                
+                // Create tracked cost record
+                val trackedCost = TrackedMaintenanceCost(
+                    id = 0,
+                    maintenanceId = maintenanceId,
+                    costType = costData.costType,
+                    laborCost = costData.laborCost,
+                    partsCost = costData.partsCost,
+                    materialCost = costData.materialCost,
+                    otherCost = costData.otherCost,
+                    totalCost = costData.laborCost + costData.partsCost + costData.materialCost + costData.otherCost,
+                    currency = costData.currency,
+                    recordedBy = costData.recordedBy,
+                    recordedAt = Date(),
+                    notes = costData.notes,
+                    attachments = costData.attachments
+                )
+                
+                // Save to database
+                val costId = database.maintenanceCostDao().insertCost(trackedCost.toEntity())
+                val savedCost = trackedCost.copy(id = costId)
+                
+                // Update maintenance record
+                updateMaintenanceCost(maintenanceId, savedCost.totalCost)
+                
+                // Update cost analysis
+                updateCostAnalysis()
+                
+                // Check budget status
+                checkBudgetStatus(savedCost)
+                
+                // Update vendor costs
+                updateVendorCosts(costData.vendorId, savedCost)
+                
+                // Generate cost optimizations
+                generateCostOptimizations()
+                
+                // Sync with server
+                if (networkUtils.isNetworkAvailable()) {
+                    syncCostWithServer(savedCost)
+                }
+                
+                // Notify listeners
+                notifyCostTracked(savedCost)
+                
+                _costTrackingState.value = CostTrackingState.CostTracked
+                Result.success(savedCost)
+                
+            } catch (e: Exception) {
+                _costTrackingState.value = CostTrackingState.Error("Failed to track maintenance cost: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Track repair cost
+     */
+    suspend fun trackRepairCost(
+        repairId: Long,
+        costData: RepairCostData
+    ): Result<TrackedRepairCost> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _costTrackingState.value = CostTrackingState.TrackingCost
+                
+                // Validate cost data
+                validateRepairCostData(costData)
+                
+                // Create tracked cost record
+                val trackedCost = TrackedRepairCost(
+                    id = 0,
+                    repairId = repairId,
+                    repairType = costData.repairType,
+                    laborCost = costData.laborCost,
+                    partsCost = costData.partsCost,
+                    materialCost = costData.materialCost,
+                    otherCost = costData.otherCost,
+                    totalCost = costData.laborCost + costData.partsCost + costData.materialCost + costData.otherCost,
+                    currency = costData.currency,
+                    recordedBy = costData.recordedBy,
+                    recordedAt = Date(),
+                    notes = costData.notes,
+                    attachments = costData.attachments
+                )
+                
+                // Save to database
+                val costId = database.repairCostDao().insertCost(trackedCost.toEntity())
+                val savedCost = trackedCost.copy(id = costId)
+                
+                // Update repair record
+                updateRepairCost(repairId, savedCost.totalCost)
+                
+                // Update cost analysis
+                updateCostAnalysis()
+                
+                // Check budget status
+                checkBudgetStatus(savedCost)
+                
+                // Update vendor costs
+                updateVendorCosts(costData.vendorId, savedCost)
+                
+                // Generate cost optimizations
+                generateCostOptimizations()
+                
+                // Sync with server
+                if (networkUtils.isNetworkAvailable()) {
+                    syncCostWithServer(savedCost)
+                }
+                
+                // Notify listeners
+                notifyRepairCostTracked(savedCost)
+                
+                _costTrackingState.value = CostTrackingState.CostTracked
+                Result.success(savedCost)
+                
+            } catch (e: Exception) {
+                _costTrackingState.value = CostTrackingState.Error("Failed to track repair cost: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate comprehensive cost analysis
+     */
+    suspend fun generateCostAnalysis(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<CostAnalysis> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _costTrackingState.value = CostTrackingState.Analyzing
+                
+                // Get maintenance costs
+                val maintenanceCosts = database.maintenanceCostDao().getCostsByDateRange(
+                    dateRange.startDate, dateRange.endDate
+                )
+                
+                // Get repair costs
+                val repairCosts = database.repairCostDao().getCostsByDateRange(
+                    dateRange.startDate, dateRange.endDate
+                )
+                
+                // Calculate total costs
+                val totalMaintenanceCost = maintenanceCosts.sumOf { it.totalCost }
+                val totalRepairCost = repairCosts.sumOf { it.totalCost }
+                val totalCost = totalMaintenanceCost + totalRepairCost
+                
+                // Analyze cost breakdown
+                val costBreakdown = analyzeCostBreakdown(maintenanceCosts, repairCosts)
+                
+                // Calculate cost trends
+                val costTrends = calculateCostTrends(maintenanceCosts, repairCosts)
+                
+                // Analyze cost by category
+                val costByCategory = analyzeCostByCategory(maintenanceCosts, repairCosts)
+                
+                // Analyze cost by vehicle
+                val costByVehicle = analyzeCostByVehicle(maintenanceCosts, repairCosts)
+                
+                // Analyze cost by vendor
+                val costByVendor = analyzeCostByVendor(maintenanceCosts, repairCosts)
+                
+                // Calculate cost per mile/hour
+                val costMetrics = calculateCostMetrics(maintenanceCosts, repairCosts)
+                
+                // Generate cost predictions
+                val predictions = generateCostPredictions(maintenanceCosts, repairCosts)
+                
+                // Calculate ROI
+                val roiAnalysis = calculateROIAnalysis(totalCost, maintenanceCosts, repairCosts)
+                
+                val analysis = CostAnalysis(
+                    dateRange = dateRange,
+                    totalMaintenanceCost = totalMaintenanceCost,
+                    totalRepairCost = totalRepairCost,
+                    totalCost = totalCost,
+                    costBreakdown = costBreakdown,
+                    costTrends = costTrends,
+                    costByCategory = costByCategory,
+                    costByVehicle = costByVehicle,
+                    costByVendor = costByVendor,
+                    costMetrics = costMetrics,
+                    predictions = predictions,
+                    roiAnalysis = roiAnalysis,
+                    generatedAt = Date()
+                )
+                
+                _costAnalysis.value = analysis
+                _costTrackingState.value = CostTrackingState.AnalysisGenerated
+                Result.success(analysis)
+                
+            } catch (e: Exception) {
+                _costTrackingState.value = CostTrackingState.Error("Failed to generate cost analysis: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Set maintenance budget
+     */
+    suspend fun setMaintenanceBudget(
+        budgetType: BudgetType,
+        budgetData: BudgetData
+    ): Result<MaintenanceBudget> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Validate budget data
+                validateBudgetData(budgetData)
+                
+                // Create budget record
+                val budget = MaintenanceBudget(
+                    id = 0,
+                    budgetType = budgetType,
+                    budgetAmount = budgetData.budgetAmount,
+                    spentAmount = 0f,
+                    remainingAmount = budgetData.budgetAmount,
+                    currency = budgetData.currency,
+                    period = budgetData.period,
+                    startDate = budgetData.startDate,
+                    endDate = budgetData.endDate,
+                    alertThreshold = budgetData.alertThreshold,
+                    isActive = true,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save to database
+                val budgetId = database.maintenanceBudgetDao().insertBudget(budget.toEntity())
+                val savedBudget = budget.copy(id = budgetId)
+                
+                // Update budget tracking
+                updateBudgetTracking()
+                
+                // Notify listeners
+                notifyBudgetSet(savedBudget)
+                
+                Result.success(savedBudget)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate cost forecasting
+     */
+    suspend fun generateCostForecasting(
+        forecastPeriod: Int = FORECASTING_HORIZON_DAYS
+    ): Result<CostForecasting> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _costTrackingState.value = CostTrackingState.Forecasting
+                
+                // Get historical cost data
+                val historicalData = getHistoricalCostData(forecastPeriod * 2)
+                
+                // Generate cost predictions
+                val predictions = generateCostPredictions(historicalData, forecastPeriod)
+                
+                // Calculate forecast accuracy
+                val accuracy = calculateForecastAccuracy(historicalData, predictions)
+                
+                // Generate forecast insights
+                val insights = generateForecastInsights(predictions, accuracy)
+                
+                val forecasting = CostForecasting(
+                    forecastPeriod = forecastPeriod,
+                    predictions = predictions,
+                    accuracy = accuracy,
+                    insights = insights,
+                    generatedAt = Date()
+                )
+                
+                _costForecasting.value = forecasting
+                _costTrackingState.value = CostTrackingState.ForecastGenerated
+                Result.success(forecasting)
+                
+            } catch (e: Exception) {
+                _costTrackingState.value = CostTrackingState.Error("Failed to generate cost forecasting: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get cost optimization recommendations
+     */
+    suspend fun getCostOptimizations(): Result<List<CostOptimization>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val optimizations = mutableListOf<CostOptimization>()
+                
+                // Get current cost analysis
+                val analysis = _costAnalysis.value
+                if (analysis != null) {
+                    // Analyze cost patterns
+                    optimizations.addAll(analyzeCostPatterns(analysis))
+                    
+                    // Analyze vendor performance
+                    optimizations.addAll(analyzeVendorPerformance(analysis.costByVendor))
+                    
+                    // Analyze maintenance frequency
+                    optimizations.addAll(analyzeMaintenanceFrequency(analysis))
+                    
+                    // Analyze parts usage
+                    optimizations.addAll(analyzePartsUsage(analysis))
+                    
+                    // Analyze labor efficiency
+                    optimizations.addAll(analyzeLaborEfficiency(analysis))
+                }
+                
+                _costOptimizations.value = optimizations
+                Result.success(optimizations)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add cost tracking listener
+     */
+    fun addCostTrackingListener(listener: CostTrackingListener) {
+        costTrackingListeners.add(listener)
+    }
+    
+    /**
+     * Remove cost tracking listener
+     */
+    fun removeCostTrackingListener(listener: CostTrackingListener) {
+        costTrackingListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadHistoricalCostData() {
+        // Load historical cost data for analysis
+    }
+    
+    private suspend fun initializeBudgetTracking() {
+        // Initialize budget tracking
+        val budgets = database.maintenanceBudgetDao().getAllActiveBudgets()
+        val tracking = BudgetTracking(
+            totalBudget = budgets.sumOf { it.budgetAmount },
+            totalSpent = budgets.sumOf { it.spentAmount },
+            totalRemaining = budgets.sumOf { it.remainingAmount },
+            budgetUtilization = 0f,
+            warningThresholds = budgets.associate { it.budgetType to it.alertThreshold }
+        )
+        _budgetTracking.value = tracking
+    }
+    
+    private suspend fun loadVendorCostData() {
+        // Load vendor cost data
+        val vendorCosts = database.vendorCostDao().getAllVendorCosts()
+        val vendorMap = vendorCosts.associateBy { it.vendorId }
+        _vendorCosts.value = vendorMap
+    }
+    
+    private suspend fun generateCostAnalysis() {
+        // Generate initial cost analysis
+        generateCostAnalysis()
+    }
+    
+    private suspend fun startCostTracking() {
+        // Start continuous cost tracking
+    }
+    
+    private fun validateCostData(costData: MaintenanceCostData) {
+        if (costData.laborCost < 0) throw Exception("Labor cost cannot be negative")
+        if (costData.partsCost < 0) throw Exception("Parts cost cannot be negative")
+        if (costData.materialCost < 0) throw Exception("Material cost cannot be negative")
+        if (costData.otherCost < 0) throw Exception("Other cost cannot be negative")
+    }
+    
+    private fun validateRepairCostData(costData: RepairCostData) {
+        if (costData.laborCost < 0) throw Exception("Labor cost cannot be negative")
+        if (costData.partsCost < 0) throw Exception("Parts cost cannot be negative")
+        if (costData.materialCost < 0) throw Exception("Material cost cannot be negative")
+        if (costData.otherCost < 0) throw Exception("Other cost cannot be negative")
+    }
+    
+    private suspend fun updateMaintenanceCost(maintenanceId: Long, totalCost: Float) {
+        val maintenance = database.maintenanceDao().getMaintenanceById(maintenanceId)
+        maintenance?.let {
+            val updatedMaintenance = it.copy(
+                totalCost = totalCost,
+                updatedAt = Date()
+            )
+            database.maintenanceDao().updateMaintenance(updatedMaintenance)
+        }
+    }
+    
+    private suspend fun updateRepairCost(repairId: Long, totalCost: Float) {
+        val repair = database.repairDao().getRepairById(repairId)
+        repair?.let {
+            val updatedRepair = it.copy(
+                totalCost = totalCost,
+                updatedAt = Date()
+            )
+            database.repairDao().updateRepair(updatedRepair)
+        }
+    }
+    
+    private suspend fun updateCostAnalysis() {
+        generateCostAnalysis()
+    }
+    
+    private suspend fun checkBudgetStatus(cost: TrackedCost) {
+        val tracking = _budgetTracking.value
+        tracking?.let {
+            val newSpent = it.totalSpent + cost.totalCost
+            val newRemaining = it.totalRemaining - cost.totalCost
+            val newUtilization = newSpent / it.totalBudget
+            
+            val updatedTracking = it.copy(
+                totalSpent = newSpent,
+                totalRemaining = newRemaining,
+                budgetUtilization = newUtilization
+            )
+            _budgetTracking.value = updatedTracking
+            
+            // Check if budget threshold exceeded
+            if (newUtilization >= BUDGET_WARNING_THRESHOLD) {
+                notifyBudgetWarning(updatedTracking)
+            }
+        }
+    }
+    
+    private suspend fun updateVendorCosts(vendorId: String?, cost: TrackedCost) {
+        vendorId?.let {
+            val currentVendorCost = _vendorCosts.value[it]
+            val updatedVendorCost = VendorCostData(
+                vendorId = it,
+                totalCost = (currentVendorCost?.totalCost ?: 0f) + cost.totalCost,
+                projectCount = (currentVendorCost?.projectCount ?: 0) + 1,
+                averageCostPerProject = 0f,
+                lastCostDate = Date(),
+                performanceRating = currentVendorCost?.performanceRating ?: 0f
+            )
+            
+            val updatedVendorMap = _vendorCosts.value.toMutableMap()
+            updatedVendorMap[it] = updatedVendorCost
+            _vendorCosts.value = updatedVendorMap
+        }
+    }
+    
+    private suspend fun generateCostOptimizations() {
+        getCostOptimizations()
+    }
+    
+    private suspend fun syncCostWithServer(cost: TrackedCost) {
+        // Sync cost data with server
+    }
+    
+    private suspend fun getHistoricalCostData(days: Int): List<HistoricalCostData> {
+        // Get historical cost data for forecasting
+        return emptyList()
+    }
+    
+    private fun analyzeCostBreakdown(
+        maintenanceCosts: List<TrackedMaintenanceCost>,
+        repairCosts: List<TrackedRepairCost>
+    ): CostBreakdown {
+        val totalMaintenanceCost = maintenanceCosts.sumOf { it.totalCost }
+        val totalRepairCost = repairCosts.sumOf { it.totalCost }
+        val totalCost = totalMaintenanceCost + totalRepairCost
+        
+        return CostBreakdown(
+            laborCost = (maintenanceCosts.sumOf { it.laborCost } + repairCosts.sumOf { it.laborCost }),
+            partsCost = (maintenanceCosts.sumOf { it.partsCost } + repairCosts.sumOf { it.partsCost }),
+            materialCost = (maintenanceCosts.sumOf { it.materialCost } + repairCosts.sumOf { it.materialCost }),
+            otherCost = (maintenanceCosts.sumOf { it.otherCost } + repairCosts.sumOf { it.otherCost }),
+            totalCost = totalCost,
+            maintenanceCostPercentage = if (totalCost > 0) (totalMaintenanceCost / totalCost) * 100 else 0f,
+            repairCostPercentage = if (totalCost > 0) (totalRepairCost / totalCost) * 100 else 0f
+        )
+    }
+    
+    private fun calculateCostTrends(
+        maintenanceCosts: List<TrackedMaintenanceCost>,
+        repairCosts: List<TrackedRepairCost>
+    ): CostTrends {
+        return CostTrends(
+            monthlyTrend = 0f,
+            quarterlyTrend = 0f,
+            yearlyTrend = 0f,
+            averageMonthlyCost = 0f,
+            averageQuarterlyCost = 0f,
+            averageYearlyCost = 0f
+        )
+    }
+    
+    private fun analyzeCostByCategory(
+        maintenanceCosts: List<TrackedMaintenanceCost>,
+        repairCosts: List<TrackedRepairCost>
+    ): Map<String, Float> {
+        val categoryCosts = mutableMapOf<String, Float>()
+        
+        // Group costs by category
+        maintenanceCosts.forEach { cost ->
+            categoryCosts[cost.costType.name] = categoryCosts.getOrDefault(cost.costType.name, 0f) + cost.totalCost
+        }
+        
+        repairCosts.forEach { cost ->
+            categoryCosts[cost.repairType.name] = categoryCosts.getOrDefault(cost.repairType.name, 0f) + cost.totalCost
+        }
+        
+        return categoryCosts
+    }
+    
+    private fun analyzeCostByVehicle(
+        maintenanceCosts: List<TrackedMaintenanceCost>,
+        repairCosts: List<TrackedRepairCost>
+    ): Map<String, Float> {
+        val vehicleCosts = mutableMapOf<String, Float>()
+        
+        // Group costs by vehicle
+        // Implementation would group by vehicle ID
+        return vehicleCosts
+    }
+    
+    private fun analyzeCostByVendor(
+        maintenanceCosts: List<TrackedMaintenanceCost>,
+        repairCosts: List<TrackedRepairCost>
+    ): Map<String, Float> {
+        val vendorCosts = mutableMapOf<String, Float>()
+        
+        // Group costs by vendor
+        // Implementation would group by vendor ID
+        return vendorCosts
+    }
+    
+    private fun calculateCostMetrics(
+        maintenanceCosts: List<TrackedMaintenanceCost>,
+        repairCosts: List<TrackedRepairCost>
+    ): CostMetrics {
+        return CostMetrics(
+            costPerMile = 0f,
+            costPerHour = 0f,
+            averageMaintenanceCost = if (maintenanceCosts.isNotEmpty()) maintenanceCosts.sumOf { it.totalCost } / maintenanceCosts.size else 0f,
+            averageRepairCost = if (repairCosts.isNotEmpty()) repairCosts.sumOf { it.totalCost } / repairCosts.size else 0f,
+            costEfficiencyScore = 0f,
+            costVariance = 0f
+        )
+    }
+    
+    private fun generateCostPredictions(
+        maintenanceCosts: List<TrackedMaintenanceCost>,
+        repairCosts: List<TrackedRepairCost>
+    ): List<CostPrediction> {
+        return emptyList()
+    }
+    
+    private fun calculateROIAnalysis(
+        totalCost: Float,
+        maintenanceCosts: List<TrackedMaintenanceCost>,
+        repairCosts: List<TrackedRepairCost>
+    ): ROIAnalysis {
+        return ROIAnalysis(
+            totalInvestment = totalCost,
+            totalSavings = 0f,
+            netROI = 0f,
+            paybackPeriod = 0,
+            annualizedReturn = 0f
+        )
+    }
+    
+    private fun validateBudgetData(budgetData: BudgetData) {
+        if (budgetData.budgetAmount <= 0) throw Exception("Budget amount must be positive")
+        if (budgetData.startDate.after(budgetData.endDate)) throw Exception("Start date must be before end date")
+    }
+    
+    private fun updateBudgetTracking() {
+        // Update budget tracking
+    }
+    
+    private fun notifyBudgetSet(budget: MaintenanceBudget) {
+        costTrackingListeners.forEach { listener ->
+            listener.onBudgetSet(budget)
+        }
+    }
+    
+    private fun notifyBudgetWarning(tracking: BudgetTracking) {
+        costTrackingListeners.forEach { listener ->
+            listener.onBudgetWarning(tracking)
+        }
+    }
+    
+    private fun notifyCostTracked(cost: TrackedMaintenanceCost) {
+        costTrackingListeners.forEach { listener ->
+            listener.onMaintenanceCostTracked(cost)
+        }
+    }
+    
+    private fun notifyRepairCostTracked(cost: TrackedRepairCost) {
+        costTrackingListeners.forEach { listener ->
+            listener.onRepairCostTracked(cost)
+        }
+    }
+    
+    private fun generateCostPredictions(
+        historicalData: List<HistoricalCostData>,
+        forecastPeriod: Int
+    ): List<CostPrediction> {
+        // Generate cost predictions based on historical data
+        return emptyList()
+    }
+    
+    private fun calculateForecastAccuracy(
+        historicalData: List<HistoricalCostData>,
+        predictions: List<CostPrediction>
+    ): Float {
+        // Calculate forecast accuracy
+        return 0.85f
+    }
+    
+    private fun generateForecastInsights(
+        predictions: List<CostPrediction>,
+        accuracy: Float
+    ): List<String> {
+        // Generate insights based on predictions and accuracy
+        return emptyList()
+    }
+    
+    private fun analyzeCostPatterns(analysis: CostAnalysis): List<CostOptimization> {
+        // Analyze cost patterns for optimization opportunities
+        return emptyList()
+    }
+    
+    private fun analyzeVendorPerformance(costByVendor: Map<String, Float>): List<CostOptimization> {
+        // Analyze vendor performance
+        return emptyList()
+    }
+    
+    private fun analyzeMaintenanceFrequency(analysis: CostAnalysis): List<CostOptimization> {
+        // Analyze maintenance frequency
+        return emptyList()
+    }
+    
+    private fun analyzePartsUsage(analysis: CostAnalysis): List<CostOptimization> {
+        // Analyze parts usage
+        return emptyList()
+    }
+    
+    private fun analyzeLaborEfficiency(analysis: CostAnalysis): List<CostOptimization> {
+        // Analyze labor efficiency
+        return emptyList()
+    }
+    
+    /**
+     * Get tracking status
+     */
+    fun isTracking(): Boolean = isTracking
+}
+
+/**
+ * Data classes
+ */
+data class MaintenanceCostData(
+    val costType: MaintenanceCostType,
+    val laborCost: Float,
+    val partsCost: Float,
+    val materialCost: Float,
+    val otherCost: Float,
+    val currency: String,
+    val recordedBy: String,
+    val notes: String,
+    val attachments: List<String>,
+    val vendorId: String? = null
+)
+
+data class RepairCostData(
+    val repairType: RepairType,
+    val laborCost: Float,
+    val partsCost: Float,
+    val materialCost: Float,
+    val otherCost: Float,
+    val currency: String,
+    val recordedBy: String,
+    val notes: String,
+    val attachments: List<String>,
+    val vendorId: String? = null
+)
+
+data class TrackedMaintenanceCost(
+    val id: Long,
+    val maintenanceId: Long,
+    val costType: MaintenanceCostType,
+    val laborCost: Float,
+    val partsCost: Float,
+    val materialCost: Float,
+    val otherCost: Float,
+    val totalCost: Float,
+    val currency: String,
+    val recordedBy: String,
+    val recordedAt: Date,
+    val notes: String,
+    val attachments: List<String>
+)
+
+data class TrackedRepairCost(
+    val id: Long,
+    val repairId: Long,
+    val repairType: RepairType,
+    val laborCost: Float,
+    val partsCost: Float,
+    val materialCost: Float,
+    val otherCost: Float,
+    val totalCost: Float,
+    val currency: String,
+    val recordedBy: String,
+    val recordedAt: Date,
+    val notes: String,
+    val attachments: List<String>
+)
+
+data class BudgetData(
+    val budgetAmount: Float,
+    val currency: String,
+    val period: BudgetPeriod,
+    val startDate: Date,
+    val endDate: Date,
+    val alertThreshold: Float
+)
+
+data class MaintenanceBudget(
+    val id: Long,
+    val budgetType: BudgetType,
+    val budgetAmount: Float,
+    val spentAmount: Float,
+    val remainingAmount: Float,
+    val currency: String,
+    val period: BudgetPeriod,
+    val startDate: Date,
+    val endDate: Date,
+    val alertThreshold: Float,
+    val isActive: Boolean,
+    val createdAt: Date,
+    val updatedAt: Date
+)
+
+data class BudgetTracking(
+    val totalBudget: Float,
+    val totalSpent: Float,
+    val totalRemaining: Float,
+    val budgetUtilization: Float,
+    val warningThresholds: Map<BudgetType, Float>
+)
+
+data class CostAnalysis(
+    val dateRange: DateRange,
+    val totalMaintenanceCost: Float,
+    val totalRepairCost: Float,
+    val totalCost: Float,
+    val costBreakdown: CostBreakdown,
+    val costTrends: CostTrends,
+    val costByCategory: Map<String, Float>,
+    val costByVehicle: Map<String, Float>,
+    val costByVendor: Map<String, Float>,
+    val costMetrics: CostMetrics,
+    val predictions: List<CostPrediction>,
+    val roiAnalysis: ROIAnalysis,
+    val generatedAt: Date
+)
+
+data class CostBreakdown(
+    val laborCost: Float,
+    val partsCost: Float,
+    val materialCost: Float,
+    val otherCost: Float,
+    val totalCost: Float,
+    val maintenanceCostPercentage: Float,
+    val repairCostPercentage: Float
+)
+
+data class CostTrends(
+    val monthlyTrend: Float,
+    val quarterlyTrend: Float,
+    val yearlyTrend: Float,
+    val averageMonthlyCost: Float,
+    val averageQuarterlyCost: Float,
+    val averageYearlyCost: Float
+)
+
+data class CostMetrics(
+    val costPerMile: Float,
+    val costPerHour: Float,
+    val averageMaintenanceCost: Float,
+    val averageRepairCost: Float,
+    val costEfficiencyScore: Float,
+    val costVariance: Float
+)
+
+data class CostPrediction(
+    val predictionDate: Date,
+    val predictedCost: Float,
+    val confidence: Float,
+    val category: String,
+    val factors: List<String>
+)
+
+data class ROIAnalysis(
+    val totalInvestment: Float,
+    val totalSavings: Float,
+    val netROI: Float,
+    val paybackPeriod: Int,
+    val annualizedReturn: Float
+)
+
+data class CostForecasting(
+    val forecastPeriod: Int,
+    val predictions: List<CostPrediction>,
+    val accuracy: Float,
+    val insights: List<String>,
+    val generatedAt: Date
+)
+
+data class VendorCostData(
+    val vendorId: String,
+    val totalCost: Float,
+    val projectCount: Int,
+    val averageCostPerProject: Float,
+    val lastCostDate: Date,
+    val performanceRating: Float
+)
+
+data class CostOptimization(
+    val id: String,
+    val type: OptimizationType,
+    val title: String,
+    val description: String,
+    val potentialSavings: Float,
+    val implementation: String,
+    val priority: OptimizationPriority,
+    val impact: String
+)
+
+data class HistoricalCostData(
+    val date: Date,
+    val cost: Float,
+    val category: String,
+    val vehicleId: String,
+    val vendorId: String?
+)
+
+/**
+ * Interfaces
+ */
+interface CostTrackingListener {
+    fun onMaintenanceCostTracked(cost: TrackedMaintenanceCost)
+    fun onRepairCostTracked(cost: TrackedRepairCost)
+    fun onBudgetSet(budget: MaintenanceBudget)
+    fun onBudgetWarning(tracking: BudgetTracking)
+    fun onCostAnalysisGenerated(analysis: CostAnalysis)
+    fun onCostForecastGenerated(forecasting: CostForecasting)
+    fun onCostOptimizationGenerated(optimizations: List<CostOptimization>)
+}
+
+/**
+ * Enums
+ */
+enum class CostTrackingState {
+    Idle,
+    Initializing,
+    Ready,
+    TrackingCost,
+    Analyzing,
+    AnalysisGenerated,
+    Forecasting,
+    ForecastGenerated,
+    Error
+}
+
+enum class MaintenanceCostType {
+    ROUTINE,
+    PREVENTIVE,
+    CORRECTIVE,
+    EMERGENCY,
+    OIL_CHANGE,
+    TIRE_REPLACEMENT,
+    BRAKE_SERVICE,
+    BATTERY_SERVICE,
+    TRANSMISSION_SERVICE
+}
+
+enum class BudgetType {
+    MAINTENANCE,
+    REPAIRS,
+    PARTS,
+    LABOR,
+    OVERALL
+}
+
+enum class BudgetPeriod {
+    WEEKLY,
+    MONTHLY,
+    QUARTERLY,
+    YEARLY
+}
+
+enum class OptimizationType {
+    VENDOR_NEGOTIATION,
+    PREVENTIVE_MAINTENANCE,
+    PARTS_OPTIMIZATION,
+    LABOR_EFFICIENCY,
+    MAINTENANCE_FREQUENCY,
+    BULK_PURCHASING
+}
+
+enum class OptimizationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

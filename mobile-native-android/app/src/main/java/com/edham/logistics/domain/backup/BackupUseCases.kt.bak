@@ -1,0 +1,337 @@
+package com.edham.logistics.domain.backup
+
+import com.edham.logistics.core.backup.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Backup Use Cases - Domain layer for backup operations
+ * Provides business logic for backup operations
+ */
+@Singleton
+class BackupUseCases @Inject constructor(
+    private val backupManager: BackupManager
+) {
+
+    /**
+     * Create manual backup use case
+     */
+    suspend fun createManualBackup(
+        name: String? = null,
+        includeFiles: Boolean = true,
+        includeDatabase: Boolean = true,
+        encryptionEnabled: Boolean = true
+    ): Result<BackupInfo> {
+        return backupManager.createManualBackup(
+            name = name,
+            includeFiles = includeFiles,
+            includeDatabase = includeDatabase,
+            encryptionEnabled = encryptionEnabled
+        )
+    }
+
+    /**
+     * Create automatic backup use case
+     */
+    suspend fun createAutoBackup(): Result<BackupInfo> {
+        return backupManager.createAutoBackup()
+    }
+
+    /**
+     * Restore backup use case
+     */
+    suspend fun restoreBackup(
+        backupId: String,
+        restoreOptions: RestoreOptions = RestoreOptions()
+    ): Result<RestoreResult> {
+        return backupManager.restoreBackup(backupId, restoreOptions)
+    }
+
+    /**
+     * Export system data use case
+     */
+    suspend fun exportSystemData(
+        exportType: ExportType,
+        dateRange: DateRange? = null,
+        includeFiles: Boolean = true
+    ): Result<ExportResult> {
+        return backupManager.exportSystemData(exportType, dateRange, includeFiles)
+    }
+
+    /**
+     * Delete backup use case
+     */
+    suspend fun deleteBackup(backupId: String): Result<Boolean> {
+        return backupManager.deleteBackup(backupId)
+    }
+
+    /**
+     * Get backup info use case
+     */
+    fun getBackupInfo(backupId: String): BackupInfo? {
+        return backupManager.getBackupInfo(backupId)
+    }
+
+    /**
+     * Get backup history use case
+     */
+    fun getBackupHistory(): Flow<List<BackupInfo>> {
+        return backupManager.backupHistory
+    }
+
+    /**
+     * Get backup statistics use case
+     */
+    fun getBackupStatistics(): BackupStatistics {
+        return backupManager.getBackupStatistics()
+    }
+
+    /**
+     * Update backup configuration use case
+     */
+    fun updateBackupConfiguration(config: BackupConfig) {
+        backupManager.updateConfig(config)
+    }
+
+    /**
+     * Get backup state use case
+     */
+    fun getBackupState(): Flow<BackupState> {
+        return backupManager.backupState
+    }
+
+    /**
+     * Validate backup before restore use case
+     */
+    suspend fun validateBackupForRestore(backupId: String): Result<BackupValidationResult> {
+        val backupInfo = backupManager.getBackupInfo(backupId)
+            ?: return Result.failure(Exception("Backup not found"))
+
+        return try {
+            // Validate backup integrity
+            val isValid = validateBackupIntegrity(backupInfo)
+            
+            Result.success(
+                BackupValidationResult(
+                    backupId = backupId,
+                    isValid = isValid,
+                    validationErrors = if (!isValid) listOf("Backup integrity check failed") else emptyList(),
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Schedule backup use case
+     */
+    fun scheduleBackup(backupTime: String): Result<Boolean> {
+        return try {
+            backupManager.updateConfig(
+                BackupConfig(
+                    enableAutoBackup = true,
+                    backupTime = backupTime
+                )
+            )
+            Result.success(true)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Cancel scheduled backup use case
+     */
+    fun cancelScheduledBackup(): Result<Boolean> {
+        return try {
+            backupManager.updateConfig(
+                BackupConfig(enableAutoBackup = false)
+            )
+            Result.success(true)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get backup recommendations use case
+     */
+    suspend fun getBackupRecommendations(): BackupRecommendations {
+        val statistics = backupManager.getBackupStatistics()
+        val history = backupManager.backupHistory.value
+        
+        val recommendations = mutableListOf<String>()
+        
+        // Check if auto backup is enabled
+        if (!statistics.autoBackupsEnabled) {
+            recommendations.add("Enable automatic daily backups for better data protection")
+        }
+        
+        // Check backup frequency
+        val recentBackups = history.filter { 
+            System.currentTimeMillis() - it.timestamp < 7 * 24 * 60 * 60 * 1000 
+        }
+        if (recentBackups.size < 3) {
+            recommendations.add("Create more frequent backups (recommended: at least 3 per week)")
+        }
+        
+        // Check backup size
+        if (statistics.totalSize > 1024 * 1024 * 1024) { // 1GB
+            recommendations.add("Consider cleaning up old backups to save storage space")
+        }
+        
+        // Check encryption
+        val encryptedBackups = history.filter { it.encrypted }
+        if (encryptedBackups.size < history.size) {
+            recommendations.add("Enable encryption for all backups to improve security")
+        }
+        
+        return BackupRecommendations(
+            recommendations = recommendations,
+            priority = if (recommendations.isNotEmpty()) RecommendationPriority.MEDIUM else RecommendationPriority.LOW,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * Validate backup integrity
+     */
+    private suspend fun validateBackupIntegrity(backupInfo: BackupInfo): Boolean {
+        return try {
+            // Implementation would validate backup file integrity
+            backupInfo.status == BackupStatus.COMPLETED && backupInfo.size > 0
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Get backup health status use case
+     */
+    suspend fun getBackupHealthStatus(): BackupHealthStatus {
+        val statistics = backupManager.getBackupStatistics()
+        val history = backupManager.backupHistory.value
+        
+        val healthScore = calculateBackupHealthScore(statistics, history)
+        val status = when {
+            healthScore >= 90 -> BackupHealthStatus.EXCELLENT
+            healthScore >= 70 -> BackupHealthStatus.GOOD
+            healthScore >= 50 -> BackupHealthStatus.FAIR
+            else -> BackupHealthStatus.POOR
+        }
+        
+        return BackupHealthStatus(
+            status = status,
+            score = healthScore,
+            issues = identifyBackupIssues(statistics, history),
+            recommendations = getBackupRecommendations().recommendations,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * Calculate backup health score
+     */
+    private fun calculateBackupHealthScore(
+        statistics: BackupStatistics,
+        history: List<BackupInfo>
+    ): Int {
+        var score = 100
+        
+        // Check auto backup enabled
+        if (!statistics.autoBackupsEnabled) score -= 20
+        
+        // Check backup frequency
+        val recentBackups = history.filter { 
+            System.currentTimeMillis() - it.timestamp < 7 * 24 * 60 * 60 * 1000 
+        }
+        if (recentBackups.size < 3) score -= 15
+        
+        // Check encryption
+        val encryptedBackups = history.filter { it.encrypted }
+        if (encryptedBackups.size < history.size) score -= 10
+        
+        // Check backup age
+        val latestBackup = statistics.latestBackup
+        if (latestBackup != null) {
+            val daysSinceLatest = (System.currentTimeMillis() - latestBackup.timestamp) / (24 * 60 * 60 * 1000)
+            if (daysSinceLatest > 7) score -= 15
+        } else {
+            score -= 25
+        }
+        
+        return maxOf(0, score)
+    }
+
+    /**
+     * Identify backup issues
+     */
+    private fun identifyBackupIssues(
+        statistics: BackupStatistics,
+        history: List<BackupInfo>
+    ): List<String> {
+        val issues = mutableListOf<String>()
+        
+        if (!statistics.autoBackupsEnabled) {
+            issues.add("Automatic backups are disabled")
+        }
+        
+        if (statistics.latestBackup == null) {
+            issues.add("No backups available")
+        } else {
+            val daysSinceLatest = (System.currentTimeMillis() - statistics.latestBackup.timestamp) / (24 * 60 * 60 * 1000)
+            if (daysSinceLatest > 7) {
+                issues.add("Latest backup is older than 7 days")
+            }
+        }
+        
+        val failedBackups = history.filter { it.status == BackupStatus.FAILED }
+        if (failedBackups.isNotEmpty()) {
+            issues.add("${failedBackups.size} backup(s) failed")
+        }
+        
+        return issues
+    }
+}
+
+/**
+ * Data classes for backup use cases
+ */
+data class BackupValidationResult(
+    val backupId: String,
+    val isValid: Boolean,
+    val validationErrors: List<String>,
+    val timestamp: Long
+)
+
+data class BackupRecommendations(
+    val recommendations: List<String>,
+    val priority: RecommendationPriority,
+    val timestamp: Long
+)
+
+data class BackupHealthStatus(
+    val status: String,
+    val score: Int,
+    val issues: List<String>,
+    val recommendations: List<String>,
+    val timestamp: Long
+) {
+    companion object {
+        const val EXCELLENT = "Excellent"
+        const val GOOD = "Good"
+        const val FAIR = "Fair"
+        const val POOR = "Poor"
+    }
+}
+
+enum class RecommendationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

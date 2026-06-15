@@ -1,0 +1,512 @@
+package com.edham.logistics.core.ui
+
+import android.content.Context
+import android.os.Bundle
+import android.view.View
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.Animation
+import android.view.animation.AnimationUtils
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.FragmentManager
+import androidx.fragment.app.FragmentTransaction
+import androidx.navigation.NavController
+import androidx.navigation.NavOptions
+import androidx.navigation.fragment.NavHostFragment
+import kotlinx.coroutines.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Navigation Manager - Manages navigation flow with smooth transitions
+ * Provides consistent navigation patterns across the application
+ */
+@Singleton
+class NavigationManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val navigationStates = ConcurrentHashMap<String, NavigationState>()
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    
+    // Default navigation configuration
+    private var defaultConfig = NavigationConfig()
+    
+    // Navigation stack for back navigation
+    private val navigationStack = mutableListOf<NavigationEntry>()
+    
+    /**
+     * Initialize navigation manager
+     */
+    fun initialize(screenId: String, config: NavigationConfig = NavigationConfig()) {
+        this.defaultConfig = config
+        navigationStates[screenId] = NavigationState.IDLE
+    }
+
+    /**
+     * Navigate with transition
+     */
+    fun navigate(
+        fromScreen: String,
+        toScreen: String,
+        transitionType: NavigationTransition = NavigationTransition.SLIDE,
+        fragmentManager: FragmentManager,
+        containerId: Int,
+        fragmentClass: Class<out Fragment>,
+        args: Bundle? = null,
+        addToBackStack: Boolean = true
+    ) {
+        if (!defaultConfig.enableTransitions) {
+            navigateWithoutTransition(
+                fromScreen,
+                toScreen,
+                fragmentManager,
+                containerId,
+                fragmentClass,
+                args,
+                addToBackStack
+            )
+            return
+        }
+
+        val fromFragment = fragmentManager.findFragmentById(containerId)
+        val toFragment = fragmentClass.newInstance().apply {
+            arguments = args
+        }
+
+        // Create fragment transaction with animation
+        val transaction = fragmentManager.beginTransaction().apply {
+            setCustomAnimations(
+                getEnterAnimation(transitionType),
+                getExitAnimation(transitionType),
+                getPopEnterAnimation(transitionType),
+                getPopExitAnimation(transitionType)
+            )
+            
+            replace(containerId, toFragment, toScreen)
+            
+            if (addToBackStack) {
+                addToBackStack(toScreen)
+            }
+        }
+
+        // Execute transaction
+        transaction.commit()
+        
+        // Update navigation state
+        updateNavigationState(fromScreen, toScreen, transitionType)
+        
+        // Add to navigation stack
+        if (addToBackStack) {
+            navigationStack.add(
+                NavigationEntry(
+                    fromScreen = fromScreen,
+                    toScreen = toScreen,
+                    fragment = toFragment,
+                    args = args,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    /**
+     * Navigate using NavController
+     */
+    fun navigateWithNavController(
+        fromScreen: String,
+        toScreen: String,
+        navController: NavController,
+        destinationId: Int,
+        args: Bundle? = null,
+        transitionType: NavigationTransition = NavigationTransition.SLIDE
+    ) {
+        val navOptions = createNavOptions(transitionType)
+        
+        try {
+            navController.navigate(destinationId, args, navOptions)
+            updateNavigationState(fromScreen, toScreen, transitionType)
+        } catch (e: Exception) {
+            // Handle navigation error
+            handleNavigationError(fromScreen, toScreen, e)
+        }
+    }
+
+    /**
+     * Navigate without transition
+     */
+    private fun navigateWithoutTransition(
+        fromScreen: String,
+        toScreen: String,
+        fragmentManager: FragmentManager,
+        containerId: Int,
+        fragmentClass: Class<out Fragment>,
+        args: Bundle? = null,
+        addToBackStack: Boolean = true
+    ) {
+        val toFragment = fragmentClass.newInstance().apply {
+            arguments = args
+        }
+
+        val transaction = fragmentManager.beginTransaction().apply {
+            replace(containerId, toFragment, toScreen)
+            
+            if (addToBackStack) {
+                addToBackStack(toScreen)
+            }
+        }
+
+        transaction.commit()
+        updateNavigationState(fromScreen, toScreen, NavigationTransition.NONE)
+    }
+
+    /**
+     * Navigate back
+     */
+    fun navigateBack(
+        currentScreen: String,
+        fragmentManager: FragmentManager
+    ): Boolean {
+        if (navigationStack.size <= 1) {
+            return false // No more screens to go back to
+        }
+
+        // Remove current screen from stack
+        navigationStack.removeLastOrNull()
+        
+        // Get previous screen
+        val previousEntry = navigationStack.lastOrNull()
+        
+        if (previousEntry != null) {
+            val transaction = fragmentManager.beginTransaction().apply {
+                setCustomAnimations(
+                    getPopEnterAnimation(defaultConfig.defaultTransition),
+                    getPopExitAnimation(defaultConfig.defaultTransition)
+                )
+                
+                replace(
+                    (fragmentManager.findFragmentById(android.R.id.content)?.parent?.id ?: 0),
+                    previousEntry.fragment,
+                    previousEntry.toScreen
+                )
+            }
+
+            transaction.commit()
+            updateNavigationState(currentScreen, previousEntry.toScreen, NavigationTransition.BACK)
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * Navigate to root
+     */
+    fun navigateToRoot(
+        currentScreen: String,
+        fragmentManager: FragmentManager,
+        containerId: Int,
+        rootFragmentClass: Class<out Fragment>
+    ) {
+        // Clear navigation stack
+        navigationStack.clear()
+        
+        val rootFragment = rootFragmentClass.newInstance()
+        
+        val transaction = fragmentManager.beginTransaction().apply {
+            setCustomAnimations(
+                getEnterAnimation(NavigationTransition.FADE),
+                getExitAnimation(NavigationTransition.FADE)
+            )
+            
+            replace(containerId, rootFragment, "root")
+        }
+
+        transaction.commit()
+        updateNavigationState(currentScreen, "root", NavigationTransition.ROOT)
+    }
+
+    /**
+     * Navigate with deep link
+     */
+    fun navigateWithDeepLink(
+        fromScreen: String,
+        deepLink: String,
+        navController: NavController
+    ) {
+        try {
+            navController.navigate(deepLink)
+            updateNavigationState(fromScreen, deepLink, NavigationTransition.DEEP_LINK)
+        } catch (e: Exception) {
+            handleNavigationError(fromScreen, deepLink, e)
+        }
+    }
+
+    /**
+     * Create navigation options
+     */
+    private fun createNavOptions(transitionType: NavigationTransition): NavOptions {
+        return when (transitionType) {
+            NavigationTransition.SLIDE -> {
+                NavOptions.Builder()
+                    .setEnterAnim(android.R.anim.slide_in_left)
+                    .setExitAnim(android.R.anim.slide_out_right)
+                    .setPopEnterAnim(android.R.anim.slide_in_right)
+                    .setPopExitAnim(android.R.anim.slide_out_left)
+                    .build()
+            }
+            NavigationTransition.FADE -> {
+                NavOptions.Builder()
+                    .setEnterAnim(android.R.anim.fade_in)
+                    .setExitAnim(android.R.anim.fade_out)
+                    .setPopEnterAnim(android.R.anim.fade_in)
+                    .setPopExitAnim(android.R.anim.fade_out)
+                    .build()
+            }
+            NavigationTransition.NONE -> {
+                NavOptions.Builder().build()
+            }
+            else -> {
+                NavOptions.Builder().build()
+            }
+        }
+    }
+
+    /**
+     * Get enter animation
+     */
+    private fun getEnterAnimation(transitionType: NavigationTransition): Int {
+        return when (transitionType) {
+            NavigationTransition.SLIDE -> android.R.anim.slide_in_left
+            NavigationTransition.FADE -> android.R.anim.fade_in
+            NavigationTransition.SLIDE_UP -> android.R.anim.slide_in_up
+            NavigationTransition.SLIDE_DOWN -> android.R.anim.slide_in_down
+            else -> android.R.anim.fade_in
+        }
+    }
+
+    /**
+     * Get exit animation
+     */
+    private fun getExitAnimation(transitionType: NavigationTransition): Int {
+        return when (transitionType) {
+            NavigationTransition.SLIDE -> android.R.anim.slide_out_right
+            NavigationTransition.FADE -> android.R.anim.fade_out
+            NavigationTransition.SLIDE_UP -> android.R.anim.slide_out_up
+            NavigationTransition.SLIDE_DOWN -> android.R.anim.slide_out_down
+            else -> android.R.anim.fade_out
+        }
+    }
+
+    /**
+     * Get pop enter animation
+     */
+    private fun getPopEnterAnimation(transitionType: NavigationTransition): Int {
+        return when (transitionType) {
+            NavigationTransition.SLIDE -> android.R.anim.slide_in_right
+            NavigationTransition.FADE -> android.R.anim.fade_in
+            NavigationTransition.SLIDE_UP -> android.R.anim.slide_in_down
+            NavigationTransition.SLIDE_DOWN -> android.R.anim.slide_in_up
+            else -> android.R.anim.fade_in
+        }
+    }
+
+    /**
+     * Get pop exit animation
+     */
+    private fun getPopExitAnimation(transitionType: NavigationTransition): Int {
+        return when (transitionType) {
+            NavigationTransition.SLIDE -> android.R.anim.slide_out_left
+            NavigationTransition.FADE -> android.R.anim.fade_out
+            NavigationTransition.SLIDE_UP -> android.R.anim.slide_out_down
+            NavigationTransition.SLIDE_DOWN -> android.R.anim.slide_out_up
+            else -> android.R.anim.fade_out
+        }
+    }
+
+    /**
+     * Update navigation state
+     */
+    private fun updateNavigationState(
+        fromScreen: String,
+        toScreen: String,
+        transitionType: NavigationTransition
+    ) {
+        navigationStates[fromScreen] = NavigationState.NAVIGATING
+        navigationStates[toScreen] = NavigationState.ACTIVE
+        
+        // Reset previous screen state after transition
+        coroutineScope.launch {
+            delay(defaultConfig.transitionDuration)
+            navigationStates[fromScreen] = NavigationState.IDLE
+        }
+    }
+
+    /**
+     * Handle navigation error
+     */
+    private fun handleNavigationError(
+        fromScreen: String,
+        toScreen: String,
+        error: Exception
+    ) {
+        navigationStates[fromScreen] = NavigationState.ERROR
+        // Log error and potentially show error dialog
+    }
+
+    /**
+     * Check if navigation is possible
+     */
+    fun canNavigate(screenId: String): Boolean {
+        val state = navigationStates[screenId] ?: NavigationState.IDLE
+        return state == NavigationState.IDLE || state == NavigationState.ACTIVE
+    }
+
+    /**
+     * Get current navigation state
+     */
+    fun getNavigationState(screenId: String): NavigationState {
+        return navigationStates[screenId] ?: NavigationState.IDLE
+    }
+
+    /**
+     * Get navigation stack size
+     */
+    fun getNavigationStackSize(): Int {
+        return navigationStack.size
+    }
+
+    /**
+     * Get current screen in stack
+     */
+    fun getCurrentScreen(): String? {
+        return navigationStack.lastOrNull()?.toScreen
+    }
+
+    /**
+     * Clear navigation stack
+     */
+    fun clearNavigationStack() {
+        navigationStack.clear()
+    }
+
+    /**
+     * Update navigation configuration
+     */
+    fun updateConfig(config: NavigationConfig) {
+        this.defaultConfig = config
+    }
+
+    /**
+     * Create custom transition animation
+     */
+    fun createCustomTransition(
+        duration: Long = 300,
+        interpolator: Int = android.view.interpolator.AccelerateDecelerateInterpolator().hashCode()
+    ): Animation {
+        return AnimationUtils.loadAnimation(context, android.R.anim.fade_in).apply {
+            this.duration = duration
+            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+        }
+    }
+
+    /**
+     * Animate view transition
+     */
+    fun animateViewTransition(
+        fromView: View,
+        toView: View,
+        transitionType: NavigationTransition = NavigationTransition.FADE
+    ) {
+        when (transitionType) {
+            NavigationTransition.FADE -> {
+                fromView.animate()
+                    .alpha(0f)
+                    .setDuration(defaultConfig.transitionDuration)
+                    .withEndAction {
+                        fromView.visibility = View.GONE
+                        toView.alpha = 0f
+                        toView.visibility = View.VISIBLE
+                        toView.animate()
+                            .alpha(1f)
+                            .setDuration(defaultConfig.transitionDuration)
+                            .start()
+                    }
+                    .start()
+            }
+            NavigationTransition.SLIDE -> {
+                // Implement slide transition
+                fromView.animate()
+                    .translationX(-fromView.width.toFloat())
+                    .setDuration(defaultConfig.transitionDuration)
+                    .withEndAction {
+                        fromView.visibility = View.GONE
+                        toView.translationX = toView.width.toFloat()
+                        toView.visibility = View.VISIBLE
+                        toView.animate()
+                            .translationX(0f)
+                            .setDuration(defaultConfig.transitionDuration)
+                            .start()
+                    }
+                    .start()
+            }
+            else -> {
+                // Simple visibility change
+                fromView.visibility = View.GONE
+                toView.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    /**
+     * Cleanup navigation manager
+     */
+    fun cleanup(screenId: String? = null) {
+        if (screenId != null) {
+            navigationStates.remove(screenId)
+        } else {
+            navigationStates.clear()
+            navigationStack.clear()
+        }
+        
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class NavigationConfig(
+    val enableTransitions: Boolean = true,
+    val defaultTransition: NavigationTransition = NavigationTransition.SLIDE,
+    val transitionDuration: Long = 300,
+    val enableBackStack: Boolean = true,
+    val maxBackStackSize: Int = 20
+)
+
+data class NavigationEntry(
+    val fromScreen: String,
+    val toScreen: String,
+    val fragment: Fragment,
+    val args: Bundle?,
+    val timestamp: Long
+)
+
+enum class NavigationState {
+    IDLE,
+    NAVIGATING,
+    ACTIVE,
+    ERROR
+}
+
+enum class NavigationTransition {
+    NONE,
+    SLIDE,
+    FADE,
+    SLIDE_UP,
+    SLIDE_DOWN,
+    BACK,
+    ROOT,
+    DEEP_LINK,
+    CUSTOM
+}

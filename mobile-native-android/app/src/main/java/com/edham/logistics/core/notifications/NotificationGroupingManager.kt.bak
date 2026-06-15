@@ -1,0 +1,427 @@
+package com.edham.logistics.core.notifications
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Notification Grouping Manager - Groups notifications by type and context
+ * Provides intelligent notification grouping and summary generation
+ */
+@Singleton
+class NotificationGroupingManager @Inject constructor() {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // Notification groups
+    private val notificationGroups = ConcurrentHashMap<String, NotificationGroup>()
+    
+    // Grouping rules
+    private val groupingRules = ConcurrentHashMap<NotificationEvent, GroupingRule>()
+    
+    // Group history
+    private val _groupHistory = MutableStateFlow<List<NotificationGroup>>(emptyList())
+    val groupHistory: StateFlow<List<NotificationGroup>> = _groupHistory.asStateFlow()
+
+    /**
+     * Initialize grouping manager
+     */
+    fun initialize() {
+        setupDefaultGroupingRules()
+        startGroupingMonitoring()
+    }
+
+    /**
+     * Add notification to group
+     */
+    suspend fun addNotificationToGroup(
+        notification: SmartNotification
+    ): NotificationGroupResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                val groupKey = generateGroupKey(notification)
+                val group = notificationGroups.getOrPut(groupKey) {
+                    createNewGroup(notification)
+                }
+                
+                // Add notification to group
+                group.addNotification(notification)
+                
+                // Update group summary
+                updateGroupSummary(group)
+                
+                // Check if should show summary notification
+                val shouldShowSummary = shouldShowGroupSummary(group)
+                
+                if (shouldShowSummary) {
+                    createSummaryNotification(group)
+                }
+                
+                // Add to history
+                addToHistory(group)
+                
+                NotificationGroupResult(
+                    group = group,
+                    summaryShown = shouldShowSummary,
+                    groupKey = groupKey
+                )
+                
+            } catch (e: Exception) {
+                NotificationGroupResult(
+                    group = null,
+                    summaryShown = false,
+                    error = e.message
+                )
+            }
+        }
+    }
+
+    /**
+     * Get notification groups
+     */
+    fun getNotificationGroups(): Map<String, NotificationGroup> {
+        return notificationGroups.toMap()
+    }
+
+    /**
+     * Get group by key
+     */
+    fun getGroupByKey(groupKey: String): NotificationGroup? {
+        return notificationGroups[groupKey]
+    }
+
+    /**
+     * Clear group
+     */
+    suspend fun clearGroup(groupKey: String) {
+        withContext(Dispatchers.IO) {
+            notificationGroups.remove(groupKey)
+            
+            // Update history
+            val currentHistory = _groupHistory.value.toMutableList()
+            currentHistory.removeAll { it.key == groupKey }
+            _groupHistory.value = currentHistory
+        }
+    }
+
+    /**
+     * Clear all groups
+     */
+    suspend fun clearAllGroups() {
+        withContext(Dispatchers.IO) {
+            notificationGroups.clear()
+            _groupHistory.value = emptyList()
+        }
+    }
+
+    /**
+     * Get grouping statistics
+     */
+    fun getGroupingStatistics(): GroupingStatistics {
+        val groups = notificationGroups.values.toList()
+        val totalNotifications = groups.sumOf { it.notifications.size }
+        val averageGroupSize = if (groups.isNotEmpty()) {
+            totalNotifications.toDouble() / groups.size
+        } else 0.0
+        
+        return GroupingStatistics(
+            totalGroups = groups.size,
+            totalNotifications = totalNotifications,
+            averageGroupSize = averageGroupSize,
+            largestGroupSize = groups.maxOfOrNull { it.notifications.size } ?: 0,
+            byEventType = groups.groupBy { it.eventType },
+            byPriority = groups.groupBy { it.highestPriority }
+        )
+    }
+
+    /**
+     * Setup default grouping rules
+     */
+    private fun setupDefaultGroupingRules() {
+        // Shipment delay grouping
+        groupingRules[NotificationEvent.SHIPMENT_DELAYED] = object : GroupingRule {
+            override fun shouldGroup(notification1: SmartNotification, notification2: SmartNotification): Boolean {
+                val shipmentId1 = notification1.data["shipmentId"] as? String
+                val shipmentId2 = notification2.data["shipmentId"] as? String
+                return shipmentId1 == shipmentId2 && shipmentId1 != null
+            }
+            
+            override fun getGroupKey(notification: SmartNotification): String {
+                val shipmentId = notification.data["shipmentId"] as? String ?: ""
+                return "shipment_delay_$shipmentId"
+            }
+        }
+        
+        // Temperature issue grouping
+        groupingRules[NotificationEvent.TEMPERATURE_ISSUE] = object : GroupingRule {
+            override fun shouldGroup(notification1: SmartNotification, notification2: SmartNotification): Boolean {
+                val location1 = notification1.data["location"] as? String
+                val location2 = notification2.data["location"] as? String
+                return location1 == location2 && location1 != null
+            }
+            
+            override fun getGroupKey(notification: SmartNotification): String {
+                val location = notification.data["location"] as? String ?: ""
+                return "temperature_issue_$location"
+            }
+        }
+        
+        // Payment overdue grouping
+        groupingRules[NotificationEvent.PAYMENT_OVERDUE] = object : GroupingRule {
+            override fun shouldGroup(notification1: SmartNotification, notification2: SmartNotification): Boolean {
+                val customerId1 = notification1.data["customerId"] as? String
+                val customerId2 = notification2.data["customerId"] as? String
+                return customerId1 == customerId2 && customerId1 != null
+            }
+            
+            override fun getGroupKey(notification: SmartNotification): String {
+                val customerId = notification.data["customerId"] as? String ?: ""
+                return "payment_overdue_$customerId"
+            }
+        }
+    }
+
+    /**
+     * Start grouping monitoring
+     */
+    private fun startGroupingMonitoring() {
+        coroutineScope.launch {
+            while (isActive) {
+                try {
+                    // Clean up old groups
+                    cleanupOldGroups()
+                    
+                    delay(60000) // Check every minute
+                } catch (e: Exception) {
+                    // Handle monitoring error
+                }
+            }
+        }
+    }
+
+    /**
+     * Generate group key
+     */
+    private fun generateGroupKey(notification: SmartNotification): String {
+        val rule = groupingRules[notification.event]
+        return rule?.getGroupKey(notification) ?: "default_${notification.event.name}"
+    }
+
+    /**
+     * Create new group
+     */
+    private fun createNewGroup(notification: SmartNotification): NotificationGroup {
+        return NotificationGroup(
+            key = generateGroupKey(notification),
+            eventType = notification.event,
+            title = generateGroupTitle(notification),
+            notifications = mutableListOf(),
+            createdAt = System.currentTimeMillis(),
+            lastUpdated = System.currentTimeMillis(),
+            highestPriority = notification.priority,
+            isRead = false
+        )
+    }
+
+    /**
+     * Generate group title
+     */
+    private fun generateGroupTitle(notification: SmartNotification): String {
+        return when (notification.event) {
+            NotificationEvent.SHIPMENT_DELAYED -> "تأخيرات الشحنات"
+            NotificationEvent.TEMPERATURE_ISSUE -> "مشاكل درجة الحرارة"
+            NotificationEvent.PAYMENT_OVERDUE -> "المدفوعات المتأخرة"
+            else -> notification.event.name
+        }
+    }
+
+    /**
+     * Update group summary
+     */
+    private fun updateGroupSummary(group: NotificationGroup) {
+        group.lastUpdated = System.currentTimeMillis()
+        group.highestPriority = group.notifications.maxOfOrNull { it.priority } ?: NotificationPriority.NORMAL
+        group.summary = generateGroupSummary(group)
+    }
+
+    /**
+     * Generate group summary
+     */
+    private fun generateGroupSummary(group: NotificationGroup): String {
+        val count = group.notifications.size
+        val eventType = group.eventType
+        
+        return when (eventType) {
+            NotificationEvent.SHIPMENT_DELAYED -> {
+                when (count) {
+                    1 -> "شحنة واحدة متأخرة"
+                    2 -> "شحنتان متأخرتان"
+                    in 3..10 -> "$count شحنات متأخرة"
+                    else -> "$count شحنة متأخرة"
+                }
+            }
+            
+            NotificationEvent.TEMPERATURE_ISSUE -> {
+                when (count) {
+                    1 -> "مشكلة حرارية واحدة"
+                    2 -> "مشكلتان حراريتان"
+                    in 3..10 -> "$count مشاكل حرارية"
+                    else -> "$count مشكلة حرارية"
+                }
+            }
+            
+            NotificationEvent.PAYMENT_OVERDUE -> {
+                when (count) {
+                    1 -> "دفعة واحدة متأخرة"
+                    2 -> "دفعتان متأخرتان"
+                    in 3..10 -> "$count دفعات متأخرة"
+                    else -> "$count دفعة متأخرة"
+                }
+            }
+            
+            else -> "$count إشعار"
+        }
+    }
+
+    /**
+     * Check if should show group summary
+     */
+    private fun shouldShowGroupSummary(group: NotificationGroup): Boolean {
+        val count = group.notifications.size
+        val timeSinceLastUpdate = System.currentTimeMillis() - group.lastUpdated
+        
+        return when {
+            count >= 5 -> true // Show summary if 5 or more notifications
+            count >= 3 && timeSinceLastUpdate > 300000 -> true // Show summary if 3+ and 5+ minutes passed
+            count >= 1 && timeSinceLastUpdate > 1800000 -> true // Show summary if 30+ minutes passed
+            else -> false
+        }
+    }
+
+    /**
+     * Create summary notification
+     */
+    private suspend fun createSummaryNotification(group: NotificationGroup) {
+        withContext(Dispatchers.IO) {
+            try {
+                val summaryNotification = SmartNotification(
+                    id = "summary_${group.key}",
+                    event = NotificationEvent.SYSTEM_UPDATE,
+                    title = group.title,
+                    message = group.summary ?: generateGroupSummary(group),
+                    priority = group.highestPriority,
+                    channelId = "summary_notifications",
+                    timestamp = System.currentTimeMillis(),
+                    data = mapOf(
+                        "groupKey" to group.key,
+                        "notificationCount" to group.notifications.size,
+                        "eventType" to group.eventType.name
+                    ),
+                    isRead = false
+                )
+                
+                // This would integrate with SmartNotificationManager
+                // smartNotificationManager.showSmartNotification(summaryNotification.event, summaryNotification.data, summaryNotification.priority)
+                
+            } catch (e: Exception) {
+                // Handle summary notification creation error
+            }
+        }
+    }
+
+    /**
+     * Add to history
+     */
+    private fun addToHistory(group: NotificationGroup) {
+        val currentHistory = _groupHistory.value.toMutableList()
+        
+        // Remove existing entry for this group
+        currentHistory.removeAll { it.key == group.key }
+        
+        // Add updated group
+        currentHistory.add(0, group)
+        
+        // Keep only last 100 groups
+        if (currentHistory.size > 100) {
+            currentHistory.removeAt(currentHistory.size - 1)
+        }
+        
+        _groupHistory.value = currentHistory
+    }
+
+    /**
+     * Clean up old groups
+     */
+    private suspend fun cleanupOldGroups() {
+        withContext(Dispatchers.IO) {
+            val now = System.currentTimeMillis()
+            val cutoffTime = now - (24 * 60 * 60 * 1000) // 24 hours ago
+            
+            val groupsToRemove = notificationGroups.filter { (_, group) ->
+                group.lastUpdated < cutoffTime && group.notifications.isEmpty()
+            }
+            
+            groupsToRemove.forEach { (key, _) ->
+                notificationGroups.remove(key)
+            }
+        }
+    }
+
+    /**
+     * Cleanup
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Data classes and interfaces
+ */
+data class NotificationGroup(
+    val key: String,
+    val eventType: NotificationEvent,
+    var title: String,
+    val notifications: MutableList<SmartNotification>,
+    val createdAt: Long,
+    var lastUpdated: Long,
+    var highestPriority: NotificationPriority,
+    var isRead: Boolean,
+    var summary: String? = null
+) {
+    fun addNotification(notification: SmartNotification) {
+        notifications.add(notification)
+        if (notification.priority.ordinal > highestPriority.ordinal) {
+            highestPriority = notification.priority
+        }
+    }
+    
+    fun markAsRead() {
+        isRead = true
+        notifications.forEach { it.isRead = true }
+    }
+}
+
+data class NotificationGroupResult(
+    val group: NotificationGroup?,
+    val summaryShown: Boolean,
+    val groupKey: String,
+    val error: String? = null
+)
+
+data class GroupingStatistics(
+    val totalGroups: Int,
+    val totalNotifications: Int,
+    val averageGroupSize: Double,
+    val largestGroupSize: Int,
+    val byEventType: Map<NotificationEvent, List<NotificationGroup>>,
+    val byPriority: Map<NotificationPriority, List<NotificationGroup>>
+)
+
+interface GroupingRule {
+    fun shouldGroup(notification1: SmartNotification, notification2: SmartNotification): Boolean
+    fun getGroupKey(notification: SmartNotification): String
+}

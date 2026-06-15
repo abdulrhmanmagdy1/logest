@@ -59,10 +59,10 @@ class TemperatureGauge @JvmOverloads constructor(
         // Draw Temperature Color Arc
         val sweepAngle = ((temperature - minTemp) / (maxTemp - minTemp)) * 270f
         arcPaint.color = when {
-            temperature < -10f -> ContextCompat.getColor(context, R.color.ed_sky)
-            temperature < 5f -> ContextCompat.getColor(context, R.color.ed_emerald)
-            temperature < 15f -> ContextCompat.getColor(context, R.color.ed_orange)
-            else -> ContextCompat.getColor(context, R.color.ed_rust)
+            temperature < -10f -> ContextCompat.getColor(context, R.color.status_info)
+            temperature < 5f -> ContextCompat.getColor(context, R.color.status_success)
+            temperature < 15f -> ContextCompat.getColor(context, R.color.status_warning)
+            else -> ContextCompat.getColor(context, R.color.status_error)
         }
         canvas.drawArc(centerX - radius, centerY - radius, centerX + radius, centerY + radius, 135f, sweepAngle, false, arcPaint)
 

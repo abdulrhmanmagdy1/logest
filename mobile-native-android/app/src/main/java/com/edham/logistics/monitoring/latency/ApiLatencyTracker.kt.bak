@@ -1,0 +1,778 @@
+package com.edham.logistics.monitoring.latency
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * API Latency Tracker - Comprehensive API performance monitoring and analytics
+ * Implements real-time latency tracking, performance analysis, and optimization insights
+ */
+
+@Singleton
+class ApiLatencyTracker @Inject constructor() {
+
+    private val latencyScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val latencyListeners = mutableListOf<ApiLatencyListener>()
+    private val apiMetrics = ConcurrentHashMap<String, ApiMetric>()
+    private val latencyHistory = ConcurrentHashMap<String, MutableList<LatencyRecord>>()
+    
+    // Performance metrics
+    private val totalApiCalls = AtomicLong(0)
+    private val totalLatency = AtomicLong(0)
+    private val failedApiCalls = AtomicLong(0)
+    private val slowApiCalls = AtomicLong(0)
+    
+    // Configuration
+    private val slowApiThreshold = 2000L // 2 seconds
+    private val maxHistorySize = 1000
+    private val enableLatencyTracking = true
+    private val monitoringInterval = 5000L // 5 seconds
+    
+    // Real-time monitoring
+    private val _realTimeLatency = MutableStateFlow<RealTimeLatencyMetrics>(RealTimeLatencyMetrics())
+    val realTimeLatency: StateFlow<RealTimeLatencyMetrics> = _realTimeLatency.asStateFlow()
+    
+    init {
+        startLatencyMonitoring()
+    }
+    
+    /**
+     * Track API call latency
+     */
+    fun trackApiCall(
+        apiName: String,
+        latency: Long,
+        success: Boolean,
+        statusCode: Int? = null,
+        errorMessage: String? = null,
+        requestSize: Long? = null,
+        responseSize: Long? = null
+    ) {
+        if (!enableLatencyTracking) return
+        
+        try {
+            totalApiCalls.incrementAndGet()
+            totalLatency.addAndGet(latency)
+            
+            // Create latency record
+            val record = LatencyRecord(
+                timestamp = System.currentTimeMillis(),
+                latency = latency,
+                success = success,
+                statusCode = statusCode,
+                errorMessage = errorMessage,
+                requestSize = requestSize,
+                responseSize = responseSize
+            )
+            
+            // Add to history
+            addToHistory(apiName, record)
+            
+            // Update API metrics
+            updateApiMetrics(apiName, record)
+            
+            // Track slow calls
+            if (latency > slowApiThreshold) {
+                slowApiCalls.incrementAndGet()
+                
+                latencyListeners.forEach { listener ->
+                    listener.onSlowApiDetected(apiName, latency, record)
+                }
+            }
+            
+            // Track failed calls
+            if (!success) {
+                failedApiCalls.incrementAndGet()
+                
+                latencyListeners.forEach { listener ->
+                    listener.onApiCallFailed(apiName, errorMessage, record)
+                }
+            }
+            
+            // Notify listeners
+            latencyListeners.forEach { listener ->
+                listener.onApiCallTracked(apiName, latency, success, record)
+            }
+            
+            Timber.d("API call tracked: $apiName - ${latency}ms - ${if (success) "SUCCESS" else "FAILED"}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error tracking API call: $apiName")
+        }
+    }
+    
+    /**
+     * Measure API call execution
+     */
+    inline fun <T> measureApiCall(
+        apiName: String,
+        statusCode: Int? = null,
+        requestSize: Long? = null,
+        responseSize: Long? = null,
+        crossinline apiCall: () -> T
+    ): T {
+        val startTime = System.currentTimeMillis()
+        
+        return try {
+            val result = apiCall()
+            val latency = System.currentTimeMillis() - startTime
+            
+            trackApiCall(
+                apiName = apiName,
+                latency = latency,
+                success = true,
+                statusCode = statusCode,
+                requestSize = requestSize,
+                responseSize = responseSize
+            )
+            
+            result
+            
+        } catch (e: Exception) {
+            val latency = System.currentTimeMillis() - startTime
+            
+            trackApiCall(
+                apiName = apiName,
+                latency = latency,
+                success = false,
+                errorMessage = e.message,
+                requestSize = requestSize,
+                responseSize = responseSize
+            )
+            
+            throw e
+        }
+    }
+    
+    /**
+     * Measure suspend API call execution
+     */
+    suspend inline fun <T> measureSuspendApiCall(
+        apiName: String,
+        statusCode: Int? = null,
+        requestSize: Long? = null,
+        responseSize: Long? = null,
+        crossinline apiCall: suspend () -> T
+    ): T {
+        val startTime = System.currentTimeMillis()
+        
+        return try {
+            val result = apiCall()
+            val latency = System.currentTimeMillis() - startTime
+            
+            trackApiCall(
+                apiName = apiName,
+                latency = latency,
+                success = true,
+                statusCode = statusCode,
+                requestSize = requestSize,
+                responseSize = responseSize
+            )
+            
+            result
+            
+        } catch (e: Exception) {
+            val latency = System.currentTimeMillis() - startTime
+            
+            trackApiCall(
+                apiName = apiName,
+                latency = latency,
+                success = false,
+                errorMessage = e.message,
+                requestSize = requestSize,
+                responseSize = responseSize
+            )
+            
+            throw e
+        }
+    }
+    
+    /**
+     * Get API latency statistics
+     */
+    fun getApiLatencyStats(apiName: String): ApiLatencyStats? {
+        return apiMetrics[apiName]?.let { metric ->
+            val history = latencyHistory[apiName] ?: emptyList()
+            val recentHistory = history.takeLast(100) // Last 100 calls
+            
+            ApiLatencyStats(
+                apiName = apiName,
+                totalCalls = metric.totalCalls,
+                successfulCalls = metric.successfulCalls,
+                failedCalls = metric.failedCalls,
+                averageLatency = metric.averageLatency,
+                minLatency = metric.minLatency,
+                maxLatency = metric.maxLatency,
+                p95Latency = calculatePercentile(recentHistory.map { it.latency }, 0.95),
+                p99Latency = calculatePercentile(recentHistory.map { it.latency }, 0.99),
+                successRate = if (metric.totalCalls > 0) metric.successfulCalls.toDouble() / metric.totalCalls else 0.0,
+                averageRequestSize = metric.averageRequestSize,
+                averageResponseSize = metric.averageResponseSize
+            )
+        }
+    }
+    
+    /**
+     * Get all API latency statistics
+     */
+    fun getAllApiLatencyStats(): Map<String, ApiLatencyStats> {
+        return apiMetrics.keys.mapNotNull { apiName ->
+            getApiLatencyStats(apiName)?.let { stats ->
+                apiName to stats
+            }
+        }.toMap()
+    }
+    
+    /**
+     * Get slowest APIs
+     */
+    fun getSlowestApis(limit: Int = 10): List<ApiLatencyStats> {
+        return getAllApiLatencyStats().values
+            .sortedByDescending { it.averageLatency }
+            .take(limit)
+    }
+    
+    /**
+     * Get APIs with highest failure rate
+     */
+    fun getHighestFailureRateApis(limit: Int = 10): List<ApiLatencyStats> {
+        return getAllApiLatencyStats().values
+            .sortedBy { it.successRate }
+            .take(limit)
+    }
+    
+    /**
+     * Get API latency history
+     */
+    fun getApiLatencyHistory(apiName: String, limit: Int = 100): List<LatencyRecord> {
+        return latencyHistory[apiName]?.takeLast(limit) ?: emptyList()
+    }
+    
+    /**
+     * Add latency listener
+     */
+    fun addLatencyListener(listener: ApiLatencyListener) {
+        latencyListeners.add(listener)
+    }
+    
+    /**
+     * Remove latency listener
+     */
+    fun removeLatencyListener(listener: ApiLatencyListener) {
+        latencyListeners.remove(listener)
+    }
+    
+    /**
+     * Get latency optimization recommendations
+     */
+    fun getLatencyOptimizationRecommendations(): List<LatencyOptimizationRecommendation> {
+        val recommendations = mutableListOf<LatencyOptimizationRecommendation>()
+        val allStats = getAllApiLatencyStats()
+        
+        // Find slow APIs
+        val slowApis = allStats.values.filter { it.averageLatency > slowApiThreshold }
+        if (slowApis.isNotEmpty()) {
+            recommendations.add(
+                LatencyOptimizationRecommendation(
+                    priority = RecommendationPriority.HIGH,
+                    apiName = "MULTIPLE_APIS",
+                    action = "OPTIMIZE_SLOW_APIS",
+                    description = "Found ${slowApis.size} APIs with average latency > ${slowApiThreshold}ms",
+                    estimatedImprovement = "30-50% latency reduction"
+                )
+            )
+        }
+        
+        // Find APIs with high failure rate
+        val highFailureApis = allStats.values.filter { it.successRate < 0.9 }
+        if (highFailureApis.isNotEmpty()) {
+            recommendations.add(
+                LatencyOptimizationRecommendation(
+                    priority = RecommendationPriority.CRITICAL,
+                    apiName = "MULTIPLE_APIS",
+                    action = "IMPROVE_SUCCESS_RATE",
+                    description = "Found ${highFailureApis.size} APIs with success rate < 90%",
+                    estimatedImprovement = "15-25% success rate improvement"
+                )
+            )
+        }
+        
+        // Individual API recommendations
+        slowApis.forEach { stats ->
+            recommendations.add(
+                LatencyOptimizationRecommendation(
+                    priority = RecommendationPriority.MEDIUM,
+                    apiName = stats.apiName,
+                    action = "OPTIMIZE_SPECIFIC_API",
+                    description = "API ${stats.apiName} has average latency of ${stats.averageLatency}ms",
+                    estimatedImprovement = "20-40% latency reduction"
+                )
+            )
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Generate latency report
+     */
+    fun generateLatencyReport(): ApiLatencyReport {
+        val allStats = getAllApiLatencyStats()
+        val recommendations = getLatencyOptimizationRecommendations()
+        val slowestApis = getSlowestApis(10)
+        val highestFailureApis = getHighestFailureRateApis(10)
+        
+        return ApiLatencyReport(
+            generatedAt = System.currentTimeMillis(),
+            totalApiCalls = totalApiCalls.get(),
+            averageLatency = if (totalApiCalls.get() > 0) totalLatency.get().toDouble() / totalApiCalls.get() else 0.0,
+            successRate = if (totalApiCalls.get() > 0) (totalApiCalls.get() - failedApiCalls.get()).toDouble() / totalApiCalls.get() else 0.0,
+            slowApiThreshold = slowApiThreshold,
+            apiStats = allStats,
+            slowestApis = slowestApis,
+            highestFailureApis = highestFailureApis,
+            recommendations = recommendations,
+            performanceScore = calculatePerformanceScore(allStats)
+        )
+    }
+    
+    // Private methods
+    
+    private fun startLatencyMonitoring() {
+        if (!enableLatencyTracking) return
+        
+        latencyScope.launch {
+            while (isActive) {
+                try {
+                    // Update real-time metrics
+                    val realTimeMetrics = collectRealTimeMetrics()
+                    _realTimeLatency.value = realTimeMetrics
+                    
+                    // Clean up old history
+                    cleanupOldHistory()
+                    
+                    delay(monitoringInterval)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in latency monitoring loop")
+                    delay(monitoringInterval * 2) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    private fun addToHistory(apiName: String, record: LatencyRecord) {
+        val history = latencyHistory.getOrPut(apiName) { mutableListOf() }
+        history.add(record)
+        
+        // Maintain history size limit
+        if (history.size > maxHistorySize) {
+            history.removeAt(0)
+        }
+    }
+    
+    private fun updateApiMetrics(apiName: String, record: LatencyRecord) {
+        val existingMetric = apiMetrics[apiName]
+        
+        if (existingMetric == null) {
+            // Create new metric
+            apiMetrics[apiName] = ApiMetric(
+                apiName = apiName,
+                totalCalls = 1,
+                successfulCalls = if (record.success) 1 else 0,
+                failedCalls = if (record.success) 0 else 1,
+                averageLatency = record.latency.toDouble(),
+                minLatency = record.latency,
+                maxLatency = record.latency,
+                totalLatency = record.latency.toLong(),
+                averageRequestSize = record.requestSize?.toDouble() ?: 0.0,
+                averageResponseSize = record.responseSize?.toDouble() ?: 0.0,
+                lastUpdated = record.timestamp
+            )
+        } else {
+            // Update existing metric
+            val newTotalCalls = existingMetric.totalCalls + 1
+            val newSuccessfulCalls = existingMetric.successfulCalls + if (record.success) 1 else 0
+            val newFailedCalls = existingMetric.failedCalls + if (record.success) 0 else 1
+            val newTotalLatency = existingMetric.totalLatency + record.latency
+            val newAverageLatency = newTotalLatency.toDouble() / newTotalCalls
+            val newMinLatency = minOf(existingMetric.minLatency, record.latency)
+            val newMaxLatency = maxOf(existingMetric.maxLatency, record.latency)
+            
+            val newAverageRequestSize = if (record.requestSize != null) {
+                (existingMetric.averageRequestSize * existingMetric.totalCalls + record.requestSize) / newTotalCalls
+            } else {
+                existingMetric.averageRequestSize
+            }
+            
+            val newAverageResponseSize = if (record.responseSize != null) {
+                (existingMetric.averageResponseSize * existingMetric.totalCalls + record.responseSize) / newTotalCalls
+            } else {
+                existingMetric.averageResponseSize
+            }
+            
+            apiMetrics[apiName] = existingMetric.copy(
+                totalCalls = newTotalCalls,
+                successfulCalls = newSuccessfulCalls,
+                failedCalls = newFailedCalls,
+                averageLatency = newAverageLatency,
+                minLatency = newMinLatency,
+                maxLatency = newMaxLatency,
+                totalLatency = newTotalLatency,
+                averageRequestSize = newAverageRequestSize,
+                averageResponseSize = newAverageResponseSize,
+                lastUpdated = record.timestamp
+            )
+        }
+    }
+    
+    private fun calculatePercentile(values: List<Long>, percentile: Double): Long {
+        if (values.isEmpty()) return 0L
+        
+        val sortedValues = values.sorted()
+        val index = (percentile * (sortedValues.size - 1)).toInt()
+        return sortedValues[index]
+    }
+    
+    private fun collectRealTimeMetrics(): RealTimeLatencyMetrics {
+        val allStats = getAllApiLatencyStats()
+        
+        return RealTimeLatencyMetrics(
+            timestamp = System.currentTimeMillis(),
+            totalApiCalls = totalApiCalls.get(),
+            averageLatency = if (totalApiCalls.get() > 0) totalLatency.get().toDouble() / totalApiCalls.get() else 0.0,
+            successRate = if (totalApiCalls.get() > 0) (totalApiCalls.get() - failedApiCalls.get()).toDouble() / totalApiCalls.get() else 0.0,
+            slowApiCalls = slowApiCalls.get(),
+            failedApiCalls = failedApiCalls.get(),
+            activeApis = apiMetrics.size,
+            slowestApi = allStats.values.maxByOrNull { it.averageLatency }?.apiName,
+            fastestApi = allStats.values.minByOrNull { it.averageLatency }?.apiName
+        )
+    }
+    
+    private fun cleanupOldHistory() {
+        val cutoffTime = System.currentTimeMillis() - (24 * 60 * 60 * 1000L) // 24 hours ago
+        
+        latencyHistory.values.forEach { history ->
+            history.removeAll { it.timestamp < cutoffTime }
+        }
+    }
+    
+    private fun calculatePerformanceScore(apiStats: Map<String, ApiLatencyStats>): Double {
+        if (apiStats.isEmpty()) return 100.0
+        
+        var score = 100.0
+        
+        // Average latency score
+        val avgLatency = apiStats.values.map { it.averageLatency }.average()
+        if (avgLatency > 1000) score -= 20
+        else if (avgLatency > 500) score -= 10
+        else if (avgLatency > 200) score -= 5
+        
+        // Success rate score
+        val avgSuccessRate = apiStats.values.map { it.successRate }.average()
+        if (avgSuccessRate < 0.9) score -= 20
+        else if (avgSuccessRate < 0.95) score -= 10
+        else if (avgSuccessRate < 0.99) score -= 5
+        
+        // Slow API score
+        val slowApiCount = apiStats.values.count { it.averageLatency > slowApiThreshold }
+        if (slowApiCount > 5) score -= 15
+        else if (slowApiCount > 2) score -= 10
+        else if (slowApiCount > 0) score -= 5
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): ApiLatencyPerformanceMetrics {
+        val allStats = getAllApiLatencyStats()
+        
+        return ApiLatencyPerformanceMetrics(
+            totalApiCalls = totalApiCalls.get(),
+            averageLatency = if (totalApiCalls.get() > 0) totalLatency.get().toDouble() / totalApiCalls.get() else 0.0,
+            successRate = if (totalApiCalls.get() > 0) (totalApiCalls.get() - failedApiCalls.get()).toDouble() / totalApiCalls.get() else 0.0,
+            slowApiCalls = slowApiCalls.get(),
+            failedApiCalls = failedApiCalls.get(),
+            activeApis = apiMetrics.size,
+            performanceScore = calculatePerformanceScore(allStats),
+            trackingEnabled = enableLatencyTracking
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalApiCalls.set(0)
+        totalLatency.set(0)
+        failedApiCalls.set(0)
+        slowApiCalls.set(0)
+        apiMetrics.clear()
+        latencyHistory.clear()
+    }
+    
+    /**
+     * Stop API latency tracker
+     */
+    fun stop() {
+        latencyScope.cancel()
+        latencyListeners.clear()
+        apiMetrics.clear()
+        latencyHistory.clear()
+    }
+}
+
+/**
+ * API Metric
+ */
+data class ApiMetric(
+    val apiName: String,
+    val totalCalls: Int,
+    val successfulCalls: Int,
+    val failedCalls: Int,
+    val averageLatency: Double,
+    val minLatency: Long,
+    val maxLatency: Long,
+    val totalLatency: Long,
+    val averageRequestSize: Double,
+    val averageResponseSize: Double,
+    val lastUpdated: Long
+)
+
+/**
+ * Latency Record
+ */
+data class LatencyRecord(
+    val timestamp: Long,
+    val latency: Long,
+    val success: Boolean,
+    val statusCode: Int?,
+    val errorMessage: String?,
+    val requestSize: Long?,
+    val responseSize: Long?
+)
+
+/**
+ * API Latency Statistics
+ */
+data class ApiLatencyStats(
+    val apiName: String,
+    val totalCalls: Int,
+    val successfulCalls: Int,
+    val failedCalls: Int,
+    val averageLatency: Double,
+    val minLatency: Long,
+    val maxLatency: Long,
+    val p95Latency: Long,
+    val p99Latency: Long,
+    val successRate: Double,
+    val averageRequestSize: Double,
+    val averageResponseSize: Double
+)
+
+/**
+ * Real-time Latency Metrics
+ */
+data class RealTimeLatencyMetrics(
+    val timestamp: Long = System.currentTimeMillis(),
+    val totalApiCalls: Long = 0,
+    val averageLatency: Double = 0.0,
+    val successRate: Double = 0.0,
+    val slowApiCalls: Long = 0,
+    val failedApiCalls: Long = 0,
+    val activeApis: Int = 0,
+    val slowestApi: String? = null,
+    val fastestApi: String? = null
+)
+
+/**
+ * Latency Optimization Recommendation
+ */
+data class LatencyOptimizationRecommendation(
+    val priority: RecommendationPriority,
+    val apiName: String,
+    val action: String,
+    val description: String,
+    val estimatedImprovement: String
+)
+
+/**
+ * API Latency Report
+ */
+data class ApiLatencyReport(
+    val generatedAt: Long,
+    val totalApiCalls: Long,
+    val averageLatency: Double,
+    val successRate: Double,
+    val slowApiThreshold: Long,
+    val apiStats: Map<String, ApiLatencyStats>,
+    val slowestApis: List<ApiLatencyStats>,
+    val highestFailureApis: List<ApiLatencyStats>,
+    val recommendations: List<LatencyOptimizationRecommendation>,
+    val performanceScore: Double
+)
+
+/**
+ * API Latency Performance Metrics
+ */
+data class ApiLatencyPerformanceMetrics(
+    val totalApiCalls: Long,
+    val averageLatency: Double,
+    val successRate: Double,
+    val slowApiCalls: Long,
+    val failedApiCalls: Long,
+    val activeApis: Int,
+    val performanceScore: Double,
+    val trackingEnabled: Boolean
+) {
+    val averageLatencyMs: Double get() = averageLatency
+    val successPercentage: Double get() = successRate * 100
+    val performancePercentage: Double get() = performanceScore
+}
+
+/**
+ * API Latency Listener Interface
+ */
+interface ApiLatencyListener {
+    fun onApiCallTracked(apiName: String, latency: Long, success: Boolean, record: LatencyRecord) {}
+    fun onSlowApiDetected(apiName: String, latency: Long, record: LatencyRecord) {}
+    fun onApiCallFailed(apiName: String, errorMessage: String?, record: LatencyRecord) {}
+}
+
+/**
+ * API Performance Analyzer
+ */
+class ApiPerformanceAnalyzer @Inject constructor(
+    private val apiLatencyTracker: ApiLatencyTracker
+) {
+    
+    /**
+     * Analyze API performance trends
+     */
+    fun analyzePerformanceTrends(apiName: String): ApiPerformanceTrend {
+        val history = apiLatencyTracker.getApiLatencyHistory(apiName, 1000)
+        val stats = apiLatencyTracker.getApiLatencyStats(apiName)
+        
+        if (history.isEmpty() || stats == null) {
+            return ApiPerformanceTrend(apiName, TrendDirection.STABLE, 0.0, emptyList())
+        }
+        
+        // Calculate trend
+        val recentLatency = history.takeLast(10).map { it.latency }.average()
+        val olderLatency = history.take(10).map { it.latency }.average()
+        val trendDirection = when {
+            recentLatency > olderLatency * 1.1 -> TrendDirection.INCREASING
+            recentLatency < olderLatency * 0.9 -> TrendDirection.DECREASING
+            else -> TrendDirection.STABLE
+        }
+        
+        val trendPercentage = ((recentLatency - olderLatency) / olderLatency) * 100
+        
+        return ApiPerformanceTrend(
+            apiName = apiName,
+            direction = trendDirection,
+            trendPercentage = trendPercentage,
+            recommendations = generateTrendRecommendations(apiName, trendDirection, trendPercentage)
+        )
+    }
+    
+    /**
+     * Get performance insights
+     */
+    fun getPerformanceInsights(): ApiPerformanceInsights {
+        val allStats = apiLatencyTracker.getAllApiLatencyStats()
+        val slowestApis = apiLatencyTracker.getSlowestApis(5)
+        val highestFailureApis = apiLatencyTracker.getHighestFailureRateApis(5)
+        
+        return ApiPerformanceInsights(
+            totalApis = allStats.size,
+            averageLatency = allStats.values.map { it.averageLatency }.average(),
+            overallSuccessRate = allStats.values.map { it.successRate }.average(),
+            slowestApis = slowestApis,
+            highestFailureApis = highestFailureApis,
+            performanceGrade = calculatePerformanceGrade(allStats)
+        )
+    }
+    
+    private fun generateTrendRecommendations(
+        apiName: String,
+        direction: TrendDirection,
+        percentage: Double
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        when (direction) {
+            TrendDirection.INCREASING -> {
+                recommendations.add("API latency is increasing by ${String.format("%.1f", percentage)}%")
+                recommendations.add("Consider optimizing the $apiName endpoint")
+                recommendations.add("Check for database queries or external service calls")
+            }
+            TrendDirection.DECREASING -> {
+                recommendations.add("API latency is improving by ${String.format("%.1f", abs(percentage))}%")
+                recommendations.add("Current optimizations for $apiName are working well")
+            }
+            TrendDirection.STABLE -> {
+                recommendations.add("API latency is stable for $apiName")
+                recommendations.add("Continue monitoring for performance changes")
+            }
+        }
+        
+        return recommendations
+    }
+    
+    private fun calculatePerformanceGrade(stats: Map<String, ApiLatencyStats>): PerformanceGrade {
+        val avgLatency = stats.values.map { it.averageLatency }.average()
+        val avgSuccessRate = stats.values.map { it.successRate }.average()
+        
+        return when {
+            avgLatency < 200 && avgSuccessRate > 0.99 -> PerformanceGrade.EXCELLENT
+            avgLatency < 500 && avgSuccessRate > 0.95 -> PerformanceGrade.GOOD
+            avgLatency < 1000 && avgSuccessRate > 0.90 -> PerformanceGrade.FAIR
+            else -> PerformanceGrade.POOR
+        }
+    }
+}
+
+/**
+ * API Performance Trend
+ */
+data class ApiPerformanceTrend(
+    val apiName: String,
+    val direction: TrendDirection,
+    val trendPercentage: Double,
+    val recommendations: List<String>
+)
+
+/**
+ * API Performance Insights
+ */
+data class ApiPerformanceInsights(
+    val totalApis: Int,
+    val averageLatency: Double,
+    val overallSuccessRate: Double,
+    val slowestApis: List<ApiLatencyStats>,
+    val highestFailureApis: List<ApiLatencyStats>,
+    val performanceGrade: PerformanceGrade
+)
+
+/**
+ * Trend Direction
+ */
+enum class TrendDirection {
+    INCREASING, DECREASING, STABLE
+}
+
+/**
+ * Performance Grade
+ */
+enum class PerformanceGrade {
+    EXCELLENT, GOOD, FAIR, POOR
+}

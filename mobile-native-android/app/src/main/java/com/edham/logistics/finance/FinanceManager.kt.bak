@@ -1,0 +1,611 @@
+package com.edham.logistics.finance
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.FinanceApi
+import com.edham.logistics.data.remote.api.PaymentGatewayApi
+import com.edham.logistics.finance.wallet.WalletService
+import com.edham.logistics.finance.payment.PaymentService
+import com.edham.logistics.finance.invoice.InvoiceService
+import com.edham.logistics.finance.expense.ExpenseService
+import com.edham.logistics.finance.analytics.RevenueAnalyticsService
+import com.edham.logistics.finance.tax.TaxCalculationService
+import com.edham.logistics.finance.report.FinancialReportService
+import com.edham.logistics.finance.audit.FinancialAuditService
+import com.edham.logistics.finance.pdf.PdfExportService
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Finance Manager - Central orchestrator for all financial operations
+ * 
+ * Features:
+ * - Wallet management and transactions
+ * - Payment processing and gateway integration
+ * - Invoice generation and management
+ * - Expense tracking and categorization
+ * - Revenue analytics and reporting
+ * - Tax calculations and compliance
+ * - Financial audit logging
+ * - PDF export functionality
+ * - Secure transaction processing
+ */
+@Singleton
+class FinanceManager @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val financeApi: FinanceApi,
+    private val paymentGatewayApi: PaymentGatewayApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils,
+    private val walletService: WalletService,
+    private val paymentService: PaymentService,
+    private val invoiceService: InvoiceService,
+    private val expenseService: ExpenseService,
+    private val revenueAnalyticsService: RevenueAnalyticsService,
+    private val taxCalculationService: TaxCalculationService,
+    private val financialReportService: FinancialReportService,
+    private val financialAuditService: FinancialAuditService,
+    private val pdfExportService: PdfExportService
+) {
+    
+    private val _financeState = MutableStateFlow<FinanceState>(FinanceState.Idle)
+    val financeState: StateFlow<FinanceState> = _financeState.asStateFlow()
+    
+    private val _financialSummary = MutableStateFlow<FinancialSummary>(FinancialSummary())
+    val financialSummary: StateFlow<FinancialSummary> = _financialSummary.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "FinanceManager"
+        private const val CURRENCY_CODE = "SAR"
+        private const val TAX_RATE = 0.15f // 15% VAT
+        private const val TRANSACTION_TIMEOUT_MS = 30000L
+    }
+    
+    /**
+     * Initialize finance system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _financeState.value = FinanceState.Initializing
+                
+                // Initialize all finance services
+                val walletInit = walletService.initialize()
+                val paymentInit = paymentService.initialize()
+                val invoiceInit = invoiceService.initialize()
+                val expenseInit = expenseService.initialize()
+                val analyticsInit = revenueAnalyticsService.initialize()
+                val taxInit = taxCalculationService.initialize()
+                val reportInit = financialReportService.initialize()
+                val auditInit = financialAuditService.initialize()
+                val pdfInit = pdfExportService.initialize()
+                
+                // Check all initializations
+                if (walletInit.isSuccess && paymentInit.isSuccess && invoiceInit.isSuccess &&
+                    expenseInit.isSuccess && analyticsInit.isSuccess && taxInit.isSuccess &&
+                    reportInit.isSuccess && auditInit.isSuccess && pdfInit.isSuccess) {
+                    
+                    // Load financial summary
+                    loadFinancialSummary()
+                    
+                    isInitialized = true
+                    _financeState.value = FinanceState.Ready
+                    Result.success(true)
+                } else {
+                    throw Exception("Failed to initialize finance services")
+                }
+                
+            } catch (e: Exception) {
+                _financeState.value = FinanceState.Error("Failed to initialize finance system: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process payment transaction
+     */
+    suspend fun processPaymentTransaction(
+        paymentRequest: PaymentRequest
+    ): Result<PaymentTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Finance system not initialized")
+                }
+                
+                _financeState.value = FinanceState.Processing
+                
+                // Validate payment request
+                validatePaymentRequest(paymentRequest)
+                
+                // Log audit trail
+                financialAuditService.logTransactionStart(paymentRequest)
+                
+                // Process payment through payment service
+                val paymentResult = paymentService.processPayment(paymentRequest)
+                
+                if (paymentResult.isSuccess) {
+                    val transaction = paymentResult.getOrThrow()
+                    
+                    // Update wallet if applicable
+                    if (paymentRequest.useWallet) {
+                        walletService.processWalletTransaction(
+                            paymentRequest.userId,
+                            paymentRequest.amount,
+                            WalletTransactionType.PAYMENT,
+                            transaction.id
+                        )
+                    }
+                    
+                    // Update invoice if applicable
+                    paymentRequest.invoiceId?.let { invoiceId ->
+                        invoiceService.updateInvoicePayment(invoiceId, paymentRequest.amount, transaction.id)
+                    }
+                    
+                    // Record expense if applicable
+                    paymentRequest.expenseCategory?.let { category ->
+                        expenseService.recordExpense(
+                            userId = paymentRequest.userId,
+                            amount = paymentRequest.amount,
+                            category = category,
+                            description = paymentRequest.description,
+                            transactionId = transaction.id
+                        )
+                    }
+                    
+                    // Log successful transaction
+                    financialAuditService.logTransactionSuccess(transaction)
+                    
+                    // Update financial summary
+                    loadFinancialSummary()
+                    
+                    _financeState.value = FinanceState.Ready
+                    Result.success(transaction)
+                    
+                } else {
+                    throw paymentResult.exceptionOrNull() ?: Exception("Payment processing failed")
+                }
+                
+            } catch (e: Exception) {
+                financialAuditService.logTransactionFailure(paymentRequest, e.message)
+                _financeState.value = FinanceState.Error("Payment processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate and send invoice
+     */
+    suspend fun generateInvoice(
+        invoiceRequest: InvoiceRequest
+    ): Result<Invoice> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Finance system not initialized")
+                }
+                
+                _financeState.value = FinanceState.Processing
+                
+                // Calculate tax
+                val taxAmount = taxCalculationService.calculateTax(invoiceRequest.subtotal, invoiceRequest.taxRate)
+                val totalAmount = invoiceRequest.subtotal + taxAmount
+                
+                // Create invoice
+                val invoice = Invoice(
+                    id = UUID.randomUUID().toString(),
+                    customerId = invoiceRequest.customerId,
+                    invoiceNumber = generateInvoiceNumber(),
+                    issueDate = Date(),
+                    dueDate = invoiceRequest.dueDate,
+                    subtotal = invoiceRequest.subtotal,
+                    taxAmount = taxAmount,
+                    totalAmount = totalAmount,
+                    status = InvoiceStatus.DRAFT,
+                    items = invoiceRequest.items,
+                    customerInfo = invoiceRequest.customerInfo,
+                    currency = CURRENCY_CODE,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save invoice
+                val savedInvoice = invoiceService.createInvoice(invoice).getOrThrow()
+                
+                // Generate PDF
+                val pdfResult = pdfExportService.generateInvoicePdf(savedInvoice)
+                if (pdfResult.isSuccess) {
+                    val pdfPath = pdfResult.getOrThrow()
+                    invoiceService.updateInvoicePdf(savedInvoice.id, pdfPath)
+                }
+                
+                // Log audit trail
+                financialAuditService.logInvoiceCreation(savedInvoice)
+                
+                _financeState.value = FinanceState.Ready
+                Result.success(savedInvoice)
+                
+            } catch (e: Exception) {
+                _financeState.value = FinanceState.Error("Invoice generation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process refund
+     */
+    suspend fun processRefund(
+        refundRequest: RefundRequest
+    ): Result<Refund> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Finance system not initialized")
+                }
+                
+                _financeState.value = FinanceState.Processing
+                
+                // Validate refund request
+                validateRefundRequest(refundRequest)
+                
+                // Get original transaction
+                val originalTransaction = paymentService.getTransaction(refundRequest.originalTransactionId)
+                    ?: throw Exception("Original transaction not found")
+                
+                // Process refund through payment gateway
+                val refundResult = paymentService.processRefund(refundRequest, originalTransaction)
+                
+                if (refundResult.isSuccess) {
+                    val refund = refundResult.getOrThrow()
+                    
+                    // Update wallet if original payment used wallet
+                    if (originalTransaction.paymentMethod == PaymentMethod.WALLET) {
+                        walletService.processWalletTransaction(
+                            originalTransaction.userId,
+                            refundRequest.amount,
+                            WalletTransactionType.REFUND,
+                            refund.id
+                        )
+                    }
+                    
+                    // Update invoice if applicable
+                    originalTransaction.invoiceId?.let { invoiceId ->
+                        invoiceService.updateInvoiceRefund(invoiceId, refundRequest.amount, refund.id)
+                    }
+                    
+                    // Log audit trail
+                    financialAuditService.logRefundProcessed(refund, originalTransaction)
+                    
+                    // Update financial summary
+                    loadFinancialSummary()
+                    
+                    _financeState.value = FinanceState.Ready
+                    Result.success(refund)
+                    
+                } else {
+                    throw refundResult.exceptionOrNull() ?: Exception("Refund processing failed")
+                }
+                
+            } catch (e: Exception) {
+                financialAuditService.logRefundFailure(refundRequest, e.message)
+                _financeState.value = FinanceState.Error("Refund processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Record expense
+     */
+    suspend fun recordExpense(
+        expenseRequest: ExpenseRequest
+    ): Result<Expense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Finance system not initialized")
+                }
+                
+                _financeState.value = FinanceState.Processing
+                
+                // Create expense
+                val expense = Expense(
+                    id = UUID.randomUUID().toString(),
+                    userId = expenseRequest.userId,
+                    amount = expenseRequest.amount,
+                    category = expenseRequest.category,
+                    subcategory = expenseRequest.subcategory,
+                    description = expenseRequest.description,
+                    date = expenseRequest.date,
+                    currency = CURRENCY_CODE,
+                    status = ExpenseStatus.PENDING,
+                    receiptUrl = expenseRequest.receiptUrl,
+                    metadata = expenseRequest.metadata,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save expense
+                val savedExpense = expenseService.createExpense(expense).getOrThrow()
+                
+                // Update wallet if expense was paid from wallet
+                if (expenseRequest.paidFromWallet) {
+                    walletService.processWalletTransaction(
+                        expenseRequest.userId,
+                        expenseRequest.amount,
+                        WalletTransactionType.EXPENSE,
+                        savedExpense.id
+                    )
+                }
+                
+                // Log audit trail
+                financialAuditService.logExpenseRecorded(savedExpense)
+                
+                // Update financial summary
+                loadFinancialSummary()
+                
+                _financeState.value = FinanceState.Ready
+                Result.success(savedExpense)
+                
+            } catch (e: Exception) {
+                _financeState.value = FinanceState.Error("Expense recording failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get financial summary
+     */
+    suspend fun getFinancialSummary(dateRange: DateRange = DateRange.currentMonth()): Result<FinancialSummary> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val summary = FinancialSummary(
+                    totalRevenue = revenueAnalyticsService.getTotalRevenue(dateRange),
+                    totalExpenses = expenseService.getTotalExpenses(dateRange),
+                    netProfit = 0f, // Will be calculated
+                    totalTransactions = paymentService.getTotalTransactions(dateRange),
+                    pendingInvoices = invoiceService.getPendingInvoicesCount(),
+                    overdueInvoices = invoiceService.getOverdueInvoicesCount(),
+                    walletBalance = walletService.getTotalWalletBalance(),
+                    taxLiability = taxCalculationService.calculateTaxLiability(dateRange),
+                    fuelExpenses = expenseService.getFuelExpenses(dateRange),
+                    maintenanceExpenses = expenseService.getMaintenanceExpenses(dateRange),
+                    driverPayments = paymentService.getDriverPayments(dateRange),
+                    customerPayments = paymentService.getCustomerPayments(dateRange)
+                )
+                
+                // Calculate net profit
+                summary.netProfit = summary.totalRevenue - summary.totalExpenses - summary.taxLiability
+                
+                Result.success(summary)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate financial report
+     */
+    suspend fun generateFinancialReport(
+        reportType: FinancialReportType,
+        dateRange: DateRange,
+        format: ReportFormat = ReportFormat.PDF
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Finance system not initialized")
+                }
+                
+                _financeState.value = FinanceState.Processing
+                
+                // Generate report data
+                val reportData = when (reportType) {
+                    FinancialReportType.REVENUE -> revenueAnalyticsService.generateRevenueReport(dateRange)
+                    FinancialReportType.EXPENSE -> expenseService.generateExpenseReport(dateRange)
+                    FinancialReportType.PROFIT_LOSS -> financialReportService.generateProfitLossReport(dateRange)
+                    FinancialReportType.TAX -> taxCalculationService.generateTaxReport(dateRange)
+                    FinancialReportType.CASH_FLOW -> financialReportService.generateCashFlowReport(dateRange)
+                    FinancialReportType.BALANCE_SHEET -> financialReportService.generateBalanceSheetReport(dateRange)
+                }
+                
+                // Export to requested format
+                val filePath = when (format) {
+                    ReportFormat.PDF -> pdfExportService.exportToPdf(reportData, reportType, dateRange)
+                    ReportFormat.EXCEL -> pdfExportService.exportToExcel(reportData, reportType, dateRange)
+                    ReportFormat.CSV -> pdfExportService.exportToCsv(reportData, reportType, dateRange)
+                }.getOrThrow()
+                
+                // Log audit trail
+                financialAuditService.logReportGenerated(reportType, dateRange, filePath)
+                
+                _financeState.value = FinanceState.Ready
+                Result.success(filePath)
+                
+            } catch (e: Exception) {
+                _financeState.value = FinanceState.Error("Report generation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get wallet balance
+     */
+    suspend fun getWalletBalance(userId: String): Result<WalletBalance> {
+        return walletService.getWalletBalance(userId)
+    }
+    
+    /**
+     * Get payment history
+     */
+    suspend fun getPaymentHistory(
+        userId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        status: PaymentStatus? = null
+    ): Result<List<PaymentTransaction>> {
+        return paymentService.getPaymentHistory(userId, dateRange, status)
+    }
+    
+    /**
+     * Get expense history
+     */
+    suspend fun getExpenseHistory(
+        userId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        category: ExpenseCategory? = null
+    ): Result<List<Expense>> {
+        return expenseService.getExpenseHistory(userId, dateRange, category)
+    }
+    
+    /**
+     * Get invoice history
+     */
+    suspend fun getInvoiceHistory(
+        customerId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        status: InvoiceStatus? = null
+    ): Result<List<Invoice>> {
+        return invoiceService.getInvoiceHistory(customerId, dateRange, status)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadFinancialSummary() {
+        try {
+            val summary = getFinancialSummary().getOrNull()
+            summary?.let {
+                _financialSummary.value = it
+            }
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun validatePaymentRequest(request: PaymentRequest) {
+        if (request.amount <= 0) throw Exception("Payment amount must be positive")
+        if (request.userId.isBlank()) throw Exception("User ID cannot be empty")
+        if (request.paymentMethod == null) throw Exception("Payment method is required")
+    }
+    
+    private fun validateRefundRequest(request: RefundRequest) {
+        if (request.amount <= 0) throw Exception("Refund amount must be positive")
+        if (request.originalTransactionId.isBlank()) throw Exception("Original transaction ID is required")
+        if (request.reason.isBlank()) throw Exception("Refund reason is required")
+    }
+    
+    private fun generateInvoiceNumber(): String {
+        val date = Date()
+        val timestamp = date.time
+        return "INV-$timestamp"
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class FinancialSummary(
+    val totalRevenue: Float = 0f,
+    val totalExpenses: Float = 0f,
+    val netProfit: Float = 0f,
+    val totalTransactions: Int = 0,
+    val pendingInvoices: Int = 0,
+    val overdueInvoices: Int = 0,
+    val walletBalance: Float = 0f,
+    val taxLiability: Float = 0f,
+    val fuelExpenses: Float = 0f,
+    val maintenanceExpenses: Float = 0f,
+    val driverPayments: Float = 0f,
+    val customerPayments: Float = 0f
+)
+
+data class PaymentRequest(
+    val userId: String,
+    val amount: Float,
+    val currency: String = "SAR",
+    val paymentMethod: PaymentMethod,
+    val description: String,
+    val invoiceId: String? = null,
+    val expenseCategory: ExpenseCategory? = null,
+    val useWallet: Boolean = false,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class InvoiceRequest(
+    val customerId: String,
+    val subtotal: Float,
+    val taxRate: Float = 0.15f,
+    val dueDate: Date,
+    val items: List<InvoiceItem>,
+    val customerInfo: CustomerInfo,
+    val notes: String? = null
+)
+
+data class RefundRequest(
+    val originalTransactionId: String,
+    val amount: Float,
+    val reason: String,
+    val refundMethod: PaymentMethod,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class ExpenseRequest(
+    val userId: String,
+    val amount: Float,
+    val category: ExpenseCategory,
+    val subcategory: String? = null,
+    val description: String,
+    val date: Date,
+    val receiptUrl: String? = null,
+    val paidFromWallet: Boolean = false,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+/**
+ * Enums
+ */
+enum class FinanceState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class FinancialReportType {
+    REVENUE,
+    EXPENSE,
+    PROFIT_LOSS,
+    TAX,
+    CASH_FLOW,
+    BALANCE_SHEET
+}
+
+enum class ReportFormat {
+    PDF,
+    EXCEL,
+    CSV
+}

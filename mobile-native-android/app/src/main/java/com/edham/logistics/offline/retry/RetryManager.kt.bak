@@ -1,0 +1,402 @@
+package com.edham.logistics.offline.retry
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Retry Manager - Handles failed request retries with intelligent strategies
+ * Implements exponential backoff, circuit breaker pattern, and adaptive retry logic
+ */
+
+// Temporarily disabled due to missing dependencies
+// @Singleton
+// class RetryManager @Inject constructor(
+//     private val networkMonitor: NetworkMonitor,
+//     private val syncQueue: SyncQueue
+// ) {
+class RetryManager {
+
+    private val retryScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val activeRetries = ConcurrentHashMap<String, RetryJob>()
+    private val retryIdGenerator = AtomicLong(0)
+    
+    // Circuit breaker state
+    private val circuitBreakerState = mutableMapOf<String, CircuitBreakerState>()
+    private val lastFailureTime = mutableMapOf<String, Long>()
+    
+    // Retry configuration
+    private val baseRetryDelay = 1000L // 1 second
+    private val maxRetryDelay = 300000L // 5 minutes
+    private val circuitBreakerThreshold = 5 // Failures before opening circuit
+    private val circuitBreakerTimeout = 60000L // 1 minute
+    
+    init {
+        startRetryProcessor()
+    }
+
+    /**
+     * Schedule a retry for a failed operation
+     */
+    suspend fun scheduleRetry(
+        operationId: String,
+        operationType: OperationType,
+        error: String,
+        retryCount: Int = 0
+    ): Result<String> {
+        return try {
+            val retryId = generateRetryId()
+            val retryDelay = calculateRetryDelay(retryCount, error)
+            val maxRetries = getMaxRetries(operationType, error)
+            
+            if (retryCount >= maxRetries) {
+                Timber.w("Max retries reached for operation $operationId, marking as permanently failed")
+                syncQueue.markFailed(operationId, "Max retries reached: $error")
+                return Result.failure(Exception("Max retries reached"))
+            }
+            
+            // Check circuit breaker
+            if (isCircuitBreakerOpen(operationType.name)) {
+                Timber.w("Circuit breaker open for ${operationType.name}, scheduling delayed retry")
+                val circuitBreakerDelay = getCircuitBreakerDelay(operationType.name)
+                scheduleDelayedRetry(retryId, operationId, operationType, error, retryCount, circuitBreakerDelay)
+            } else {
+                scheduleDelayedRetry(retryId, operationId, operationType, error, retryCount, retryDelay)
+            }
+            
+            Result.success(retryId)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error scheduling retry for operation $operationId")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Cancel a scheduled retry
+     */
+    suspend fun cancelRetry(operationId: String): Result<Unit> {
+        return try {
+            activeRetries[operationId]?.job?.cancel()
+            activeRetries.remove(operationId)
+            Timber.d("Cancelled retry for operation $operationId")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Error cancelling retry for operation $operationId")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get retry statistics
+     */
+    fun getRetryStats(): Flow<RetryStats> {
+        return flowOf(
+            RetryStats(
+                activeRetries = activeRetries.size,
+                circuitBreakersOpen = circuitBreakerState.values.count { it.state == CircuitState.OPEN },
+                totalRetriesToday = getTotalRetriesToday(),
+                averageRetryTime = getAverageRetryTime(),
+                successRate = getRetrySuccessRate()
+            )
+        )
+    }
+
+    /**
+     * Reset circuit breaker for an operation type
+     */
+    suspend fun resetCircuitBreaker(operationType: String): Result<Unit> {
+        return try {
+            circuitBreakerState[operationType] = CircuitBreakerState(CircuitState.CLOSED, 0)
+            lastFailureTime.remove(operationType)
+            Timber.d("Reset circuit breaker for $operationType")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Error resetting circuit breaker for $operationType")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get retry history for an operation
+     */
+    suspend fun getRetryHistory(operationId: String): List<RetryAttempt> {
+        return try {
+            // This would typically query a database for retry history
+            // For now, return empty list
+            emptyList()
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting retry history for $operationId")
+            emptyList()
+        }
+    }
+
+    // Private methods
+
+    private fun startRetryProcessor() {
+        retryScope.launch {
+            while (isActive) {
+                try {
+                    // Process circuit breaker state transitions
+                    processCircuitBreakers()
+                    
+                    // Clean up completed retries
+                    cleanupCompletedRetries()
+                    
+                    delay(10000) // Check every 10 seconds
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in retry processor")
+                    delay(30000) // Wait longer on error
+                }
+            }
+        }
+    }
+
+    private suspend fun scheduleDelayedRetry(
+        retryId: String,
+        operationId: String,
+        operationType: OperationType,
+        error: String,
+        retryCount: Int,
+        delay: Long
+    ) {
+        val job = retryScope.launch {
+            try {
+                delay(delay)
+                
+                // Check if still should retry
+                if (shouldRetry(operationId, operationType)) {
+                    Timber.d("Executing retry $retryCount for operation $operationId")
+                    
+                    // Mark operation as pending for sync queue
+                    // The actual retry will be handled by the sync queue
+                    updateCircuitBreakerOnAttempt(operationType.name)
+                    
+                } else {
+                    Timber.d("Retry cancelled for operation $operationId")
+                }
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error in scheduled retry $retryId")
+            } finally {
+                activeRetries.remove(operationId)
+            }
+        }
+        
+        activeRetries[operationId] = RetryJob(retryId, job, delay, retryCount)
+    }
+
+    private fun calculateRetryDelay(retryCount: Int, error: String): Long {
+        // Base exponential backoff with jitter
+        val exponentialDelay = baseRetryDelay * Math.pow(2.0, retryCount.toDouble()).toLong()
+        
+        // Add jitter to prevent thundering herd
+        val jitter = (exponentialDelay * 0.1 * Math.random()).toLong()
+        
+        // Adjust delay based on error type
+        val errorMultiplier = getErrorMultiplier(error)
+        
+        // Adjust delay based on network conditions
+        val networkMultiplier = getNetworkMultiplier()
+        
+        val totalDelay = (exponentialDelay + jitter) * errorMultiplier * networkMultiplier
+        
+        return totalDelay.coerceIn(baseRetryDelay, maxRetryDelay)
+    }
+
+    private fun getErrorMultiplier(error: String): Double {
+        return when {
+            error.contains("timeout", ignoreCase = true) -> 1.5
+            error.contains("network", ignoreCase = true) -> 2.0
+            error.contains("server", ignoreCase = true) -> 1.2
+            error.contains("auth", ignoreCase = true) -> 0.5 // Auth errors should retry quickly
+            else -> 1.0
+        }
+    }
+
+    private fun getNetworkMultiplier(): Double {
+        return when (networkMonitor.getNetworkQuality()) {
+            NetworkQuality.EXCELLENT -> 0.5
+            NetworkQuality.GOOD -> 1.0
+            NetworkQuality.FAIR -> 1.5
+            NetworkQuality.POOR -> 2.0
+        }
+    }
+
+    private fun getMaxRetries(operationType: OperationType, error: String): Int {
+        val baseRetries = when (operationType) {
+            OperationType.CREATE_SHIPMENT -> 5
+            OperationType.UPDATE_STATUS -> 5
+            OperationType.UPDATE_LOCATION -> 10
+            OperationType.UPDATE_SHIPMENT -> 3
+            OperationType.DELETE_SHIPMENT -> 3
+            OperationType.UPLOAD_PROOF -> 7
+            OperationType.SYNC_SHIPMENTS -> 2
+            OperationType.SYNC_MAPS_DATA -> 2
+        }
+        
+        // Adjust based on error type
+        return when {
+            error.contains("timeout", ignoreCase = true) -> baseRetries + 2
+            error.contains("network", ignoreCase = true) -> baseRetries + 3
+            error.contains("server", ignoreCase = true) -> baseRetries + 1
+            error.contains("auth", ignoreCase = true) -> baseRetries - 1
+            else -> baseRetries
+        }
+    }
+
+    private fun isCircuitBreakerOpen(operationType: String): Boolean {
+        val state = circuitBreakerState[operationType]
+        return state?.state == CircuitState.OPEN && 
+               (System.currentTimeMillis() - (lastFailureTime[operationType] ?: 0)) < circuitBreakerTimeout
+    }
+
+    private fun getCircuitBreakerDelay(operationType: String): Long {
+        return circuitBreakerTimeout
+    }
+
+    private fun updateCircuitBreakerOnAttempt(operationType: String) {
+        val currentState = circuitBreakerState.getOrPut(operationType) {
+            CircuitBreakerState(CircuitState.CLOSED, 0)
+        }
+        
+        when (currentState.state) {
+            CircuitState.CLOSED -> {
+                // Normal operation
+                currentState.failureCount++
+                if (currentState.failureCount >= circuitBreakerThreshold) {
+                    currentState.state = CircuitState.OPEN
+                    lastFailureTime[operationType] = System.currentTimeMillis()
+                    Timber.w("Circuit breaker opened for $operationType")
+                }
+            }
+            CircuitState.HALF_OPEN -> {
+                // Testing the waters
+                currentState.state = CircuitState.CLOSED
+                currentState.failureCount = 0
+                Timber.d("Circuit breaker closed for $operationType")
+            }
+            CircuitState.OPEN -> {
+                // Already open, do nothing
+            }
+        }
+    }
+
+    private fun updateCircuitBreakerOnSuccess(operationType: String) {
+        val currentState = circuitBreakerState.getOrPut(operationType) {
+            CircuitBreakerState(CircuitState.CLOSED, 0)
+        }
+        
+        when (currentState.state) {
+            CircuitState.OPEN -> {
+                // Check if timeout has passed
+                if (System.currentTimeMillis() - (lastFailureTime[operationType] ?: 0) > circuitBreakerTimeout) {
+                    currentState.state = CircuitState.HALF_OPEN
+                    Timber.d("Circuit breaker half-open for $operationType")
+                }
+            }
+            CircuitState.HALF_OPEN -> {
+                // Success, close the circuit
+                currentState.state = CircuitState.CLOSED
+                currentState.failureCount = 0
+                Timber.d("Circuit breaker closed for $operationType")
+            }
+            CircuitState.CLOSED -> {
+                // Reset failure count on success
+                currentState.failureCount = 0
+            }
+        }
+    }
+
+    private fun processCircuitBreakers() {
+        val currentTime = System.currentTimeMillis()
+        
+        circuitBreakerState.forEach { (operationType, state) ->
+            if (state.state == CircuitState.OPEN) {
+                val lastFailure = lastFailureTime[operationType] ?: 0
+                if (currentTime - lastFailure > circuitBreakerTimeout) {
+                    state.state = CircuitState.HALF_OPEN
+                    Timber.d("Circuit breaker half-open for $operationType")
+                }
+            }
+        }
+    }
+
+    private fun cleanupCompletedRetries() {
+        val completedRetries = activeRetries.filter { it.value.job.isCompleted }
+        completedRetries.forEach { (operationId, _) ->
+            activeRetries.remove(operationId)
+        }
+    }
+
+    private fun shouldRetry(operationId: String, operationType: OperationType): Boolean {
+        // Check if operation still exists and needs retry
+        // This would typically query the database or sync queue
+        return networkMonitor.isOnline() && !isCircuitBreakerOpen(operationType.name)
+    }
+
+    private fun generateRetryId(): String {
+        return "retry_${retryIdGenerator.incrementAndGet()}_${System.currentTimeMillis()}"
+    }
+
+    private fun getTotalRetriesToday(): Int {
+        // This would typically query metrics database
+        return 0
+    }
+
+    private fun getAverageRetryTime(): Double {
+        // This would typically query metrics database
+        return 0.0
+    }
+
+    private fun getRetrySuccessRate(): Double {
+        // This would typically query metrics database
+        return 0.0
+    }
+}
+
+/**
+ * Data classes for retry management
+ */
+data class RetryJob(
+    val retryId: String,
+    val job: Job,
+    val delay: Long,
+    val retryCount: Int
+)
+
+data class RetryStats(
+    val activeRetries: Int,
+    val circuitBreakersOpen: Int,
+    val totalRetriesToday: Int,
+    val averageRetryTime: Double,
+    val successRate: Double
+)
+
+data class RetryAttempt(
+    val timestamp: Long,
+    val retryCount: Int,
+    val delay: Long,
+    val error: String,
+    val success: Boolean
+)
+
+data class CircuitBreakerState(
+    var state: CircuitState,
+    var failureCount: Int
+)
+
+enum class CircuitState {
+    CLOSED,     // Normal operation
+    OPEN,       // Circuit is open, no requests
+    HALF_OPEN   // Testing if service is recovered
+}
+
+enum class NetworkQuality {
+    EXCELLENT, GOOD, FAIR, POOR
+}

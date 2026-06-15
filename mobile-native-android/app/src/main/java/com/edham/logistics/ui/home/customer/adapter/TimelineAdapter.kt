@@ -15,8 +15,13 @@ data class TimelineStep(
     val isActive: Boolean
 )
 
-class TimelineAdapter(private val steps: List<TimelineStep>) :
+class TimelineAdapter(private var steps: List<TimelineStep>) :
     RecyclerView.Adapter<TimelineAdapter.ViewHolder>() {
+
+    fun updateData(newSteps: List<TimelineStep>) {
+        this.steps = newSteps
+        notifyDataSetChanged()
+    }
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val title: TextView = view.findViewById(R.id.tvEventTitle)

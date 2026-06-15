@@ -26,6 +26,19 @@ class EdhamMessagingService : FirebaseMessagingService() {
                 // Show a standard notification for supervisor
                 NotificationHelper.showCriticalAlert(applicationContext, title, body)
             }
+            "MISSION_ASSIGNED" -> {
+                // For Driver
+                NotificationHelper.showCriticalAlert(applicationContext, "مهمة جديدة", body)
+                // Logic to trigger DriverNewMissionActivity
+            }
+            "MAINTENANCE_APPROVAL" -> {
+                // For Accountant
+                NotificationHelper.showCriticalAlert(applicationContext, "طلب اعتماد مالي", body)
+            }
+            "DRIVER_EXPENSE" -> {
+                // For Accountant
+                NotificationHelper.showCriticalAlert(applicationContext, "مصروف سائق جديد", body)
+            }
             else -> {
                 // Handle other types
             }

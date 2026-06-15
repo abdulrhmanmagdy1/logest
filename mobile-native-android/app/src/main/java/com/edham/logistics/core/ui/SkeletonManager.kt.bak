@@ -1,0 +1,392 @@
+package com.edham.logistics.core.ui
+
+import android.animation.ValueAnimator
+import android.content.Context
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.view.View
+import android.view.ViewGroup
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.widget.ImageView
+import android.widget.TextView
+import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.core.view.isVisible
+import kotlinx.coroutines.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Skeleton Manager - Manages skeleton loading screens with shimmer effects
+ * Provides consistent loading patterns across the application
+ */
+@Singleton
+class SkeletonManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val skeletonViews = ConcurrentHashMap<String, List<View>>()
+    private val shimmerAnimators = ConcurrentHashMap<String, ValueAnimator>()
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    
+    // Default skeleton configuration
+    private var defaultConfig = SkeletonConfig()
+    
+    /**
+     * Initialize skeleton manager
+     */
+    fun initialize(screenId: String, config: SkeletonConfig = SkeletonConfig()) {
+        this.defaultConfig = config
+    }
+
+    /**
+     * Show skeleton for a view group
+     */
+    fun showSkeleton(screenId: String, rootView: ViewGroup) {
+        if (!defaultConfig.enableSkeleton) return
+        
+        hideSkeleton(screenId) // Hide any existing skeleton
+        
+        val skeletonViews = createSkeletonViews(rootView)
+        this.skeletonViews[screenId] = skeletonViews
+        
+        // Add skeleton views to root
+        skeletonViews.forEach { skeletonView ->
+            rootView.addView(skeletonView)
+        }
+        
+        // Start shimmer animation
+        startShimmerAnimation(screenId, skeletonViews)
+    }
+
+    /**
+     * Hide skeleton for a screen
+     */
+    fun hideSkeleton(screenId: String) {
+        val skeletonViews = skeletonViews[screenId] ?: return
+        
+        // Stop shimmer animation
+        stopShimmerAnimation(screenId)
+        
+        // Remove skeleton views
+        skeletonViews.forEach { skeletonView ->
+            (skeletonView.parent as? ViewGroup)?.removeView(skeletonView)
+        }
+        
+        this.skeletonViews.remove(screenId)
+    }
+
+    /**
+     * Create skeleton views for a view group
+     */
+    private fun createSkeletonViews(rootView: ViewGroup): List<View> {
+        val skeletonViews = mutableListOf<View>()
+        
+        // Traverse the view hierarchy and create skeleton views
+        traverseAndCreateSkeleton(rootView, skeletonViews)
+        
+        return skeletonViews
+    }
+
+    /**
+     * Traverse view hierarchy and create skeleton views
+     */
+    private fun traverseAndCreateSkeleton(view: View, skeletonViews: MutableList<View>) {
+        when (view) {
+            is TextView -> {
+                val skeletonView = createTextSkeleton(view)
+                skeletonViews.add(skeletonView)
+            }
+            is ImageView -> {
+                val skeletonView = createImageSkeleton(view)
+                skeletonViews.add(skeletonView)
+            }
+            is ViewGroup -> {
+                // Recursively process child views
+                for (i in 0 until view.childCount) {
+                    traverseAndCreateSkeleton(view.getChildAt(i), skeletonViews)
+                }
+            }
+        }
+    }
+
+    /**
+     * Create skeleton view for TextView
+     */
+    private fun createTextSkeleton(textView: TextView): View {
+        val skeletonView = View(context).apply {
+            layoutParams = textView.layoutParams
+            background = createSkeletonDrawable()
+            
+            // Match the original view's positioning
+            (layoutParams as? ViewGroup.MarginLayoutParams)?.let {
+                setMargins(it.leftMargin, it.topMargin, it.rightMargin, it.bottomMargin)
+            }
+        }
+        
+        return skeletonView
+    }
+
+    /**
+     * Create skeleton view for ImageView
+     */
+    private fun createImageSkeleton(imageView: ImageView): View {
+        val skeletonView = View(context).apply {
+            layoutParams = imageView.layoutParams
+            background = createSkeletonDrawable()
+            
+            // Apply corner radius for circular images
+            if (isCircularImageView(imageView)) {
+                background = createCircularSkeletonDrawable()
+            }
+            
+            (layoutParams as? ViewGroup.MarginLayoutParams)?.let {
+                setMargins(it.leftMargin, it.topMargin, it.rightMargin, it.bottomMargin)
+            }
+        }
+        
+        return skeletonView
+    }
+
+    /**
+     * Create skeleton drawable
+     */
+    private fun createSkeletonDrawable(): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(Color.parseColor("#E0E0E0"))
+            cornerRadius = defaultConfig.cornerRadius
+        }
+    }
+
+    /**
+     * Create circular skeleton drawable
+     */
+    private fun createCircularSkeletonDrawable(): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(Color.parseColor("#E0E0E0"))
+            cornerRadius = 1000f // Large value for circular shape
+            shape = GradientDrawable.OVAL
+        }
+    }
+
+    /**
+     * Check if ImageView is circular
+     */
+    private fun isCircularImageView(imageView: ImageView): Boolean {
+        // Check if the ImageView has circular properties
+        return imageView.scaleType == android.widget.ImageView.ScaleType.CENTER_CROP &&
+                (imageView.width == imageView.height || imageView.width > 0 && imageView.height > 0)
+    }
+
+    /**
+     * Start shimmer animation
+     */
+    private fun startShimmerAnimation(screenId: String, skeletonViews: List<View>) {
+        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = defaultConfig.shimmerDuration
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = AccelerateDecelerateInterpolator()
+            
+            addUpdateListener { animation ->
+                val value = animation.animatedValue as Float
+                val alpha = calculateShimmerAlpha(value)
+                
+                skeletonViews.forEach { skeletonView ->
+                    skeletonView.alpha = alpha
+                }
+            }
+        }
+        
+        animator.start()
+        shimmerAnimators[screenId] = animator
+    }
+
+    /**
+     * Stop shimmer animation
+     */
+    private fun stopShimmerAnimation(screenId: String) {
+        shimmerAnimators[screenId]?.let { animator ->
+            animator.cancel()
+            shimmerAnimators.remove(screenId)
+        }
+    }
+
+    /**
+     * Calculate shimmer alpha value
+     */
+    private fun calculateShimmerAlpha(value: Float): Float {
+        // Create a shimmer effect by varying alpha
+        return when {
+            value < 0.3f -> 0.3f
+            value < 0.7f -> 0.3f + (value - 0.3f) * 1.4f
+            else -> 1f - (value - 0.7f) * 3.33f
+        }
+    }
+
+    /**
+     * Create skeleton for list items
+     */
+    fun createListSkeleton(
+        screenId: String,
+        parentView: ViewGroup,
+        itemCount: Int,
+        itemLayoutId: Int
+    ) {
+        if (!defaultConfig.enableSkeleton) return
+        
+        hideSkeleton(screenId)
+        
+        val skeletonViews = mutableListOf<View>()
+        
+        repeat(itemCount) { index ->
+            val skeletonItem = createListItemSkeleton(parentView, itemLayoutId)
+            skeletonViews.add(skeletonItem)
+            parentView.addView(skeletonItem)
+        }
+        
+        this.skeletonViews[screenId] = skeletonViews
+        startShimmerAnimation(screenId, skeletonViews)
+    }
+
+    /**
+     * Create skeleton for a list item
+     */
+    private fun createListItemSkeleton(parentView: ViewGroup, itemLayoutId: Int): View {
+        // Create a simple skeleton view for list items
+        return View(context).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                120 // Approximate height for list item
+            )
+            background = createSkeletonDrawable()
+            
+            // Add margin for list item separation
+            (layoutParams as? ViewGroup.MarginLayoutParams)?.let {
+                setMargins(16, 8, 16, 8)
+            }
+        }
+    }
+
+    /**
+     * Create skeleton for card layouts
+     */
+    fun createCardSkeleton(
+        screenId: String,
+        parentView: ViewGroup,
+        cardCount: Int
+    ) {
+        if (!defaultConfig.enableSkeleton) return
+        
+        hideSkeleton(screenId)
+        
+        val skeletonViews = mutableListOf<View>()
+        
+        repeat(cardCount) { index ->
+            val skeletonCard = createCardSkeletonItem()
+            skeletonViews.add(skeletonCard)
+            parentView.addView(skeletonCard)
+        }
+        
+        this.skeletonViews[screenId] = skeletonViews
+        startShimmerAnimation(screenId, skeletonViews)
+    }
+
+    /**
+     * Create skeleton for a card item
+     */
+    private fun createCardSkeletonItem(): View {
+        val cardView = ConstraintLayout(context).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            background = createSkeletonDrawable()
+            
+            // Add padding
+            setPadding(16, 16, 16, 16)
+            
+            // Add skeleton elements
+            addView(createSkeletonLine(200, 16)) // Title
+            addView(createSkeletonLine(300, 12, marginTop = 8)) // Subtitle
+            addView(createSkeletonLine(150, 12, marginTop = 8)) // Additional info
+        }
+        
+        return cardView
+    }
+
+    /**
+     * Create skeleton line
+     */
+    private fun createSkeletonLine(width: Int, height: Int, marginTop: Int = 0): View {
+        return View(context).apply {
+            layoutParams = ConstraintLayout.LayoutParams(width, height).apply {
+                topMargin = marginTop
+            }
+            background = createSkeletonDrawable()
+        }
+    }
+
+    /**
+     * Pause skeleton animation
+     */
+    fun pause(screenId: String) {
+        shimmerAnimators[screenId]?.pause()
+    }
+
+    /**
+     * Resume skeleton animation
+     */
+    fun resume(screenId: String) {
+        shimmerAnimators[screenId]?.resume()
+    }
+
+    /**
+     * Update skeleton configuration
+     */
+    fun updateConfig(config: SkeletonConfig) {
+        this.defaultConfig = config
+        
+        // Update existing skeleton views with new configuration
+        skeletonViews.forEach { (screenId, views) ->
+            stopShimmerAnimation(screenId)
+            startShimmerAnimation(screenId, views)
+        }
+    }
+
+    /**
+     * Check if skeleton is showing for screen
+     */
+    fun isSkeletonShowing(screenId: String): Boolean {
+        return skeletonViews.containsKey(screenId)
+    }
+
+    /**
+     * Get skeleton view count for screen
+     */
+    fun getSkeletonViewCount(screenId: String): Int {
+        return skeletonViews[screenId]?.size ?: 0
+    }
+
+    /**
+     * Cleanup skeleton manager
+     */
+    fun cleanup() {
+        // Stop all animations
+        shimmerAnimators.forEach { (screenId, _) ->
+            stopShimmerAnimation(screenId)
+        }
+        
+        // Clear all skeleton views
+        skeletonViews.clear()
+        shimmerAnimators.clear()
+        
+        coroutineScope.cancel()
+    }
+
+    /**
+     * Cleanup specific screen
+     */
+    fun cleanup(screenId: String) {
+        hideSkeleton(screenId)
+    }
+}

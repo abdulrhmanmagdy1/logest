@@ -1,0 +1,705 @@
+package com.edham.logistics.notifications
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.edham.logistics.R
+import com.edham.logistics.network.RetrofitClient
+import com.edham.logistics.network.api.NotificationApi
+import com.edham.logistics.utils.SharedPreferencesHelper
+import com.google.firebase.messaging.FirebaseMessagingService
+import com.google.firebase.messaging.RemoteMessage
+import kotlinx.coroutines.*
+import org.json.JSONObject
+
+/**
+ * Unified notification service for Android
+ * Provides Firebase push notifications and in-app notifications with role-based alerts
+ */
+class UnifiedNotificationService : FirebaseMessagingService() {
+
+    companion object {
+        private const val TAG = "UnifiedNotificationService"
+        private const val NOTIFICATION_CHANNEL_ID = "edham_notifications"
+        private const val NOTIFICATION_CHANNEL_NAME = "Edham Logistics Notifications"
+        private const val NOTIFICATION_CHANNEL_DESCRIPTION = "All notifications from Edham Logistics"
+        
+        // Notification channels for different categories
+        private const val SHIPMENT_CHANNEL_ID = "shipment_notifications"
+        private const val COLD_CHAIN_CHANNEL_ID = "cold_chain_notifications"
+        private const val DRIVER_CHANNEL_ID = "driver_notifications"
+        private const val PAYMENT_CHANNEL_ID = "payment_notifications"
+        private const val SYSTEM_CHANNEL_ID = "system_notifications"
+        private const val EMERGENCY_CHANNEL_ID = "emergency_notifications"
+        
+        // Notification IDs
+        private const val BASE_NOTIFICATION_ID = 1000
+        private var notificationIdCounter = BASE_NOTIFICATION_ID
+        
+        // In-app notification storage
+        private val inAppNotifications = mutableListOf<InAppNotification>()
+        private val maxInAppNotifications = 50
+    }
+
+    private lateinit var notificationApi: NotificationApi
+    private lateinit var notificationManager: NotificationManager
+    private lateinit var sharedPreferences: SharedPreferencesHelper
+
+    override fun onCreate() {
+        super.onCreate()
+        Log.d(TAG, "Unified notification service starting")
+
+        notificationApi = RetrofitClient.getInstance().create(NotificationApi::class.java)
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        sharedPreferences = SharedPreferencesHelper(this)
+
+        createNotificationChannels()
+        startNotificationProcessing()
+
+        Log.i(TAG, "Unified notification service initialized successfully")
+    }
+
+    override fun onNewToken(token: String) {
+        super.onNewToken(token)
+        Log.d(TAG, "FCM token refreshed: $token")
+
+        // Save token locally
+        sharedPreferences.saveFcmToken(token)
+
+        // Send token to server
+        sendFcmTokenToServer(token)
+    }
+
+    override fun onMessageReceived(remoteMessage: RemoteMessage) {
+        super.onMessageReceived(remoteMessage)
+        Log.d(TAG, "Firebase message received: ${remoteMessage.messageId}")
+
+        try {
+            // Parse message data
+            val notificationData = parseNotificationData(remoteMessage.data)
+            
+            // Determine notification type
+            val notificationType = notificationData["category"] ?: "GENERAL"
+            val priority = notificationData["priority"] ?: "MEDIUM"
+            
+            // Check if user should receive this notification based on role and preferences
+            if (shouldShowNotification(notificationData)) {
+                // Show push notification
+                showPushNotification(notificationData)
+                
+                // Add to in-app notifications
+                addInAppNotification(notificationData)
+                
+                // Broadcast to UI
+                broadcastNotification(notificationData)
+                
+                Log.i(TAG, "Notification displayed: $notificationType")
+            } else {
+                Log.d(TAG, "Notification filtered out: $notificationType")
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing Firebase message", e)
+        }
+    }
+
+    override fun onMessageSent(messageId: String) {
+        super.onMessageSent(messageId)
+        Log.d(TAG, "Message sent successfully: $messageId")
+    }
+
+    override fun onDeletedMessages() {
+        super.onDeletedMessages()
+        Log.w(TAG, "Messages deleted on server")
+    }
+
+    /**
+     * Create notification channels for different categories
+     */
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Main notification channel
+            val mainChannel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                NOTIFICATION_CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = NOTIFICATION_CHANNEL_DESCRIPTION
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+            }
+
+            // Shipment notifications
+            val shipmentChannel = NotificationChannel(
+                SHIPMENT_CHANNEL_ID,
+                "Shipment Updates",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Notifications about shipment status updates"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = android.graphics.Color.BLUE
+            }
+
+            // Cold-chain notifications
+            val coldChainChannel = NotificationChannel(
+                COLD_CHAIN_CHANNEL_ID,
+                "Temperature Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Temperature monitoring and cold-chain alerts"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = android.graphics.Color.RED
+                vibrationPattern = longArrayOf(0, 500, 200, 500)
+            }
+
+            // Driver notifications
+            val driverChannel = NotificationChannel(
+                DRIVER_CHANNEL_ID,
+                "Driver Tasks",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Driver task assignments and updates"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = android.graphics.Color.GREEN
+            }
+
+            // Payment notifications
+            val paymentChannel = NotificationChannel(
+                PAYMENT_CHANNEL_ID,
+                "Payment Updates",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Payment confirmations and financial updates"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = android.graphics.Color.YELLOW
+            }
+
+            // System notifications
+            val systemChannel = NotificationChannel(
+                SYSTEM_CHANNEL_ID,
+                "System Updates",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "System maintenance and updates"
+                enableLights(false)
+                enableVibration(false)
+                setShowBadge(true)
+            }
+
+            // Emergency notifications
+            val emergencyChannel = NotificationChannel(
+                EMERGENCY_CHANNEL_ID,
+                "Emergency Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Emergency alerts and critical notifications"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = android.graphics.Color.RED
+                vibrationPattern = longArrayOf(0, 1000, 500, 1000)
+                setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_ALARM))
+            }
+
+            // Register channels
+            notificationManager.createNotificationChannels(listOf(
+                mainChannel, shipmentChannel, coldChainChannel, driverChannel,
+                paymentChannel, systemChannel, emergencyChannel
+            ))
+
+            Log.d(TAG, "Notification channels created")
+        }
+    }
+
+    /**
+     * Parse notification data from Firebase message
+     */
+    private fun parseNotificationData(data: Map<String, String>): Map<String, String> {
+        val parsedData = mutableMapOf<String, String>()
+        
+        // Basic notification data
+        parsedData["title"] = data["title"] ?: "Edham Logistics"
+        parsedData["body"] = data["body"] ?: "You have a new notification"
+        parsedData["category"] = data["category"] ?: "GENERAL"
+        parsedData["priority"] = data["priority"] ?: "MEDIUM"
+        parsedData["notificationId"] = data["notificationId"] ?: ""
+        parsedData["timestamp"] = data["timestamp"] ?: System.currentTimeMillis().toString()
+        
+        // Additional data
+        data.forEach { (key, value) ->
+            if (!parsedData.containsKey(key)) {
+                parsedData[key] = value
+            }
+        }
+        
+        return parsedData
+    }
+
+    /**
+     * Check if notification should be shown based on user preferences and role
+     */
+    private fun shouldShowNotification(data: Map<String, String>): Boolean {
+        try {
+            // Check if notifications are enabled
+            if (!sharedPreferences.isNotificationsEnabled()) {
+                return false
+            }
+
+            // Check category preferences
+            val category = data["category"] ?: "GENERAL"
+            if (!isCategoryEnabled(category)) {
+                return false
+            }
+
+            // Check priority preferences
+            val priority = data["priority"] ?: "MEDIUM"
+            if (!isPriorityEnabled(priority)) {
+                return false
+            }
+
+            // Check quiet hours
+            if (isQuietHours() && priority != "CRITICAL") {
+                return false
+            }
+
+            // Check role-based access
+            if (!isRoleAuthorized(data)) {
+                return false
+            }
+
+            return true
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking notification preferences", e)
+            return true // Show notification if there's an error
+        }
+    }
+
+    /**
+     * Show push notification
+     */
+    private fun showPushNotification(data: Map<String, String>) {
+        try {
+            val title = data["title"] ?: "Edham Logistics"
+            val body = data["body"] ?: "You have a new notification"
+            val category = data["category"] ?: "GENERAL"
+            val priority = data["priority"] ?: "MEDIUM"
+
+            // Get appropriate channel
+            val channelId = getChannelId(category)
+
+            // Create notification
+            val builder = NotificationCompat.Builder(this, channelId)
+                .setSmallIcon(getNotificationIcon(category))
+                .setContentTitle(title)
+                .setContentText(body)
+                .setPriority(getNotificationPriority(priority))
+                .setAutoCancel(true)
+                .setDefaults(0) // We handle sound and vibration manually
+                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+
+            // Add sound and vibration based on priority
+            when (priority) {
+                "CRITICAL" -> {
+                    builder.setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_ALARM))
+                    builder.setVibrate(longArrayOf(0, 1000, 500, 1000))
+                }
+                "HIGH" -> {
+                    builder.setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION))
+                    builder.setVibrate(longArrayOf(0, 500, 200, 500))
+                }
+                "MEDIUM" -> {
+                    builder.setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION))
+                }
+                "LOW" -> {
+                    // Silent for low priority
+                }
+            }
+
+            // Add action buttons for certain categories
+            when (category) {
+                "SHIPMENT" -> {
+                    builder.addAction(
+                        R.drawable.ic_tracking,
+                        "Track",
+                        createTrackingPendingIntent(data)
+                    )
+                }
+                "DRIVER" -> {
+                    builder.addAction(
+                        R.drawable.ic_task,
+                        "View Task",
+                        createTaskPendingIntent(data)
+                    )
+                }
+                "PAYMENT" -> {
+                    builder.addAction(
+                        R.drawable.ic_payment,
+                        "View Payment",
+                        createPaymentPendingIntent(data)
+                    )
+                }
+            }
+
+            // Show notification
+            notificationManager.notify(notificationIdCounter++, builder.build())
+
+            Log.d(TAG, "Push notification displayed: $category")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error showing push notification", e)
+        }
+    }
+
+    /**
+     * Add notification to in-app list
+     */
+    private fun addInAppNotification(data: Map<String, String>) {
+        try {
+            val notification = InAppNotification(
+                id = data["notificationId"] ?: "",
+                title = data["title"] ?: "",
+                body = data["body"] ?: "",
+                category = data["category"] ?: "GENERAL",
+                priority = data["priority"] ?: "MEDIUM",
+                timestamp = data["timestamp"]?.toLongOrNull() ?: System.currentTimeMillis(),
+                read = false,
+                data = data
+            )
+
+            synchronized(inAppNotifications) {
+                inAppNotifications.add(0, notification) // Add to beginning
+                
+                // Limit size
+                while (inAppNotifications.size > maxInAppNotifications) {
+                    inAppNotifications.removeAt(inAppNotifications.size - 1)
+                }
+            }
+
+            // Save to local storage
+            saveInAppNotifications()
+
+            Log.d(TAG, "In-app notification added: ${notification.category}")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error adding in-app notification", e)
+        }
+    }
+
+    /**
+     * Broadcast notification to UI
+     */
+    private fun broadcastNotification(data: Map<String, String>) {
+        try {
+            val intent = Intent("com.edham.logistics.NOTIFICATION_RECEIVED")
+            intent.putExtra("notification_data", HashMap(data))
+            sendBroadcast(intent)
+
+            Log.d(TAG, "Notification broadcasted to UI")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error broadcasting notification", e)
+        }
+    }
+
+    /**
+     * Get in-app notifications
+     */
+    fun getInAppNotifications(): List<InAppNotification> {
+        return synchronized(inAppNotifications) {
+            inAppNotifications.toList()
+        }
+    }
+
+    /**
+     * Mark notification as read
+     */
+    fun markNotificationAsRead(notificationId: String) {
+        synchronized(inAppNotifications) {
+            val notification = inAppNotifications.find { it.id == notificationId }
+            if (notification != null) {
+                notification.read = true
+                saveInAppNotifications()
+                
+                // Broadcast read status
+                val intent = Intent("com.edham.logistics.NOTIFICATION_READ")
+                intent.putExtra("notification_id", notificationId)
+                sendBroadcast(intent)
+            }
+        }
+    }
+
+    /**
+     * Mark all notifications as read
+     */
+    fun markAllNotificationsAsRead() {
+        synchronized(inAppNotifications) {
+            inAppNotifications.forEach { it.read = true }
+            saveInAppNotifications()
+            
+            // Broadcast read status
+            val intent = Intent("com.edham.logistics.ALL_NOTIFICATIONS_READ")
+            sendBroadcast(intent)
+        }
+    }
+
+    /**
+     * Clear all notifications
+     */
+    fun clearAllNotifications() {
+        synchronized(inAppNotifications) {
+            inAppNotifications.clear()
+            saveInAppNotifications()
+            
+            // Clear system notifications
+            notificationManager.cancelAll()
+            
+            // Broadcast clear status
+            val intent = Intent("com.edham.logistics.ALL_NOTIFICATIONS_CLEARED")
+            sendBroadcast(intent)
+        }
+    }
+
+    /**
+     * Get notification statistics
+     */
+    fun getNotificationStatistics(): NotificationStatistics {
+        synchronized(inAppNotifications) {
+            val total = inAppNotifications.size
+            val unread = inAppNotifications.count { !it.read }
+            
+            val categoryStats = mutableMapOf<String, Int>()
+            val priorityStats = mutableMapOf<String, Int>()
+            
+            inAppNotifications.forEach { notification ->
+                categoryStats[notification.category] = categoryStats.getOrDefault(notification.category, 0) + 1
+                priorityStats[notification.priority] = priorityStats.getOrDefault(notification.priority, 0) + 1
+            }
+            
+            return NotificationStatistics(
+                total = total,
+                unread = unread,
+                categoryStats = categoryStats,
+                priorityStats = priorityStats
+            )
+        }
+    }
+
+    // Helper methods
+    private fun startNotificationProcessing() {
+        // Start background processing for notification queue
+        CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                try {
+                    processNotificationQueue()
+                    delay(30000) // Process every 30 seconds
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in notification processing", e)
+                }
+            }
+        }
+    }
+
+    private fun processNotificationQueue() {
+        // Implementation for processing queued notifications
+    }
+
+    private fun sendFcmTokenToServer(token: String) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val request = mapOf(
+                    "fcmToken" to token,
+                    "deviceId" to android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID),
+                    "platform" to "android",
+                    "appVersion" to getAppVersion()
+                )
+
+                val response = notificationApi.registerFcmToken(request)
+                if (response.isSuccessful) {
+                    Log.d(TAG, "FCM token registered successfully")
+                } else {
+                    Log.w(TAG, "Failed to register FCM token: ${response.code()}")
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error sending FCM token to server", e)
+            }
+        }
+    }
+
+    private fun isCategoryEnabled(category: String): Boolean {
+        return sharedPreferences.isCategoryEnabled(category)
+    }
+
+    private fun isPriorityEnabled(priority: String): Boolean {
+        return sharedPreferences.isPriorityEnabled(priority)
+    }
+
+    private fun isQuietHours(): Boolean {
+        return sharedPreferences.isQuietHoursEnabled() && sharedPreferences.isInQuietHours()
+    }
+
+    private fun isRoleAuthorized(data: Map<String, String>): Boolean {
+        // Implementation would check user role against notification permissions
+        return true // Placeholder
+    }
+
+    private fun getChannelId(category: String): String {
+        return when (category) {
+            "SHIPMENT" -> SHIPMENT_CHANNEL_ID
+            "COLD_CHAIN" -> COLD_CHAIN_CHANNEL_ID
+            "DRIVER" -> DRIVER_CHANNEL_ID
+            "PAYMENT" -> PAYMENT_CHANNEL_ID
+            "SYSTEM" -> SYSTEM_CHANNEL_ID
+            "EMERGENCY" -> EMERGENCY_CHANNEL_ID
+            else -> NOTIFICATION_CHANNEL_ID
+        }
+    }
+
+    private fun getNotificationIcon(category: String): Int {
+        return when (category) {
+            "SHIPMENT" -> R.drawable.ic_shipment
+            "COLD_CHAIN" -> R.drawable.ic_temperature
+            "DRIVER" -> R.drawable.ic_driver
+            "PAYMENT" -> R.drawable.ic_payment
+            "SYSTEM" -> R.drawable.ic_system
+            "EMERGENCY" -> R.drawable.ic_emergency
+            else -> R.drawable.ic_notification
+        }
+    }
+
+    private fun getNotificationPriority(priority: String): Int {
+        return when (priority) {
+            "CRITICAL" -> NotificationCompat.PRIORITY_HIGH
+            "HIGH" -> NotificationCompat.PRIORITY_HIGH
+            "MEDIUM" -> NotificationCompat.PRIORITY_DEFAULT
+            "LOW" -> NotificationCompat.PRIORITY_LOW
+            else -> NotificationCompat.PRIORITY_DEFAULT
+        }
+    }
+
+    private fun createTrackingPendingIntent(data: Map<String, String>): PendingIntent {
+        val intent = Intent(this, TrackingActivity::class.java)
+        intent.putExtra("tracking_number", data["trackingNumber"])
+        intent.putExtra("shipment_id", data["shipmentId"])
+        return PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun createTaskPendingIntent(data: Map<String, String>): PendingIntent {
+        val intent = Intent(this, TaskActivity::class.java)
+        intent.putExtra("task_id", data["taskId"])
+        intent.putExtra("task_type", data["taskType"])
+        return PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun createPaymentPendingIntent(data: Map<String, String>): PendingIntent {
+        val intent = Intent(this, PaymentActivity::class.java)
+        intent.putExtra("payment_id", data["paymentId"])
+        intent.putExtra("amount", data["amount"])
+        return PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun getAppVersion(): String {
+        return try {
+            val packageInfo = packageManager.getPackageInfo(packageName, 0)
+            packageInfo.versionName ?: "1.0"
+        } catch (e: Exception) {
+            "1.0"
+        }
+    }
+
+    private fun saveInAppNotifications() {
+        try {
+            val notificationsJson = JSONObject()
+            synchronized(inAppNotifications) {
+                inAppNotifications.forEachIndexed { index, notification ->
+                    val notificationJson = JSONObject()
+                    notificationJson.put("id", notification.id)
+                    notificationJson.put("title", notification.title)
+                    notificationJson.put("body", notification.body)
+                    notificationJson.put("category", notification.category)
+                    notificationJson.put("priority", notification.priority)
+                    notificationJson.put("timestamp", notification.timestamp)
+                    notificationJson.put("read", notification.read)
+                    notificationsJson.put(index.toString(), notificationJson)
+                }
+            }
+            sharedPreferences.saveInAppNotifications(notificationsJson.toString())
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving in-app notifications", e)
+        }
+    }
+
+    private fun loadInAppNotifications() {
+        try {
+            val notificationsJson = sharedPreferences.getInAppNotifications()
+            if (notificationsJson.isNotEmpty()) {
+                val jsonObject = JSONObject(notificationsJson)
+                val loadedNotifications = mutableListOf<InAppNotification>()
+                
+                for (key in jsonObject.keys()) {
+                    val notificationJson = jsonObject.getJSONObject(key)
+                    val notification = InAppNotification(
+                        id = notificationJson.getString("id"),
+                        title = notificationJson.getString("title"),
+                        body = notificationJson.getString("body"),
+                        category = notificationJson.getString("category"),
+                        priority = notificationJson.getString("priority"),
+                        timestamp = notificationJson.getLong("timestamp"),
+                        read = notificationJson.getBoolean("read"),
+                        data = emptyMap()
+                    )
+                    loadedNotifications.add(notification)
+                }
+                
+                synchronized(inAppNotifications) {
+                    inAppNotifications.clear()
+                    inAppNotifications.addAll(loadedNotifications)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading in-app notifications", e)
+        }
+    }
+
+    // Data classes
+    data class InAppNotification(
+        val id: String,
+        val title: String,
+        val body: String,
+        val category: String,
+        val priority: String,
+        val timestamp: Long,
+        var read: Boolean,
+        val data: Map<String, String>
+    )
+
+    data class NotificationStatistics(
+        val total: Int,
+        val unread: Int,
+        val categoryStats: Map<String, Int>,
+        val priorityStats: Map<String, Int>
+    )
+}

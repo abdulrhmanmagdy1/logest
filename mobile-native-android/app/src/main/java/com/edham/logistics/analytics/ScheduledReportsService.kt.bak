@@ -1,0 +1,857 @@
+package com.edham.logistics.analytics
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.ScheduledReportsApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Scheduled Reports Service - Automated report generation and delivery
+ * 
+ * Features:
+ * - Automated report scheduling
+ * - Multiple report types and formats
+ * - Email delivery integration
+ * - Report template management
+ * - Scheduling configuration
+ * - Performance monitoring
+ * - Report history tracking
+ */
+@Singleton
+class ScheduledReportsService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val scheduledReportsApi: ScheduledReportsApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _scheduledReportsState = MutableStateFlow<ScheduledReportsState>(ScheduledReportsState.Idle)
+    val scheduledReportsState: StateFlow<ScheduledReportsState> = _scheduledReportsState.asStateFlow()
+    
+    private val _scheduledReports = MutableStateFlow<List<ScheduledReport>>(emptyList())
+    val scheduledReports: StateFlow<List<ScheduledReport>> = _scheduledReports.asStateFlow()
+    
+    private val _reportHistory = MutableStateFlow<List<ReportExecution>>(emptyList())
+    val reportHistory: StateFlow<List<ReportExecution>> = _reportHistory.asStateFlow()
+    
+    private var isInitialized = false
+    private var schedulerTimer: Timer? = null
+    
+    companion object {
+        private const val TAG = "ScheduledReportsService"
+        private const val SCHEDULER_INTERVAL_MS = 60000L // 1 minute
+        private const val MAX_RETRY_ATTEMPTS = 3
+        private const val REPORT_CACHE_SIZE = 100
+    }
+    
+    /**
+     * Initialize scheduled reports service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _scheduledReportsState.value = ScheduledReportsState.Initializing
+                
+                // Load scheduled reports
+                loadScheduledReports()
+                
+                // Load report history
+                loadReportHistory()
+                
+                // Initialize scheduler
+                initializeScheduler()
+                
+                // Start scheduler timer
+                startSchedulerTimer()
+                
+                isInitialized = true
+                _scheduledReportsState.value = ScheduledReportsState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _scheduledReportsState.value = ScheduledReportsState.Error("Failed to initialize scheduled reports service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create scheduled report
+     */
+    suspend fun createScheduledReport(
+        name: String,
+        reportType: ReportType,
+        schedule: ReportSchedule,
+        recipients: List<String>,
+        format: ReportFormat = ReportFormat.PDF,
+        template: ReportTemplate = ReportTemplate.STANDARD,
+        filters: ReportFilters? = null
+    ): Result<ScheduledReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Scheduled reports service not initialized")
+                }
+                
+                _scheduledReportsState.value = ScheduledReportsState.Creating
+                
+                // Validate schedule
+                validateSchedule(schedule)
+                
+                // Create scheduled report
+                val scheduledReport = ScheduledReport(
+                    id = UUID.randomUUID().toString(),
+                    name = name,
+                    reportType = reportType,
+                    schedule = schedule,
+                    recipients = recipients,
+                    format = format,
+                    template = template,
+                    filters = filters ?: ReportFilters(),
+                    isActive = true,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    lastExecuted = null,
+                    nextExecution = calculateNextExecution(schedule)
+                )
+                
+                // Save to database
+                val savedReport = database.scheduledReportDao().insertScheduledReport(scheduledReport.toEntity())
+                    .let { id -> scheduledReport.copy(id = id.toString()) }
+                
+                // Add to cache
+                addToScheduledReports(savedReport)
+                
+                _scheduledReportsState.value = ScheduledReportsState.Ready
+                Result.success(savedReport)
+                
+            } catch (e: Exception) {
+                _scheduledReportsState.value = ScheduledReportsState.Error("Failed to create scheduled report: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update scheduled report
+     */
+    suspend fun updateScheduledReport(
+        reportId: String,
+        name: String? = null,
+        schedule: ReportSchedule? = null,
+        recipients: List<String>? = null,
+        format: ReportFormat? = null,
+        template: ReportTemplate? = null,
+        filters: ReportFilters? = null,
+        isActive: Boolean? = null
+    ): Result<ScheduledReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Scheduled reports service not initialized")
+                }
+                
+                _scheduledReportsState.value = ScheduledReportsState.Updating
+                
+                val existingReport = getScheduledReport(reportId)
+                    ?: throw Exception("Scheduled report not found")
+                
+                // Validate schedule if provided
+                schedule?.let { validateSchedule(it) }
+                
+                // Update report
+                val updatedReport = existingReport.copy(
+                    name = name ?: existingReport.name,
+                    schedule = schedule ?: existingReport.schedule,
+                    recipients = recipients ?: existingReport.recipients,
+                    format = format ?: existingReport.format,
+                    template = template ?: existingReport.template,
+                    filters = filters ?: existingReport.filters,
+                    isActive = isActive ?: existingReport.isActive,
+                    updatedAt = Date(),
+                    nextExecution = schedule?.let { calculateNextExecution(it) } ?: existingReport.nextExecution
+                )
+                
+                // Update in database
+                database.scheduledReportDao().updateScheduledReport(updatedReport.toEntity())
+                
+                // Update in cache
+                updateScheduledReportInList(updatedReport)
+                
+                _scheduledReportsState.value = ScheduledReportsState.Ready
+                Result.success(updatedReport)
+                
+            } catch (e: Exception) {
+                _scheduledReportsState.value = ScheduledReportsState.Error("Failed to update scheduled report: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Delete scheduled report
+     */
+    suspend fun deleteScheduledReport(reportId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Scheduled reports service not initialized")
+                }
+                
+                _scheduledReportsState.value = ScheduledReportsState.Deleting
+                
+                // Delete from database
+                database.scheduledReportDao().deleteScheduledReport(reportId.toLong())
+                
+                // Remove from cache
+                removeFromScheduledReports(reportId)
+                
+                _scheduledReportsState.value = ScheduledReportsState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _scheduledReportsState.value = ScheduledReportsState.Error("Failed to delete scheduled report: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Execute scheduled report manually
+     */
+    suspend fun executeScheduledReport(reportId: String): Result<ReportExecution> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Scheduled reports service not initialized")
+                }
+                
+                _scheduledReportsState.value = ScheduledReportsState.Executing
+                
+                val scheduledReport = getScheduledReport(reportId)
+                    ?: throw Exception("Scheduled report not found")
+                
+                // Execute report
+                val execution = executeReport(scheduledReport, isManual = true)
+                
+                // Add to history
+                addToReportHistory(execution)
+                
+                // Update last execution time
+                val updatedReport = scheduledReport.copy(
+                    lastExecuted = execution.executedAt,
+                    nextExecution = calculateNextExecution(scheduledReport.schedule)
+                )
+                database.scheduledReportDao().updateScheduledReport(updatedReport.toEntity())
+                updateScheduledReportInList(updatedReport)
+                
+                _scheduledReportsState.value = ScheduledReportsState.Ready
+                Result.success(execution)
+                
+            } catch (e: Exception) {
+                _scheduledReportsState.value = ScheduledReportsState.Error("Failed to execute scheduled report: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get scheduled reports
+     */
+    suspend fun getScheduledReports(
+        isActive: Boolean? = null,
+        reportType: ReportType? = null
+    ): Result<List<ScheduledReport>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val reports = database.scheduledReportDao().getScheduledReports(isActive, reportType)
+                    .map { it.toDomainModel() }
+                
+                Result.success(reports)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get scheduled report by ID
+     */
+    suspend fun getScheduledReport(reportId: String): ScheduledReport? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _scheduledReports.value.find { it.id == reportId }
+                    ?: database.scheduledReportDao().getScheduledReportById(reportId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get report execution history
+     */
+    suspend fun getReportExecutionHistory(
+        reportId: String? = null,
+        dateRange: DateRange? = null,
+        status: ExecutionStatus? = null,
+        page: Int = 0,
+        pageSize: Int = 50
+    ): Result<ReportExecutionHistory> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val executions = database.reportExecutionDao().getReportExecutions(
+                    reportId = reportId,
+                    startDate = dateRange?.startDate,
+                    endDate = dateRange?.endDate,
+                    status = status,
+                    limit = pageSize,
+                    offset = page * pageSize
+                ).map { it.toDomainModel() }
+                
+                val totalCount = database.reportExecutionDao().getReportExecutionsCount(
+                    reportId = reportId,
+                    startDate = dateRange?.startDate,
+                    endDate = dateRange?.endDate,
+                    status = status
+                )
+                
+                Result.success(
+                    ReportExecutionHistory(
+                        executions = executions,
+                        totalCount = totalCount,
+                        page = page,
+                        pageSize = pageSize,
+                        totalPages = (totalCount + pageSize - 1) / pageSize
+                    )
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get upcoming executions
+     */
+    suspend fun getUpcomingExecutions(
+        hours: Int = 24
+    ): Result<List<ReportExecution>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val calendar = Calendar.getInstance()
+                calendar.add(Calendar.HOUR_OF_DAY, hours)
+                val endTime = calendar.time
+                
+                val upcomingReports = _scheduledReports.value
+                    .filter { it.isActive && it.nextExecution?.before(endTime) == true }
+                
+                val upcomingExecutions = upcomingReports.map { report ->
+                    ReportExecution(
+                        id = UUID.randomUUID().toString(),
+                        scheduledReportId = report.id,
+                        reportName = report.name,
+                        reportType = report.reportType,
+                        format = report.format,
+                        recipients = report.recipients,
+                        filters = report.filters,
+                        scheduledAt = report.nextExecution!!,
+                        executedAt = null,
+                        status = ExecutionStatus.SCHEDULED,
+                        filePath = null,
+                        errorMessage = null,
+                        retryCount = 0
+                    )
+                }
+                
+                Result.success(upcomingExecutions.sortedBy { it.scheduledAt })
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadScheduledReports() {
+        try {
+            val reports = database.scheduledReportDao().getAllScheduledReports()
+                .map { it.toDomainModel() }
+            
+            _scheduledReports.value = reports
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun loadReportHistory() {
+        try {
+            val executions = database.reportExecutionDao().getRecentReportExecutions(REPORT_CACHE_SIZE)
+                .map { it.toDomainModel() }
+            
+            _reportHistory.value = executions
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun initializeScheduler() {
+        // Initialize scheduler for automatic report execution
+    }
+    
+    private fun startSchedulerTimer() {
+        schedulerTimer = Timer()
+        schedulerTimer?.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                // Check for scheduled reports to execute
+                checkAndExecuteScheduledReports()
+            }
+        }, 0, SCHEDULER_INTERVAL_MS)
+    }
+    
+    private suspend fun checkAndExecuteScheduledReports() {
+        try {
+            val now = Date()
+            val reportsToExecute = _scheduledReports.value
+                .filter { it.isActive && it.nextExecution?.before(now) == true }
+            
+            reportsToExecute.forEach { report ->
+                try {
+                    val execution = executeReport(report, isManual = false)
+                    addToReportHistory(execution)
+                    
+                    // Update next execution time
+                    val updatedReport = report.copy(
+                        lastExecuted = execution.executedAt,
+                        nextExecution = calculateNextExecution(report.schedule)
+                    )
+                    database.scheduledReportDao().updateScheduledReport(updatedReport.toEntity())
+                    updateScheduledReportInList(updatedReport)
+                    
+                } catch (e: Exception) {
+                    // Log error and continue
+                }
+            }
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun executeReport(scheduledReport: ScheduledReport, isManual: Boolean): ReportExecution {
+        val execution = ReportExecution(
+            id = UUID.randomUUID().toString(),
+            scheduledReportId = scheduledReport.id,
+            reportName = scheduledReport.name,
+            reportType = scheduledReport.reportType,
+            format = scheduledReport.format,
+            recipients = scheduledReport.recipients,
+            filters = scheduledReport.filters,
+            scheduledAt = if (isManual) Date() else scheduledReport.nextExecution!!,
+            executedAt = Date(),
+            status = ExecutionStatus.RUNNING,
+            filePath = null,
+            errorMessage = null,
+            retryCount = 0
+        )
+        
+        return try {
+            // Generate report
+            val reportData = generateReportData(scheduledReport.reportType, scheduledReport.filters)
+            val filePath = generateReportFile(reportData, scheduledReport.format, scheduledReport.template)
+            
+            // Send report to recipients
+            sendReportToRecipients(filePath, scheduledReport.recipients, scheduledReport.format)
+            
+            execution.copy(
+                status = ExecutionStatus.COMPLETED,
+                filePath = filePath
+            )
+            
+        } catch (e: Exception) {
+            execution.copy(
+                status = ExecutionStatus.FAILED,
+                errorMessage = e.message
+            )
+        }
+    }
+    
+    private suspend fun generateReportData(reportType: ReportType, filters: ReportFilters): ReportData {
+        return when (reportType) {
+            ReportType.FLEET_ANALYTICS -> {
+                val fleetAnalytics = analyticsEngineService.getFleetAnalytics(filters.dateRange ?: DateRange.last30Days()).getOrThrow()
+                ReportData(
+                    type = reportType,
+                    data = fleetAnalytics,
+                    generatedAt = Date()
+                )
+            }
+            ReportType.SHIPMENT_ANALYTICS -> {
+                val shipmentAnalytics = analyticsEngineService.getShipmentAnalytics(filters.dateRange ?: DateRange.last30Days()).getOrThrow()
+                ReportData(
+                    type = reportType,
+                    data = shipmentAnalytics,
+                    generatedAt = Date()
+                )
+            }
+            ReportType.DRIVER_PERFORMANCE -> {
+                val driverAnalytics = analyticsEngineService.getDriverPerformanceAnalytics(filters.dateRange ?: DateRange.last30Days()).getOrThrow()
+                ReportData(
+                    type = reportType,
+                    data = driverAnalytics,
+                    generatedAt = Date()
+                )
+            }
+            ReportType.FINANCIAL_REPORT -> {
+                val financialAnalytics = analyticsEngineService.getRevenueAnalytics(filters.dateRange ?: DateRange.last30Days()).getOrThrow()
+                ReportData(
+                    type = reportType,
+                    data = financialAnalytics,
+                    generatedAt = Date()
+                )
+            }
+            ReportType.TEMPERATURE_ANALYTICS -> {
+                val temperatureAnalytics = analyticsEngineService.getTemperatureAnalytics(filters.dateRange ?: DateRange.last30Days()).getOrThrow()
+                ReportData(
+                    type = reportType,
+                    data = temperatureAnalytics,
+                    generatedAt = Date()
+                )
+            }
+            ReportType.DELAY_ANALYTICS -> {
+                val delayAnalytics = analyticsEngineService.getDelayAnalytics(filters.dateRange ?: DateRange.last30Days()).getOrThrow()
+                ReportData(
+                    type = reportType,
+                    data = delayAnalytics,
+                    generatedAt = Date()
+                )
+            }
+            ReportType.INCIDENT_ANALYTICS -> {
+                val incidentAnalytics = analyticsEngineService.getIncidentAnalytics(filters.dateRange ?: DateRange.last30Days()).getOrThrow()
+                ReportData(
+                    type = reportType,
+                    data = incidentAnalytics,
+                    generatedAt = Date()
+                )
+            }
+        }
+    }
+    
+    private suspend fun generateReportFile(reportData: ReportData, format: ReportFormat, template: ReportTemplate): String {
+        return when (format) {
+            ReportFormat.PDF -> {
+                pdfExportService.generateReportPDF(reportData, template)
+            }
+            ReportFormat.EXCEL -> {
+                pdfExportService.generateReportExcel(reportData, template)
+            }
+            ReportFormat.CSV -> {
+                pdfExportService.generateReportCSV(reportData, template)
+            }
+        }
+    }
+    
+    private suspend fun sendReportToRecipients(filePath: String, recipients: List<String>, format: ReportFormat) {
+        // Send report via email or other delivery methods
+        recipients.forEach { recipient ->
+            // Send email with attachment
+        }
+    }
+    
+    private fun validateSchedule(schedule: ReportSchedule) {
+        // Validate schedule configuration
+        when (schedule.type) {
+            ScheduleType.DAILY -> {
+                // Validate daily schedule
+            }
+            ScheduleType.WEEKLY -> {
+                // Validate weekly schedule
+            }
+            ScheduleType.MONTHLY -> {
+                // Validate monthly schedule
+            }
+            ScheduleType.CUSTOM -> {
+                // Validate custom schedule
+            }
+        }
+    }
+    
+    private fun calculateNextExecution(schedule: ReportSchedule): Date {
+        val calendar = Calendar.getInstance()
+        
+        return when (schedule.type) {
+            ScheduleType.DAILY -> {
+                calendar.add(Calendar.DAY_OF_MONTH, 1)
+                calendar.time
+            }
+            ScheduleType.WEEKLY -> {
+                calendar.add(Calendar.WEEK_OF_YEAR, 1)
+                calendar.time
+            }
+            ScheduleType.MONTHLY -> {
+                calendar.add(Calendar.MONTH, 1)
+                calendar.time
+            }
+            ScheduleType.CUSTOM -> {
+                // Calculate based on custom cron expression
+                calendar.time
+            }
+        }
+    }
+    
+    private fun addToScheduledReports(report: ScheduledReport) {
+        val currentReports = _scheduledReports.value.toMutableList()
+        currentReports.add(report)
+        
+        // Keep only REPORT_CACHE_SIZE reports in cache
+        if (currentReports.size > REPORT_CACHE_SIZE) {
+            currentReports.removeAt(0)
+        }
+        
+        _scheduledReports.value = currentReports
+    }
+    
+    private fun updateScheduledReportInList(report: ScheduledReport) {
+        val currentReports = _scheduledReports.value.toMutableList()
+        val index = currentReports.indexOfFirst { it.id == report.id }
+        
+        if (index != -1) {
+            currentReports[index] = report
+            _scheduledReports.value = currentReports
+        }
+    }
+    
+    private fun removeFromScheduledReports(reportId: String) {
+        val currentReports = _scheduledReports.value.toMutableList()
+        currentReports.removeAll { it.id == reportId }
+        _scheduledReports.value = currentReports
+    }
+    
+    private fun addToReportHistory(execution: ReportExecution) {
+        val currentHistory = _reportHistory.value.toMutableList()
+        currentHistory.add(0, execution) // Add to beginning
+        
+        // Keep only REPORT_CACHE_SIZE executions in cache
+        if (currentHistory.size > REPORT_CACHE_SIZE) {
+            currentHistory.removeAt(currentHistory.size - 1)
+        }
+        
+        _reportHistory.value = currentHistory
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        schedulerTimer?.cancel()
+        schedulerTimer = null
+    }
+}
+
+/**
+ * Data classes
+ */
+data class ScheduledReport(
+    val id: String = "",
+    val name: String,
+    val reportType: ReportType,
+    val schedule: ReportSchedule,
+    val recipients: List<String>,
+    val format: ReportFormat = ReportFormat.PDF,
+    val template: ReportTemplate = ReportTemplate.STANDARD,
+    val filters: ReportFilters = ReportFilters(),
+    val isActive: Boolean = true,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val lastExecuted: Date? = null,
+    val nextExecution: Date? = null
+)
+
+data class ReportExecution(
+    val id: String = "",
+    val scheduledReportId: String,
+    val reportName: String,
+    val reportType: ReportType,
+    val format: ReportFormat,
+    val recipients: List<String>,
+    val filters: ReportFilters,
+    val scheduledAt: Date,
+    val executedAt: Date?,
+    val status: ExecutionStatus,
+    val filePath: String? = null,
+    val errorMessage: String? = null,
+    val retryCount: Int = 0
+)
+
+data class ReportExecutionHistory(
+    val executions: List<ReportExecution>,
+    val totalCount: Int,
+    val page: Int,
+    val pageSize: Int,
+    val totalPages: Int
+)
+
+data class ReportSchedule(
+    val type: ScheduleType,
+    val time: String, // HH:MM format
+    val daysOfWeek: List<Int>? = null, // For weekly schedules (1-7, Monday-Sunday)
+    val dayOfMonth: Int? = null, // For monthly schedules (1-31)
+    val cronExpression: String? = null // For custom schedules
+)
+
+data class ReportFilters(
+    val dateRange: DateRange? = null,
+    val reportType: ReportType? = null,
+    val vehicleIds: List<String> = emptyList(),
+    val driverIds: List<String> = emptyList(),
+    val customerIds: List<String> = emptyList(),
+    val regionIds: List<String> = emptyList(),
+    val customFilters: Map<String, Any> = emptyMap()
+)
+
+data class ReportData(
+    val type: ReportType,
+    val data: Any,
+    val generatedAt: Date
+)
+
+data class DateRange(
+    val startDate: Date,
+    val endDate: Date
+) {
+    companion object {
+        fun last30Days(): DateRange {
+            val calendar = Calendar.getInstance()
+            val endDate = calendar.time
+            calendar.add(Calendar.DAY_OF_MONTH, -30)
+            val startDate = calendar.time
+            return DateRange(startDate, endDate)
+        }
+        
+        fun last7Days(): DateRange {
+            val calendar = Calendar.getInstance()
+            val endDate = calendar.time
+            calendar.add(Calendar.DAY_OF_MONTH, -7)
+            val startDate = calendar.time
+            return DateRange(startDate, endDate)
+        }
+        
+        fun today(): DateRange {
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.HOUR_OF_DAY, 0)
+            calendar.set(Calendar.MINUTE, 0)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            val startDate = calendar.time
+            
+            calendar.add(Calendar.DAY_OF_MONTH, 1)
+            val endDate = calendar.time
+            
+            return DateRange(startDate, endDate)
+        }
+        
+        fun thisMonth(): DateRange {
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.DAY_OF_MONTH, 1)
+            calendar.set(Calendar.HOUR_OF_DAY, 0)
+            calendar.set(Calendar.MINUTE, 0)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            val startDate = calendar.time
+            
+            calendar.add(Calendar.MONTH, 1)
+            val endDate = calendar.time
+            
+            return DateRange(startDate, endDate)
+        }
+        
+        fun thisWeek(): DateRange {
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.DAY_OF_WEEK, Calendar.MONDAY)
+            calendar.set(Calendar.HOUR_OF_DAY, 0)
+            calendar.set(Calendar.MINUTE, 0)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            val startDate = calendar.time
+            
+            calendar.add(Calendar.DAY_OF_WEEK, 7)
+            val endDate = calendar.time
+            
+            return DateRange(startDate, endDate)
+        }
+    }
+}
+
+/**
+ * Enums
+ */
+enum class ScheduledReportsState {
+    Idle,
+    Initializing,
+    Ready,
+    Creating,
+    Updating,
+    Deleting,
+    Executing,
+    Error
+}
+
+enum class ReportType {
+    FLEET_ANALYTICS,
+    SHIPMENT_ANALYTICS,
+    DRIVER_PERFORMANCE,
+    FINANCIAL_REPORT,
+    TEMPERATURE_ANALYTICS,
+    DELAY_ANALYTICS,
+    INCIDENT_ANALYTICS
+}
+
+enum class ReportFormat {
+    PDF,
+    EXCEL,
+    CSV
+}
+
+enum class ReportTemplate {
+    STANDARD,
+    DETAILED,
+    SUMMARY,
+    EXECUTIVE
+}
+
+enum class ScheduleType {
+    DAILY,
+    WEEKLY,
+    MONTHLY,
+    CUSTOM
+}
+
+enum class ExecutionStatus {
+    SCHEDULED,
+    RUNNING,
+    COMPLETED,
+    FAILED,
+    CANCELLED
+}

@@ -1,0 +1,390 @@
+package com.edham.logistics.presentation.notifications
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import com.edham.logistics.R
+import com.edham.logistics.core.notifications.*
+import com.edham.logistics.databinding.FragmentNotificationPreferencesBinding
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.timepicker.MaterialTimePicker
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import java.util.*
+
+/**
+ * Notification Preferences Fragment - Manage notification preferences
+ * Provides comprehensive settings for notification customization
+ */
+@AndroidEntryPoint
+class NotificationPreferencesFragment : Fragment() {
+
+    private var _binding: FragmentNotificationPreferencesBinding? = null
+    private val binding get() = _binding!!
+
+    private val viewModel: NotificationViewModel by viewModels()
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentNotificationPreferencesBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupObservers()
+        setupClickListeners()
+        setupInitialValues()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
+    /**
+     * Setup observers
+     */
+    private fun setupObservers() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe user preferences
+            viewModel.userPreferences.collectLatest { preferences ->
+                updateUI(preferences)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe loading state
+            viewModel.isLoading.collectLatest { isLoading ->
+                binding.progressBar.visibility = 
+                    if (isLoading) View.VISIBLE else View.GONE
+                binding.scrollView.isEnabled = !isLoading
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe error messages
+            viewModel.errorMessage.collectLatest { errorMessage ->
+                errorMessage?.let {
+                    showErrorDialog(it)
+                }
+            }
+        }
+    }
+
+    /**
+     * Setup click listeners
+     */
+    private fun setupClickListeners() {
+        // Notification type switches
+        binding.switchShipmentAlerts.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("shipment_alerts", isChecked)
+        }
+
+        binding.switchPaymentAlerts.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("payment_alerts", isChecked)
+        }
+
+        binding.switchTemperatureAlerts.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("temperature_alerts", isChecked)
+        }
+
+        // Threshold inputs
+        binding.editTextMinDelayMinutes.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                val value = binding.editTextMinDelayMinutes.text.toString().toIntOrNull() ?: 30
+                viewModel.updatePreference("min_delay_minutes", value)
+            }
+        }
+
+        binding.editTextMinPaymentOverdueDays.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                val value = binding.editTextMinPaymentOverdueDays.text.toString().toIntOrNull() ?: 7
+                viewModel.updatePreference("min_payment_overdue_days", value)
+            }
+        }
+
+        // Auto actions switches
+        binding.switchAutoReschedule.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("auto_reschedule", isChecked)
+        }
+
+        binding.switchPaymentReminders.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("payment_reminders", isChecked)
+        }
+
+        // Quiet hours
+        binding.switchQuietHours.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("quiet_hours", isChecked)
+            binding.layoutQuietHoursSettings.visibility = 
+                if (isChecked) View.VISIBLE else View.GONE
+        }
+
+        binding.textViewQuietStartTime.setOnClickListener {
+            showTimePicker(true) { hour, minute ->
+                binding.textViewQuietStartTime.text = String.format("%02d:%02d", hour, minute)
+                viewModel.updatePreference("quiet_start_hour", hour)
+                viewModel.updatePreference("quiet_end_hour", minute)
+            }
+        }
+
+        binding.textViewQuietEndTime.setOnClickListener {
+            showTimePicker(false) { hour, minute ->
+                binding.textViewQuietEndTime.text = String.format("%02d:%02d", hour, minute)
+                viewModel.updatePreference("quiet_end_hour", hour)
+                viewModel.updatePreference("quiet_end_hour", minute)
+            }
+        }
+
+        // Grouping and frequency
+        binding.switchGroupSimilar.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("group_similar", isChecked)
+        }
+
+        binding.seekBarMaxNotificationsPerHour.setOnSeekBarChangeListener(object : 
+            android.widget.SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
+                binding.textViewMaxNotificationsValue.text = progress.toString()
+            }
+
+            override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) {}
+
+            override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) {
+                viewModel.updatePreference("max_notifications_per_hour", seekBar?.progress ?: 10)
+            }
+        })
+
+        // Device settings
+        binding.switchNotificationSound.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("notification_sound", isChecked)
+        }
+
+        binding.switchVibration.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("vibration", isChecked)
+        }
+
+        binding.switchLedIndicator.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("led_indicator", isChecked)
+        }
+
+        // Priority filter
+        binding.switchPriorityFilter.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePreference("priority_filter", isChecked)
+            binding.layoutPrioritySettings.visibility = 
+                if (isChecked) View.VISIBLE else View.GONE
+        }
+
+        binding.chipGroupCritical.setOnCheckedChangeListener { _, isChecked ->
+            updateAllowedPriorities()
+        }
+
+        binding.chipGroupHigh.setOnCheckedChangeListener { _, isChecked ->
+            updateAllowedPriorities()
+        }
+
+        binding.chipGroupNormal.setOnCheckedChangeListener { _, isChecked ->
+            updateAllowedPriorities()
+        }
+
+        binding.chipGroupLow.setOnCheckedChangeListener { _, isChecked ->
+            updateAllowedPriorities()
+        }
+
+        // Action buttons
+        binding.buttonSave.setOnClickListener {
+            savePreferences()
+        }
+
+        binding.buttonReset.setOnClickListener {
+            showResetDialog()
+        }
+
+        binding.buttonExport.setOnClickListener {
+            showExportDialog()
+        }
+
+        binding.buttonImport.setOnClickListener {
+            showImportDialog()
+        }
+    }
+
+    /**
+     * Setup initial values
+     */
+    private fun setupInitialValues() {
+        // Set initial values from current preferences
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.userPreferences.collectLatest { preferences ->
+                binding.editTextMinDelayMinutes.setText(preferences.minDelayMinutes.toString())
+                binding.editTextMinPaymentOverdueDays.setText(preferences.minPaymentOverdueDays.toString())
+                binding.textViewQuietStartTime.text = String.format("%02d:%02d", preferences.quietStartHour, 0)
+                binding.textViewQuietEndTime.text = String.format("%02d:%02d", preferences.quietEndHour, 0)
+                binding.seekBarMaxNotificationsPerHour.progress = preferences.maxNotificationsPerHour
+                binding.textViewMaxNotificationsValue.text = preferences.maxNotificationsPerHour.toString()
+                
+                // Update priority chips
+                binding.chipGroupCritical.isChecked = NotificationPriority.CRITICAL in preferences.allowedPriorities
+                binding.chipGroupHigh.isChecked = NotificationPriority.HIGH in preferences.allowedPriorities
+                binding.chipGroupNormal.isChecked = NotificationPriority.NORMAL in preferences.allowedPriorities
+                binding.chipGroupLow.isChecked = NotificationPriority.LOW in preferences.allowedPriorities
+            }
+        }
+    }
+
+    /**
+     * Update UI with preferences
+     */
+    private fun updateUI(preferences: NotificationPreferences) {
+        binding.switchShipmentAlerts.isChecked = preferences.shipmentAlerts
+        binding.switchPaymentAlerts.isChecked = preferences.paymentAlerts
+        binding.switchTemperatureAlerts.isChecked = preferences.temperatureAlerts
+        binding.switchAutoReschedule.isChecked = preferences.autoReschedule
+        binding.switchPaymentReminders.isChecked = preferences.paymentReminders
+        binding.switchQuietHours.isChecked = preferences.quietHours
+        binding.switchGroupSimilar.isChecked = preferences.groupSimilar
+        binding.switchNotificationSound.isChecked = preferences.notificationSound
+        binding.switchVibration.isChecked = preferences.vibration
+        binding.switchLedIndicator.isChecked = preferences.ledIndicator
+        binding.switchPriorityFilter.isChecked = preferences.priorityFilter
+        
+        // Update visibility based on switches
+        binding.layoutQuietHoursSettings.visibility = 
+            if (preferences.quietHours) View.VISIBLE else View.GONE
+        binding.layoutPrioritySettings.visibility = 
+            if (preferences.priorityFilter) View.VISIBLE else View.GONE
+    }
+
+    /**
+     * Show time picker
+     */
+    private fun showTimePicker(isStartTime: Boolean, onTimeSet: (Int, Int) -> Unit) {
+        val calendar = Calendar.getInstance()
+        val hour = calendar.get(Calendar.HOUR_OF_DAY)
+        val minute = calendar.get(Calendar.MINUTE)
+
+        val timePicker = MaterialTimePicker.Builder()
+            .setTimeFormat(android.text.format.DateFormat.is24HourFormat(requireContext()))
+            .setHour(hour)
+            .setMinute(minute)
+            .setTitle(if (isStartTime) R.string.quiet_start_time else R.string.quiet_end_time)
+            .build()
+
+        timePicker.addOnPositiveButtonClickListener { selectedTime ->
+            onTimeSet(selectedTime.hour, selectedTime.minute)
+        }
+
+        timePicker.show(childFragmentManager, "time_picker")
+    }
+
+    /**
+     * Update allowed priorities
+     */
+    private fun updateAllowedPriorities() {
+        val allowedPriorities = mutableSetOf<NotificationPriority>()
+        
+        if (binding.chipGroupCritical.isChecked) {
+            allowedPriorities.add(NotificationPriority.CRITICAL)
+        }
+        if (binding.chipGroupHigh.isChecked) {
+            allowedPriorities.add(NotificationPriority.HIGH)
+        }
+        if (binding.chipGroupNormal.isChecked) {
+            allowedPriorities.add(NotificationPriority.NORMAL)
+        }
+        if (binding.chipGroupLow.isChecked) {
+            allowedPriorities.add(NotificationPriority.LOW)
+        }
+        
+        viewModel.updatePreference("allowed_priorities", allowedPriorities)
+    }
+
+    /**
+     * Save preferences
+     */
+    private fun savePreferences() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.userPreferences.collectLatest { currentPrefs ->
+                val updatedPrefs = currentPrefs.copy(
+                    shipmentAlerts = binding.switchShipmentAlerts.isChecked,
+                    paymentAlerts = binding.switchPaymentAlerts.isChecked,
+                    temperatureAlerts = binding.switchTemperatureAlerts.isChecked,
+                    minDelayMinutes = binding.editTextMinDelayMinutes.text.toString().toIntOrNull() ?: 30,
+                    minPaymentOverdueDays = binding.editTextMinPaymentOverdueDays.text.toString().toIntOrNull() ?: 7,
+                    autoReschedule = binding.switchAutoReschedule.isChecked,
+                    paymentReminders = binding.switchPaymentReminders.isChecked,
+                    quietHours = binding.switchQuietHours.isChecked,
+                    quietStartHour = binding.textViewQuietStartTime.text.toString().split(":")[0].toIntOrNull() ?: 22,
+                    quietEndHour = binding.textViewQuietEndTime.text.toString().split(":")[0].toIntOrNull() ?: 8,
+                    groupSimilar = binding.switchGroupSimilar.isChecked,
+                    maxNotificationsPerHour = binding.seekBarMaxNotificationsPerHour.progress,
+                    notificationSound = binding.switchNotificationSound.isChecked,
+                    vibration = binding.switchVibration.isChecked,
+                    ledIndicator = binding.switchLedIndicator.isChecked,
+                    priorityFilter = binding.switchPriorityFilter.isChecked
+                )
+                
+                viewModel.updateUserPreferences(updatedPrefs)
+            }
+        }
+    }
+
+    /**
+     * Show reset dialog
+     */
+    private fun showResetDialog() {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.reset_preferences))
+            .setMessage(getString(R.string.reset_preferences_message))
+            .setPositiveButton(getString(R.string.reset)) { _, _ ->
+                viewModel.resetPreferencesToDefaults()
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    /**
+     * Show export dialog
+     */
+    private fun showExportDialog() {
+        // This would implement file export functionality
+        // For now, just show a success message
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.export_preferences))
+            .setMessage(getString(R.string.export_success))
+            .setPositiveButton(getString(R.string.ok), null)
+            .show()
+    }
+
+    /**
+     * Show import dialog
+     */
+    private fun showImportDialog() {
+        // This would implement file import functionality
+        // For now, just show a placeholder message
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.import_preferences))
+            .setMessage(getString(R.string.import_coming_soon))
+            .setPositiveButton(getString(R.string.ok), null)
+            .show()
+    }
+
+    /**
+     * Show error dialog
+     */
+    private fun showErrorDialog(message: String) {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.error))
+            .setMessage(message)
+            .setPositiveButton(getString(R.string.ok), null)
+            .show()
+    }
+}

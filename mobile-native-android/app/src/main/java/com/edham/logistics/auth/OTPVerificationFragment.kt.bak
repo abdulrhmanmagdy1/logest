@@ -1,0 +1,341 @@
+package com.edham.logistics.auth
+
+import android.os.Bundle
+import android.os.CountDownTimer
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentOtpVerificationBinding
+import com.edham.logistics.utils.NetworkUtils
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * OTP Verification Fragment - Handles OTP code verification
+ * 
+ * Features:
+ * - 6-digit OTP input
+ * - Auto-advance between fields
+ * - Timer for resend functionality
+ * - Auto-verification when complete
+ * - Arabic RTL support
+ */
+@AndroidEntryPoint
+class OTPVerificationFragment : Fragment() {
+
+    private var _binding: FragmentOtpVerificationBinding? = null
+    private val binding get() = _binding!!
+
+    @Inject
+    lateinit var authenticationManager: AuthenticationManager
+
+    @Inject
+    lateinit var networkUtils: NetworkUtils
+
+    private val viewModel: OTPVerificationViewModel by viewModels()
+
+    private var phoneNumber: String = ""
+    private var otpId: String = ""
+    private var countDownTimer: CountDownTimer? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        arguments?.let {
+            phoneNumber = OTPVerificationFragmentArgs.fromBundle(it).phoneNumber
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentOtpVerificationBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupUI()
+        setupObservers()
+        setupClickListeners()
+        setupOTPInputs()
+        startTimer()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        countDownTimer?.cancel()
+        _binding = null
+    }
+
+    private fun setupUI() {
+        // Set phone number
+        binding.phoneNumberText.text = phoneNumber
+        
+        // Configure text direction for RTL support
+        if (isRTL()) {
+            binding.phoneNumberText.textDirection = View.TEXT_DIRECTION_RTL
+        }
+        
+        // Initially disable verify button
+        updateVerifyButtonState()
+    }
+
+    private fun setupObservers() {
+        // Observe OTP verification result
+        viewModel.verificationResult.observe(viewLifecycleOwner) { result ->
+            result.onSuccess { verified ->
+                showLoading(false)
+                if (verified) {
+                    navigateToMain()
+                } else {
+                    showError("Invalid OTP code")
+                }
+            }.onFailure { exception ->
+                showLoading(false)
+                showError(exception.message ?: "OTP verification failed")
+            }
+        }
+
+        // Observe resend OTP result
+        viewModel.resendResult.observe(viewLifecycleOwner) { result ->
+            result.onSuccess { newOtpId ->
+                showLoading(false)
+                otpId = newOtpId
+                clearOTPFields()
+                startTimer()
+                showSuccessMessage("OTP sent successfully")
+            }.onFailure { exception ->
+                showLoading(false)
+                showError(exception.message ?: "Failed to resend OTP")
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.verifyButton.setOnClickListener {
+            attemptVerification()
+        }
+
+        binding.resendButton.setOnClickListener {
+            resendOTP()
+        }
+
+        binding.contactSupportText.setOnClickListener {
+            // Navigate to support or open email
+            contactSupport()
+        }
+    }
+
+    private fun setupOTPInputs() {
+        val otpEditTexts = arrayOf(
+            binding.otpDigit1,
+            binding.otpDigit2,
+            binding.otpDigit3,
+            binding.otpDigit4,
+            binding.otpDigit5,
+            binding.otpDigit6
+        )
+
+        // Set up text watchers for auto-advance
+        otpEditTexts.forEachIndexed { index, editText ->
+            editText.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    val text = s?.toString() ?: ""
+                    
+                    if (text.isNotEmpty()) {
+                        // Move to next field
+                        if (index < otpEditTexts.size - 1) {
+                            otpEditTexts[index + 1].requestFocus()
+                        } else {
+                            // Last field, hide keyboard
+                            editText.clearFocus()
+                            // Auto-verify if all fields are filled
+                            if (isOTPComplete()) {
+                                attemptVerification()
+                            }
+                        }
+                    }
+                    
+                    updateVerifyButtonState()
+                }
+            })
+
+            // Handle backspace
+            editText.setOnKeyListener { _, keyCode, event ->
+                if (keyCode == android.view.KeyEvent.KEYCODE_DEL && 
+                    event.action == android.view.KeyEvent.ACTION_DOWN &&
+                    editText.text?.isEmpty() == true &&
+                    index > 0) {
+                    otpEditTexts[index - 1].requestFocus()
+                    otpEditTexts[index - 1].text?.clear()
+                    return@setOnKeyListener true
+                }
+                false
+            }
+        }
+
+        // Focus first field
+        binding.otpDigit1.requestFocus()
+    }
+
+    private fun attemptVerification() {
+        val otpCode = getOTPCode()
+        
+        if (otpCode.length != 6) {
+            showError("Please enter complete OTP code")
+            return
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            showLoading(true)
+            val result = authenticationManager.verifyOTP(otpId, otpCode)
+            result.onSuccess { verified ->
+                showLoading(false)
+                if (verified) {
+                    navigateToMain()
+                } else {
+                    showError("Invalid OTP code")
+                }
+            }.onFailure { exception ->
+                showLoading(false)
+                showError(exception.message ?: "OTP verification failed")
+            }
+        }
+    }
+
+    private fun resendOTP() {
+        if (!networkUtils.isNetworkAvailable()) {
+            showError("No internet connection")
+            return
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            showLoading(true)
+            val result = authenticationManager.sendOTP(phoneNumber)
+            result.onSuccess { newOtpId ->
+                showLoading(false)
+                otpId = newOtpId
+                clearOTPFields()
+                startTimer()
+                showSuccessMessage("OTP sent successfully")
+            }.onFailure { exception ->
+                showLoading(false)
+                showError(exception.message ?: "Failed to resend OTP")
+            }
+        }
+    }
+
+    private fun startTimer() {
+        countDownTimer?.cancel()
+        
+        countDownTimer = object : CountDownTimer(120000, 1000) { // 2 minutes
+            override fun onTick(millisUntilFinished: Long) {
+                val minutes = millisUntilFinished / 60000
+                val seconds = (millisUntilFinished % 60000) / 1000
+                binding.timerText.text = String.format("%02d:%02d", minutes, seconds)
+            }
+
+            override fun onFinish() {
+                binding.timerText.text = "00:00"
+                binding.resendButton.isEnabled = true
+                binding.resendButton.text = getString(R.string.resend_code)
+            }
+        }.start()
+        
+        // Disable resend button during timer
+        binding.resendButton.isEnabled = false
+        binding.resendButton.text = getString(R.string.resend_code_in_timer)
+    }
+
+    private fun getOTPCode(): String {
+        return binding.otpDigit1.text.toString() +
+                binding.otpDigit2.text.toString() +
+                binding.otpDigit3.text.toString() +
+                binding.otpDigit4.text.toString() +
+                binding.otpDigit5.text.toString() +
+                binding.otpDigit6.text.toString()
+    }
+
+    private fun isOTPComplete(): Boolean {
+        return binding.otpDigit1.text?.isNotEmpty() == true &&
+                binding.otpDigit2.text?.isNotEmpty() == true &&
+                binding.otpDigit3.text?.isNotEmpty() == true &&
+                binding.otpDigit4.text?.isNotEmpty() == true &&
+                binding.otpDigit5.text?.isNotEmpty() == true &&
+                binding.otpDigit6.text?.isNotEmpty() == true
+    }
+
+    private fun clearOTPFields() {
+        binding.otpDigit1.text?.clear()
+        binding.otpDigit2.text?.clear()
+        binding.otpDigit3.text?.clear()
+        binding.otpDigit4.text?.clear()
+        binding.otpDigit5.text?.clear()
+        binding.otpDigit6.text?.clear()
+        
+        binding.otpDigit1.requestFocus()
+        updateVerifyButtonState()
+    }
+
+    private fun updateVerifyButtonState() {
+        val isComplete = isOTPComplete()
+        val hasNetwork = networkUtils.isNetworkAvailable()
+        
+        binding.verifyButton.isEnabled = isComplete && hasNetwork
+    }
+
+    private fun showLoading(show: Boolean) {
+        binding.progressOverlay.visibility = if (show) View.VISIBLE else View.GONE
+        binding.verifyButton.isEnabled = !show
+        binding.resendButton.isEnabled = !show && binding.timerText.text == "00:00"
+    }
+
+    private fun showError(message: String) {
+        // Show error message (could use snackbar or toast)
+        // For now, show in the first OTP field
+        binding.otpDigit1.error = message
+    }
+
+    private fun showSuccessMessage(message: String) {
+        // Show success message (could use snackbar or toast)
+        // For now, update description
+        binding.otpDescription.text = message
+    }
+
+    private fun navigateToMain() {
+        findNavController().navigate(R.id.action_otpVerificationFragment_to_mainActivity)
+        requireActivity().finish()
+    }
+
+    private fun contactSupport() {
+        // Open email app or navigate to support screen
+        val emailIntent = android.content.Intent(android.content.Intent.ACTION_SENDTO).apply {
+            data = "mailto:support@edhamlogistics.com"
+            putExtra(android.content.Intent.EXTRA_SUBJECT, "OTP Verification Issue")
+            putExtra(android.content.Intent.EXTRA_TEXT, "Phone: $phoneNumber")
+        }
+        startActivity(emailIntent)
+    }
+
+    private fun isRTL(): Boolean {
+        return resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL
+    }
+
+    companion object {
+        private const val TAG = "OTPVerificationFragment"
+        private const val OTP_LENGTH = 6
+    }
+}

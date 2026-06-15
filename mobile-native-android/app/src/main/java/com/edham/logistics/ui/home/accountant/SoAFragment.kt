@@ -19,6 +19,7 @@ class SoAFragment : Fragment() {
 
     private val viewModel: AccountantViewModel by viewModels()
     private lateinit var adapter: SoAAdapter
+    private lateinit var swipeRefresh: androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -31,11 +32,49 @@ class SoAFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        setupRecyclerView(view)
-        observeViewModel(view)
+        swipeRefresh = view.findViewById(R.id.swipeRefresh)
+        val etSearch = view.findViewById<com.google.android.material.textfield.TextInputEditText>(R.id.etSearchClient)
+        
+        swipeRefresh.setOnRefreshListener { 
+            val query = etSearch?.text?.toString()
+            if (!query.isNullOrEmpty()) {
+                viewModel.loadSoA(query)
+            } else {
+                swipeRefresh.isRefreshing = false
+            }
+        }
 
-        // Mock search for now
-        viewModel.loadSoA("CLIENT_001")
+        setupRecyclerView(view)
+        setupListeners(view)
+        setupSearch(view)
+        observeViewModel(view)
+    }
+
+    private fun setupSearch(view: View) {
+        val etSearch = view.findViewById<com.google.android.material.textfield.TextInputEditText>(R.id.etSearchClient)
+        etSearch?.setOnEditorActionListener { v, _, _ ->
+            val query = v.text.toString()
+            if (query.isNotEmpty()) {
+                viewModel.loadSoA(query)
+            }
+            true
+        }
+    }
+
+    private fun setupListeners(view: View) {
+        view.findViewById<View>(R.id.btnExportPdf).setOnClickListener {
+            viewModel.soa.value?.let { soa ->
+                com.edham.logistics.core.utils.PdfGenerator.generateSoA(requireContext(), soa)
+            } ?: Toast.makeText(context, "يرجى البحث عن عميل أولاً", Toast.LENGTH_SHORT).show()
+        }
+
+        view.findViewById<View>(R.id.btnDateRange).setOnClickListener {
+            Toast.makeText(context, "تحديد الفترة المحاسبية...", Toast.LENGTH_SHORT).show()
+        }
+
+        view.findViewById<View>(R.id.btnPrintSoA).setOnClickListener {
+            Toast.makeText(context, "إرسال للطابعة اللاسلكية...", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun setupRecyclerView(view: View) {
@@ -51,6 +90,10 @@ class SoAFragment : Fragment() {
             view.findViewById<TextView>(R.id.tvTotalPaid).text = soa.totalPaid.toInt().toString()
             view.findViewById<TextView>(R.id.tvTotalRemaining).text = soa.remaining.toInt().toString()
             adapter.updateData(soa.entries)
+        }
+
+        viewModel.isLoading.observe(viewLifecycleOwner) { loading ->
+            swipeRefresh.isRefreshing = loading
         }
 
         viewModel.error.observe(viewLifecycleOwner) { error ->

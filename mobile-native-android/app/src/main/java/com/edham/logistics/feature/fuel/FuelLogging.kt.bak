@@ -1,0 +1,987 @@
+package com.edham.logistics.feature.fuel
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import kotlin.math.roundToInt
+
+/**
+ * Comprehensive Fuel Logging System
+ * 
+ * Provides complete fuel management capabilities including:
+ * - Fuel transaction recording and validation
+ * - Fuel station management and records
+ * - Mileage tracking and efficiency calculations
+ * - Fuel expense tracking and reporting
+ * - Real-time fuel monitoring and alerts
+ */
+class FuelLogging {
+    
+    companion object {
+        private const val TAG = "FuelLogging"
+        private const val MIN_FUEL_AMOUNT = 0.1
+        private const val MAX_FUEL_AMOUNT = 1000.0
+        private const val MIN_ODOMETER_READING = 0
+        private const val MAX_ODOMETER_READING = 10000000
+    }
+    
+    private val fuelTransactions = mutableListOf<FuelTransaction>()
+    private val fuelStations = mutableListOf<FuelStation>()
+    private val vehicleFuelRecords = mutableMapOf<String, VehicleFuelRecord>()
+    
+    /**
+     * Records a new fuel transaction with comprehensive validation
+     */
+    suspend fun recordFuelTransaction(
+        vehicleId: String,
+        driverId: String,
+        amount: Double,
+        pricePerLiter: Double,
+        odometerReading: Int,
+        fuelType: FuelType,
+        stationId: String? = null,
+        receiptNumber: String? = null,
+        notes: String? = null
+    ): Result<FuelTransaction> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Recording fuel transaction for vehicle: $vehicleId")
+            
+            // Validate input data
+            val validationResult = validateFuelTransaction(
+                amount, pricePerLiter, odometerReading, fuelType
+            )
+            
+            if (!validationResult.isValid) {
+                Log.e(TAG, "Invalid fuel transaction: ${validationResult.errors}")
+                return@withContext Result.failure(
+                    IllegalArgumentException("Invalid transaction data: ${validationResult.errors.joinToString(", ")}")
+                )
+            }
+            
+            // Calculate total cost and efficiency
+            val totalCost = amount * pricePerLiter
+            val efficiency = calculateFuelEfficiency(vehicleId, amount, odometerReading)
+            
+            // Create transaction record
+            val transaction = FuelTransaction(
+                id = generateTransactionId(),
+                vehicleId = vehicleId,
+                driverId = driverId,
+                amount = amount,
+                pricePerLiter = pricePerLiter,
+                totalCost = totalCost,
+                odometerReading = odometerReading,
+                fuelType = fuelType,
+                stationId = stationId,
+                receiptNumber = receiptNumber,
+                efficiency = efficiency,
+                timestamp = LocalDateTime.now(),
+                notes = notes
+            )
+            
+            // Store transaction
+            fuelTransactions.add(transaction)
+            updateVehicleFuelRecord(vehicleId, transaction)
+            
+            Log.d(TAG, "Fuel transaction recorded successfully: ${transaction.id}")
+            Result.success(transaction)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error recording fuel transaction", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Adds or updates a fuel station record
+     */
+    suspend fun addFuelStation(
+        name: String,
+        address: String,
+        latitude: Double,
+        longitude: Double,
+        fuelTypes: List<FuelType>,
+        amenities: List<String> = emptyList(),
+        contactInfo: String? = null
+    ): Result<FuelStation> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Adding fuel station: $name")
+            
+            val station = FuelStation(
+                id = generateStationId(),
+                name = name,
+                address = address,
+                latitude = latitude,
+                longitude = longitude,
+                fuelTypes = fuelTypes,
+                amenities = amenities,
+                contactInfo = contactInfo,
+                createdAt = LocalDateTime.now()
+            )
+            
+            // Check if station already exists
+            val existingStation = fuelStations.find { 
+                it.latitude == latitude && it.longitude == longitude 
+            }
+            
+            if (existingStation != null) {
+                // Update existing station
+                fuelStations.remove(existingStation)
+                fuelStations.add(station)
+                Log.d(TAG, "Updated existing fuel station: ${station.id}")
+            } else {
+                // Add new station
+                fuelStations.add(station)
+                Log.d(TAG, "Added new fuel station: ${station.id}")
+            }
+            
+            Result.success(station)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error adding fuel station", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets fuel consumption analytics for a vehicle
+     */
+    suspend fun getFuelConsumptionAnalytics(
+        vehicleId: String,
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS
+    ): Result<FuelConsumptionAnalytics> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting fuel consumption analytics for vehicle: $vehicleId")
+            
+            val transactions = getVehicleTransactions(vehicleId, timeWindow)
+            
+            if (transactions.isEmpty()) {
+                return@withContext Result.success(
+                    FuelConsumptionAnalytics.empty(vehicleId, timeWindow)
+                )
+            }
+            
+            val totalFuelConsumed = transactions.sumOf { it.amount }
+            val totalCost = transactions.sumOf { it.totalCost }
+            val totalDistance = calculateTotalDistance(vehicleId, transactions)
+            val averageEfficiency = if (totalDistance > 0) totalDistance / totalFuelConsumed else 0.0
+            val averagePricePerLiter = totalCost / totalFuelConsumed
+            
+            // Calculate trends
+            val consumptionTrend = calculateConsumptionTrend(transactions)
+            val costTrend = calculateCostTrend(transactions)
+            val efficiencyTrend = calculateEfficiencyTrend(transactions)
+            
+            val analytics = FuelConsumptionAnalytics(
+                vehicleId = vehicleId,
+                timeWindow = timeWindow,
+                totalFuelConsumed = totalFuelConsumed,
+                totalCost = totalCost,
+                totalDistance = totalDistance,
+                averageEfficiency = averageEfficiency,
+                averagePricePerLiter = averagePricePerLiter,
+                consumptionTrend = consumptionTrend,
+                costTrend = costTrend,
+                efficiencyTrend = efficiencyTrend,
+                transactionCount = transactions.size,
+                firstTransactionDate = transactions.minOfOrNull { it.timestamp },
+                lastTransactionDate = transactions.maxOfOrNull { it.timestamp }
+            )
+            
+            Result.success(analytics)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting fuel consumption analytics", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Tracks mileage for a vehicle
+     */
+    suspend fun trackMileage(
+        vehicleId: String,
+        currentOdometerReading: Int,
+        timestamp: LocalDateTime = LocalDateTime.now()
+    ): Result<MileageRecord> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Tracking mileage for vehicle: $vehicleId")
+            
+            val vehicleRecord = vehicleFuelRecords.getOrPut(vehicleId) {
+                VehicleFuelRecord(vehicleId = vehicleId)
+            }
+            
+            val lastReading = vehicleRecord.lastOdometerReading
+            val distanceTraveled = if (lastReading != null) {
+                currentOdometerReading - lastReading
+            } else {
+                0
+            }
+            
+            val mileageRecord = MileageRecord(
+                id = generateMileageId(),
+                vehicleId = vehicleId,
+                odometerReading = currentOdometerReading,
+                distanceTraveled = distanceTraveled,
+                timestamp = timestamp
+            )
+            
+            // Update vehicle record
+            vehicleRecord.lastOdometerReading = currentOdometerReading
+            vehicleRecord.totalDistance = (vehicleRecord.totalDistance ?: 0) + distanceTraveled
+            vehicleRecord.mileageRecords.add(mileageRecord)
+            
+            Result.success(mileageRecord)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error tracking mileage", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Detects potential fuel theft based on consumption patterns
+     */
+    suspend fun detectFuelTheft(vehicleId: String): Result<FuelTheftAnalysis> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Detecting fuel theft for vehicle: $vehicleId")
+            
+            val recentTransactions = getVehicleTransactions(vehicleId, TimeWindow.LAST_7_DAYS)
+            val vehicleRecord = vehicleFuelRecords[vehicleId]
+            
+            if (recentTransactions.isEmpty() || vehicleRecord == null) {
+                return@withContext Result.success(
+                    FuelTheftAnalysis.empty(vehicleId)
+                )
+            }
+            
+            // Analyze fuel consumption patterns
+            val averageConsumption = calculateAverageConsumption(recentTransactions)
+            val expectedConsumption = calculateExpectedConsumption(vehicleId, recentTransactions)
+            val actualConsumption = recentTransactions.sumOf { it.amount }
+            
+            val consumptionDifference = expectedConsumption - actualConsumption
+            val theftPercentage = if (expectedConsumption > 0) {
+                (consumptionDifference / expectedConsumption) * 100
+            } else {
+                0.0
+            }
+            
+            // Detect anomalies
+            val anomalies = detectFuelAnomalies(recentTransactions)
+            val riskLevel = determineTheftRiskLevel(theftPercentage, anomalies.size)
+            
+            val analysis = FuelTheftAnalysis(
+                vehicleId = vehicleId,
+                analysisDate = LocalDateTime.now(),
+                expectedConsumption = expectedConsumption,
+                actualConsumption = actualConsumption,
+                consumptionDifference = consumptionDifference,
+                theftPercentage = theftPercentage,
+                riskLevel = riskLevel,
+                anomalies = anomalies,
+                recommendations = generateTheftRecommendations(riskLevel, anomalies)
+            )
+            
+            Result.success(analysis)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting fuel theft", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Generates fuel efficiency reports
+     */
+    suspend fun generateFuelEfficiencyReport(
+        vehicleId: String,
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS
+    ): Result<FuelEfficiencyReport> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Generating fuel efficiency report for vehicle: $vehicleId")
+            
+            val transactions = getVehicleTransactions(vehicleId, timeWindow)
+            val analytics = getFuelConsumptionAnalytics(vehicleId, timeWindow).getOrThrow()
+            
+            if (transactions.isEmpty()) {
+                return@withContext Result.success(
+                    FuelEfficiencyReport.empty(vehicleId, timeWindow)
+                )
+            }
+            
+            // Calculate efficiency metrics
+            val efficiencyMetrics = calculateEfficiencyMetrics(transactions)
+            val efficiencyTrends = calculateEfficiencyTrends(transactions)
+            val efficiencyByFuelType = calculateEfficiencyByFuelType(transactions)
+            val efficiencyByStation = calculateEfficiencyByStation(transactions)
+            
+            // Generate insights and recommendations
+            val insights = generateEfficiencyInsights(efficiencyMetrics, efficiencyTrends)
+            val recommendations = generateEfficiencyRecommendations(efficiencyMetrics)
+            
+            val report = FuelEfficiencyReport(
+                vehicleId = vehicleId,
+                timeWindow = timeWindow,
+                generatedAt = LocalDateTime.now(),
+                analytics = analytics,
+                efficiencyMetrics = efficiencyMetrics,
+                efficiencyTrends = efficiencyTrends,
+                efficiencyByFuelType = efficiencyByFuelType,
+                efficiencyByStation = efficiencyByStation,
+                insights = insights,
+                recommendations = recommendations
+            )
+            
+            Result.success(report)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error generating fuel efficiency report", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Creates fuel alerts based on various conditions
+     */
+    suspend fun createFuelAlerts(vehicleId: String): Result<List<FuelAlert>> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Creating fuel alerts for vehicle: $vehicleId")
+            
+            val alerts = mutableListOf<FuelAlert>()
+            val vehicleRecord = vehicleFuelRecords[vehicleId]
+            
+            if (vehicleRecord == null) {
+                return@withContext Result.success(alerts)
+            }
+            
+            // Low fuel efficiency alert
+            val recentEfficiency = calculateRecentEfficiency(vehicleId)
+            if (recentEfficiency < 8.0) { // Below 8 km/l
+                alerts.add(
+                    FuelAlert(
+                        id = generateAlertId(),
+                        vehicleId = vehicleId,
+                        type = AlertType.LOW_EFFICIENCY,
+                        severity = AlertSeverity.HIGH,
+                        message = "Fuel efficiency is below optimal level: ${String.format("%.2f", recentEfficiency)} km/l",
+                        createdAt = LocalDateTime.now()
+                    )
+                )
+            }
+            
+            // High fuel consumption alert
+            val consumptionAnalysis = getFuelConsumptionAnalytics(vehicleId, TimeWindow.LAST_7_DAYS).getOrNull()
+            if (consumptionAnalysis != null && consumptionAnalysis.consumptionTrend == TrendDirection.INCREASING) {
+                alerts.add(
+                    FuelAlert(
+                        id = generateAlertId(),
+                        vehicleId = vehicleId,
+                        type = AlertType.HIGH_CONSUMPTION,
+                        severity = AlertSeverity.MEDIUM,
+                        message = "Fuel consumption has increased by ${String.format("%.1f", consumptionAnalysis.consumptionTrendPercentage)}%",
+                        createdAt = LocalDateTime.now()
+                    )
+                )
+            }
+            
+            // Fuel theft alert
+            val theftAnalysis = detectFuelTheft(vehicleId).getOrNull()
+            if (theftAnalysis != null && theftAnalysis.riskLevel != RiskLevel.LOW) {
+                alerts.add(
+                    FuelAlert(
+                        id = generateAlertId(),
+                        vehicleId = vehicleId,
+                        type = AlertType.POTENTIAL_THEFT,
+                        severity = if (theftAnalysis.riskLevel == RiskLevel.HIGH) AlertSeverity.CRITICAL else AlertSeverity.HIGH,
+                        message = "Potential fuel theft detected: ${String.format("%.1f", theftAnalysis.theftPercentage)}% discrepancy",
+                        createdAt = LocalDateTime.now()
+                    )
+                )
+            }
+            
+            Result.success(alerts)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating fuel alerts", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets all fuel transactions for a vehicle within a time window
+     */
+    private fun getVehicleTransactions(
+        vehicleId: String,
+        timeWindow: TimeWindow
+    ): List<FuelTransaction> {
+        val cutoffDate = LocalDateTime.now().minus(timeWindow.duration)
+        return fuelTransactions.filter { 
+            it.vehicleId == vehicleId && it.timestamp >= cutoffDate 
+        }.sortedBy { it.timestamp }
+    }
+    
+    /**
+     * Validates fuel transaction data
+     */
+    private fun validateFuelTransaction(
+        amount: Double,
+        pricePerLiter: Double,
+        odometerReading: Int,
+        fuelType: FuelType
+    ): ValidationResult {
+        val errors = mutableListOf<String>()
+        
+        if (amount < MIN_FUEL_AMOUNT || amount > MAX_FUEL_AMOUNT) {
+            errors.add("Fuel amount must be between $MIN_FUEL_AMOUNT and $MAX_FUEL_AMOUNT liters")
+        }
+        
+        if (pricePerLiter <= 0) {
+            errors.add("Price per liter must be positive")
+        }
+        
+        if (odometerReading < MIN_ODOMETER_READING || odometerReading > MAX_ODOMETER_READING) {
+            errors.add("Odometer reading must be between $MIN_ODOMETER_READING and $MAX_ODOMETER_READING")
+        }
+        
+        return ValidationResult(
+            isValid = errors.isEmpty(),
+            errors = errors
+        )
+    }
+    
+    /**
+     * Calculates fuel efficiency for a transaction
+     */
+    private fun calculateFuelEfficiency(
+        vehicleId: String,
+        amount: Double,
+        odometerReading: Int
+    ): Double {
+        val vehicleRecord = vehicleFuelRecords[vehicleId]
+        val lastReading = vehicleRecord?.lastOdometerReading
+        
+        return if (lastReading != null && lastReading < odometerReading) {
+            val distance = odometerReading - lastReading
+            distance / amount
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Updates vehicle fuel record with new transaction
+     */
+    private fun updateVehicleFuelRecord(vehicleId: String, transaction: FuelTransaction) {
+        val record = vehicleFuelRecords.getOrPut(vehicleId) {
+            VehicleFuelRecord(vehicleId = vehicleId)
+        }
+        
+        record.transactions.add(transaction)
+        record.totalFuelConsumed = (record.totalFuelConsumed ?: 0.0) + transaction.amount
+        record.totalFuelCost = (record.totalFuelCost ?: 0.0) + transaction.totalCost
+        record.lastOdometerReading = transaction.odometerReading
+    }
+    
+    /**
+     * Calculates total distance from transactions
+     */
+    private fun calculateTotalDistance(
+        vehicleId: String,
+        transactions: List<FuelTransaction>
+    ): Int {
+        val vehicleRecord = vehicleFuelRecords[vehicleId] ?: return 0
+        return transactions.sumOf { transaction ->
+            val lastReading = vehicleRecord.lastOdometerReading
+            if (lastReading != null && lastReading < transaction.odometerReading) {
+                transaction.odometerReading - lastReading
+            } else {
+                0
+            }
+        }
+    }
+    
+    /**
+     * Calculates consumption trend
+     */
+    private fun calculateConsumptionTrend(transactions: List<FuelTransaction>): TrendDirection {
+        if (transactions.size < 2) return TrendDirection.STABLE
+        
+        val firstHalf = transactions.take(transactions.size / 2)
+        val secondHalf = transactions.drop(transactions.size / 2)
+        
+        val firstHalfAverage = firstHalf.map { it.amount }.average()
+        val secondHalfAverage = secondHalf.map { it.amount }.average()
+        
+        return when {
+            secondHalfAverage > firstHalfAverage * 1.1 -> TrendDirection.INCREASING
+            secondHalfAverage < firstHalfAverage * 0.9 -> TrendDirection.DECREASING
+            else -> TrendDirection.STABLE
+        }
+    }
+    
+    /**
+     * Calculates cost trend
+     */
+    private fun calculateCostTrend(transactions: List<FuelTransaction>): TrendDirection {
+        if (transactions.size < 2) return TrendDirection.STABLE
+        
+        val firstHalf = transactions.take(transactions.size / 2)
+        val secondHalf = transactions.drop(transactions.size / 2)
+        
+        val firstHalfAverage = firstHalf.map { it.totalCost }.average()
+        val secondHalfAverage = secondHalf.map { it.totalCost }.average()
+        
+        return when {
+            secondHalfAverage > firstHalfAverage * 1.1 -> TrendDirection.INCREASING
+            secondHalfAverage < firstHalfAverage * 0.9 -> TrendDirection.DECREASING
+            else -> TrendDirection.STABLE
+        }
+    }
+    
+    /**
+     * Calculates efficiency trend
+     */
+    private fun calculateEfficiencyTrend(transactions: List<FuelTransaction>): TrendDirection {
+        if (transactions.size < 2) return TrendDirection.STABLE
+        
+        val firstHalf = transactions.take(transactions.size / 2)
+        val secondHalf = transactions.drop(transactions.size / 2)
+        
+        val firstHalfAverage = firstHalf.mapNotNull { it.efficiency }.average()
+        val secondHalfAverage = secondHalf.mapNotNull { it.efficiency }.average()
+        
+        return when {
+            secondHalfAverage > firstHalfAverage * 1.1 -> TrendDirection.INCREASING
+            secondHalfAverage < firstHalfAverage * 0.9 -> TrendDirection.DECREASING
+            else -> TrendDirection.STABLE
+        }
+    }
+    
+    /**
+     * Calculates average consumption
+     */
+    private fun calculateAverageConsumption(transactions: List<FuelTransaction>): Double {
+        return if (transactions.isNotEmpty()) {
+            transactions.map { it.amount }.average()
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Calculates expected consumption based on distance
+     */
+    private fun calculateExpectedConsumption(
+        vehicleId: String,
+        transactions: List<FuelTransaction>
+    ): Double {
+        val vehicleRecord = vehicleFuelRecords[vehicleId] ?: return 0.0
+        val totalDistance = vehicleRecord.totalDistance ?: 0
+        val averageEfficiency = transactions.mapNotNull { it.efficiency }.average()
+        
+        return if (averageEfficiency > 0) {
+            totalDistance / averageEfficiency
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Detects fuel consumption anomalies
+     */
+    private fun detectFuelAnomalies(transactions: List<FuelTransaction>): List<FuelAnomaly> {
+        val anomalies = mutableListOf<FuelAnomaly>()
+        
+        if (transactions.size < 3) return anomalies
+        
+        val averageAmount = transactions.map { it.amount }.average()
+        val standardDeviation = calculateStandardDeviation(transactions.map { it.amount })
+        
+        transactions.forEach { transaction ->
+            val deviation = kotlin.math.abs(transaction.amount - averageAmount)
+            if (deviation > standardDeviation * 2) {
+                anomalies.add(
+                    FuelAnomaly(
+                        transactionId = transaction.id,
+                        type = AnomalyType.UNUSUAL_CONSUMPTION,
+                        description = "Fuel consumption deviates significantly from average",
+                        severity = if (deviation > standardDeviation * 3) AnomalySeverity.HIGH else AnomalySeverity.MEDIUM
+                    )
+                )
+            }
+        }
+        
+        return anomalies
+    }
+    
+    /**
+     * Calculates standard deviation
+     */
+    private fun calculateStandardDeviation(values: List<Double>): Double {
+        if (values.isEmpty()) return 0.0
+        
+        val mean = values.average()
+        val variance = values.map { (it - mean) * (it - mean) }.average()
+        return kotlin.math.sqrt(variance)
+    }
+    
+    /**
+     * Determines theft risk level
+     */
+    private fun determineTheftRiskLevel(theftPercentage: Double, anomalyCount: Int): RiskLevel {
+        return when {
+            theftPercentage > 20 || anomalyCount > 3 -> RiskLevel.HIGH
+            theftPercentage > 10 || anomalyCount > 1 -> RiskLevel.MEDIUM
+            else -> RiskLevel.LOW
+        }
+    }
+    
+    /**
+     * Generates theft recommendations
+     */
+    private fun generateTheftRecommendations(riskLevel: RiskLevel, anomalies: List<FuelAnomaly>): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        when (riskLevel) {
+            RiskLevel.HIGH -> {
+                recommendations.add("Install fuel tank locks and security seals")
+                recommendations.add("Implement GPS-based fuel monitoring system")
+                recommendations.add("Conduct immediate fuel audit and inspection")
+                recommendations.add("Review driver fuel consumption patterns")
+            }
+            RiskLevel.MEDIUM -> {
+                recommendations.add("Monitor fuel levels more frequently")
+                recommendations.add("Verify fuel receipts and transactions")
+                recommendations.add("Consider installing fuel monitoring sensors")
+            }
+            RiskLevel.LOW -> {
+                recommendations.add("Maintain regular fuel tracking")
+                recommendations.add("Continue monitoring consumption patterns")
+            }
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Calculates recent fuel efficiency
+     */
+    private fun calculateRecentEfficiency(vehicleId: String): Double {
+        val recentTransactions = getVehicleTransactions(vehicleId, TimeWindow.LAST_7_DAYS)
+        return recentTransactions.mapNotNull { it.efficiency }.average()
+    }
+    
+    /**
+     * Generates unique IDs
+     */
+    private fun generateTransactionId(): String = "TXN_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    private fun generateStationId(): String = "STN_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    private fun generateMileageId(): String = "MLG_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    private fun generateAlertId(): String = "ALT_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    
+    // Data classes and enums
+    
+    data class FuelTransaction(
+        val id: String,
+        val vehicleId: String,
+        val driverId: String,
+        val amount: Double,
+        val pricePerLiter: Double,
+        val totalCost: Double,
+        val odometerReading: Int,
+        val fuelType: FuelType,
+        val stationId: String?,
+        val receiptNumber: String?,
+        val efficiency: Double?,
+        val timestamp: LocalDateTime,
+        val notes: String?
+    )
+    
+    data class FuelStation(
+        val id: String,
+        val name: String,
+        val address: String,
+        val latitude: Double,
+        val longitude: Double,
+        val fuelTypes: List<FuelType>,
+        val amenities: List<String>,
+        val contactInfo: String?,
+        val createdAt: LocalDateTime
+    )
+    
+    data class VehicleFuelRecord(
+        val vehicleId: String,
+        var totalFuelConsumed: Double? = null,
+        var totalFuelCost: Double? = null,
+        var lastOdometerReading: Int? = null,
+        var totalDistance: Int? = null,
+        val transactions: MutableList<FuelTransaction> = mutableListOf(),
+        val mileageRecords: MutableList<MileageRecord> = mutableListOf()
+    )
+    
+    data class MileageRecord(
+        val id: String,
+        val vehicleId: String,
+        val odometerReading: Int,
+        val distanceTraveled: Int,
+        val timestamp: LocalDateTime
+    )
+    
+    data class FuelConsumptionAnalytics(
+        val vehicleId: String,
+        val timeWindow: TimeWindow,
+        val totalFuelConsumed: Double,
+        val totalCost: Double,
+        val totalDistance: Int,
+        val averageEfficiency: Double,
+        val averagePricePerLiter: Double,
+        val consumptionTrend: TrendDirection,
+        val costTrend: TrendDirection,
+        val efficiencyTrend: TrendDirection,
+        val transactionCount: Int,
+        val firstTransactionDate: LocalDateTime?,
+        val lastTransactionDate: LocalDateTime?
+    ) {
+        companion object {
+            fun empty(vehicleId: String, timeWindow: TimeWindow) = FuelConsumptionAnalytics(
+                vehicleId = vehicleId,
+                timeWindow = timeWindow,
+                totalFuelConsumed = 0.0,
+                totalCost = 0.0,
+                totalDistance = 0,
+                averageEfficiency = 0.0,
+                averagePricePerLiter = 0.0,
+                consumptionTrend = TrendDirection.STABLE,
+                costTrend = TrendDirection.STABLE,
+                efficiencyTrend = TrendDirection.STABLE,
+                transactionCount = 0,
+                firstTransactionDate = null,
+                lastTransactionDate = null
+            )
+        }
+    }
+    
+    data class FuelTheftAnalysis(
+        val vehicleId: String,
+        val analysisDate: LocalDateTime,
+        val expectedConsumption: Double,
+        val actualConsumption: Double,
+        val consumptionDifference: Double,
+        val theftPercentage: Double,
+        val riskLevel: RiskLevel,
+        val anomalies: List<FuelAnomaly>,
+        val recommendations: List<String>
+    ) {
+        companion object {
+            fun empty(vehicleId: String) = FuelTheftAnalysis(
+                vehicleId = vehicleId,
+                analysisDate = LocalDateTime.now(),
+                expectedConsumption = 0.0,
+                actualConsumption = 0.0,
+                consumptionDifference = 0.0,
+                theftPercentage = 0.0,
+                riskLevel = RiskLevel.LOW,
+                anomalies = emptyList(),
+                recommendations = emptyList()
+            )
+        }
+    }
+    
+    data class FuelAnomaly(
+        val transactionId: String,
+        val type: AnomalyType,
+        val description: String,
+        val severity: AnomalySeverity
+    )
+    
+    data class FuelEfficiencyReport(
+        val vehicleId: String,
+        val timeWindow: TimeWindow,
+        val generatedAt: LocalDateTime,
+        val analytics: FuelConsumptionAnalytics,
+        val efficiencyMetrics: EfficiencyMetrics,
+        val efficiencyTrends: List<EfficiencyTrend>,
+        val efficiencyByFuelType: Map<FuelType, Double>,
+        val efficiencyByStation: Map<String, Double>,
+        val insights: List<String>,
+        val recommendations: List<String>
+    ) {
+        companion object {
+            fun empty(vehicleId: String, timeWindow: TimeWindow) = FuelEfficiencyReport(
+                vehicleId = vehicleId,
+                timeWindow = timeWindow,
+                generatedAt = LocalDateTime.now(),
+                analytics = FuelConsumptionAnalytics.empty(vehicleId, timeWindow),
+                efficiencyMetrics = EfficiencyMetrics(),
+                efficiencyTrends = emptyList(),
+                efficiencyByFuelType = emptyMap(),
+                efficiencyByStation = emptyMap(),
+                insights = emptyList(),
+                recommendations = emptyList()
+            )
+        }
+    }
+    
+    data class EfficiencyMetrics(
+        val bestEfficiency: Double = 0.0,
+        val worstEfficiency: Double = 0.0,
+        val averageEfficiency: Double = 0.0,
+        val efficiencyVariance: Double = 0.0,
+        val efficiencyImprovement: Double = 0.0
+    )
+    
+    data class EfficiencyTrend(
+        val date: LocalDateTime,
+        val efficiency: Double,
+        val trend: TrendDirection
+    )
+    
+    data class FuelAlert(
+        val id: String,
+        val vehicleId: String,
+        val type: AlertType,
+        val severity: AlertSeverity,
+        val message: String,
+        val createdAt: LocalDateTime
+    )
+    
+    data class ValidationResult(
+        val isValid: Boolean,
+        val errors: List<String>
+    )
+    
+    enum class FuelType {
+        PETROL, DIESEL, CNG, LPG, ELECTRIC, HYBRID
+    }
+    
+    enum class TimeWindow(val duration: java.time.Duration) {
+        LAST_7_DAYS(java.time.Duration.ofDays(7)),
+        LAST_30_DAYS(java.time.Duration.ofDays(30)),
+        LAST_90_DAYS(java.time.Duration.ofDays(90)),
+        LAST_YEAR(java.time.Duration.ofDays(365))
+    }
+    
+    enum class TrendDirection {
+        INCREASING, DECREASING, STABLE
+    }
+    
+    enum class RiskLevel {
+        LOW, MEDIUM, HIGH
+    }
+    
+    enum class AnomalyType {
+        UNUSUAL_CONSUMPTION, MISSING_RECEIPT, INVALID_ODOMETER, SUSPICIOUS_TIMING
+    }
+    
+    enum class AnomalySeverity {
+        LOW, MEDIUM, HIGH
+    }
+    
+    enum class AlertType {
+        LOW_EFFICIENCY, HIGH_CONSUMPTION, POTENTIAL_THEFT, MAINTENANCE_DUE
+    }
+    
+    enum class AlertSeverity {
+        LOW, MEDIUM, HIGH, CRITICAL
+    }
+    
+    // Helper methods for complex calculations
+    
+    private fun calculateEfficiencyMetrics(transactions: List<FuelTransaction>): EfficiencyMetrics {
+        val efficiencies = transactions.mapNotNull { it.efficiency }
+        
+        return if (efficiencies.isNotEmpty()) {
+            EfficiencyMetrics(
+                bestEfficiency = efficiencies.maxOrNull() ?: 0.0,
+                worstEfficiency = efficiencies.minOrNull() ?: 0.0,
+                averageEfficiency = efficiencies.average(),
+                efficiencyVariance = calculateStandardDeviation(efficiencies),
+                efficiencyImprovement = calculateEfficiencyImprovement(efficiencies)
+            )
+        } else {
+            EfficiencyMetrics()
+        }
+    }
+    
+    private fun calculateEfficiencyTrends(transactions: List<FuelTransaction>): List<EfficiencyTrend> {
+        return transactions.mapNotNull { transaction ->
+            transaction.efficiency?.let { efficiency ->
+                EfficiencyTrend(
+                    date = transaction.timestamp,
+                    efficiency = efficiency,
+                    trend = TrendDirection.STABLE // Would need more complex logic for actual trend
+                )
+            }
+        }
+    }
+    
+    private fun calculateEfficiencyByFuelType(transactions: List<FuelTransaction>): Map<FuelType, Double> {
+        return transactions.groupBy { it.fuelType }
+            .mapValues { (_, transactions) ->
+                transactions.mapNotNull { it.efficiency }.average()
+            }
+    }
+    
+    private fun calculateEfficiencyByStation(transactions: List<FuelTransaction>): Map<String, Double> {
+        return transactions.groupBy { it.stationId ?: "Unknown" }
+            .mapValues { (_, transactions) ->
+                transactions.mapNotNull { it.efficiency }.average()
+            }
+    }
+    
+    private fun calculateEfficiencyImprovement(efficiencies: List<Double>): Double {
+        if (efficiencies.size < 2) return 0.0
+        
+        val firstHalf = efficiencies.take(efficiencies.size / 2).average()
+        val secondHalf = efficiencies.drop(efficiencies.size / 2).average()
+        
+        return ((secondHalf - firstHalf) / firstHalf) * 100
+    }
+    
+    private fun generateEfficiencyInsights(
+        metrics: EfficiencyMetrics,
+        trends: List<EfficiencyTrend>
+    ): List<String> {
+        val insights = mutableListOf<String>()
+        
+        if (metrics.averageEfficiency < 8.0) {
+            insights.add("Average fuel efficiency is below optimal level")
+        }
+        
+        if (metrics.efficiencyVariance > 2.0) {
+            insights.add("Fuel efficiency varies significantly between trips")
+        }
+        
+        if (metrics.efficiencyImprovement > 5.0) {
+            insights.add("Fuel efficiency has improved significantly")
+        } else if (metrics.efficiencyImprovement < -5.0) {
+            insights.add("Fuel efficiency has declined significantly")
+        }
+        
+        return insights
+    }
+    
+    private fun generateEfficiencyRecommendations(metrics: EfficiencyMetrics): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (metrics.averageEfficiency < 8.0) {
+            recommendations.add("Consider vehicle maintenance to improve fuel efficiency")
+            recommendations.add("Review driving habits and routes for optimization")
+        }
+        
+        if (metrics.efficiencyVariance > 2.0) {
+            recommendations.add("Standardize driving practices across drivers")
+            recommendations.add("Investigate causes of efficiency variation")
+        }
+        
+        if (metrics.efficiencyImprovement < -5.0) {
+            recommendations.add("Schedule vehicle inspection for potential issues")
+            recommendations.add("Review recent changes in routes or driving patterns")
+        }
+        
+        return recommendations
+    }
+}

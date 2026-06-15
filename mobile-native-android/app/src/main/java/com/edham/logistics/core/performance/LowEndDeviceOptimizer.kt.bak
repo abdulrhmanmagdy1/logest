@@ -1,0 +1,579 @@
+package com.edham.logistics.core.performance
+
+import android.content.Context
+import android.os.Build
+import android.view.View
+import android.view.animation.Animation
+import android.view.animation.AnimationUtils
+import androidx.recyclerview.widget.RecyclerView
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Low End Device Optimizer - Ensures smooth performance on low-end devices
+ * Reduces animations, lowers image quality, throttles background tasks, and optimizes UI rendering
+ */
+@Singleton
+class LowEndDeviceOptimizer @Inject constructor(
+    private val context: Context
+) {
+
+    private var config: LowEndConfig = LowEndConfig()
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // Device capability detection
+    private val deviceCapability = detectDeviceCapability()
+    
+    // Performance throttling
+    private val backgroundThrottler = Throttler(maxConcurrentTasks = 2)
+    private val uiThrottler = Throttler(maxConcurrentTasks = 1)
+    
+    // Animation control
+    private val animationScale = calculateAnimationScale()
+    private val isLowEndDevice = deviceCapability == DeviceCapability.LOW || deviceCapability == DeviceCapability.VERY_LOW
+    
+    // UI optimization flags
+    private val complexUIDisabled = AtomicBoolean(false)
+    private val animationsDisabled = AtomicBoolean(false)
+    
+    // Metrics
+    private val optimizedFrames = AtomicInteger(0)
+    private val skippedAnimations = AtomicInteger(0)
+    private val throttledTasks = AtomicInteger(0)
+
+    /**
+     * Configure the low-end device optimizer
+     */
+    fun configure(config: LowEndConfig) {
+        this.config = config
+        
+        if (isLowEndDevice) {
+            applyLowEndOptimizations()
+        }
+    }
+
+    /**
+     * Optimize UI rendering for low-end devices
+     */
+    fun optimizeRendering(
+        viewOptimizer: () -> Unit,
+        complexity: UIComplexity = UIComplexity.MEDIUM
+    ) {
+        if (!isLowEndDevice) {
+            viewOptimizer()
+            return
+        }
+
+        when {
+            config.disableComplexUI && complexity == UIComplexity.VERY_HIGH -> {
+                // Skip complex UI rendering on very low-end devices
+                skippedAnimations.incrementAndGet()
+                return
+            }
+            config.reduceAnimations && complexity >= UIComplexity.HIGH -> {
+                // Reduce UI complexity for high complexity screens
+                optimizeHighComplexityUI(viewOptimizer)
+            }
+            else -> {
+                // Apply general optimizations
+                optimizeGeneralUI(viewOptimizer)
+            }
+        }
+        
+        optimizedFrames.incrementAndGet()
+    }
+
+    /**
+     * Optimize RecyclerView for low-end devices
+     */
+    fun optimizeRecyclerView(recyclerView: RecyclerView) {
+        if (!isLowEndDevice) return
+
+        // Reduce item animations
+        recyclerView.itemAnimator?.let { animator ->
+            animator.changeDuration = 50 // Reduce animation duration
+            animator.moveDuration = 50
+            animator.addDuration = 50
+            animator.removeDuration = 50
+        }
+
+        // Set smaller prefetch size
+        recyclerView.setItemViewCacheSize(10)
+
+        // Disable nested scrolling for better performance
+        recyclerView.isNestedScrollingEnabled = false
+
+        // Optimize layout manager
+        recyclerView.layoutManager?.let { layoutManager ->
+            if (layoutManager is androidx.recyclerview.widget.LinearLayoutManager) {
+                layoutManager.initialPrefetchItemCount = 2
+            }
+        }
+    }
+
+    /**
+     * Optimize image loading for low-end devices
+     */
+    fun optimizeImageLoading(): ImageOptimizationConfig {
+        return when (deviceCapability) {
+            DeviceCapability.VERY_LOW -> ImageOptimizationConfig(
+                maxSize = 100 * 1024, // 100KB
+                quality = 0.3f, // 30% quality
+                enableCaching = true,
+                enableCompression = true,
+                enablePlaceholder = true,
+                loadDelayMs = 200
+            )
+            DeviceCapability.LOW -> ImageOptimizationConfig(
+                maxSize = 200 * 1024, // 200KB
+                quality = 0.5f, // 50% quality
+                enableCaching = true,
+                enableCompression = true,
+                enablePlaceholder = true,
+                loadDelayMs = 100
+            )
+            else -> ImageOptimizationConfig(
+                maxSize = 500 * 1024, // 500KB
+                quality = 0.7f, // 70% quality
+                enableCaching = true,
+                enableCompression = false,
+                enablePlaceholder = false,
+                loadDelayMs = 0
+            )
+        }
+    }
+
+    /**
+     * Throttle background tasks
+     */
+    suspend fun <T> throttleBackgroundTask(
+        task: suspend () -> T,
+        priority: TaskPriority = TaskPriority.NORMAL
+    ): T {
+        if (!config.enableBackgroundThrottling) {
+            return task()
+        }
+
+        return backgroundThrottler.execute {
+            // Add delay for very low-end devices
+            if (deviceCapability == DeviceCapability.VERY_LOW) {
+                delay(50)
+            }
+            
+            try {
+                task()
+            } catch (e: Exception) {
+                // Log error but don't fail
+                throw e
+            }
+        }
+    }
+
+    /**
+     * Throttle UI tasks
+     */
+    suspend fun <T> throttleUITask(
+        task: suspend () -> T,
+        priority: TaskPriority = TaskPriority.NORMAL
+    ): T {
+        if (!config.enableBackgroundThrottling) {
+            return task()
+        }
+
+        return uiThrottler.execute {
+            try {
+                task()
+            } catch (e: Exception) {
+                // Log error but don't fail
+                throw e
+            }
+        }
+    }
+
+    /**
+     * Optimize animations
+     */
+    fun optimizeAnimation(animation: Animation?): Animation? {
+        if (!config.reduceAnimations || animation == null) {
+            return animation
+        }
+
+        val scaledDuration = (animation.duration * animationScale).toLong()
+        return object : Animation() {
+            override fun getDuration(): Long = scaledDuration
+            override fun start() {
+                animation.start()
+            }
+            override fun cancel() {
+                animation.cancel()
+            }
+            override fun setAnimationListener(listener: Animation.AnimationListener?) {
+                animation.setAnimationListener(listener)
+            }
+        }
+    }
+
+    /**
+     * Check if animation should be skipped
+     */
+    fun shouldSkipAnimation(complexity: UIComplexity): Boolean {
+        if (!config.reduceAnimations) return false
+        
+        return when (deviceCapability) {
+            DeviceCapability.VERY_LOW -> complexity >= UIComplexity.MEDIUM
+            DeviceCapability.LOW -> complexity >= UIComplexity.HIGH
+            else -> false
+        }
+    }
+
+    /**
+     * Optimize memory usage
+     */
+    fun optimizeMemoryUsage(): MemoryOptimizationConfig {
+        return when (deviceCapability) {
+            DeviceCapability.VERY_LOW -> MemoryOptimizationConfig(
+                maxCacheSize = 10 * 1024 * 1024, // 10MB
+                enableAggressiveCleanup = true,
+                cleanupIntervalMs = 30_000, // 30 seconds
+                enableMemoryPooling = true,
+                maxObjectPoolSize = 50
+            )
+            DeviceCapability.LOW -> MemoryOptimizationConfig(
+                maxCacheSize = 25 * 1024 * 1024, // 25MB
+                enableAggressiveCleanup = true,
+                cleanupIntervalMs = 60_000, // 1 minute
+                enableMemoryPooling = true,
+                maxObjectPoolSize = 100
+            )
+            else -> MemoryOptimizationConfig(
+                maxCacheSize = 50 * 1024 * 1024, // 50MB
+                enableAggressiveCleanup = false,
+                cleanupIntervalMs = 300_000, // 5 minutes
+                enableMemoryPooling = false,
+                maxObjectPoolSize = 200
+            )
+        }
+    }
+
+    /**
+     * Get performance recommendations
+     */
+    fun getPerformanceRecommendations(): List<PerformanceRecommendation> {
+        val recommendations = mutableListOf<PerformanceRecommendation>()
+        
+        when (deviceCapability) {
+            DeviceCapability.VERY_LOW -> {
+                recommendations.add(
+                    PerformanceRecommendation(
+                        type = RecommendationType.UI_OPTIMIZATION,
+                        description = "Disable all animations and reduce UI complexity",
+                        impact = ImpactLevel.HIGH,
+                        implementation = "Set animation scale to 0.0 and simplify layouts"
+                    )
+                )
+                recommendations.add(
+                    PerformanceRecommendation(
+                        type = RecommendationType.IMAGE_OPTIMIZATION,
+                        description = "Use very low image quality (30%) and aggressive compression",
+                        impact = ImpactLevel.HIGH,
+                        implementation = "Set image quality to 0.3f and enable compression"
+                    )
+                )
+                recommendations.add(
+                    PerformanceRecommendation(
+                        type = RecommendationType.BACKGROUND_THROTTLING,
+                        description = "Throttle all background tasks to maximum",
+                        impact = ImpactLevel.MEDIUM,
+                        implementation = "Limit concurrent background tasks to 1"
+                    )
+                )
+            }
+            DeviceCapability.LOW -> {
+                recommendations.add(
+                    PerformanceRecommendation(
+                        type = RecommendationType.UI_OPTIMIZATION,
+                        description = "Reduce animation speed and simplify complex layouts",
+                        impact = ImpactLevel.MEDIUM,
+                        implementation = "Set animation scale to 0.5 and reduce view complexity"
+                    )
+                )
+                recommendations.add(
+                    PerformanceRecommendation(
+                        type = RecommendationType.IMAGE_OPTIMIZATION,
+                        description = "Use low image quality (50%) and enable compression",
+                        impact = ImpactLevel.MEDIUM,
+                        implementation = "Set image quality to 0.5f and enable compression"
+                    )
+                )
+            }
+            else -> {
+                recommendations.add(
+                    PerformanceRecommendation(
+                        type = RecommendationType.GENERAL,
+                        description = "Device is capable, no specific optimizations needed",
+                        impact = ImpactLevel.LOW,
+                        implementation = "Use standard performance settings"
+                    )
+                )
+            }
+        }
+        
+        return recommendations
+    }
+
+    /**
+     * Apply low-end device optimizations
+     */
+    private fun applyLowEndOptimizations() {
+        if (config.reduceAnimations) {
+            animationsDisabled.set(true)
+        }
+        
+        if (config.disableComplexUI) {
+            complexUIDisabled.set(true)
+        }
+        
+        // Start periodic cleanup
+        if (config.enableBackgroundThrottling) {
+            startPeriodicCleanup()
+        }
+    }
+
+    /**
+     * Optimize high complexity UI
+     */
+    private fun optimizeHighComplexityUI(viewOptimizer: () -> Unit) {
+        coroutineScope.launch {
+            // Add delay to prevent overwhelming the UI thread
+            delay(50)
+            withContext(Dispatchers.Main) {
+                viewOptimizer()
+            }
+        }
+    }
+
+    /**
+     * Optimize general UI
+     */
+    private fun optimizeGeneralUI(viewOptimizer: () -> Unit) {
+        coroutineScope.launch {
+            withContext(Dispatchers.Main) {
+                viewOptimizer()
+            }
+        }
+    }
+
+    /**
+     * Start periodic cleanup
+     */
+    private fun startPeriodicCleanup() {
+        coroutineScope.launch {
+            while (true) {
+                delay(60_000) // Every minute
+                performCleanup()
+            }
+        }
+    }
+
+    /**
+     * Perform cleanup tasks
+     */
+    private fun performCleanup() {
+        // Force garbage collection
+        System.gc()
+        
+        // Clear caches if needed
+        if (Runtime.getRuntime().freeMemory() < Runtime.getRuntime().totalMemory() * 0.2) {
+            // Memory is low, clear caches
+        }
+    }
+
+    /**
+     * Detect device capability
+     */
+    private fun detectDeviceCapability(): DeviceCapability {
+        val memoryInfo = getMemoryInfo()
+        val cpuInfo = getCPUInfo()
+        val apiLevel = Build.VERSION.SDK_INT
+
+        return when {
+            memoryInfo.totalMemory > 6_000_000_000L && cpuInfo.cores >= 8 && apiLevel >= 30 -> {
+                DeviceCapability.HIGH
+            }
+            memoryInfo.totalMemory > 3_000_000_000L && cpuInfo.cores >= 6 && apiLevel >= 28 -> {
+                DeviceCapability.MEDIUM
+            }
+            memoryInfo.totalMemory > 1_500_000_000L && cpuInfo.cores >= 4 && apiLevel >= 26 -> {
+                DeviceCapability.LOW
+            }
+            else -> {
+                DeviceCapability.VERY_LOW
+            }
+        }
+    }
+
+    /**
+     * Calculate animation scale based on device capability
+     */
+    private fun calculateAnimationScale(): Float {
+        return when (deviceCapability) {
+            DeviceCapability.HIGH -> 1.0f
+            DeviceCapability.MEDIUM -> 0.8f
+            DeviceCapability.LOW -> 0.5f
+            DeviceCapability.VERY_LOW -> 0.0f
+        }
+    }
+
+    /**
+     * Get memory information
+     */
+    private fun getMemoryInfo(): MemoryInfo {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val memoryInfo = android.app.ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memoryInfo)
+        
+        return MemoryInfo(
+            totalMemory = memoryInfo.totalMem,
+            availableMemory = memoryInfo.availMem,
+            threshold = memoryInfo.threshold
+        )
+    }
+
+    /**
+     * Get CPU information
+     */
+    private fun getCPUInfo(): CPUInfo {
+        val cores = Runtime.getRuntime().availableProcessors()
+        return CPUInfo(
+            cores = cores,
+            architecture = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
+        )
+    }
+
+    /**
+     * Get optimization metrics
+     */
+    fun getMetrics(): LowEndDeviceMetrics {
+        return LowEndDeviceMetrics(
+            deviceCapability = deviceCapability,
+            isLowEndDevice = isLowEndDevice,
+            optimizedFrames = optimizedFrames.get(),
+            skippedAnimations = skippedAnimations.get(),
+            throttledTasks = throttledTasks.get(),
+            animationScale = animationScale,
+            complexUIDisabled = complexUIDisabled.get(),
+            animationsDisabled = animationsDisabled.get()
+        )
+    }
+
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+        backgroundThrottler.cleanup()
+        uiThrottler.cleanup()
+    }
+}
+
+/**
+ * Task throttler implementation
+ */
+class Throttler(
+    private val maxConcurrentTasks: Int
+) {
+    private val semaphore = Semaphore(maxConcurrentTasks)
+    private val executor = Executors.newFixedThreadPool(maxConcurrentTasks) as ExecutorService
+
+    suspend fun <T> execute(task: suspend () -> T): T {
+        return withContext(Dispatchers.IO) {
+            semaphore.withPermit {
+                withContext(Dispatchers.Default) {
+                    task()
+                }
+            }
+        }
+    }
+
+    fun cleanup() {
+        executor.shutdown()
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class LowEndConfig(
+    val enableUIOptimization: Boolean = true,
+    val reduceAnimations: Boolean = true,
+    val lowerImageQuality: Boolean = true,
+    val enableBackgroundThrottling: Boolean = true,
+    val disableComplexUI: Boolean = false,
+    val reduceConcurrentOperations: Boolean = false
+)
+
+data class ImageOptimizationConfig(
+    val maxSize: Int,
+    val quality: Float,
+    val enableCaching: Boolean,
+    val enableCompression: Boolean,
+    val enablePlaceholder: Boolean,
+    val loadDelayMs: Long
+)
+
+data class MemoryOptimizationConfig(
+    val maxCacheSize: Int,
+    val enableAggressiveCleanup: Boolean,
+    val cleanupIntervalMs: Long,
+    val enableMemoryPooling: Boolean,
+    val maxObjectPoolSize: Int
+)
+
+data class PerformanceRecommendation(
+    val type: RecommendationType,
+    val description: String,
+    val impact: ImpactLevel,
+    val implementation: String
+)
+
+data class LowEndDeviceMetrics(
+    val deviceCapability: DeviceCapability,
+    val isLowEndDevice: Boolean,
+    val optimizedFrames: Int,
+    val skippedAnimations: Int,
+    val throttledTasks: Int,
+    val animationScale: Float,
+    val complexUIDisabled: Boolean,
+    val animationsDisabled: Boolean
+)
+
+data class MemoryInfo(
+    val totalMemory: Long,
+    val availableMemory: Long,
+    val threshold: Long
+)
+
+data class CPUInfo(
+    val cores: Int,
+    val architecture: String
+)
+
+enum class UIComplexity {
+    LOW, MEDIUM, HIGH, VERY_HIGH
+}
+
+enum class TaskPriority {
+    LOW, NORMAL, HIGH, CRITICAL
+}
+
+enum class RecommendationType {
+    UI_OPTIMIZATION, IMAGE_OPTIMIZATION, BACKGROUND_THROTTLING, MEMORY_OPTIMIZATION, GENERAL
+}
+
+enum class ImpactLevel {
+    LOW, MEDIUM, HIGH, CRITICAL
+}

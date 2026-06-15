@@ -1,0 +1,543 @@
+package com.edham.logistics.feature.telematics
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Safety Scoring System - Advanced driver safety assessment and scoring
+ * Calculates comprehensive safety scores based on driving events and behavior patterns
+ */
+class SafetyScoring {
+    
+    companion object {
+        private const val TAG = "SafetyScoring"
+        
+        // Scoring weights
+        private const val HARSH_BRAKING_WEIGHT = 0.30
+        private const val RAPID_ACCELERATION_WEIGHT = 0.25
+        private const val OVER_SPEEDING_WEIGHT = 0.20
+        private const val SHARP_TURN_WEIGHT = 0.15
+        private const val SEATBELT_VIOLATION_WEIGHT = 0.10
+        
+        // Score thresholds
+        private const val EXCELLENT_THRESHOLD = 90.0
+        private const val GOOD_THRESHOLD = 80.0
+        private const val AVERAGE_THRESHOLD = 70.0
+        private const val BELOW_AVERAGE_THRESHOLD = 60.0
+        
+        // Event severity multipliers
+        private const val CRITICAL_MULTIPLIER = 3.0
+        private const val HIGH_MULTIPLIER = 2.0
+        private const val MEDIUM_MULTIPLIER = 1.5
+        private const val LOW_MULTIPLIER = 1.0
+        
+        // Time-based decay factors
+        private const val RECENT_DECAY_FACTOR = 1.0 // Last 7 days
+        private const val MEDIUM_DECAY_FACTOR = 0.8 // Last 30 days
+        private const val OLD_DECAY_FACTOR = 0.6 // Last 90 days
+    }
+    
+    /**
+     * Calculate comprehensive safety score
+     */
+    suspend fun calculateSafetyScore(
+        driverId: String,
+        events: List<TelematicsEvent>,
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS,
+        previousScore: Double? = null
+    ): SafetyScoreResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Calculating safety score for driver $driverId")
+                
+                // Filter events by time window
+                val filteredEvents = filterEventsByTimeWindow(events, timeWindow)
+                
+                // Categorize events
+                val harshBrakingEvents = filteredEvents.filter { it.type == TelematicsEngine.EventType.HARSH_BRAKING }
+                val rapidAccelerationEvents = filteredEvents.filter { it.type == TelematicsEngine.EventType.RAPID_ACCELERATION }
+                val overSpeedingEvents = filteredEvents.filter { it.type == TelematicsEngine.EventType.OVER_SPEEDING }
+                val sharpTurnEvents = filteredEvents.filter { it.type == TelematicsEngine.EventType.SHARP_TURN }
+                val seatbeltViolations = filteredEvents.filter { it.type == TelematicsEngine.EventType.SEATBELT_VIOLATION }
+                
+                // Calculate individual component scores
+                val brakingScore = calculateBrakingScore(harshBrakingEvents)
+                val accelerationScore = calculateAccelerationScore(rapidAccelerationEvents)
+                val speedingScore = calculateSpeedingScore(overSpeedingEvents)
+                val turnScore = calculateTurnScore(sharpTurnEvents)
+                val seatbeltScore = calculateSeatbeltScore(seatbeltViolations)
+                
+                // Calculate weighted overall score
+                val overallScore = calculateWeightedScore(
+                    brakingScore,
+                    accelerationScore,
+                    speedingScore,
+                    turnScore,
+                    seatbeltScore
+                )
+                
+                // Apply time-based smoothing
+                val smoothedScore = applyScoreSmoothing(overallScore, previousScore)
+                
+                // Generate safety insights
+                val insights = generateSafetyInsights(
+                    harshBrakingEvents,
+                    rapidAccelerationEvents,
+                    overSpeedingEvents,
+                    sharpTurnEvents,
+                    seatbeltViolations
+                )
+                
+                // Determine safety level
+                val safetyLevel = determineSafetyLevel(smoothedScore)
+                
+                val result = SafetyScoreResult(
+                    driverId = driverId,
+                    overallScore = smoothedScore,
+                    brakingScore = brakingScore,
+                    accelerationScore = accelerationScore,
+                    speedingScore = speedingScore,
+                    turnScore = turnScore,
+                    seatbeltScore = seatbeltScore,
+                    safetyLevel = safetyLevel,
+                    totalEvents = filteredEvents.size,
+                    criticalEvents = filteredEvents.count { it.severity == TelematicsEngine.Severity.CRITICAL },
+                    highEvents = filteredEvents.count { it.severity == TelematicsEngine.Severity.HIGH },
+                    mediumEvents = filteredEvents.count { it.severity == TelematicsEngine.Severity.MEDIUM },
+                    lowEvents = filteredEvents.count { it.severity == TelematicsEngine.Severity.LOW },
+                    insights = insights,
+                    calculatedAt = LocalDateTime.now(),
+                    timeWindow = timeWindow
+                )
+                
+                Log.d(TAG, "Safety score calculation completed: ${result.overallScore}")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error calculating safety score", e)
+                SafetyScoreResult.createError(driverId, timeWindow)
+            }
+        }
+    }
+    
+    /**
+     * Calculate harsh braking score component
+     */
+    private fun calculateBrakingScore(events: List<TelematicsEvent>): Double {
+        if (events.isEmpty()) return 100.0
+        
+        val weightedScore = events.sumOf { event ->
+            val basePenalty = when (event.severity) {
+                TelematicsEngine.Severity.CRITICAL -> 15.0
+                TelematicsEngine.Severity.HIGH -> 10.0
+                TelematicsEngine.Severity.MEDIUM -> 5.0
+                TelematicsEngine.Severity.LOW -> 2.0
+            }
+            
+            val timeDecay = getTimeDecayFactor(event.timestamp)
+            basePenalty * timeDecay
+        }
+        
+        return maxOf(0.0, 100.0 - weightedScore)
+    }
+    
+    /**
+     * Calculate rapid acceleration score component
+     */
+    private fun calculateAccelerationScore(events: List<TelematicsEvent>): Double {
+        if (events.isEmpty()) return 100.0
+        
+        val weightedScore = events.sumOf { event ->
+            val basePenalty = when (event.severity) {
+                TelematicsEngine.Severity.CRITICAL -> 12.0
+                TelematicsEngine.Severity.HIGH -> 8.0
+                TelematicsEngine.Severity.MEDIUM -> 4.0
+                TelematicsEngine.Severity.LOW -> 2.0
+            }
+            
+            val timeDecay = getTimeDecayFactor(event.timestamp)
+            basePenalty * timeDecay
+        }
+        
+        return maxOf(0.0, 100.0 - weightedScore)
+    }
+    
+    /**
+     * Calculate over-speeding score component
+     */
+    private fun calculateSpeedingScore(events: List<TelematicsEvent>): Double {
+        if (events.isEmpty()) return 100.0
+        
+        val weightedScore = events.sumOf { event ->
+            val basePenalty = when (event.severity) {
+                TelematicsEngine.Severity.CRITICAL -> 20.0
+                TelematicsEngine.Severity.HIGH -> 15.0
+                TelematicsEngine.Severity.MEDIUM -> 8.0
+                TelematicsEngine.Severity.LOW -> 3.0
+            }
+            
+            val timeDecay = getTimeDecayFactor(event.timestamp)
+            basePenalty * timeDecay
+        }
+        
+        return maxOf(0.0, 100.0 - weightedScore)
+    }
+    
+    /**
+     * Calculate sharp turn score component
+     */
+    private fun calculateTurnScore(events: List<TelematicsEvent>): Double {
+        if (events.isEmpty()) return 100.0
+        
+        val weightedScore = events.sumOf { event ->
+            val basePenalty = when (event.severity) {
+                TelematicsEngine.Severity.CRITICAL -> 10.0
+                TelematicsEngine.Severity.HIGH -> 7.0
+                TelematicsEngine.Severity.MEDIUM -> 4.0
+                TelematicsEngine.Severity.LOW -> 2.0
+            }
+            
+            val timeDecay = getTimeDecayFactor(event.timestamp)
+            basePenalty * timeDecay
+        }
+        
+        return maxOf(0.0, 100.0 - weightedScore)
+    }
+    
+    /**
+     * Calculate seatbelt violation score component
+     */
+    private fun calculateSeatbeltScore(events: List<TelematicsEvent>): Double {
+        if (events.isEmpty()) return 100.0
+        
+        val weightedScore = events.sumOf { event ->
+            val basePenalty = when (event.severity) {
+                TelematicsEngine.Severity.CRITICAL -> 25.0
+                TelematicsEngine.Severity.HIGH -> 20.0
+                TelematicsEngine.Severity.MEDIUM -> 15.0
+                TelematicsEngine.Severity.LOW -> 10.0
+            }
+            
+            val timeDecay = getTimeDecayFactor(event.timestamp)
+            basePenalty * timeDecay
+        }
+        
+        return maxOf(0.0, 100.0 - weightedScore)
+    }
+    
+    /**
+     * Calculate weighted overall safety score
+     */
+    private fun calculateWeightedScore(
+        brakingScore: Double,
+        accelerationScore: Double,
+        speedingScore: Double,
+        turnScore: Double,
+        seatbeltScore: Double
+    ): Double {
+        return (brakingScore * HARSH_BRAKING_WEIGHT) +
+               (accelerationScore * RAPID_ACCELERATION_WEIGHT) +
+               (speedingScore * OVER_SPEEDING_WEIGHT) +
+               (turnScore * SHARP_TURN_WEIGHT) +
+               (seatbeltScore * SEATBELT_VIOLATION_WEIGHT)
+    }
+    
+    /**
+     * Apply score smoothing based on previous score
+     */
+    private fun applyScoreSmoothing(currentScore: Double, previousScore: Double?): Double {
+        if (previousScore == null) return currentScore
+        
+        // Apply exponential moving average for smoothing
+        val alpha = 0.3 // Smoothing factor
+        return (alpha * currentScore) + ((1 - alpha) * previousScore)
+    }
+    
+    /**
+     * Get time decay factor for events
+     */
+    private fun getTimeDecayFactor(eventTime: LocalDateTime): Double {
+        val now = LocalDateTime.now()
+        val daysDifference = java.time.Duration.between(eventTime, now).toDays()
+        
+        return when {
+            daysDifference <= 7 -> RECENT_DECAY_FACTOR
+            daysDifference <= 30 -> MEDIUM_DECAY_FACTOR
+            daysDifference <= 90 -> OLD_DECAY_FACTOR
+            else -> 0.5 // Very old events have minimal impact
+        }
+    }
+    
+    /**
+     * Filter events by time window
+     */
+    private fun filterEventsByTimeWindow(
+        events: List<TelematicsEvent>,
+        timeWindow: TimeWindow
+    ): List<TelematicsEvent> {
+        val now = LocalDateTime.now()
+        val cutoffDate = when (timeWindow) {
+            TimeWindow.LAST_7_DAYS -> now.minusDays(7)
+            TimeWindow.LAST_30_DAYS -> now.minusDays(30)
+            TimeWindow.LAST_90_DAYS -> now.minusDays(90)
+            TimeWindow.LAST_YEAR -> now.minusDays(365)
+        }
+        
+        return events.filter { it.timestamp.isAfter(cutoffDate) }
+    }
+    
+    /**
+     * Generate safety insights based on event patterns
+     */
+    private fun generateSafetyInsights(
+        harshBrakingEvents: List<TelematicsEvent>,
+        rapidAccelerationEvents: List<TelematicsEvent>,
+        overSpeedingEvents: List<TelematicsEvent>,
+        sharpTurnEvents: List<TelematicsEvent>,
+        seatbeltViolations: List<TelematicsEvent>
+    ): List<SafetyInsight> {
+        val insights = mutableListOf<SafetyInsight>()
+        
+        // Harsh braking insights
+        if (harshBrakingEvents.isNotEmpty()) {
+            val criticalCount = harshBrakingEvents.count { it.severity == TelematicsEngine.Severity.CRITICAL }
+            if (criticalCount > 0) {
+                insights.add(
+                    SafetyInsight(
+                        type = SafetyInsight.Type.HARSH_BRAKING,
+                        severity = SafetyInsight.Severity.HIGH,
+                        title = "Critical Harsh Braking Detected",
+                        description = "You had $criticalCount critical harsh braking events. This indicates unsafe following distance.",
+                        recommendation = "Maintain 3-second following distance and anticipate traffic flow.",
+                        potentialScoreImprovement = 15.0
+                    )
+                )
+            }
+        }
+        
+        // Over-speeding insights
+        if (overSpeedingEvents.isNotEmpty()) {
+            val highSeverityCount = overSpeedingEvents.count { 
+                it.severity == TelematicsEngine.Severity.HIGH || it.severity == TelematicsEngine.Severity.CRITICAL 
+            }
+            if (highSeverityCount > 2) {
+                insights.add(
+                    SafetyInsight(
+                        type = SafetyInsight.Type.OVER_SPEEDING,
+                        severity = SafetyInsight.Severity.HIGH,
+                        title = "Frequent Over-Speeding",
+                        description = "You had $highSeverityCount high-severity over-speeding events.",
+                        recommendation = "Adhere to speed limits and use cruise control on highways.",
+                        potentialScoreImprovement = 20.0
+                    )
+                )
+            }
+        }
+        
+        // Seatbelt violation insights
+        if (seatbeltViolations.isNotEmpty()) {
+            insights.add(
+                SafetyInsight(
+                    type = SafetyInsight.Type.SEATBELT_VIOLATION,
+                    severity = SafetyInsight.Severity.CRITICAL,
+                    title = "Seatbelt Violations Detected",
+                    description = "Seatbelt violations were detected. This is a critical safety issue.",
+                    recommendation = "Always wear seatbelt before starting the vehicle.",
+                    potentialScoreImprovement = 25.0
+                )
+            )
+        }
+        
+        // Positive reinforcement
+        if (harshBrakingEvents.isEmpty() && rapidAccelerationEvents.isEmpty() && 
+            overSpeedingEvents.isEmpty() && sharpTurnEvents.isEmpty()) {
+            insights.add(
+                SafetyInsight(
+                    type = SafetyInsight.Type.EXCELLENT_DRIVING,
+                    severity = SafetyInsight.Severity.POSITIVE,
+                    title = "Excellent Safe Driving",
+                    description = "No safety events detected in this period. Keep up the great work!",
+                    recommendation = "Continue maintaining safe driving habits.",
+                    potentialScoreImprovement = 0.0
+                )
+            )
+        }
+        
+        return insights
+    }
+    
+    /**
+     * Determine safety level based on score
+     */
+    private fun determineSafetyLevel(score: Double): SafetyLevel {
+        return when {
+            score >= EXCELLENT_THRESHOLD -> SafetyLevel.EXCELLENT
+            score >= GOOD_THRESHOLD -> SafetyLevel.GOOD
+            score >= AVERAGE_THRESHOLD -> SafetyLevel.AVERAGE
+            score >= BELOW_AVERAGE_THRESHOLD -> SafetyLevel.BELOW_AVERAGE
+            else -> SafetyLevel.POOR
+        }
+    }
+    
+    /**
+     * Get safety trend analysis
+     */
+    suspend fun getSafetyTrend(
+        driverId: String,
+        historicalScores: List<SafetyScoreResult>
+    ): SafetyTrend {
+        return withContext(Dispatchers.IO) {
+            if (historicalScores.size < 2) {
+                return@withContext SafetyTrend(
+                    trend = SafetyTrend.TrendType.INSUFFICIENT_DATA,
+                    changePercentage = 0.0,
+                    averageScore = 0.0,
+                    bestScore = 0.0,
+                    worstScore = 0.0
+                )
+            }
+            
+            val recentScore = historicalScores.first().overallScore
+            val previousScore = historicalScores[1].overallScore
+            val changePercentage = ((recentScore - previousScore) / previousScore) * 100
+            
+            val trend = when {
+                changePercentage > 5.0 -> SafetyTrend.TrendType.IMPROVING
+                changePercentage < -5.0 -> SafetyTrend.TrendType.DECLINING
+                else -> SafetyTrend.TrendType.STABLE
+            }
+            
+            val allScores = historicalScores.map { it.overallScore }
+            val averageScore = allScores.average()
+            val bestScore = allScores.maxOrNull() ?: 0.0
+            val worstScore = allScores.minOrNull() ?: 0.0
+            
+            SafetyTrend(
+                trend = trend,
+                changePercentage = changePercentage,
+                averageScore = averageScore,
+                bestScore = bestScore,
+                worstScore = worstScore
+            )
+        }
+    }
+}
+
+/**
+ * Time window enum for scoring calculations
+ */
+enum class TimeWindow {
+    LAST_7_DAYS,
+    LAST_30_DAYS,
+    LAST_90_DAYS,
+    LAST_YEAR
+}
+
+/**
+ * Safety level enum
+ */
+enum class SafetyLevel {
+    EXCELLENT,
+    GOOD,
+    AVERAGE,
+    BELOW_AVERAGE,
+    POOR
+}
+
+/**
+ * Safety score result data class
+ */
+data class SafetyScoreResult(
+    val driverId: String,
+    val overallScore: Double,
+    val brakingScore: Double,
+    val accelerationScore: Double,
+    val speedingScore: Double,
+    val turnScore: Double,
+    val seatbeltScore: Double,
+    val safetyLevel: SafetyLevel,
+    val totalEvents: Int,
+    val criticalEvents: Int,
+    val highEvents: Int,
+    val mediumEvents: Int,
+    val lowEvents: Int,
+    val insights: List<SafetyInsight>,
+    val calculatedAt: LocalDateTime,
+    val timeWindow: TimeWindow,
+    val errorMessage: String? = null
+) {
+    companion object {
+        fun createError(driverId: String, timeWindow: TimeWindow): SafetyScoreResult {
+            return SafetyScoreResult(
+                driverId = driverId,
+                overallScore = 0.0,
+                brakingScore = 0.0,
+                accelerationScore = 0.0,
+                speedingScore = 0.0,
+                turnScore = 0.0,
+                seatbeltScore = 0.0,
+                safetyLevel = SafetyLevel.POOR,
+                totalEvents = 0,
+                criticalEvents = 0,
+                highEvents = 0,
+                mediumEvents = 0,
+                lowEvents = 0,
+                insights = emptyList(),
+                calculatedAt = LocalDateTime.now(),
+                timeWindow = timeWindow,
+                errorMessage = "Error calculating safety score"
+            )
+        }
+    }
+}
+
+/**
+ * Safety insight data class
+ */
+data class SafetyInsight(
+    val type: Type,
+    val severity: Severity,
+    val title: String,
+    val description: String,
+    val recommendation: String,
+    val potentialScoreImprovement: Double
+) {
+    enum class Type {
+        HARSH_BRAKING,
+        RAPID_ACCELERATION,
+        OVER_SPEEDING,
+        SHARP_TURN,
+        SEATBELT_VIOLATION,
+        EXCELLENT_DRIVING
+    }
+    
+    enum class Severity {
+        POSITIVE,
+        LOW,
+        MEDIUM,
+        HIGH,
+        CRITICAL
+    }
+}
+
+/**
+ * Safety trend data class
+ */
+data class SafetyTrend(
+    val trend: TrendType,
+    val changePercentage: Double,
+    val averageScore: Double,
+    val bestScore: Double,
+    val worstScore: Double
+) {
+    enum class TrendType {
+        IMPROVING,
+        DECLINING,
+        STABLE,
+        INSUFFICIENT_DATA
+    }
+}

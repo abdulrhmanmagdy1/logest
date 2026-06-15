@@ -1,0 +1,752 @@
+package com.edham.logistics.feature.tracking.data.repository
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.core.utils.TokenManager
+import com.edham.logistics.feature.tracking.data.api.TrackingApiService
+import com.edham.logistics.feature.tracking.data.database.TrackingDatabase
+import com.edham.logistics.feature.tracking.data.service.TrackingWebSocketService
+import com.edham.logistics.feature.tracking.domain.model.*
+import com.edham.logistics.feature.tracking.domain.repository.TrackingRepository
+import com.google.android.gms.maps.model.LatLng
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class TrackingRepositoryImpl @Inject constructor(
+    private val trackingApiService: TrackingApiService,
+    private val trackingDatabase: TrackingDatabase,
+    private val trackingWebSocketService: TrackingWebSocketService,
+    private val tokenManager: TokenManager
+) : TrackingRepository {
+
+    override suspend fun startTracking(request: StartTrackingRequest): Result<ShipmentTracking> {
+        return try {
+            val response = trackingApiService.startTracking(request)
+            if (response.isSuccessful) {
+                response.body()?.let { tracking ->
+                    // Save to local database
+                    trackingDatabase.trackingDao().insertTracking(tracking.toEntity())
+                    Result.Success(tracking)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to start tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun stopTracking(shipmentId: String): Result<Unit> {
+        return try {
+            val response = trackingApiService.stopTracking(shipmentId)
+            if (response.isSuccessful) {
+                // Update local database
+                trackingDatabase.trackingDao().updateTrackingStatus(
+                    shipmentId,
+                    TrackingStatus.DELIVERED.name
+                )
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to stop tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun pauseTracking(shipmentId: String): Result<Unit> {
+        return try {
+            val response = trackingApiService.pauseTracking(shipmentId)
+            if (response.isSuccessful) {
+                trackingDatabase.trackingDao().updateTrackingStatus(
+                    shipmentId,
+                    TrackingStatus.DELAYED.name
+                )
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to pause tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun resumeTracking(shipmentId: String): Result<Unit> {
+        return try {
+            val response = trackingApiService.resumeTracking(shipmentId)
+            if (response.isSuccessful) {
+                trackingDatabase.trackingDao().updateTrackingStatus(
+                    shipmentId,
+                    TrackingStatus.EN_ROUTE_TO_DESTINATION.name
+                )
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to resume tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateLocation(request: UpdateLocationRequest): Result<LocationUpdate> {
+        return try {
+            val response = trackingApiService.updateLocation(request)
+            if (response.isSuccessful) {
+                response.body()?.let { locationUpdate ->
+                    // Save to local database
+                    trackingDatabase.trackingDao().insertLocationUpdate(locationUpdate.toEntity())
+                    Result.Success(locationUpdate)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update location: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun batchUpdateLocations(requests: List<UpdateLocationRequest>): Result<List<LocationUpdate>> {
+        return try {
+            val response = trackingApiService.batchUpdateLocations(requests)
+            if (response.isSuccessful) {
+                response.body()?.let { updates ->
+                    // Save to local database
+                    updates.forEach { update ->
+                        trackingDatabase.trackingDao().insertLocationUpdate(update.toEntity())
+                    }
+                    Result.Success(updates)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to batch update locations: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getShipmentTracking(shipmentId: String): Result<ShipmentTracking> {
+        return try {
+            // Try local database first
+            val localTracking = trackingDatabase.trackingDao().getTrackingByShipmentId(shipmentId)
+            if (localTracking != null) {
+                return Result.Success(localTracking.toDomainModel())
+            }
+
+            // Fetch from API if not in local database
+            val response = trackingApiService.getShipmentTracking(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { tracking ->
+                    // Save to local database
+                    trackingDatabase.trackingDao().insertTracking(tracking.toEntity())
+                    Result.Success(tracking)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get shipment tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeShipmentTracking(shipmentId: String): Flow<Result<ShipmentTracking>> {
+        return flow {
+            try {
+                // Emit local data first
+                val localTracking = trackingDatabase.trackingDao().getTrackingByShipmentId(shipmentId)
+                if (localTracking != null) {
+                    emit(Result.Success(localTracking.toDomainModel()))
+                }
+
+                // Listen for WebSocket updates
+                trackingWebSocketService.messageFlow.collect { message ->
+                    if (message.shipmentId == shipmentId) {
+                        when (message.type) {
+                            TrackingMessageType.LOCATION_UPDATE,
+                            TrackingMessageType.STATUS_CHANGE,
+                            TrackingMessageType.ETA_UPDATE -> {
+                                // Refresh local data
+                                val updatedTracking = trackingDatabase.trackingDao().getTrackingByShipmentId(shipmentId)
+                                updatedTracking?.let {
+                                    emit(Result.Success(it.toDomainModel()))
+                                }
+                            }
+                            else -> {}
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getCustomerTracking(customerId: String): Result<List<ShipmentTracking>> {
+        return try {
+            val response = trackingApiService.getCustomerTracking(customerId)
+            if (response.isSuccessful) {
+                response.body()?.let { trackings ->
+                    Result.Success(trackings)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get customer tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getDriverTracking(driverId: String): Result<List<ShipmentTracking>> {
+        return try {
+            val response = trackingApiService.getDriverTracking(driverId)
+            if (response.isSuccessful) {
+                response.body()?.let { trackings ->
+                    Result.Success(trackings)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get driver tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getFleetTracking(request: GetFleetTrackingRequest): Result<FleetTracking> {
+        return try {
+            val response = trackingApiService.getFleetTracking(request)
+            if (response.isSuccessful) {
+                response.body()?.let { fleetTracking ->
+                    Result.Success(fleetTracking)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get fleet tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeFleetTracking(): Flow<Result<FleetTracking>> {
+        return flow {
+            try {
+                trackingWebSocketService.messageFlow.collect { message ->
+                    when (message.type) {
+                        TrackingMessageType.LOCATION_UPDATE,
+                        TrackingMessageType.STATUS_CHANGE -> {
+                            // Refresh fleet data
+                            val response = trackingApiService.getFleetTracking(
+                                GetFleetTrackingRequest(
+                                    vehicleIds = null,
+                                    driverIds = null,
+                                    activeOnly = true
+                                )
+                            )
+                            if (response.isSuccessful) {
+                                response.body()?.let { fleetTracking ->
+                                    emit(Result.Success(fleetTracking))
+                                }
+                            }
+                        }
+                        else -> {}
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getVehicleTracking(vehicleId: String): Result<VehicleTracking> {
+        return try {
+            val response = trackingApiService.getVehicleTracking(vehicleId)
+            if (response.isSuccessful) {
+                response.body()?.let { vehicleTracking ->
+                    Result.Success(vehicleTracking)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get vehicle tracking: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeVehicleTracking(vehicleId: String): Flow<Result<VehicleTracking>> {
+        return flow {
+            try {
+                trackingWebSocketService.messageFlow.collect { message ->
+                    if (message.vehicleId == vehicleId) {
+                        when (message.type) {
+                            TrackingMessageType.LOCATION_UPDATE,
+                            TrackingMessageType.STATUS_CHANGE -> {
+                                val response = trackingApiService.getVehicleTracking(vehicleId)
+                                if (response.isSuccessful) {
+                                    response.body()?.let { vehicleTracking ->
+                                        emit(Result.Success(vehicleTracking))
+                                    }
+                                }
+                            }
+                            else -> {}
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getRouteHistory(shipmentId: String): Result<RouteHistory> {
+        return try {
+            val response = trackingApiService.getRouteHistory(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { routeHistory ->
+                    Result.Success(routeHistory)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get route history: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeRouteHistory(shipmentId: String): Flow<Result<RouteHistory>> {
+        return flow {
+            try {
+                trackingWebSocketService.messageFlow.collect { message ->
+                    if (message.shipmentId == shipmentId) {
+                        when (message.type) {
+                            TrackingMessageType.LOCATION_UPDATE -> {
+                                // Refresh route history
+                                val response = trackingApiService.getRouteHistory(shipmentId)
+                                if (response.isSuccessful) {
+                                    response.body()?.let { routeHistory ->
+                                        emit(Result.Success(routeHistory))
+                                    }
+                                }
+                            }
+                            else -> {}
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getDriverRouteHistory(driverId: String, limit: Int): Result<List<RouteHistory>> {
+        return try {
+            val response = trackingApiService.getDriverRouteHistory(driverId, limit)
+            if (response.isSuccessful) {
+                response.body()?.let { routeHistories ->
+                    Result.Success(routeHistories)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get driver route history: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getCustomerRouteHistory(customerId: String, limit: Int): Result<List<RouteHistory>> {
+        return try {
+            val response = trackingApiService.getCustomerRouteHistory(customerId, limit)
+            if (response.isSuccessful) {
+                response.body()?.let { routeHistories ->
+                    Result.Success(routeHistories)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get customer route history: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun calculateETA(
+        currentLocation: LatLng,
+        destinationLocation: LatLng,
+        currentSpeed: Float,
+        trafficData: Map<String, Any>?
+    ): Result<Long> {
+        return try {
+            val response = trackingApiService.calculateETA(
+                currentLocation,
+                destinationLocation,
+                currentSpeed,
+                trafficData
+            )
+            if (response.isSuccessful) {
+                response.body()?.let { eta ->
+                    Result.Success(eta)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to calculate ETA: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getOptimizedRoute(request: RouteOptimizationRequest): Result<List<LatLng>> {
+        return try {
+            val response = trackingApiService.getOptimizedRoute(request)
+            if (response.isSuccessful) {
+                response.body()?.let { route ->
+                    Result.Success(route)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get optimized route: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getRouteDistance(route: List<LatLng>): Result<Double> {
+        return try {
+            val response = trackingApiService.getRouteDistance(route)
+            if (response.isSuccessful) {
+                response.body()?.let { distance ->
+                    Result.Success(distance)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get route distance: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getRouteDuration(route: List<LatLng>): Result<Long> {
+        return try {
+            val response = trackingApiService.getRouteDuration(route)
+            if (response.isSuccessful) {
+                response.body()?.let { duration ->
+                    Result.Success(duration)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get route duration: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getTrackingSettings(driverId: String): Result<TrackingSettings> {
+        return try {
+            val response = trackingApiService.getTrackingSettings(driverId)
+            if (response.isSuccessful) {
+                response.body()?.let { settings ->
+                    Result.Success(settings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get tracking settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateTrackingSettings(driverId: String, settings: TrackingSettings): Result<TrackingSettings> {
+        return try {
+            val response = trackingApiService.updateTrackingSettings(driverId, settings)
+            if (response.isSuccessful) {
+                response.body()?.let { updatedSettings ->
+                    Result.Success(updatedSettings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update tracking settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getDefaultTrackingSettings(): Result<TrackingSettings> {
+        return try {
+            val response = trackingApiService.getDefaultTrackingSettings()
+            if (response.isSuccessful) {
+                response.body()?.let { settings ->
+                    Result.Success(settings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get default tracking settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getTrackingStatistics(shipmentId: String): Result<TrackingStatistics> {
+        return try {
+            val response = trackingApiService.getTrackingStatistics(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { statistics ->
+                    Result.Success(statistics)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get tracking statistics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getDriverTrackingStatistics(driverId: String, period: String): Result<TrackingStatistics> {
+        return try {
+            val response = trackingApiService.getDriverTrackingStatistics(driverId, period)
+            if (response.isSuccessful) {
+                response.body()?.let { statistics ->
+                    Result.Success(statistics)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get driver tracking statistics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getFleetTrackingStatistics(period: String): Result<TrackingStatistics> {
+        return try {
+            val response = trackingApiService.getFleetTrackingStatistics(period)
+            if (response.isSuccessful) {
+                response.body()?.let { statistics ->
+                    Result.Success(statistics)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get fleet tracking statistics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun connectToTrackingWebSocket(): Result<Unit> {
+        return try {
+            val token = tokenManager.getAccessToken()
+            if (token != null) {
+                trackingWebSocketService.connect(token)
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("No access token available"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun disconnectFromTrackingWebSocket(): Result<Unit> {
+        return try {
+            trackingWebSocketService.disconnect()
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeTrackingMessages(): Flow<Result<TrackingWebSocketMessage>> {
+        return trackingWebSocketService.messageFlow.map { message ->
+            Result.Success(message)
+        }
+    }
+
+    override suspend fun sendTrackingMessage(message: TrackingWebSocketMessage): Result<Unit> {
+        return try {
+            trackingWebSocketService.sendMessage(message)
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getCurrentLocation(): Result<LatLng> {
+        return try {
+            val response = trackingApiService.getCurrentLocation()
+            if (response.isSuccessful) {
+                response.body()?.let { location ->
+                    Result.Success(location)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get current location: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getAddressFromLocation(location: LatLng): Result<String> {
+        return try {
+            val response = trackingApiService.getAddressFromLocation(location)
+            if (response.isSuccessful) {
+                response.body()?.let { address ->
+                    Result.Success(address)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get address from location: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getLocationFromAddress(address: String): Result<LatLng> {
+        return try {
+            val response = trackingApiService.getLocationFromAddress(address)
+            if (response.isSuccessful) {
+                response.body()?.let { location ->
+                    Result.Success(location)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get location from address: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun enableBatteryOptimization(): Result<Unit> {
+        return try {
+            val response = trackingApiService.enableBatteryOptimization()
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to enable battery optimization: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun disableBatteryOptimization(): Result<Unit> {
+        return try {
+            val response = trackingApiService.disableBatteryOptimization()
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to disable battery optimization: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun isBatteryOptimizationEnabled(): Result<Boolean> {
+        return try {
+            val response = trackingApiService.isBatteryOptimizationEnabled()
+            if (response.isSuccessful) {
+                response.body()?.let { enabled ->
+                    Result.Success(enabled)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to check battery optimization status: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun detectRouteDeviation(
+        shipmentId: String,
+        currentLocation: LatLng,
+        plannedRoute: List<LatLng>
+    ): Result<Boolean> {
+        return try {
+            val response = trackingApiService.detectRouteDeviation(shipmentId, currentLocation, plannedRoute)
+            if (response.isSuccessful) {
+                response.body()?.let { isDeviated ->
+                    Result.Success(isDeviated)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to detect route deviation: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getRouteDeviationThreshold(): Result<Double> {
+        return try {
+            val response = trackingApiService.getRouteDeviationThreshold()
+            if (response.isSuccessful) {
+                response.body()?.let { threshold ->
+                    Result.Success(threshold)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get route deviation threshold: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateRouteDeviationThreshold(threshold: Double): Result<Double> {
+        return try {
+            val response = trackingApiService.updateRouteDeviationThreshold(threshold)
+            if (response.isSuccessful) {
+                response.body()?.let { updatedThreshold ->
+                    Result.Success(updatedThreshold)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update route deviation threshold: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun createGeofence(
+        id: String,
+        location: LatLng,
+        radius: Float,
+        type: GeofenceType
+    ): Result<Unit> {
+        return try {
+            val response = trackingApiService.createGeofence(id, location, radius, type)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to create geofence: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun removeGeofence(id: String): Result<Unit> {
+        return try {
+            val response = trackingApiService.removeGeofence(id)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to remove geofence: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeGeofenceEvents(): Flow<Result<GeofenceEvent>> {
+        return flow {
+            try {
+                trackingWebSocketService.messageFlow.collect { message ->
+                    when (message.type) {
+                        TrackingMessageType.LOCATION_UPDATE -> {
+                            // Handle geofence events from message
+                            // This would need to be implemented based on the message structure
+                        }
+                        else -> {}
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+}

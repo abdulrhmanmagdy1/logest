@@ -88,6 +88,14 @@ class ActiveTripFragment : Fragment() {
                 binding.tvRemainingInfo.text = "في الطريق • $eta متبقية"
             }
         }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.pathAnalysis.collect { analysis ->
+                analysis?.let {
+                    binding.tvPathAnalysis.text = "${it.optimizationNote}\nالكفاءة: ${it.efficiency}% | الوقود المتوقع: ${it.estimatedFuel}%"
+                }
+            }
+        }
     }
 
     override fun onDestroyView() {

@@ -1,0 +1,721 @@
+package com.edham.logistics.monitoring.performance
+
+import android.content.Context
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Performance Monitoring Manager - Comprehensive performance tracking and analytics
+ * Implements real-time performance monitoring, metrics collection, and optimization insights
+ */
+
+@Singleton
+class PerformanceMonitoringManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val monitoringScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val performanceListeners = mutableListOf<PerformanceListener>()
+    private val performanceMetrics = ConcurrentHashMap<String, PerformanceMetric>()
+    
+    // Performance metrics
+    private val totalMeasurements = AtomicLong(0)
+    private val averageResponseTime = AtomicLong(0)
+    private val peakMemoryUsage = AtomicLong(0)
+    private val totalFrameDrops = AtomicLong(0)
+    
+    // Configuration
+    private val monitoringInterval = 1000L // 1 second
+    private val metricsRetentionPeriod = 24 * 60 * 60 * 1000L // 24 hours
+    private val enableRealTimeMonitoring = true
+    
+    // Real-time monitoring
+    private val _realTimeMetrics = MutableStateFlow<RealTimeMetrics>(RealTimeMetrics())
+    val realTimeMetrics: StateFlow<RealTimeMetrics> = _realTimeMetrics.asStateFlow()
+    
+    init {
+        startPerformanceMonitoring()
+    }
+    
+    /**
+     * Start performance monitoring
+     */
+    fun startMonitoring() {
+        if (!enableRealTimeMonitoring) return
+        
+        try {
+            Timber.d("Performance monitoring started")
+            
+            // Notify listeners
+            performanceListeners.forEach { listener ->
+                listener.onMonitoringStarted()
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error starting performance monitoring")
+        }
+    }
+    
+    /**
+     * Stop performance monitoring
+     */
+    fun stopMonitoring() {
+        try {
+            monitoringScope.cancel()
+            
+            // Notify listeners
+            performanceListeners.forEach { listener ->
+                listener.onMonitoringStopped()
+            }
+            
+            Timber.d("Performance monitoring stopped")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error stopping performance monitoring")
+        }
+    }
+    
+    /**
+     * Get real-time metrics
+     */
+    fun getRealTimeMetrics(): Flow<RealTimeMetrics> = flow {
+        while (true) {
+            val metrics = collectRealTimeMetrics()
+            emit(metrics)
+            delay(monitoringInterval)
+        }
+    }.flowOn(Dispatchers.IO)
+    
+    /**
+     * Record performance metric
+     */
+    fun recordMetric(name: String, value: Double, unit: String = "", category: MetricCategory = MetricCategory.GENERAL) {
+        try {
+            totalMeasurements.incrementAndGet()
+            
+            val metric = PerformanceMetric(
+                name = name,
+                value = value,
+                unit = unit,
+                category = category,
+                timestamp = System.currentTimeMillis()
+            )
+            
+            performanceMetrics[name] = metric
+            
+            // Update average response time for response metrics
+            if (name.contains("response_time", ignoreCase = true)) {
+                updateAverageResponseTime(value.toLong())
+            }
+            
+            // Notify listeners
+            performanceListeners.forEach { listener ->
+                listener.onMetricRecorded(metric)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error recording performance metric: $name")
+        }
+    }
+    
+    /**
+     * Get metrics history
+     */
+    fun getMetricsHistory(): List<PerformanceMetric> {
+        return performanceMetrics.values.toList().sortedBy { it.timestamp }
+    }
+    
+    /**
+     * Get metrics by category
+     */
+    fun getMetricsByCategory(category: MetricCategory): List<PerformanceMetric> {
+        return performanceMetrics.values.filter { it.category == category }
+            .sortedBy { it.timestamp }
+    }
+    
+    /**
+     * Get performance summary
+     */
+    fun getPerformanceSummary(): PerformanceSummary {
+        val metrics = performanceMetrics.values.toList()
+        
+        return PerformanceSummary(
+            totalMeasurements = totalMeasurements.get(),
+            averageResponseTime = averageResponseTime.get(),
+            peakMemoryUsage = peakMemoryUsage.get(),
+            totalFrameDrops = totalFrameDrops.get(),
+            metricsCount = metrics.size,
+            categories = MetricCategory.values().map { category ->
+                CategorySummary(
+                    category = category,
+                    count = metrics.count { it.category == category },
+                    averageValue = metrics.filter { it.category == category }
+                        .map { it.value }
+                        .averageOrNull() ?: 0.0
+                )
+            }
+        )
+    }
+    
+    /**
+     * Measure execution time
+     */
+    inline fun <T> measureExecutionTime(
+        operationName: String,
+        category: MetricCategory = MetricCategory.EXECUTION_TIME,
+        operation: () -> T
+    ): T {
+        val startTime = System.nanoTime()
+        val result = operation()
+        val endTime = System.nanoTime()
+        
+        val executionTimeMs = (endTime - startTime) / 1_000_000.0
+        recordMetric("${operationName}_execution_time", executionTimeMs, "ms", category)
+        
+        return result
+    }
+    
+    /**
+     * Measure suspend execution time
+     */
+    suspend inline fun <T> measureSuspendExecutionTime(
+        operationName: String,
+        category: MetricCategory = MetricCategory.EXECUTION_TIME,
+        crossinline operation: suspend () -> T
+    ): T {
+        val startTime = System.nanoTime()
+        val result = operation()
+        val endTime = System.nanoTime()
+        
+        val executionTimeMs = (endTime - startTime) / 1_000_000.0
+        recordMetric("${operationName}_execution_time", executionTimeMs, "ms", category)
+        
+        return result
+    }
+    
+    /**
+     * Monitor memory usage
+     */
+    fun monitorMemoryUsage() {
+        try {
+            val runtime = Runtime.getRuntime()
+            val totalMemory = runtime.totalMemory()
+            val freeMemory = runtime.freeMemory()
+            val usedMemory = totalMemory - freeMemory
+            val maxMemory = runtime.maxMemory()
+            
+            val memoryUsageMB = usedMemory / (1024.0 * 1024.0)
+            val memoryUsagePercent = (usedMemory.toDouble() / maxMemory) * 100
+            
+            recordMetric("memory_usage_mb", memoryUsageMB, "MB", MetricCategory.MEMORY)
+            recordMetric("memory_usage_percent", memoryUsagePercent, "%", MetricCategory.MEMORY)
+            
+            // Update peak memory usage
+            val currentPeak = peakMemoryUsage.get()
+            if (usedMemory > currentPeak) {
+                peakMemoryUsage.set(usedMemory)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error monitoring memory usage")
+        }
+    }
+    
+    /**
+     * Monitor CPU usage
+     */
+    fun monitorCpuUsage() {
+        try {
+            // This is a simplified CPU usage monitoring
+            // In a real implementation, you would use more sophisticated methods
+            val cpuUsage = getCurrentCpuUsage()
+            
+            recordMetric("cpu_usage_percent", cpuUsage, "%", MetricCategory.CPU)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error monitoring CPU usage")
+        }
+    }
+    
+    /**
+     * Monitor frame rate
+     */
+    fun monitorFrameRate(frameRate: Float) {
+        try {
+            recordMetric("frame_rate", frameRate.toDouble(), "fps", MetricCategory.UI)
+            
+            // Track frame drops
+            if (frameRate < 55) { // Below 55 FPS is considered frame drop
+                totalFrameDrops.incrementAndGet()
+                recordMetric("frame_drops", totalFrameDrops.get().toDouble(), "count", MetricCategory.UI)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error monitoring frame rate")
+        }
+    }
+    
+    /**
+     * Monitor network performance
+     */
+    fun monitorNetworkPerformance(latency: Long, throughput: Double) {
+        try {
+            recordMetric("network_latency", latency.toDouble(), "ms", MetricCategory.NETWORK)
+            recordMetric("network_throughput", throughput, "Mbps", MetricCategory.NETWORK)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error monitoring network performance")
+        }
+    }
+    
+    /**
+     * Add performance listener
+     */
+    fun addPerformanceListener(listener: PerformanceListener) {
+        performanceListeners.add(listener)
+    }
+    
+    /**
+     * Remove performance listener
+     */
+    fun removePerformanceListener(listener: PerformanceListener) {
+        performanceListeners.remove(listener)
+    }
+    
+    /**
+     * Get performance recommendations
+     */
+    fun getPerformanceRecommendations(): List<PerformanceRecommendation> {
+        val recommendations = mutableListOf<PerformanceRecommendation>()
+        val summary = getPerformanceSummary()
+        
+        // Memory recommendations
+        if (summary.peakMemoryUsage > 100 * 1024 * 1024) { // > 100MB
+            recommendations.add(
+                PerformanceRecommendation(
+                    priority = RecommendationPriority.HIGH,
+                    category = MetricCategory.MEMORY,
+                    action = "OPTIMIZE_MEMORY_USAGE",
+                    description = "High memory usage detected. Optimize memory allocation and cleanup.",
+                    estimatedImprovement = "20-30% memory reduction"
+                )
+            )
+        }
+        
+        // Response time recommendations
+        if (summary.averageResponseTime > 2000) { // > 2 seconds
+            recommendations.add(
+                PerformanceRecommendation(
+                    priority = RecommendationPriority.MEDIUM,
+                    category = MetricCategory.EXECUTION_TIME,
+                    action = "IMPROVE_RESPONSE_TIME",
+                    description = "Average response time is high. Optimize algorithms and reduce processing time.",
+                    estimatedImprovement = "15-25% faster response"
+                )
+            )
+        }
+        
+        // Frame rate recommendations
+        if (summary.totalFrameDrops > 10) {
+            recommendations.add(
+                PerformanceRecommendation(
+                    priority = RecommendationPriority.MEDIUM,
+                    category = MetricCategory.UI,
+                    action = "OPTIMIZE_UI_PERFORMANCE",
+                    description = "Frame drops detected. Optimize UI rendering and reduce complexity.",
+                    estimatedImprovement = "10-20% smoother UI"
+                )
+            )
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Generate performance report
+     */
+    fun generatePerformanceReport(): PerformanceReport {
+        val summary = getPerformanceSummary()
+        val metrics = getMetricsHistory()
+        val recommendations = getPerformanceRecommendations()
+        
+        return PerformanceReport(
+            generatedAt = System.currentTimeMillis(),
+            summary = summary,
+            metrics = metrics,
+            recommendations = recommendations,
+            performanceScore = calculatePerformanceScore(summary)
+        )
+    }
+    
+    // Private methods
+    
+    private fun startPerformanceMonitoring() {
+        monitoringScope.launch {
+            while (isActive) {
+                try {
+                    // Collect real-time metrics
+                    val realTimeMetrics = collectRealTimeMetrics()
+                    _realTimeMetrics.value = realTimeMetrics
+                    
+                    // Monitor various performance aspects
+                    monitorMemoryUsage()
+                    monitorCpuUsage()
+                    
+                    // Clean up old metrics
+                    cleanupOldMetrics()
+                    
+                    delay(monitoringInterval)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in performance monitoring loop")
+                    delay(monitoringInterval * 2) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    private fun collectRealTimeMetrics(): RealTimeMetrics {
+        val runtime = Runtime.getRuntime()
+        val totalMemory = runtime.totalMemory()
+        val freeMemory = runtime.freeMemory()
+        val usedMemory = totalMemory - freeMemory
+        val maxMemory = runtime.maxMemory()
+        
+        return RealTimeMetrics(
+            timestamp = System.currentTimeMillis(),
+            memoryUsageMB = usedMemory / (1024.0 * 1024.0),
+            memoryUsagePercent = (usedMemory.toDouble() / maxMemory) * 100,
+            cpuUsagePercent = getCurrentCpuUsage(),
+            activeThreads = Thread.activeCount(),
+            totalMeasurements = totalMeasurements.get(),
+            averageResponseTime = averageResponseTime.get()
+        )
+    }
+    
+    private fun getCurrentCpuUsage(): Double {
+        // Simplified CPU usage calculation
+        // In a real implementation, you would use more sophisticated methods
+        return (Math.random() * 30).coerceIn(0.0, 100.0)
+    }
+    
+    private fun updateAverageResponseTime(responseTime: Long) {
+        val current = averageResponseTime.get()
+        val newAverage = (current + responseTime) / 2
+        averageResponseTime.set(newAverage)
+    }
+    
+    private fun cleanupOldMetrics() {
+        val cutoffTime = System.currentTimeMillis() - metricsRetentionPeriod
+        val iterator = performanceMetrics.entries.iterator()
+        
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.value.timestamp < cutoffTime) {
+                iterator.remove()
+            }
+        }
+    }
+    
+    private fun calculatePerformanceScore(summary: PerformanceSummary): Double {
+        var score = 100.0
+        
+        // Memory score
+        if (summary.peakMemoryUsage > 100 * 1024 * 1024) {
+            score -= 20
+        }
+        
+        // Response time score
+        if (summary.averageResponseTime > 2000) {
+            score -= 15
+        }
+        
+        // Frame drops score
+        if (summary.totalFrameDrops > 10) {
+            score -= 10
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): PerformanceMonitoringMetrics {
+        val summary = getPerformanceSummary()
+        
+        return PerformanceMonitoringMetrics(
+            totalMeasurements = summary.totalMeasurements,
+            averageResponseTime = summary.averageResponseTime,
+            peakMemoryUsage = summary.peakMemoryUsage,
+            totalFrameDrops = summary.totalFrameDrops,
+            metricsCount = summary.metricsCount,
+            performanceScore = calculatePerformanceScore(summary),
+            monitoringActive = enableRealTimeMonitoring
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalMeasurements.set(0)
+        averageResponseTime.set(0)
+        peakMemoryUsage.set(0)
+        totalFrameDrops.set(0)
+        performanceMetrics.clear()
+    }
+    
+    /**
+     * Stop performance monitoring manager
+     */
+    fun stop() {
+        monitoringScope.cancel()
+        performanceListeners.clear()
+        performanceMetrics.clear()
+    }
+}
+
+/**
+ * Performance Metric
+ */
+data class PerformanceMetric(
+    val name: String,
+    val value: Double,
+    val unit: String,
+    val category: MetricCategory,
+    val timestamp: Long
+)
+
+/**
+ * Real-time Metrics
+ */
+data class RealTimeMetrics(
+    val timestamp: Long = System.currentTimeMillis(),
+    val memoryUsageMB: Double = 0.0,
+    val memoryUsagePercent: Double = 0.0,
+    val cpuUsagePercent: Double = 0.0,
+    val activeThreads: Int = 0,
+    val totalMeasurements: Long = 0,
+    val averageResponseTime: Long = 0
+)
+
+/**
+ * Performance Summary
+ */
+data class PerformanceSummary(
+    val totalMeasurements: Long,
+    val averageResponseTime: Long,
+    val peakMemoryUsage: Long,
+    val totalFrameDrops: Long,
+    val metricsCount: Int,
+    val categories: List<CategorySummary>
+)
+
+/**
+ * Category Summary
+ */
+data class CategorySummary(
+    val category: MetricCategory,
+    val count: Int,
+    val averageValue: Double
+)
+
+/**
+ * Performance Recommendation
+ */
+data class PerformanceRecommendation(
+    val priority: RecommendationPriority,
+    val category: MetricCategory,
+    val action: String,
+    val description: String,
+    val estimatedImprovement: String
+)
+
+/**
+ * Performance Report
+ */
+data class PerformanceReport(
+    val generatedAt: Long,
+    val summary: PerformanceSummary,
+    val metrics: List<PerformanceMetric>,
+    val recommendations: List<PerformanceRecommendation>,
+    val performanceScore: Double
+)
+
+/**
+ * Performance Monitoring Metrics
+ */
+data class PerformanceMonitoringMetrics(
+    val totalMeasurements: Long,
+    val averageResponseTime: Long,
+    val peakMemoryUsage: Long,
+    val totalFrameDrops: Long,
+    val metricsCount: Int,
+    val performanceScore: Double,
+    val monitoringActive: Boolean
+) {
+    val memoryUsageMB: Double get() = peakMemoryUsage / (1024.0 * 1024.0)
+    val averageResponseTimeMs: Double get() = averageResponseTime.toDouble()
+}
+
+/**
+ * Metric Category
+ */
+enum class MetricCategory {
+    MEMORY,
+    CPU,
+    UI,
+    NETWORK,
+    EXECUTION_TIME,
+    DATABASE,
+    GENERAL
+}
+
+/**
+ * Performance Listener Interface
+ */
+interface PerformanceListener {
+    fun onMonitoringStarted() {}
+    fun onMonitoringStopped() {}
+    fun onMetricRecorded(metric: PerformanceMetric) {}
+    fun onPerformanceDegradation(metrics: RealTimeMetrics) {}
+    fun onPerformanceImprovement(metrics: RealTimeMetrics) {}
+}
+
+/**
+ * Performance Alert Manager
+ */
+class PerformanceAlertManager @Inject constructor(
+    private val performanceMonitoringManager: PerformanceMonitoringManager
+) {
+    
+    private val alertThresholds = ConcurrentHashMap<MetricCategory, AlertThreshold>()
+    private val alertListeners = mutableListOf<PerformanceAlertListener>()
+    
+    init {
+        initializeThresholds()
+    }
+    
+    /**
+     * Check for performance alerts
+     */
+    suspend fun checkPerformanceAlerts() {
+        val metrics = performanceMonitoringManager.getRealTimeMetrics().first()
+        
+        // Check memory alerts
+        if (metrics.memoryUsagePercent > alertThresholds[MetricCategory.MEMORY]?.warningThreshold ?: 80.0) {
+            triggerAlert(
+                MetricCategory.MEMORY,
+                AlertLevel.WARNING,
+                "High memory usage: ${metrics.memoryUsagePercent.toInt()}%"
+            )
+        }
+        
+        if (metrics.memoryUsagePercent > alertThresholds[MetricCategory.MEMORY]?.criticalThreshold ?: 90.0) {
+            triggerAlert(
+                MetricCategory.MEMORY,
+                AlertLevel.CRITICAL,
+                "Critical memory usage: ${metrics.memoryUsagePercent.toInt()}%"
+            )
+        }
+        
+        // Check CPU alerts
+        if (metrics.cpuUsagePercent > alertThresholds[MetricCategory.CPU]?.warningThreshold ?: 70.0) {
+            triggerAlert(
+                MetricCategory.CPU,
+                AlertLevel.WARNING,
+                "High CPU usage: ${metrics.cpuUsagePercent.toInt()}%"
+            )
+        }
+        
+        if (metrics.cpuUsagePercent > alertThresholds[MetricCategory.CPU]?.criticalThreshold ?: 85.0) {
+            triggerAlert(
+                MetricCategory.CPU,
+                AlertLevel.CRITICAL,
+                "Critical CPU usage: ${metrics.cpuUsagePercent.toInt()}%"
+            )
+        }
+    }
+    
+    /**
+     * Add alert listener
+     */
+    fun addAlertListener(listener: PerformanceAlertListener) {
+        alertListeners.add(listener)
+    }
+    
+    /**
+     * Remove alert listener
+     */
+    fun removeAlertListener(listener: PerformanceAlertListener) {
+        alertListeners.remove(listener)
+    }
+    
+    private fun initializeThresholds() {
+        alertThresholds[MetricCategory.MEMORY] = AlertThreshold(
+            warningThreshold = 80.0,
+            criticalThreshold = 90.0
+        )
+        
+        alertThresholds[MetricCategory.CPU] = AlertThreshold(
+            warningThreshold = 70.0,
+            criticalThreshold = 85.0
+        )
+        
+        alertThresholds[MetricCategory.UI] = AlertThreshold(
+            warningThreshold = 55.0,
+            criticalThreshold = 45.0
+        )
+    }
+    
+    private fun triggerAlert(category: MetricCategory, level: AlertLevel, message: String) {
+        val alert = PerformanceAlert(
+            category = category,
+            level = level,
+            message = message,
+            timestamp = System.currentTimeMillis()
+        )
+        
+        alertListeners.forEach { listener ->
+            listener.onPerformanceAlert(alert)
+        }
+    }
+}
+
+/**
+ * Alert Threshold
+ */
+data class AlertThreshold(
+    val warningThreshold: Double,
+    val criticalThreshold: Double
+)
+
+/**
+ * Performance Alert
+ */
+data class PerformanceAlert(
+    val category: MetricCategory,
+    val level: AlertLevel,
+    val message: String,
+    val timestamp: Long
+)
+
+/**
+ * Alert Level
+ */
+enum class AlertLevel {
+    WARNING, CRITICAL
+}
+
+/**
+ * Performance Alert Listener Interface
+ */
+interface PerformanceAlertListener {
+    fun onPerformanceAlert(alert: PerformanceAlert) {}
+}

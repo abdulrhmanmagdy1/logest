@@ -1,0 +1,300 @@
+package com.edham.logistics.feature.tracking.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.tracking.domain.usecase.*
+import com.edham.logistics.feature.tracking.domain.model.*
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import com.google.android.gms.maps.model.LatLng
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class FleetTrackingViewModel @Inject constructor(
+    private val getFleetTrackingUseCase: GetFleetTrackingUseCase,
+    private val getShipmentTrackingUseCase: GetShipmentTrackingUseCase,
+    private val calculateETAUseCase: CalculateETAUseCase,
+    private val getRouteHistoryUseCase: GetRouteHistoryUseCase
+) : BaseViewModel<FleetTrackingViewModel.FleetTrackingUiState>() {
+
+    private val _uiState = MutableStateFlow(FleetTrackingUiState())
+    val uiState: StateFlow<FleetTrackingUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): FleetTrackingUiState = FleetTrackingUiState()
+
+    fun initialize() {
+        loadFleetTracking()
+        startRealTimeUpdates()
+    }
+
+    fun loadFleetTracking() {
+        viewModelScope.launch {
+            val request = GetFleetTrackingRequest(
+                vehicleIds = null,
+                driverIds = null,
+                activeOnly = true
+            )
+            
+            when (val result = getFleetTrackingUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        fleetTracking = result.data,
+                        isLoading = false,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(
+                        isLoading = false,
+                        error = result.exception.message ?: "فشل تحميل تتبع الأسطول"
+                    )}
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun startRealTimeUpdates() {
+        viewModelScope.launch {
+            getFleetTrackingUseCase.observeFleetTracking().collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            fleetTracking = result.data,
+                            error = null
+                        )}
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(error = result.exception.message ?: "خطأ في التحديثات المباشرة") }
+                    }
+                    is Result.Loading -> {
+                        // Handle loading state if needed
+                    }
+                }
+            }
+        }
+    }
+
+    fun selectVehicle(vehicleId: String) {
+        viewModelScope.launch {
+            when (val result = getFleetTrackingUseCase(
+                GetFleetTrackingRequest(
+                    vehicleIds = listOf(vehicleId),
+                    driverIds = null,
+                    activeOnly = true
+                )
+            )) {
+                is Result.Success -> {
+                    val vehicle = result.data.vehicles.find { it.id == vehicleId }
+                    if (vehicle != null) {
+                        updateUiState { copy(
+                            selectedVehicle = vehicle,
+                            selectedShipment = null
+                        )}
+                        
+                        // Load shipment details if vehicle has active shipment
+                        vehicle.currentShipmentId?.let { shipmentId ->
+                            loadShipmentDetails(shipmentId)
+                        }
+                    }
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل بيانات المركبة") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun selectShipment(shipmentId: String) {
+        viewModelScope.launch {
+            when (val result = getShipmentTrackingUseCase(shipmentId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        selectedShipment = result.data,
+                        selectedVehicle = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل بيانات الشحنة") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    private fun loadShipmentDetails(shipmentId: String) {
+        viewModelScope.launch {
+            when (val result = getShipmentTrackingUseCase(shipmentId)) {
+                is Result.Success -> {
+                    updateUiState { copy(selectedShipment = result.data) }
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل تفاصيل الشحنة") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun calculateETA(shipmentId: String) {
+        viewModelScope.launch {
+            val shipment = _uiState.value.selectedShipment
+            if (shipment != null) {
+                when (val result = calculateETAUseCase(
+                    currentLocation = shipment.currentLocation,
+                    destinationLocation = shipment.destinationLocation,
+                    currentSpeed = shipment.speed
+                )) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            etaUpdates = _uiState.value.etaUpdates + (shipmentId to result.data)
+                        )}
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(error = result.exception.message ?: "فشل حساب وقت الوصول") }
+                    }
+                    is Result.Loading -> {
+                        // Handle loading state
+                    }
+                }
+            }
+        }
+    }
+
+    fun loadRouteHistory(shipmentId: String) {
+        viewModelScope.launch {
+            when (val result = getRouteHistoryUseCase(shipmentId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        selectedRouteHistory = result.data,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل سجل المسار") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun filterByVehicleType(vehicleType: String) {
+        val currentFleet = _uiState.value.fleetTracking
+        if (currentFleet != null) {
+            val filteredVehicles = if (vehicleType == "all") {
+                currentFleet.vehicles
+            } else {
+                currentFleet.vehicles.filter { it.vehicleType == vehicleType }
+            }
+            
+            updateUiState { copy(
+                filteredVehicles = filteredVehicles,
+                selectedVehicleType = vehicleType
+            )}
+        }
+    }
+
+    fun filterByStatus(status: VehicleStatus) {
+        val currentFleet = _uiState.value.fleetTracking
+        if (currentFleet != null) {
+            val filteredVehicles = currentFleet.vehicles.filter { it.status == status }
+            updateUiState { copy(
+                filteredVehicles = filteredVehicles,
+                selectedStatus = status
+            )}
+        }
+    }
+
+    fun searchVehicles(query: String) {
+        val currentFleet = _uiState.value.fleetTracking
+        if (currentFleet != null) {
+            val filteredVehicles = currentFleet.vehicles.filter { vehicle ->
+                vehicle.driverName.contains(query, ignoreCase = true) ||
+                vehicle.vehicleLicensePlate.contains(query, ignoreCase = true) ||
+                vehicle.currentShipmentNumber?.contains(query, ignoreCase = true) == true
+            }
+            
+            updateUiState { copy(
+                filteredVehicles = filteredVehicles,
+                searchQuery = query
+            )}
+        }
+    }
+
+    fun clearSelection() {
+        updateUiState { copy(
+            selectedVehicle = null,
+            selectedShipment = null,
+            selectedRouteHistory = null
+        )}
+    }
+
+    fun refresh() {
+        loadFleetTracking()
+    }
+
+    fun toggleMapStyle() {
+        updateUiState { copy(isDarkMap = !_uiState.value.isDarkMap) }
+    }
+
+    fun toggleTrafficLayer() {
+        updateUiState { copy(showTrafficLayer = !_uiState.value.showTrafficLayer) }
+    }
+
+    fun centerMapOnVehicle(vehicleId: String) {
+        val vehicle = _uiState.value.fleetTracking?.vehicles?.find { it.id == vehicleId }
+        if (vehicle != null) {
+            updateUiState { copy(
+                mapCenter = vehicle.currentLocation,
+                mapZoom = 15f
+            )}
+        }
+    }
+
+    fun centerMapOnShipment(shipmentId: String) {
+        val shipment = _uiState.value.fleetTracking?.activeShipments?.find { it.id == shipmentId }
+        if (shipment != null) {
+            updateUiState { copy(
+                mapCenter = shipment.currentLocation,
+                mapZoom = 15f
+            )}
+        }
+    }
+
+    data class FleetTrackingUiState(
+        val isLoading: Boolean = false,
+        val fleetTracking: FleetTracking? = null,
+        val selectedVehicle: VehicleTracking? = null,
+        val selectedShipment: ShipmentTracking? = null,
+        val selectedRouteHistory: RouteHistory? = null,
+        val filteredVehicles: List<VehicleTracking> = emptyList(),
+        val etaUpdates: Map<String, Long> = emptyMap(),
+        val selectedVehicleType: String = "all",
+        val selectedStatus: VehicleStatus? = null,
+        val searchQuery: String = "",
+        val mapCenter: LatLng? = null,
+        val mapZoom: Float = 10f,
+        val isDarkMap: Boolean = false,
+        val showTrafficLayer: Boolean = true,
+        val error: String? = null
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = this
+    }
+}

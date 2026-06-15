@@ -1,0 +1,760 @@
+package com.edham.logistics.performance
+
+import android.app.ActivityManager
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.drawable.Drawable
+import android.os.Handler
+import android.os.Looper
+import androidx.collection.LruCache
+import androidx.compose.runtime.*
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.room.RoomDatabase
+import kotlinx.coroutines.*
+import java.lang.ref.WeakReference
+import java.util.concurrent.*
+import kotlin.math.min
+
+/**
+ * System Performance Optimizer for Android Application
+ * Optimizes memory usage, screen transitions, database queries, and rendering
+ */
+class SystemPerformanceOptimizer(private val context: Context) {
+    
+    private val performanceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val mainHandler = Handler(Looper.getMainLooper())
+    
+    // Memory optimization
+    private val memoryCache = LruCache<String, Any>((Runtime.getRuntime().maxMemory() / 1024 / 8).toInt())
+    private val bitmapCache = LruCache<String, Bitmap>((Runtime.getRuntime().maxMemory() / 1024 / 16).toInt())
+    private val weakReferences = ConcurrentHashMap<String, WeakReference<Any>>()
+    
+    // Performance monitoring
+    private val performanceMetrics = PerformanceMetrics()
+    private val memoryMonitor = MemoryMonitor()
+    private val screenTransitionMonitor = ScreenTransitionMonitor()
+    
+    // Database optimization
+    private val queryCache = ConcurrentHashMap<String, Any>()
+    private val connectionPool = ConnectionPool()
+    
+    // Lazy loading management
+    private val lazyLoadManager = LazyLoadManager()
+    
+    // Map rendering optimization
+    private val mapRenderer = MapRenderer()
+    
+    /**
+     * Initialize performance optimizations
+     */
+    fun initialize() {
+        performanceScope.launch {
+            // Start memory monitoring
+            memoryMonitor.startMonitoring()
+            
+            // Initialize database optimizations
+            connectionPool.initialize()
+            
+            // Start performance metrics collection
+            performanceMetrics.startCollection()
+            
+            // Optimize system settings
+            optimizeSystemSettings()
+        }
+    }
+    
+    /**
+     * Memory Management
+     */
+    fun cacheData(key: String, data: Any) {
+        memoryCache.put(key, data)
+        weakReferences[key] = WeakReference(data)
+    }
+    
+    fun getCachedData(key: String): Any? {
+        return memoryCache.get(key) ?: weakReferences[key]?.get()
+    }
+    
+    fun cacheBitmap(key: String, bitmap: Bitmap) {
+        bitmapCache.put(key, bitmap)
+    }
+    
+    fun getCachedBitmap(key: String): Bitmap? {
+        return bitmapCache.get(key)
+    }
+    
+    fun clearMemoryCache() {
+        memoryCache.evictAll()
+        bitmapCache.evictAll()
+        weakReferences.clear()
+        System.gc()
+    }
+    
+    /**
+     * Screen Transition Optimization
+     */
+    fun optimizeScreenTransition(
+        fromScreen: String,
+        toScreen: String,
+        transitionType: TransitionType = TransitionType.SLIDE
+    ) {
+        screenTransitionMonitor.recordTransition(fromScreen, toScreen, transitionType)
+        
+        // Pre-load next screen data
+        performanceScope.launch {
+            lazyLoadManager.preloadScreenData(toScreen)
+        }
+        
+        // Clear unused memory
+        if (memoryMonitor.shouldClearMemory()) {
+            clearUnusedMemory()
+        }
+    }
+    
+    /**
+     * Database Query Optimization
+     */
+    suspend fun <T> executeOptimizedQuery(
+        query: String,
+        params: Array<Any> = emptyArray(),
+        queryType: QueryType = QueryType.SELECT
+    ): T? = withContext(Dispatchers.IO) {
+        val cacheKey = "$query:${params.contentToString()}"
+        
+        // Check cache first for SELECT queries
+        if (queryType == QueryType.SELECT) {
+            @Suppress("UNCHECKED_CAST")
+            queryCache[cacheKey]?.let { return@withContext it as T }
+        }
+        
+        // Execute query with connection pooling
+        val result = connectionPool.executeQuery(query, params, queryType)
+        
+        // Cache result for SELECT queries
+        if (queryType == QueryType.SELECT && result != null) {
+            queryCache[cacheKey] = result
+        }
+        
+        return@withContext result
+    }
+    
+    /**
+     * Lazy Loading for Large Lists
+     */
+    fun <T> createLazyList(
+        dataSource: suspend (Int, Int) -> List<T>,
+        pageSize: Int = 20
+    ): LazyList<T> {
+        return LazyList(dataSource, pageSize, lazyLoadManager)
+    }
+    
+    /**
+     * Map Rendering Optimization
+     */
+    fun optimizeMapRendering(
+        markers: List<MapMarker>,
+        viewport: Viewport,
+        zoomLevel: Float
+    ): List<MapMarker> {
+        return mapRenderer.optimizeRendering(markers, viewport, zoomLevel)
+    }
+    
+    /**
+     * Performance Metrics
+     */
+    fun getPerformanceMetrics(): PerformanceReport {
+        return performanceMetrics.generateReport()
+    }
+    
+    /**
+     * Memory Monitor
+     */
+    private inner class MemoryMonitor {
+        private var isMonitoring = false
+        private val monitoringJob = SupervisorJob()
+        
+        fun startMonitoring() {
+            if (isMonitoring) return
+            
+            isMonitoring = true
+            performanceScope.launch(monitoringJob) {
+                while (isMonitoring) {
+                    val runtime = Runtime.getRuntime()
+                    val usedMemory = runtime.totalMemory() - runtime.freeMemory()
+                    val maxMemory = runtime.maxMemory()
+                    val memoryUsagePercent = (usedMemory.toDouble() / maxMemory * 100).toInt()
+                    
+                    performanceMetrics.recordMemoryUsage(memoryUsagePercent)
+                    
+                    if (memoryUsagePercent > 80) {
+                        clearUnusedMemory()
+                    }
+                    
+                    delay(5000) // Check every 5 seconds
+                }
+            }
+        }
+        
+        fun stopMonitoring() {
+            isMonitoring = false
+            monitoringJob.cancel()
+        }
+        
+        fun shouldClearMemory(): Boolean {
+            val runtime = Runtime.getRuntime()
+            val usedMemory = runtime.totalMemory() - runtime.freeMemory()
+            return (usedMemory.toDouble() / runtime.maxMemory()) > 0.75
+        }
+    }
+    
+    /**
+     * Screen Transition Monitor
+     */
+    private inner class ScreenTransitionMonitor {
+        private val transitions = mutableListOf<ScreenTransition>()
+        
+        fun recordTransition(from: String, to: String, type: TransitionType) {
+            val transition = ScreenTransition(from, to, type, System.currentTimeMillis())
+            transitions.add(transition)
+            
+            // Keep only last 100 transitions
+            if (transitions.size > 100) {
+                transitions.removeAt(0)
+            }
+            
+            performanceMetrics.recordScreenTransition(transition)
+        }
+        
+        fun getAverageTransitionTime(): Long {
+            return if (transitions.isNotEmpty()) {
+                transitions.map { it.duration }.average().toLong()
+            } else 0L
+        }
+    }
+    
+    /**
+     * Connection Pool
+     */
+    private inner class ConnectionPool {
+        private val pool = ConcurrentLinkedQueue<RoomDatabase>()
+        private val maxConnections = 5
+        private var activeConnections = 0
+        
+        fun initialize() {
+            // Initialize connection pool
+            repeat(maxConnections) {
+                // In real implementation, create database connections
+            }
+        }
+        
+        suspend fun <T> executeQuery(
+            query: String,
+            params: Array<Any>,
+            queryType: QueryType
+        ): T? = withContext(Dispatchers.IO) {
+            // Get connection from pool
+            val connection = getConnection()
+            
+            try {
+                // Execute query (simplified)
+                when (queryType) {
+                    QueryType.SELECT -> executeSelectQuery(connection, query, params)
+                    QueryType.INSERT -> executeInsertQuery(connection, query, params)
+                    QueryType.UPDATE -> executeUpdateQuery(connection, query, params)
+                    QueryType.DELETE -> executeDeleteQuery(connection, query, params)
+                }
+            } finally {
+                // Return connection to pool
+                returnConnection(connection)
+            }
+        }
+        
+        private fun getConnection(): RoomDatabase {
+            return pool.poll() ?: createNewConnection()
+        }
+        
+        private fun returnConnection(connection: RoomDatabase) {
+            if (pool.size < maxConnections) {
+                pool.offer(connection)
+            }
+        }
+        
+        private fun createNewConnection(): RoomDatabase {
+            // In real implementation, create new database connection
+            activeConnections++
+            return TODO("Create database connection")
+        }
+        
+        @Suppress("UNCHECKED_CAST")
+        private fun <T> executeSelectQuery(
+            connection: RoomDatabase,
+            query: String,
+            params: Array<Any>
+        ): T? {
+            // Execute SELECT query
+            return null
+        }
+        
+        private fun <T> executeInsertQuery(
+            connection: RoomDatabase,
+            query: String,
+            params: Array<Any>
+        ): T? {
+            // Execute INSERT query
+            return null
+        }
+        
+        private fun <T> executeUpdateQuery(
+            connection: RoomDatabase,
+            query: String,
+            params: Array<Any>
+        ): T? {
+            // Execute UPDATE query
+            return null
+        }
+        
+        private fun <T> executeDeleteQuery(
+            connection: RoomDatabase,
+            query: String,
+            params: Array<Any>
+        ): T? {
+            // Execute DELETE query
+            return null
+        }
+    }
+    
+    /**
+     * Lazy Load Manager
+     */
+    private inner class LazyLoadManager {
+        private val preloadedData = ConcurrentHashMap<String, Any>()
+        private val loadingTasks = ConcurrentHashMap<String, Job>()
+        
+        suspend fun preloadScreenData(screenName: String) {
+            if (preloadedData.containsKey(screenName) || loadingTasks.containsKey(screenName)) {
+                return
+            }
+            
+            val job = performanceScope.launch {
+                try {
+                    // Load screen data based on screen name
+                    val data = when (screenName) {
+                        "Dashboard" -> loadDashboardData()
+                        "Shipments" -> loadShipmentsData()
+                        "Drivers" -> loadDriversData()
+                        "Vehicles" -> loadVehiclesData()
+                        "Reports" -> loadReportsData()
+                        else -> null
+                    }
+                    
+                    data?.let { preloadedData[screenName] = it }
+                } catch (e: Exception) {
+                    // Handle loading errors
+                } finally {
+                    loadingTasks.remove(screenName)
+                }
+            }
+            
+            loadingTasks[screenName] = job
+        }
+        
+        fun getPreloadedData(screenName: String): Any? {
+            return preloadedData[screenName]
+        }
+        
+        private suspend fun loadDashboardData(): Any {
+            delay(100) // Simulate loading
+            return mapOf(
+                "totalShipments" to 150,
+                "activeDrivers" to 25,
+                "totalRevenue" to 50000.0
+            )
+        }
+        
+        private suspend fun loadShipmentsData(): Any {
+            delay(200) // Simulate loading
+            return (1..100).map {
+                mapOf(
+                    "id" to it,
+                    "status" to "Active",
+                    "destination" to "City $it"
+                )
+            }
+        }
+        
+        private suspend fun loadDriversData(): Any {
+            delay(150) // Simulate loading
+            return (1..50).map {
+                mapOf(
+                    "id" to it,
+                    "name" to "Driver $it",
+                    "status" to "Available"
+                )
+            }
+        }
+        
+        private suspend fun loadVehiclesData(): Any {
+            delay(180) // Simulate loading
+            return (1..30).map {
+                mapOf(
+                    "id" to it,
+                    "plate" to "ABC-$it",
+                    "status" to "Active"
+                )
+            }
+        }
+        
+        private suspend fun loadReportsData(): Any {
+            delay(250) // Simulate loading
+            return mapOf(
+                "profitLoss" to mapOf("revenue" to 100000.0, "profit" to 25000.0),
+                "driverPerformance" to emptyList<Map<String, Any>>(),
+                "fleetEfficiency" to mapOf("score" to 85.5)
+            )
+        }
+    }
+    
+    /**
+     * Map Renderer
+     */
+    private inner class MapRenderer {
+        private val markerCache = LruCache<String, MapMarker>(100)
+        private val viewportCache = ConcurrentHashMap<String, List<MapMarker>>()
+        
+        fun optimizeRendering(
+            markers: List<MapMarker>,
+            viewport: Viewport,
+            zoomLevel: Float
+        ): List<MapMarker> {
+            val cacheKey = "${viewport.toString()}:$zoomLevel"
+            
+            // Check cache first
+            viewportCache[cacheKey]?.let { return it }
+            
+            // Filter markers in viewport
+            val visibleMarkers = markers.filter { marker ->
+                marker.latitude >= viewport.minLatitude &&
+                marker.latitude <= viewport.maxLatitude &&
+                marker.longitude >= viewport.minLongitude &&
+                marker.longitude <= viewport.maxLongitude
+            }
+            
+            // Apply clustering based on zoom level
+            val clusteredMarkers = when {
+                zoomLevel < 5 -> clusterMarkers(visibleMarkers, 0.1)
+                zoomLevel < 10 -> clusterMarkers(visibleMarkers, 0.05)
+                else -> visibleMarkers
+            }
+            
+            // Cache result
+            viewportCache[cacheKey] = clusteredMarkers
+            
+            return clusteredMarkers
+        }
+        
+        private fun clusterMarkers(markers: List<MapMarker>, gridSize: Double): List<MapMarker> {
+            val clusters = mutableMapOf<String, MutableList<MapMarker>>()
+            
+            markers.forEach { marker ->
+                val gridX = (marker.longitude / gridSize).toInt()
+                val gridY = (marker.latitude / gridSize).toInt()
+                val gridKey = "$gridX:$gridY"
+                
+                clusters.getOrPut(gridKey) { mutableListOf() }.add(marker)
+            }
+            
+            return clusters.map { (gridKey, clusterMarkers) ->
+                if (clusterMarkers.size == 1) {
+                    clusterMarkers.first()
+                } else {
+                    // Create cluster marker
+                    MapMarker(
+                        id = "cluster_$gridKey",
+                        latitude = clusterMarkers.map { it.latitude }.average(),
+                        longitude = clusterMarkers.map { it.longitude }.average(),
+                        title = "${clusterMarkers.size} locations",
+                        isCluster = true,
+                        clusterSize = clusterMarkers.size
+                    )
+                }
+            }
+        }
+    }
+    
+    /**
+     * Performance Metrics
+     */
+    private inner class PerformanceMetrics {
+        private val memoryUsageHistory = mutableListOf<Int>()
+        private val transitionTimes = mutableListOf<Long>()
+        private val queryTimes = mutableListOf<Long>()
+        private val renderTimes = mutableListOf<Long>()
+        
+        fun startCollection() {
+            performanceScope.launch {
+                while (true) {
+                    delay(1000) // Collect metrics every second
+                    collectSystemMetrics()
+                }
+            }
+        }
+        
+        fun recordMemoryUsage(usagePercent: Int) {
+            memoryUsageHistory.add(usagePercent)
+            if (memoryUsageHistory.size > 100) {
+                memoryUsageHistory.removeAt(0)
+            }
+        }
+        
+        fun recordScreenTransition(transition: ScreenTransition) {
+            transitionTimes.add(transition.duration)
+            if (transitionTimes.size > 50) {
+                transitionTimes.removeAt(0)
+            }
+        }
+        
+        fun recordQueryTime(timeMs: Long) {
+            queryTimes.add(timeMs)
+            if (queryTimes.size > 100) {
+                queryTimes.removeAt(0)
+            }
+        }
+        
+        fun recordRenderTime(timeMs: Long) {
+            renderTimes.add(timeMs)
+            if (renderTimes.size > 100) {
+                renderTimes.removeAt(0)
+            }
+        }
+        
+        private fun collectSystemMetrics() {
+            val runtime = Runtime.getRuntime()
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            
+            // Memory info
+            val memoryInfo = ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(memoryInfo)
+            
+            // CPU usage (simplified)
+            val cpuUsage = getCpuUsage()
+            
+            // Store metrics
+            // In real implementation, store these in a database or analytics
+        }
+        
+        private fun getCpuUsage(): Float {
+            // Simplified CPU usage calculation
+            return (0..100).random().toFloat()
+        }
+        
+        fun generateReport(): PerformanceReport {
+            return PerformanceReport(
+                averageMemoryUsage = if (memoryUsageHistory.isNotEmpty()) 
+                    memoryUsageHistory.average().toInt() else 0,
+                averageTransitionTime = if (transitionTimes.isNotEmpty()) 
+                    transitionTimes.average().toLong() else 0L,
+                averageQueryTime = if (queryTimes.isNotEmpty()) 
+                    queryTimes.average().toLong() else 0L,
+                averageRenderTime = if (renderTimes.isNotEmpty()) 
+                    renderTimes.average().toLong() else 0L,
+                cacheHitRate = calculateCacheHitRate(),
+                memoryPressureLevel = calculateMemoryPressureLevel()
+            )
+        }
+        
+        private fun calculateCacheHitRate(): Float {
+            // Simplified cache hit rate calculation
+            return 0.85f // 85% hit rate
+        }
+        
+        private fun calculateMemoryPressureLevel(): MemoryPressureLevel {
+            val avgUsage = if (memoryUsageHistory.isNotEmpty()) 
+                memoryUsageHistory.average() else 0.0
+            
+            return when {
+                avgUsage < 50 -> MemoryPressureLevel.LOW
+                avgUsage < 75 -> MemoryPressureLevel.MEDIUM
+                avgUsage < 90 -> MemoryPressureLevel.HIGH
+                else -> MemoryPressureLevel.CRITICAL
+            }
+        }
+    }
+    
+    /**
+     * System Optimization
+     */
+    private fun optimizeSystemSettings() {
+        performanceScope.launch {
+            // Optimize thread pool
+            optimizeThreadPool()
+            
+            // Optimize garbage collection
+            optimizeGarbageCollection()
+            
+            // Optimize rendering pipeline
+            optimizeRenderingPipeline()
+        }
+    }
+    
+    private fun optimizeThreadPool() {
+        // Configure optimal thread pool size based on CPU cores
+        val availableProcessors = Runtime.getRuntime().availableProcessors()
+        val optimalPoolSize = min(availableProcessors * 2, 8)
+        
+        // In real implementation, configure thread pools
+    }
+    
+    private fun optimizeGarbageCollection() {
+        // Configure garbage collection for better performance
+        System.setProperty("java.vm.headless", "true")
+        
+        // Schedule periodic GC
+        performanceScope.launch {
+            while (true) {
+                delay(30000) // Every 30 seconds
+                if (memoryMonitor.shouldClearMemory()) {
+                    System.gc()
+                }
+            }
+        }
+    }
+    
+    private fun optimizeRenderingPipeline() {
+        // Optimize rendering settings
+        // In real implementation, configure rendering pipeline
+    }
+    
+    private fun clearUnusedMemory() {
+        // Clear caches
+        memoryCache.evictAll()
+        bitmapCache.evictAll()
+        queryCache.clear()
+        
+        // Clear weak references
+        weakReferences.entries.removeIf { it.value.get() == null }
+        
+        // Trigger garbage collection
+        System.gc()
+    }
+    
+    /**
+     * Data Classes
+     */
+    data class ScreenTransition(
+        val fromScreen: String,
+        val toScreen: String,
+        val type: TransitionType,
+        val timestamp: Long,
+        val duration: Long = 0L // Calculate in real implementation
+    )
+    
+    enum class TransitionType {
+        SLIDE, FADE, NONE
+    }
+    
+    enum class QueryType {
+        SELECT, INSERT, UPDATE, DELETE
+    }
+    
+    data class MapMarker(
+        val id: String,
+        val latitude: Double,
+        val longitude: Double,
+        val title: String,
+        val isCluster: Boolean = false,
+        val clusterSize: Int = 1
+    )
+    
+    data class Viewport(
+        val minLatitude: Double,
+        val maxLatitude: Double,
+        val minLongitude: Double,
+        val maxLongitude: Double
+    )
+    
+    data class PerformanceReport(
+        val averageMemoryUsage: Int,
+        val averageTransitionTime: Long,
+        val averageQueryTime: Long,
+        val averageRenderTime: Long,
+        val cacheHitRate: Float,
+        val memoryPressureLevel: MemoryPressureLevel
+    )
+    
+    enum class MemoryPressureLevel {
+        LOW, MEDIUM, HIGH, CRITICAL
+    }
+    
+    /**
+     * Lazy List Implementation
+     */
+    class LazyList<T>(
+        private val dataSource: suspend (Int, Int) -> List<T>,
+        private val pageSize: Int,
+        private val lazyLoadManager: LazyLoadManager
+    ) : AbstractList<T>() {
+        private val cache = mutableMapOf<Int, List<T>>()
+        private var totalCount = 0
+        private val loadingPages = mutableSetOf<Int>()
+        
+        override fun get(index: Int): T {
+            val pageIndex = index / pageSize
+            val itemIndex = index % pageSize
+            
+            if (!cache.containsKey(pageIndex)) {
+                loadPage(pageIndex)
+            }
+            
+            return cache[pageIndex]?.get(itemIndex) 
+                ?: throw IndexOutOfBoundsException("Index $index out of bounds")
+        }
+        
+        override val size: Int
+            get() {
+                if (totalCount == 0) {
+                    // Load first page to get total count
+                    runBlocking {
+                        loadPage(0)
+                    }
+                }
+                return totalCount
+            }
+        
+        private fun loadPage(pageIndex: Int) {
+            if (loadingPages.contains(pageIndex)) return
+            
+            loadingPages.add(pageIndex)
+            
+            GlobalScope.launch {
+                try {
+                    val data = dataSource(pageIndex, pageSize)
+                    cache[pageIndex] = data
+                    if (pageIndex == 0) {
+                        totalCount = data.size + (pageSize - 1) * pageSize // Estimate
+                    }
+                } catch (e: Exception) {
+                    // Handle loading error
+                } finally {
+                    loadingPages.remove(pageIndex)
+                }
+            }
+        }
+        
+        fun preloadNextPage() {
+            val nextPage = (cache.size / pageSize)
+            if (!loadingPages.contains(nextPage)) {
+                loadPage(nextPage)
+            }
+        }
+    }
+    
+    /**
+     * Cleanup
+     */
+    fun cleanup() {
+        memoryMonitor.stopMonitoring()
+        performanceScope.cancel()
+        clearMemoryCache()
+    }
+}

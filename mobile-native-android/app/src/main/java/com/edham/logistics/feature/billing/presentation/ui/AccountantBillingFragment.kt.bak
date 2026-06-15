@@ -1,0 +1,381 @@
+package com.edham.logistics.feature.billing.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.databinding.FragmentAccountantBillingBinding
+import com.edham.logistics.feature.billing.domain.model.ExportFormat
+import com.edham.logistics.feature.billing.domain.model.InvoiceStatus
+import com.edham.logistics.feature.billing.domain.model.PaymentMethod
+import com.edham.logistics.feature.billing.presentation.adapter.InvoiceAdapter
+import com.edham.logistics.feature.billing.presentation.adapter.PaymentAdapter
+import com.edham.logistics.feature.billing.presentation.adapter.FinancialSummaryAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class AccountantBillingFragment : Fragment() {
+
+    private var _binding: FragmentAccountantBillingBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: AccountantBillingViewModel by viewModels()
+    
+    @Inject
+    lateinit var invoiceAdapter: InvoiceAdapter
+    
+    @Inject
+    lateinit var paymentAdapter: PaymentAdapter
+    
+    @Inject
+    lateinit var financialSummaryAdapter: FinancialSummaryAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentAccountantBillingBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerViews()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize with user data
+        viewModel.initialize("accountant_123")
+    }
+
+    private fun setupRecyclerViews() {
+        invoiceAdapter = InvoiceAdapter { invoice, action ->
+            handleInvoiceAction(invoice, action)
+        }
+        
+        paymentAdapter = PaymentAdapter { payment, action ->
+            handlePaymentAction(payment, action)
+        }
+        
+        financialSummaryAdapter = FinancialSummaryAdapter()
+        
+        binding.recyclerViewInvoices.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = invoiceAdapter
+        }
+        
+        binding.recyclerViewPayments.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = paymentAdapter
+        }
+        
+        binding.recyclerViewFinancialSummary.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = financialSummaryAdapter
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refresh()
+        }
+        
+        binding.buttonGenerateInvoice.setOnClickListener {
+            showGenerateInvoiceDialog()
+        }
+        
+        binding.buttonExportInvoices.setOnClickListener {
+            exportSelectedInvoices()
+        }
+        
+        binding.buttonMarkAsPaid.setOnClickListener {
+            markSelectedInvoicesAsPaid()
+        }
+        
+        binding.buttonMarkAsUnpaid.setOnClickListener {
+            markSelectedInvoicesAsUnpaid()
+        }
+        
+        binding.buttonProcessPayment.setOnClickListener {
+            showProcessPaymentDialog()
+        }
+        
+        binding.cardTotalRevenue.setOnClickListener {
+            navigateToRevenueAnalytics()
+        }
+        
+        binding.cardTotalExpenses.setOnClickListener {
+            navigateToExpenseAnalytics()
+        }
+        
+        binding.cardUnpaidInvoices.setOnClickListener {
+            navigateToUnpaidInvoices()
+        }
+        
+        binding.cardTotalProfit.setOnClickListener {
+            navigateToProfitAnalytics()
+        }
+    }
+
+    private fun updateUI(uiState: AccountantBillingViewModel.AccountantBillingUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.contentLayout.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refresh()
+        }
+    }
+
+    private fun showContent(uiState: AccountantBillingViewModel.AccountantBillingUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        
+        // Update financial summary cards
+        updateFinancialCards(uiState.financialSummary)
+        
+        // Update lists
+        invoiceAdapter.submitList(uiState.invoices)
+        paymentAdapter.submitList(uiState.payments)
+        
+        // Update financial summary
+        uiState.financialSummary?.let { summary ->
+            financialSummaryAdapter.submitList(listOf(summary))
+        }
+        
+        // Show success messages
+        uiState.generatedInvoice?.let { invoice ->
+            showSnackbar("تم إنشاء الفاتورة ${invoice.invoiceNumber} بنجاح")
+            viewModel.clearSuccessMessages()
+        }
+        
+        uiState.processedPayment?.let { payment ->
+            showSnackbar("تم معالجة الدفع ${payment.transactionId} بنجاح")
+            viewModel.clearSuccessMessages()
+        }
+        
+        uiState.exportedInvoiceUrl?.let { url ->
+            showSnackbar("تم تصدير الفاتورة بنجاح: $url")
+            viewModel.clearSuccessMessages()
+        }
+        
+        // Update button states
+        updateButtonStates(uiState)
+    }
+
+    private fun updateFinancialCards(summary: com.edham.logistics.feature.billing.domain.model.FinancialSummary?) {
+        summary?.let {
+            binding.apply {
+                // Total Revenue
+                textTotalRevenue.text = formatCurrency(it.revenue.current)
+                textTotalRevenueTrend.text = formatTrend(it.revenue.growth, it.revenue.trend)
+                
+                // Total Expenses
+                textTotalExpenses.text = formatCurrency(it.expenses.current)
+                textTotalExpensesTrend.text = formatTrend(it.expenses.growth, it.expenses.trend)
+                
+                // Unpaid Invoices
+                textUnpaidInvoices.text = "${(it.invoices.current - it.payments.current).toInt()}"
+                textUnpaidInvoicesTrend.text = formatTrend(
+                    (it.invoices.current - it.payments.current) - (it.invoices.previous - it.payments.previous),
+                    TrendDirection.UP // Simplified
+                )
+                
+                // Total Profit
+                textTotalProfit.text = formatCurrency(it.profit.current)
+                textTotalProfitTrend.text = formatTrend(it.profit.growth, it.profit.trend)
+            }
+        }
+    }
+
+    private fun updateButtonStates(uiState: AccountantBillingViewModel.AccountantBillingUiState) {
+        binding.apply {
+            buttonGenerateInvoice.isEnabled = !uiState.isGeneratingInvoice
+            buttonProcessPayment.isEnabled = !uiState.isProcessingPayment
+            buttonExportInvoices.isEnabled = !uiState.isExportingInvoice
+            
+            // Show loading indicators
+            if (uiState.isGeneratingInvoice) {
+                buttonGenerateInvoice.text = "جاري الإنشاء..."
+            } else {
+                buttonGenerateInvoice.text = "إنشاء فاتورة"
+            }
+            
+            if (uiState.isProcessingPayment) {
+                buttonProcessPayment.text = "جاري المعالجة..."
+            } else {
+                buttonProcessPayment.text = "معالجة دفع"
+            }
+            
+            if (uiState.isExportingInvoice) {
+                buttonExportInvoices.text = "جاري التصدير..."
+            } else {
+                buttonExportInvoices.text = "تصدير الفواتير"
+            }
+        }
+    }
+
+    private fun handleInvoiceAction(invoice: com.edham.logistics.feature.billing.domain.model.Invoice, action: String) {
+        when (action) {
+            "view" -> navigateToInvoiceDetails(invoice.id)
+            "edit" -> navigateToInvoiceEdit(invoice.id)
+            "delete" -> deleteInvoice(invoice.id)
+            "export" -> exportInvoice(invoice.id)
+            "mark_paid" -> viewModel.markInvoiceAsPaid(invoice.id)
+            "mark_unpaid" -> viewModel.markInvoiceAsUnpaid(invoice.id)
+        }
+    }
+
+    private fun handlePaymentAction(payment: com.edham.logistics.feature.billing.domain.model.Payment, action: String) {
+        when (action) {
+            "view" -> navigateToPaymentDetails(payment.id)
+            "refund" -> processRefund(payment.id)
+            "receipt" -> generateReceipt(payment.id)
+        }
+    }
+
+    private fun showGenerateInvoiceDialog() {
+        // Show dialog to enter shipment ID
+        showSnackbar("فتح مربع حوار إنشاء الفاتورة")
+        
+        // For demo, generate with sample shipment ID
+        viewModel.generateInvoice("shipment_demo_001")
+    }
+
+    private fun showProcessPaymentDialog() {
+        // Show dialog to enter payment details
+        showSnackbar("فتح مربع حوار معالجة الدفع")
+        
+        // For demo, process with sample data
+        viewModel.processPayment("inv_002", 3120.0, PaymentMethod.BANK_TRANSFER)
+    }
+
+    private fun exportSelectedInvoices() {
+        // Export selected invoices
+        showSnackbar("تصدير الفواتير المحددة")
+        
+        // For demo, export first invoice as PDF
+        viewModel.exportInvoice("inv_001", ExportFormat.PDF)
+    }
+
+    private fun markSelectedInvoicesAsPaid() {
+        // Mark selected invoices as paid
+        showSnackbar("تعليم الفواتير المحددة كمدفوعة")
+        
+        // For demo, mark first invoice as paid
+        viewModel.markInvoiceAsPaid("inv_001")
+    }
+
+    private fun markSelectedInvoicesAsUnpaid() {
+        // Mark selected invoices as unpaid
+        showSnackbar("تعليم الفواتير المحددة كغير مدفوعة")
+        
+        // For demo, mark first invoice as unpaid
+        viewModel.markInvoiceAsUnpaid("inv_001")
+    }
+
+    private fun exportInvoice(invoiceId: String) {
+        viewModel.exportInvoice(invoiceId, ExportFormat.PDF)
+    }
+
+    private fun deleteInvoice(invoiceId: String) {
+        showSnackbar("حذف الفاتورة: $invoiceId")
+    }
+
+    private fun navigateToInvoiceDetails(invoiceId: String) {
+        showSnackbar("فتح تفاصيل الفاتورة: $invoiceId")
+    }
+
+    private fun navigateToInvoiceEdit(invoiceId: String) {
+        showSnackbar("فتح تعديل الفاتورة: $invoiceId")
+    }
+
+    private fun navigateToPaymentDetails(paymentId: String) {
+        showSnackbar("فتح تفاصيل الدفع: $paymentId")
+    }
+
+    private fun processRefund(paymentId: String) {
+        showSnackbar("معالجة استرداد: $paymentId")
+    }
+
+    private fun generateReceipt(paymentId: String) {
+        showSnackbar("إنشاء إيصال: $paymentId")
+    }
+
+    private fun navigateToRevenueAnalytics() {
+        showSnackbar("فتح تحليلات الإيرادات")
+    }
+
+    private fun navigateToExpenseAnalytics() {
+        showSnackbar("فتح تحليلات المصروفات")
+    }
+
+    private fun navigateToUnpaidInvoices() {
+        showSnackbar("فتح الفواتير غير المدفوعة")
+    }
+
+    private fun navigateToProfitAnalytics() {
+        showSnackbar("فتح تحليلات الأرباح")
+    }
+
+    private fun formatCurrency(amount: Double): String {
+        return String.format("%,.0f ر.س", amount)
+    }
+
+    private fun formatTrend(growth: Double, direction: com.edham.logistics.feature.billing.domain.model.TrendDirection): String {
+        val symbol = when (direction) {
+            com.edham.logistics.feature.billing.domain.model.TrendDirection.UP -> "↑"
+            com.edham.logistics.feature.billing.domain.model.TrendDirection.DOWN -> "↓"
+            com.edham.logistics.feature.billing.domain.model.TrendDirection.STABLE -> "→"
+        }
+        return "$symbol ${Math.abs(growth).toInt()}%"
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

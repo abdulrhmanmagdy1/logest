@@ -1,0 +1,693 @@
+package com.edham.logistics.feature.telematics
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Telematics Engine - Core driver behavior and vehicle telematics processing
+ * Real-time monitoring of driving events, safety metrics, and performance analytics
+ */
+class TelematicsEngine {
+    
+    companion object {
+        private const val TAG = "TelematicsEngine"
+        
+        // Telematics event types
+        enum class EventType {
+            HARSH_BRAKING,
+            RAPID_ACCELERATION,
+            OVER_SPEEDING,
+            IDLE_TIME_START,
+            IDLE_TIME_END,
+            SHARP_TURN,
+            ENGINE_START,
+            ENGINE_STOP,
+            FUEL_CONSUMPTION_UPDATE,
+            LOCATION_UPDATE,
+            ROUTE_DEVIATION,
+            PHONE_USAGE_DETECTED,
+            SEATBELT_VIOLATION
+        }
+        
+        // Severity levels
+        enum class Severity {
+            LOW, MEDIUM, HIGH, CRITICAL
+        }
+        
+        // Scoring categories
+        enum class ScoringCategory {
+            SAFETY,
+            EFFICIENCY,
+            COMPLIANCE,
+            PERFORMANCE
+        }
+        
+        // Thresholds
+        private const val HARSH_BRAKING_THRESHOLD = 5.0 // m/s²
+        private const val RAPID_ACCELERATION_THRESHOLD = 3.5 // m/s²
+        private const val OVER_SPEEDING_THRESHOLD = 120.0 // km/h
+        private const val IDLE_TIME_THRESHOLD = 300.0 // seconds (5 minutes)
+        private const val SHARP_TURN_THRESHOLD = 0.5 // g-force
+        private const val FUEL_EFFICIENCY_GOOD = 8.0 // km/l
+        private const val FUEL_EFFICIENCY_POOR = 5.0 // km/l
+    }
+    
+    /**
+     * Process telematics data and detect events
+     */
+    suspend fun processTelematicsData(
+        data: TelematicsData,
+        previousData: TelematicsData?,
+        driverProfile: DriverProfile,
+        currentTime: LocalDateTime = LocalDateTime.now()
+    ): TelematicsResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Processing telematics data for driver ${driverProfile.driverId}")
+                
+                val events = mutableListOf<TelematicsEvent>()
+                val metrics = calculateDrivingMetrics(data, previousData, driverProfile)
+                
+                // Detect events
+                if (previousData != null) {
+                    detectHarshBraking(data, previousData)?.let { events.add(it) }
+                    detectRapidAcceleration(data, previousData)?.let { events.add(it) }
+                    detectOverSpeeding(data, driverProfile)?.let { events.add(it) }
+                    detectSharpTurn(data, previousData)?.let { events.add(it) }
+                    detectIdleTime(data, previousData)?.let { events.add(it) }
+                    detectRouteDeviation(data, driverProfile)?.let { events.add(it) }
+                }
+                
+                // Update driver scores
+                val updatedScores = updateDriverScores(
+                    events,
+                    metrics,
+                    driverProfile.scores
+                )
+                
+                // Generate coaching insights
+                val coachingInsights = generateCoachingInsights(
+                    events,
+                    metrics,
+                    updatedScores
+                )
+                
+                val result = TelematicsResult(
+                    driverId = driverProfile.driverId,
+                    processedAt = currentTime,
+                    telematicsData = data,
+                    detectedEvents = events,
+                    drivingMetrics = metrics,
+                    updatedScores = updatedScores,
+                    coachingInsights = coachingInsights,
+                    requiresImmediateAttention = events.any { it.severity == Severity.CRITICAL }
+                )
+                
+                Log.d(TAG, "Telematics processing completed: ${events.size} events detected")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing telematics data", e)
+                TelematicsResult.createError(driverProfile.driverId, currentTime)
+            }
+        }
+    }
+    
+    /**
+     * Detect harsh braking events
+     */
+    private fun detectHarshBraking(
+        current: TelematicsData,
+        previous: TelematicsData
+    ): TelematicsEvent? {
+        val acceleration = current.acceleration ?: return null
+        val previousAcceleration = previous.acceleration ?: return null
+        
+        // Calculate deceleration (negative acceleration)
+        val deceleration = acceleration - previousAcceleration
+        
+        return if (deceleration < -HARSH_BRAKING_THRESHOLD) {
+            val severity = when {
+                deceleration < -10.0 -> Severity.CRITICAL
+                deceleration < -7.5 -> Severity.HIGH
+                deceleration < -5.0 -> Severity.MEDIUM
+                else -> Severity.LOW
+            }
+            
+            TelematicsEvent(
+                id = generateEventId(),
+                type = EventType.HARSH_BRAKING,
+                severity = severity,
+                timestamp = current.timestamp,
+                location = current.location,
+                value = abs(deceleration),
+                unit = "m/s²",
+                description = "Harsh braking detected: ${String.format("%.1f", abs(deceleration))} m/s²",
+                impactOnScore = calculateScoreImpact(EventType.HARSH_BRAKING, severity)
+            )
+        } else null
+    }
+    
+    /**
+     * Detect rapid acceleration events
+     */
+    private fun detectRapidAcceleration(
+        current: TelematicsData,
+        previous: TelematicsData
+    ): TelematicsEvent? {
+        val acceleration = current.acceleration ?: return null
+        val previousAcceleration = previous.acceleration ?: return null
+        
+        val accelerationChange = acceleration - previousAcceleration
+        
+        return if (accelerationChange > RAPID_ACCELERATION_THRESHOLD) {
+            val severity = when {
+                accelerationChange > 7.0 -> Severity.CRITICAL
+                accelerationChange > 5.0 -> Severity.HIGH
+                accelerationChange > 3.5 -> Severity.MEDIUM
+                else -> Severity.LOW
+            }
+            
+            TelematicsEvent(
+                id = generateEventId(),
+                type = EventType.RAPID_ACCELERATION,
+                severity = severity,
+                timestamp = current.timestamp,
+                location = current.location,
+                value = accelerationChange,
+                unit = "m/s²",
+                description = "Rapid acceleration detected: ${String.format("%.1f", accelerationChange)} m/s²",
+                impactOnScore = calculateScoreImpact(EventType.RAPID_ACCELERATION, severity)
+            )
+        } else null
+    }
+    
+    /**
+     * Detect over-speeding events
+     */
+    private fun detectOverSpeeding(
+        current: TelematicsData,
+        driverProfile: DriverProfile
+    ): TelematicsEvent? {
+        val speed = current.speed ?: return null
+        val speedLimit = driverProfile.vehicleSpeedLimit ?: return null
+        
+        return if (speed > speedLimit) {
+            val excessSpeed = speed - speedLimit
+            val severity = when {
+                excessSpeed > 30.0 -> Severity.CRITICAL
+                excessSpeed > 20.0 -> Severity.HIGH
+                excessSpeed > 10.0 -> Severity.MEDIUM
+                else -> Severity.LOW
+            }
+            
+            TelematicsEvent(
+                id = generateEventId(),
+                type = EventType.OVER_SPEEDING,
+                severity = severity,
+                timestamp = current.timestamp,
+                location = current.location,
+                value = excessSpeed,
+                unit = "km/h",
+                description = "Over-speeding detected: ${String.format("%.1f", speed)} km/h (limit: $speedLimit km/h)",
+                impactOnScore = calculateScoreImpact(EventType.OVER_SPEEDING, severity)
+            )
+        } else null
+    }
+    
+    /**
+     * Detect sharp turn events
+     */
+    private fun detectSharpTurn(
+        current: TelematicsData,
+        previous: TelematicsData
+    ): TelematicsEvent? {
+        val lateralAcceleration = current.lateralAcceleration ?: return null
+        
+        return if (abs(lateralAcceleration) > SHARP_TURN_THRESHOLD) {
+            val severity = when {
+                abs(lateralAcceleration) > 1.0 -> Severity.CRITICAL
+                abs(lateralAcceleration) > 0.75 -> Severity.HIGH
+                abs(lateralAcceleration) > 0.5 -> Severity.MEDIUM
+                else -> Severity.LOW
+            }
+            
+            TelematicsEvent(
+                id = generateEventId(),
+                type = EventType.SHARP_TURN,
+                severity = severity,
+                timestamp = current.timestamp,
+                location = current.location,
+                value = abs(lateralAcceleration),
+                unit = "g",
+                description = "Sharp turn detected: ${String.format("%.2f", abs(lateralAcceleration))} g",
+                impactOnScore = calculateScoreImpact(EventType.SHARP_TURN, severity)
+            )
+        } else null
+    }
+    
+    /**
+     * Detect idle time events
+     */
+    private fun detectIdleTime(
+        current: TelematicsData,
+        previous: TelematicsData
+    ): TelematicsEvent? {
+        val speed = current.speed ?: return null
+        val engineRPM = current.engineRPM ?: return null
+        val previousEngineRPM = previous.engineRPM ?: return null
+        
+        // Check if vehicle is idle (engine running but not moving)
+        val isIdle = speed < 1.0 && engineRPM > 800
+        val wasIdle = previous.speed ?: 0.0 < 1.0 && (previousEngineRPM ?: 0) > 800
+        
+        return when {
+            isIdle && !wasIdle -> {
+                // Idle time started
+                TelematicsEvent(
+                    id = generateEventId(),
+                    type = EventType.IDLE_TIME_START,
+                    severity = Severity.LOW,
+                    timestamp = current.timestamp,
+                    location = current.location,
+                    value = 0.0,
+                    unit = "seconds",
+                    description = "Idle time started",
+                    impactOnScore = calculateScoreImpact(EventType.IDLE_TIME_START, Severity.LOW)
+                )
+            }
+            !isIdle && wasIdle -> {
+                // Idle time ended
+                val idleDuration = current.timestamp.minusSeconds(previous.timestamp.toEpochSecond()).toSecond()
+                TelematicsEvent(
+                    id = generateEventId(),
+                    type = EventType.IDLE_TIME_END,
+                    severity = if (idleDuration > IDLE_TIME_THRESHOLD) Severity.MEDIUM else Severity.LOW,
+                    timestamp = current.timestamp,
+                    location = current.location,
+                    value = idleDuration.toDouble(),
+                    unit = "seconds",
+                    description = "Idle time ended: ${idleDuration} seconds",
+                    impactOnScore = calculateScoreImpact(EventType.IDLE_TIME_END, 
+                        if (idleDuration > IDLE_TIME_THRESHOLD) Severity.MEDIUM else Severity.LOW)
+                )
+            }
+            else -> null
+        }
+    }
+    
+    /**
+     * Detect route deviation events
+     */
+    private fun detectRouteDeviation(
+        current: TelematicsData,
+        driverProfile: DriverProfile
+    ): TelematicsEvent? {
+        // Simplified route deviation detection
+        // In production, this would compare actual location with planned route
+        return null // Placeholder
+    }
+    
+    /**
+     * Calculate comprehensive driving metrics
+     */
+    private fun calculateDrivingMetrics(
+        current: TelematicsData,
+        previous: TelematicsData?,
+        driverProfile: DriverProfile
+    ): DrivingMetrics {
+        val totalDistance = current.totalDistance ?: 0.0
+        val totalFuelConsumed = current.totalFuelConsumed ?: 0.0
+        val totalDrivingTime = current.totalDrivingTime ?: 0.0
+        val averageSpeed = current.averageSpeed ?: 0.0
+        val maxSpeed = current.maxSpeed ?: 0.0
+        
+        // Calculate fuel efficiency
+        val fuelEfficiency = if (totalFuelConsumed > 0) {
+            totalDistance / totalFuelConsumed
+        } else {
+            0.0
+        }
+        
+        // Calculate idle time percentage
+        val idleTimePercentage = if (totalDrivingTime > 0) {
+            (current.totalIdleTime ?: 0.0) / totalDrivingTime * 100
+        } else {
+            0.0
+        }
+        
+        // Calculate harsh events per 100km
+        val harshEventsPer100km = if (totalDistance > 0) {
+            ((current.harshBrakingCount ?: 0) + (current.rapidAccelerationCount ?: 0)) / totalDistance * 100
+        } else {
+            0.0
+        }
+        
+        return DrivingMetrics(
+            totalDistance = totalDistance,
+            totalFuelConsumed = totalFuelConsumed,
+            fuelEfficiency = fuelEfficiency,
+            averageSpeed = averageSpeed,
+            maxSpeed = maxSpeed,
+            totalDrivingTime = totalDrivingTime,
+            idleTimePercentage = idleTimePercentage,
+            harshEventsPer100km = harshEventsPer100km,
+            estimatedCostPerKm = calculateCostPerKm(fuelEfficiency, driverProfile),
+            safetyScore = calculateSafetyScore(current, previous),
+            efficiencyScore = calculateEfficiencyScore(fuelEfficiency, idleTimePercentage),
+            complianceScore = calculateComplianceScore(current, driverProfile)
+        )
+    }
+    
+    /**
+     * Update driver scores based on events and metrics
+     */
+    private fun updateDriverScores(
+        events: List<TelematicsEvent>,
+        metrics: DrivingMetrics,
+        currentScores: DriverScores
+    ): DriverScores {
+        val safetyScore = calculateUpdatedSafetyScore(events, currentScores.safety)
+        val efficiencyScore = calculateUpdatedEfficiencyScore(metrics, currentScores.efficiency)
+        val complianceScore = calculateUpdatedComplianceScore(events, currentScores.compliance)
+        val performanceScore = calculateUpdatedPerformanceScore(metrics, currentScores.performance)
+        
+        val overallScore = (safetyScore + efficiencyScore + complianceScore + performanceScore) / 4.0
+        
+        return DriverScores(
+            safety = safetyScore,
+            efficiency = efficiencyScore,
+            compliance = complianceScore,
+            performance = performanceScore,
+            overall = overallScore,
+            lastUpdated = LocalDateTime.now()
+        )
+    }
+    
+    /**
+     * Generate coaching insights based on driving behavior
+     */
+    private fun generateCoachingInsights(
+        events: List<TelematicsEvent>,
+        metrics: DrivingMetrics,
+        scores: DriverScores
+    ): List<CoachingInsight> {
+        val insights = mutableListOf<CoachingInsight>()
+        
+        // Safety insights
+        if (scores.safety < 70.0) {
+            insights.add(
+                CoachingInsight(
+                    category = ScoringCategory.SAFETY,
+                    priority = CoachingInsight.Priority.HIGH,
+                    title = "Improve Safe Driving Habits",
+                    description = "Focus on smooth acceleration and braking to improve safety scores",
+                    recommendation = "Maintain safe following distance and anticipate traffic flow",
+                    potentialImprovement = 15.0
+                )
+            )
+        }
+        
+        // Efficiency insights
+        if (scores.efficiency < 75.0) {
+            insights.add(
+                CoachingInsight(
+                    category = ScoringCategory.EFFICIENCY,
+                    priority = CoachingInsight.Priority.MEDIUM,
+                    title = "Reduce Fuel Consumption",
+                    description = "Your fuel efficiency is below optimal levels",
+                    recommendation = "Avoid excessive idling and maintain steady speeds",
+                    potentialImprovement = 20.0
+                )
+            )
+        }
+        
+        // Compliance insights
+        if (scores.compliance < 80.0) {
+            insights.add(
+                CoachingInsight(
+                    category = ScoringCategory.COMPLIANCE,
+                    priority = CoachingInsight.Priority.HIGH,
+                    title = "Follow Traffic Regulations",
+                    description = "Multiple compliance issues detected",
+                    recommendation = "Adhere to speed limits and traffic rules",
+                    potentialImprovement = 10.0
+                )
+            )
+        }
+        
+        return insights
+    }
+    
+    // Helper methods for scoring calculations
+    
+    private fun calculateScoreImpact(eventType: EventType, severity: Severity): Double {
+        return when (severity) {
+            Severity.CRITICAL -> -10.0
+            Severity.HIGH -> -5.0
+            Severity.MEDIUM -> -2.0
+            Severity.LOW -> -1.0
+        }
+    }
+    
+    private fun calculateSafetyScore(current: TelematicsData, previous: TelematicsData?): Double {
+        val harshBrakingCount = current.harshBrakingCount ?: 0
+        val rapidAccelerationCount = current.rapidAccelerationCount ?: 0
+        val sharpTurnCount = current.sharpTurnCount ?: 0
+        val totalEvents = harshBrakingCount + rapidAccelerationCount + sharpTurnCount
+        
+        return maxOf(0.0, 100.0 - (totalEvents * 2.0))
+    }
+    
+    private fun calculateEfficiencyScore(fuelEfficiency: Double, idleTimePercentage: Double): Double {
+        val fuelScore = when {
+            fuelEfficiency >= FUEL_EFFICIENCY_GOOD -> 100.0
+            fuelEfficiency >= FUEL_EFFICIENCY_POOR -> 70.0
+            else -> 40.0
+        }
+        
+        val idleScore = maxOf(0.0, 100.0 - idleTimePercentage)
+        
+        return (fuelScore + idleScore) / 2.0
+    }
+    
+    private fun calculateComplianceScore(current: TelematicsData, driverProfile: DriverProfile): Double {
+        val overSpeedingEvents = current.overSpeedingCount ?: 0
+        val baseScore = 100.0 - (overSpeedingEvents * 5.0)
+        return maxOf(0.0, baseScore)
+    }
+    
+    private fun calculateUpdatedSafetyScore(events: List<TelematicsEvent>, currentScore: Double): Double {
+        val safetyEvents = events.filter { 
+            it.type == EventType.HARSH_BRAKING || 
+            it.type == EventType.RAPID_ACCELERATION || 
+            it.type == EventType.SHARP_TURN 
+        }
+        val totalImpact = safetyEvents.sumOf { it.impactOnScore }
+        return maxOf(0.0, minOf(100.0, currentScore + totalImpact))
+    }
+    
+    private fun calculateUpdatedEfficiencyScore(metrics: DrivingMetrics, currentScore: Double): Double {
+        val targetScore = (metrics.fuelEfficiencyScore + (100.0 - metrics.idleTimePercentage)) / 2.0
+        return (currentScore * 0.7) + (targetScore * 0.3) // Weighted average
+    }
+    
+    private fun calculateUpdatedComplianceScore(events: List<TelematicsEvent>, currentScore: Double): Double {
+        val complianceEvents = events.filter { it.type == EventType.OVER_SPEEDING }
+        val totalImpact = complianceEvents.sumOf { it.impactOnScore }
+        return maxOf(0.0, minOf(100.0, currentScore + totalImpact))
+    }
+    
+    private fun calculateUpdatedPerformanceScore(metrics: DrivingMetrics, currentScore: Double): Double {
+        return (metrics.safetyScore + metrics.efficiencyScore + metrics.complianceScore) / 3.0
+    }
+    
+    private fun calculateCostPerKm(fuelEfficiency: Double, driverProfile: DriverProfile): Double {
+        val fuelPrice = driverProfile.fuelPricePerLiter ?: 1.5
+        return if (fuelEfficiency > 0) {
+            fuelPrice / fuelEfficiency
+        } else {
+            0.0
+        }
+    }
+    
+    private fun generateEventId(): String {
+        return "event_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    }
+}
+
+/**
+ * Telematics data class
+ */
+data class TelematicsData(
+    val timestamp: LocalDateTime,
+    val location: LocationData?,
+    val speed: Double?, // km/h
+    val acceleration: Double?, // m/s²
+    val lateralAcceleration: Double?, // g-force
+    val engineRPM: Int?,
+    val fuelLevel: Double?, // percentage
+    val totalDistance: Double?, // km
+    val totalFuelConsumed: Double?, // liters
+    val totalDrivingTime: Double?, // seconds
+    val totalIdleTime: Double?, // seconds
+    val averageSpeed: Double?, // km/h
+    val maxSpeed: Double?, // km/h
+    val harshBrakingCount: Int?,
+    val rapidAccelerationCount: Int?,
+    val sharpTurnCount: Int?,
+    val overSpeedingCount: Int?
+)
+
+/**
+ * Location data class
+ */
+data class LocationData(
+    val latitude: Double,
+    val longitude: Double,
+    val accuracy: Float,
+    val altitude: Double?
+)
+
+/**
+ * Driver profile data class
+ */
+data class DriverProfile(
+    val driverId: String,
+    val vehicleSpeedLimit: Double?, // km/h
+    val fuelPricePerLiter: Double?,
+    val scores: DriverScores
+)
+
+/**
+ * Telematics event data class
+ */
+data class TelematicsEvent(
+    val id: String,
+    val type: TelematicsEngine.EventType,
+    val severity: TelematicsEngine.Severity,
+    val timestamp: LocalDateTime,
+    val location: LocationData?,
+    val value: Double,
+    val unit: String,
+    val description: String,
+    val impactOnScore: Double
+)
+
+/**
+ * Driving metrics data class
+ */
+data class DrivingMetrics(
+    val totalDistance: Double,
+    val totalFuelConsumed: Double,
+    val fuelEfficiency: Double, // km/l
+    val averageSpeed: Double,
+    val maxSpeed: Double,
+    val totalDrivingTime: Double,
+    val idleTimePercentage: Double,
+    val harshEventsPer100km: Double,
+    val estimatedCostPerKm: Double,
+    val safetyScore: Double,
+    val efficiencyScore: Double,
+    val complianceScore: Double
+)
+
+/**
+ * Driver scores data class
+ */
+data class DriverScores(
+    val safety: Double,
+    val efficiency: Double,
+    val compliance: Double,
+    val performance: Double,
+    val overall: Double,
+    val lastUpdated: LocalDateTime
+)
+
+/**
+ * Coaching insight data class
+ */
+data class CoachingInsight(
+    val category: TelematicsEngine.ScoringCategory,
+    val priority: Priority,
+    val title: String,
+    val description: String,
+    val recommendation: String,
+    val potentialImprovement: Double
+) {
+    enum class Priority { LOW, MEDIUM, HIGH, CRITICAL }
+}
+
+/**
+ * Telematics result data class
+ */
+data class TelematicsResult(
+    val driverId: String,
+    val processedAt: LocalDateTime,
+    val telematicsData: TelematicsData,
+    val detectedEvents: List<TelematicsEvent>,
+    val drivingMetrics: DrivingMetrics,
+    val updatedScores: DriverScores,
+    val coachingInsights: List<CoachingInsight>,
+    val requiresImmediateAttention: Boolean,
+    val errorMessage: String? = null
+) {
+    companion object {
+        fun createError(driverId: String, currentTime: LocalDateTime): TelematicsResult {
+            return TelematicsResult(
+                driverId = driverId,
+                processedAt = currentTime,
+                telematicsData = TelematicsData(
+                    timestamp = currentTime,
+                    location = null,
+                    speed = null,
+                    acceleration = null,
+                    lateralAcceleration = null,
+                    engineRPM = null,
+                    fuelLevel = null,
+                    totalDistance = null,
+                    totalFuelConsumed = null,
+                    totalDrivingTime = null,
+                    totalIdleTime = null,
+                    averageSpeed = null,
+                    maxSpeed = null,
+                    harshBrakingCount = null,
+                    rapidAccelerationCount = null,
+                    sharpTurnCount = null,
+                    overSpeedingCount = null
+                ),
+                detectedEvents = emptyList(),
+                drivingMetrics = DrivingMetrics(
+                    totalDistance = 0.0,
+                    totalFuelConsumed = 0.0,
+                    fuelEfficiency = 0.0,
+                    averageSpeed = 0.0,
+                    maxSpeed = 0.0,
+                    totalDrivingTime = 0.0,
+                    idleTimePercentage = 0.0,
+                    harshEventsPer100km = 0.0,
+                    estimatedCostPerKm = 0.0,
+                    safetyScore = 0.0,
+                    efficiencyScore = 0.0,
+                    complianceScore = 0.0
+                ),
+                updatedScores = DriverScores(
+                    safety = 0.0,
+                    efficiency = 0.0,
+                    compliance = 0.0,
+                    performance = 0.0,
+                    overall = 0.0,
+                    lastUpdated = currentTime
+                ),
+                coachingInsights = emptyList(),
+                requiresImmediateAttention = false,
+                errorMessage = "Error processing telematics data"
+            )
+        }
+    }
+}

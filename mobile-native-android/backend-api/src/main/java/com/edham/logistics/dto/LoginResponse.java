@@ -1,17 +1,19 @@
 package com.edham.logistics.dto;
 
+import com.edham.logistics.model.User;
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
-import java.util.List;
+import lombok.NoArgsConstructor;
 
 @Data
 @Builder
+@NoArgsConstructor
+@AllArgsConstructor
 public class LoginResponse {
-    private String token;
-    private String type = "Bearer";
+    private String accessToken;
     private String refreshToken;
-    private Long id;
-    private String email;
-    private String name;
-    private List<String> roles;
+    private String tokenType;
+    private Long expiresIn;
+    private User user;
 }

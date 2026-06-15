@@ -1,0 +1,476 @@
+package com.edham.logistics.core.backup
+
+import android.content.Context
+import kotlinx.coroutines.*
+import java.io.*
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * File Backup Service - Handles file backup and restoration
+ * Provides secure and efficient file backup operations
+ */
+@Singleton
+class FileBackupService @Inject constructor(
+    private val context: Context
+) {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Create file backups
+     */
+    suspend fun createFileBackups(
+        directories: List<String> = getDefaultBackupDirectories()
+    ): List<FileBackup> {
+        return withContext(Dispatchers.IO) {
+            val backups = mutableListOf<FileBackup>()
+            
+            directories.forEach { directory ->
+                try {
+                    val dir = File(context.filesDir, directory)
+                    if (dir.exists()) {
+                        val dirBackups = backupDirectory(dir, directory)
+                        backups.addAll(dirBackups)
+                    }
+                } catch (e: Exception) {
+                    // Handle directory backup error
+                }
+            }
+            
+            backups
+        }
+    }
+
+    /**
+     * Restore file backups
+     */
+    suspend fun restoreFileBackups(
+        backupFile: File,
+        backupInfo: BackupInfo
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val restoredFiles = mutableListOf<String>()
+                
+                // Extract backup file
+                val zipInputStream = java.util.zip.ZipInputStream(FileInputStream(backupFile))
+                
+                zipInputStream.use { zipIn ->
+                    var entry = zipIn.nextEntry
+                    
+                    while (entry != null) {
+                        if (entry.name.startsWith("files/")) {
+                            val relativePath = entry.name.substring("files/".length)
+                            val restoredFile = restoreFile(zipIn, relativePath)
+                            
+                            if (restoredFile) {
+                                restoredFiles.add(relativePath)
+                            }
+                        }
+                        
+                        zipIn.closeEntry()
+                        entry = zipIn.nextEntry
+                    }
+                }
+                
+                restoredFiles.isNotEmpty()
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Backup specific directory
+     */
+    suspend fun backupDirectory(
+        directory: File,
+        relativePath: String
+    ): List<FileBackup> {
+        return withContext(Dispatchers.IO) {
+            val backups = mutableListOf<FileBackup>()
+            
+            directory.walkTopDown().forEach { file ->
+                if (file.isFile) {
+                    try {
+                        val fileRelativePath = "$relativePath/${file.name}"
+                        val fileData = file.readBytes()
+                        val checksum = calculateChecksum(fileData)
+                        
+                        backups.add(
+                            FileBackup(
+                                relativePath = fileRelativePath,
+                                fileName = file.name,
+                                data = fileData,
+                                size = fileData.size.toLong(),
+                                lastModified = file.lastModified(),
+                                checksum = checksum,
+                                mimeType = getMimeType(file)
+                            )
+                        )
+                        
+                    } catch (e: Exception) {
+                        // Handle file backup error
+                    }
+                }
+            }
+            
+            backups
+        }
+    }
+
+    /**
+     * Backup single file
+     */
+    suspend fun backupFile(
+        filePath: String
+    ): FileBackup? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val file = File(context.filesDir, filePath)
+                if (file.exists() && file.isFile) {
+                    val fileData = file.readBytes()
+                    val checksum = calculateChecksum(fileData)
+                    
+                    FileBackup(
+                        relativePath = filePath,
+                        fileName = file.name,
+                        data = fileData,
+                        size = fileData.size.toLong(),
+                        lastModified = file.lastModified(),
+                        checksum = checksum,
+                        mimeType = getMimeType(file)
+                    )
+                } else {
+                    null
+                }
+                
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
+    /**
+     * Restore single file
+     */
+    suspend fun restoreSingleFile(
+        fileBackup: FileBackup
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val targetFile = File(context.filesDir, fileBackup.relativePath)
+                
+                // Create parent directories if they don't exist
+                targetFile.parentFile?.mkdirs()
+                
+                // Verify file integrity
+                val checksum = calculateChecksum(fileBackup.data)
+                if (checksum != fileBackup.checksum) {
+                    throw BackupException("File integrity check failed")
+                }
+                
+                // Write file
+                targetFile.writeBytes(fileBackup.data)
+                
+                // Restore file timestamp
+                targetFile.setLastModified(fileBackup.lastModified)
+                
+                true
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Create incremental file backup
+     */
+    suspend fun createIncrementalFileBackup(
+        lastBackupTime: Long
+    ): List<FileBackup> {
+        return withContext(Dispatchers.IO) {
+            val backups = mutableListOf<FileBackup>()
+            val directories = getDefaultBackupDirectories()
+            
+            directories.forEach { directory ->
+                try {
+                    val dir = File(context.filesDir, directory)
+                    if (dir.exists()) {
+                        val dirBackups = getChangedFiles(dir, directory, lastBackupTime)
+                        backups.addAll(dirBackups)
+                    }
+                } catch (e: Exception) {
+                    // Handle directory backup error
+                }
+            }
+            
+            backups
+        }
+    }
+
+    /**
+     * Get changed files since last backup
+     */
+    private suspend fun getChangedFiles(
+        directory: File,
+        relativePath: String,
+        lastBackupTime: Long
+    ): List<FileBackup> {
+        return withContext(Dispatchers.IO) {
+            val backups = mutableListOf<FileBackup>()
+            
+            directory.walkTopDown().forEach { file ->
+                if (file.isFile && file.lastModified() > lastBackupTime) {
+                    try {
+                        val fileRelativePath = "$relativePath/${file.name}"
+                        val fileData = file.readBytes()
+                        val checksum = calculateChecksum(fileData)
+                        
+                        backups.add(
+                            FileBackup(
+                                relativePath = fileRelativePath,
+                                fileName = file.name,
+                                data = fileData,
+                                size = fileData.size.toLong(),
+                                lastModified = file.lastModified(),
+                                checksum = checksum,
+                                mimeType = getMimeType(file),
+                                changeType = ChangeType.UPDATE
+                            )
+                        )
+                        
+                    } catch (e: Exception) {
+                        // Handle file backup error
+                    }
+                }
+            }
+            
+            backups
+        }
+    }
+
+    /**
+     * Restore file from zip input stream
+     */
+    private suspend fun restoreFile(
+        zipInputStream: java.util.zip.ZipInputStream,
+        relativePath: String
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val targetFile = File(context.filesDir, relativePath)
+                
+                // Create parent directories if they don't exist
+                targetFile.parentFile?.mkdirs()
+                
+                // Read file data
+                val fileData = zipInputStream.readBytes()
+                
+                // Write file
+                targetFile.writeBytes(fileData)
+                
+                true
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Get default backup directories
+     */
+    private fun getDefaultBackupDirectories(): List<String> {
+        return listOf(
+            "documents",
+            "images",
+            "exports",
+            "temp",
+            "logs"
+        )
+    }
+
+    /**
+     * Get MIME type for file
+     */
+    private fun getMimeType(file: File): String {
+        val extension = file.extension.lowercase()
+        return when (extension) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "gif" -> "image/gif"
+            "pdf" -> "application/pdf"
+            "doc", "docx" -> "application/msword"
+            "xls", "xlsx" -> "application/vnd.ms-excel"
+            "txt" -> "text/plain"
+            "json" -> "application/json"
+            "xml" -> "application/xml"
+            "zip" -> "application/zip"
+            "mp4" -> "video/mp4"
+            "mp3" -> "audio/mpeg"
+            else -> "application/octet-stream"
+        }
+    }
+
+    /**
+     * Calculate checksum for file data
+     */
+    private fun calculateChecksum(data: ByteArray): String {
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            val digest = md.digest(data)
+            digest.joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    /**
+     * Get file statistics
+     */
+    suspend fun getFileStatistics(): FileStatistics {
+        return withContext(Dispatchers.IO) {
+            val directories = getDefaultBackupDirectories()
+            var totalFiles = 0
+            var totalSize = 0L
+            val fileTypes = mutableMapOf<String, Int>()
+            
+            directories.forEach { directory ->
+                try {
+                    val dir = File(context.filesDir, directory)
+                    if (dir.exists()) {
+                        dir.walkTopDown().forEach { file ->
+                            if (file.isFile) {
+                                totalFiles++
+                                totalSize += file.length()
+                                
+                                val extension = file.extension.lowercase()
+                                fileTypes[extension] = fileTypes.getOrDefault(extension, 0) + 1
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Handle directory scan error
+                }
+            }
+            
+            FileStatistics(
+                totalFiles = totalFiles,
+                totalSize = totalSize,
+                fileTypes = fileTypes,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+    }
+
+    /**
+     * Clean up old temporary files
+     */
+    suspend fun cleanupTempFiles() {
+        withContext(Dispatchers.IO) {
+            try {
+                val tempDir = File(context.cacheDir, "backup_temp")
+                if (tempDir.exists()) {
+                    tempDir.walkTopDown().forEach { file ->
+                        if (file.isFile && file.lastModified() < System.currentTimeMillis() - 24 * 60 * 60 * 1000) {
+                            file.delete()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Handle cleanup error
+            }
+        }
+    }
+
+    /**
+     * Verify file backup integrity
+     */
+    suspend fun verifyBackupIntegrity(fileBackups: List<FileBackup>): Boolean {
+        return withContext(Dispatchers.IO) {
+            fileBackups.all { fileBackup ->
+                val calculatedChecksum = calculateChecksum(fileBackup.data)
+                calculatedChecksum == fileBackup.checksum
+            }
+        }
+    }
+
+    /**
+     * Create backup manifest
+     */
+    suspend fun createBackupManifest(fileBackups: List<FileBackup>): BackupManifest {
+        return withContext(Dispatchers.IO) {
+            BackupManifest(
+                version = "1.0",
+                created = System.currentTimeMillis(),
+                fileCount = fileBackups.size,
+                totalSize = fileBackups.sumOf { it.size },
+                files = fileBackups.map { backup ->
+                    FileManifest(
+                        path = backup.relativePath,
+                        name = backup.fileName,
+                        size = backup.size,
+                        checksum = backup.checksum,
+                        mimeType = backup.mimeType,
+                        lastModified = backup.lastModified
+                    )
+                }
+            )
+        }
+    }
+
+    /**
+     * Cleanup service
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Data classes and exceptions
+ */
+data class FileBackup(
+    val relativePath: String,
+    val fileName: String,
+    val data: ByteArray,
+    val size: Long,
+    val lastModified: Long,
+    val checksum: String,
+    val mimeType: String,
+    val changeType: ChangeType = ChangeType.UPDATE
+)
+
+data class FileStatistics(
+    val totalFiles: Int,
+    val totalSize: Long,
+    val fileTypes: Map<String, Int>,
+    val timestamp: Long
+)
+
+data class BackupManifest(
+    val version: String,
+    val created: Long,
+    val fileCount: Int,
+    val totalSize: Long,
+    val files: List<FileManifest>
+)
+
+data class FileManifest(
+    val path: String,
+    val name: String,
+    val size: Long,
+    val checksum: String,
+    val mimeType: String,
+    val lastModified: Long
+)
+
+class BackupException(message: String, cause: Throwable? = null) : Exception(message, cause)

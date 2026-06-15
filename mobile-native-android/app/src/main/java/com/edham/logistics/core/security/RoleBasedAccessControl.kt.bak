@@ -1,0 +1,515 @@
+package com.edham.logistics.core.security
+
+import com.edham.logistics.core.utils.Result
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Role-based access control system for preventing unauthorized access between roles
+ */
+@Singleton
+class RoleBasedAccessControl @Inject constructor(
+    private val secureTokenManager: SecureTokenManager,
+    private val sessionManager: SessionManager
+) {
+    
+    companion object {
+        // Role hierarchy (higher number = higher privilege)
+        const val ROLE_CUSTOMER = 1
+        const val ROLE_DRIVER = 2
+        const val ROLE_ACCOUNTANT = 3
+        const val ROLE_ADMIN = 4
+        
+        // Permission categories
+        const val PERMISSION_READ = "read"
+        const val PERMISSION_WRITE = "write"
+        const val PERMISSION_DELETE = "delete"
+        const val PERMISSION_ADMIN = "admin"
+        const val PERMISSION_FINANCIAL = "financial"
+        const val PERMISSION_ANALYTICS = "analytics"
+        const val PERMISSION_SHIPMENT = "shipment"
+        const val PERMISSION_BILLING = "billing"
+        const val PERMISSION_USER_MANAGEMENT = "user_management"
+        const val PERMISSION_SYSTEM_CONFIG = "system_config"
+    }
+    
+    private val _accessControlState = MutableStateFlow<AccessControlState>(AccessControlState.Denied)
+    val accessControlState: StateFlow<AccessControlState> = _accessControlState.asStateFlow()
+    
+    private val _accessViolations = MutableStateFlow<List<AccessViolation>>(emptyList())
+    val accessViolations: StateFlow<List<AccessViolation>> = _accessViolations.asStateFlow()
+    
+    // Role permissions mapping
+    private val rolePermissions = mapOf(
+        "customer" to setOf(
+            PERMISSION_READ,
+            PERMISSION_WRITE,
+            PERMISSION_SHIPMENT,
+            PERMISSION_BILLING
+        ),
+        "driver" to setOf(
+            PERMISSION_READ,
+            PERMISSION_WRITE,
+            PERMISSION_SHIPMENT
+        ),
+        "accountant" to setOf(
+            PERMISSION_READ,
+            PERMISSION_WRITE,
+            PERMISSION_FINANCIAL,
+            PERMISSION_BILLING,
+            PERMISSION_ANALYTICS
+        ),
+        "admin" to setOf(
+            PERMISSION_READ,
+            PERMISSION_WRITE,
+            PERMISSION_DELETE,
+            PERMISSION_ADMIN,
+            PERMISSION_FINANCIAL,
+            PERMISSION_ANALYTICS,
+            PERMISSION_SHIPMENT,
+            PERMISSION_BILLING,
+            PERMISSION_USER_MANAGEMENT,
+            PERMISSION_SYSTEM_CONFIG
+        )
+    )
+    
+    // Resource access rules
+    private val resourceAccessRules = mapOf(
+        // Customer resources
+        "/api/customer/" to setOf("customer"),
+        "/api/shipment/customer/" to setOf("customer"),
+        "/api/billing/customer/" to setOf("customer"),
+        "/api/analytics/customer/" to setOf("customer"),
+        
+        // Driver resources
+        "/api/driver/" to setOf("driver", "admin", "accountant"),
+        "/api/shipment/driver/" to setOf("driver", "admin", "accountant"),
+        "/api/analytics/driver/" to setOf("driver", "admin", "accountant"),
+        
+        // Accountant resources
+        "/api/accountant/" to setOf("accountant", "admin"),
+        "/api/billing/" to setOf("accountant", "admin"),
+        "/api/financial/" to setOf("accountant", "admin"),
+        "/api/analytics/financial/" to setOf("accountant", "admin"),
+        
+        // Admin resources
+        "/api/admin/" to setOf("admin"),
+        "/api/system/" to setOf("admin"),
+        "/api/users/" to setOf("admin"),
+        "/api/roles/" to setOf("admin"),
+        "/api/permissions/" to setOf("admin"),
+        
+        // General resources
+        "/api/auth/" to setOf("customer", "driver", "accountant", "admin"),
+        "/api/profile/" to setOf("customer", "driver", "accountant", "admin"),
+        "/api/notifications/" to setOf("customer", "driver", "accountant", "admin"),
+        
+        // Analytics resources
+        "/api/analytics/" to setOf("customer", "driver", "accountant", "admin")
+    )
+    
+    /**
+     * Check if user has permission for specific action
+     */
+    suspend fun hasPermission(permission: String): Boolean {
+        return try {
+            val userRole = secureTokenManager.getUserRole()
+            val userId = secureTokenManager.getUserId()
+            
+            if (userRole == null || userId == null) {
+                return false
+            }
+            
+            val userPermissions = rolePermissions[userRole.lowercase()] ?: emptySet()
+            val hasPermission = userPermissions.contains(permission)
+            
+            if (!hasPermission) {
+                logAccessViolation(userId, userRole, permission, "Permission denied")
+            }
+            
+            hasPermission
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Check if user can access specific resource
+     */
+    suspend fun canAccessResource(resourcePath: String, action: String = PERMISSION_READ): Boolean {
+        return try {
+            val userRole = secureTokenManager.getUserRole()
+            val userId = secureTokenManager.getUserId()
+            
+            if (userRole == null || userId == null) {
+                return false
+            }
+            
+            // Check role-based access
+            val allowedRoles = getAllowedRolesForResource(resourcePath)
+            val roleAllowed = allowedRoles.contains(userRole.lowercase())
+            
+            // Check permission-based access
+            val permissionAllowed = hasPermission(action)
+            
+            val canAccess = roleAllowed && permissionAllowed
+            
+            if (!canAccess) {
+                logAccessViolation(userId, userRole, resourcePath, "Resource access denied")
+            }
+            
+            canAccess
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Check if user can access another user's data
+     */
+    suspend fun canAccessUserData(targetUserId: String, action: String = PERMISSION_READ): Boolean {
+        return try {
+            val currentUserId = secureTokenManager.getUserId()
+            val currentUserRole = secureTokenManager.getUserRole()
+            
+            if (currentUserId == null || currentUserRole == null) {
+                return false
+            }
+            
+            // Users can always access their own data
+            if (currentUserId == targetUserId) {
+                return true
+            }
+            
+            // Admin can access all user data
+            if (currentUserRole.lowercase() == "admin") {
+                return true
+            }
+            
+            // Accountant can access financial data for all users
+            if (currentUserRole.lowercase() == "accountant" && action == PERMISSION_FINANCIAL) {
+                return true
+            }
+            
+            // Check specific role permissions
+            when (currentUserRole.lowercase()) {
+                "driver" -> {
+                    // Drivers can only access their own data
+                    false
+                }
+                "customer" -> {
+                    // Customers can only access their own data
+                    false
+                }
+                else -> {
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Check if user can perform admin action
+     */
+    suspend fun canPerformAdminAction(): Boolean {
+        return hasPermission(PERMISSION_ADMIN)
+    }
+    
+    /**
+     * Check if user can access financial data
+     */
+    suspend fun canAccessFinancialData(): Boolean {
+        return hasPermission(PERMISSION_FINANCIAL)
+    }
+    
+    /**
+     * Check if user can access analytics
+     */
+    suspend fun canAccessAnalytics(): Boolean {
+        return hasPermission(PERMISSION_ANALYTICS)
+    }
+    
+    /**
+     * Check if user can manage shipments
+     */
+    suspend fun canManageShipments(): Boolean {
+        return hasPermission(PERMISSION_SHIPMENT)
+    }
+    
+    /**
+     * Check if user can manage billing
+     */
+    suspend fun canManageBilling(): Boolean {
+        return hasPermission(PERMISSION_BILLING)
+    }
+    
+    /**
+     * Check if user can manage users
+     */
+    suspend fun canManageUsers(): Boolean {
+        return hasPermission(PERMISSION_USER_MANAGEMENT)
+    }
+    
+    /**
+     * Check if user can configure system
+     */
+    suspend fun canConfigureSystem(): Boolean {
+        return hasPermission(PERMISSION_SYSTEM_CONFIG)
+    }
+    
+    /**
+     * Validate API request access
+     */
+    suspend fun validateApiAccess(
+        userId: String,
+        userRole: String,
+        resourcePath: String,
+        action: String = PERMISSION_READ
+    ): Result<AccessValidationResult> {
+        return try {
+            // Check if user is authenticated
+            if (userId.isEmpty()) {
+                return Result.Error(SecurityException("User not authenticated"))
+            }
+            
+            // Check role validity
+            if (!rolePermissions.containsKey(userRole.lowercase())) {
+                return Result.Error(SecurityException("Invalid user role: $userRole"))
+            }
+            
+            // Check resource access
+            val allowedRoles = getAllowedRolesForResource(resourcePath)
+            if (!allowedRoles.contains(userRole.lowercase())) {
+                logAccessViolation(userId, userRole, resourcePath, "API access denied")
+                return Result.Success(AccessValidationResult.Denied("Access denied for resource: $resourcePath"))
+            }
+            
+            // Check permission
+            val userPermissions = rolePermissions[userRole.lowercase()] ?: emptySet()
+            if (!userPermissions.contains(action)) {
+                logAccessViolation(userId, userRole, action, "Permission denied")
+                return Result.Success(AccessValidationResult.Denied("Permission denied for action: $action"))
+            }
+            
+            // Check user data access if applicable
+            if (isUserDataResource(resourcePath)) {
+                val targetUserId = extractUserIdFromResourcePath(resourcePath)
+                if (targetUserId != null && targetUserId != userId) {
+                    if (!canAccessUserData(targetUserId, action)) {
+                        logAccessViolation(userId, userRole, resourcePath, "User data access denied")
+                        return Result.Success(AccessValidationResult.Denied("Access denied to user data"))
+                    }
+                }
+            }
+            
+            Result.Success(AccessValidationResult.Allowed)
+            
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    /**
+     * Get allowed roles for resource
+     */
+    private fun getAllowedRolesForResource(resourcePath: String): Set<String> {
+        return resourceAccessRules.entries
+            .filter { resourcePath.startsWith(it.key) }
+            .flatMap { it.value }
+            .toSet()
+    }
+    
+    /**
+     * Check if resource is user data
+     */
+    private fun isUserDataResource(resourcePath: String): Boolean {
+        return resourcePath.contains("/user/") || 
+               resourcePath.contains("/customer/") ||
+               resourcePath.contains("/driver/") ||
+               resourcePath.contains("/accountant/")
+    }
+    
+    /**
+     * Extract user ID from resource path
+     */
+    private fun extractUserIdFromResourcePath(resourcePath: String): String? {
+        return try {
+            val parts = resourcePath.split("/")
+            val userIndex = parts.indexOf("user")
+            if (userIndex != -1 && userIndex + 1 < parts.size) {
+                parts[userIndex + 1]
+            } else {
+                val customerIndex = parts.indexOf("customer")
+                if (customerIndex != -1 && customerIndex + 1 < parts.size) {
+                    parts[customerIndex + 1]
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    /**
+     * Get user permissions
+     */
+    suspend fun getUserPermissions(): Set<String> {
+        return try {
+            val userRole = secureTokenManager.getUserRole()
+            rolePermissions[userRole?.lowercase() ?: ""] ?: emptySet()
+        } catch (e: Exception) {
+            emptySet()
+        }
+    }
+    
+    /**
+     * Get role hierarchy level
+     */
+    fun getRoleHierarchyLevel(role: String): Int {
+        return when (role.lowercase()) {
+            "customer" -> ROLE_CUSTOMER
+            "driver" -> ROLE_DRIVER
+            "accountant" -> ROLE_ACCOUNTANT
+            "admin" -> ROLE_ADMIN
+            else -> 0
+        }
+    }
+    
+    /**
+     * Check if role can access another role's resources
+     */
+    fun canAccessRoleResources(currentRole: String, targetRole: String): Boolean {
+        val currentLevel = getRoleHierarchyLevel(currentRole)
+        val targetLevel = getRoleHierarchyLevel(targetRole)
+        
+        return when (currentRole.lowercase()) {
+            "admin" -> true // Admin can access everything
+            "accountant" -> targetRole.lowercase() != "admin" // Accountant can't access admin resources
+            "driver" -> targetRole.lowercase() == "driver" // Driver can only access driver resources
+            "customer" -> targetRole.lowercase() == "customer" // Customer can only access customer resources
+            else -> false
+        }
+    }
+    
+    /**
+     * Log access violation
+     */
+    private fun logAccessViolation(userId: String, userRole: String, resource: String, reason: String) {
+        val violation = AccessViolation(
+            userId = userId,
+            userRole = userRole,
+            resource = resource,
+            reason = reason,
+            timestamp = System.currentTimeMillis(),
+            severity = when {
+                reason.contains("admin") -> AccessViolationSeverity.HIGH
+                reason.contains("financial") -> AccessViolationSeverity.HIGH
+                reason.contains("user data") -> AccessViolationSeverity.MEDIUM
+                else -> AccessViolationSeverity.LOW
+            }
+        )
+        
+        val currentViolations = _accessViolations.value.toMutableList()
+        currentViolations.add(violation)
+        
+        // Keep only recent violations
+        if (currentViolations.size > 100) {
+            currentViolations.removeAt(0)
+        }
+        
+        _accessViolations.value = currentViolations
+    }
+    
+    /**
+     * Get access control status
+     */
+    fun getAccessControlStatus(): AccessControlStatus {
+        return try {
+            val userId = secureTokenManager.getUserId()
+            val userRole = secureTokenManager.getUserRole()
+            val userPermissions = getUserPermissions()
+            
+            AccessControlStatus(
+                isAuthenticated = userId != null,
+                userId = userId,
+                userRole = userRole,
+                userPermissions = userPermissions,
+                accessViolations = _accessViolations.value,
+                isSecure = userId != null && userRole != null
+            )
+        } catch (e: Exception) {
+            AccessControlStatus(
+                isAuthenticated = false,
+                userId = null,
+                userRole = null,
+                userPermissions = emptySet(),
+                accessViolations = _accessViolations.value,
+                isSecure = false
+            )
+        }
+    }
+    
+    /**
+     * Clear access violations
+     */
+    fun clearAccessViolations() {
+        _accessViolations.value = emptyList()
+    }
+}
+
+/**
+ * Access control state enum
+ */
+enum class AccessControlState {
+    Allowed,
+    Denied,
+    Suspended
+}
+
+/**
+ * Access validation result
+ */
+sealed class AccessValidationResult {
+    object Allowed : AccessValidationResult()
+    data class Denied(val reason: String) : AccessValidationResult()
+}
+
+/**
+ * Access violation data class
+ */
+data class AccessViolation(
+    val userId: String,
+    val userRole: String,
+    val resource: String,
+    val reason: String,
+    val timestamp: Long,
+    val severity: AccessViolationSeverity
+)
+
+/**
+ * Access violation severity
+ */
+enum class AccessViolationSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+/**
+ * Access control status
+ */
+data class AccessControlStatus(
+    val isAuthenticated: Boolean,
+    val userId: String?,
+    val userRole: String?,
+    val userPermissions: Set<String>,
+    val accessViolations: List<AccessViolation>,
+    val isSecure: Boolean
+)

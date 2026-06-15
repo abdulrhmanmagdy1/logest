@@ -1,0 +1,943 @@
+package com.edham.logistics.analytics.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.edham.logistics.analytics.AnalyticsEngineService
+import com.edham.logistics.ui.theme.*
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Exportable Reports Fragment - Comprehensive report generation and export functionality
+ * 
+ * Features:
+ * - Multiple report templates
+ * - Export to PDF, Excel, CSV
+ * - Scheduled report generation
+ * - Report customization
+ * - Report history
+ * - Email sharing
+ * - Print functionality
+ * - Report templates management
+ */
+@AndroidEntryPoint
+class ExportableReportsFragment : Fragment() {
+    
+    @Inject
+    lateinit var analyticsEngineService: AnalyticsEngineService
+    
+    private val viewModel: ExportableReportsViewModel by viewModels()
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        return ComposeView(requireContext()).apply {
+            setContent {
+                EdhamLogisticsTheme {
+                    ExportableReportsScreen(
+                        viewModel = viewModel,
+                        analyticsEngineService = analyticsEngineService
+                    )
+                }
+            }
+        }
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Initialize analytics engine
+        lifecycleScope.launch {
+            analyticsEngineService.initialize()
+        }
+        
+        // Load reports data
+        viewModel.loadReportsData()
+    }
+}
+
+@Composable
+fun ExportableReportsScreen(
+    viewModel: ExportableReportsViewModel,
+    analyticsEngineService: AnalyticsEngineService
+) {
+    val reportsData by viewModel.reportsData.collectAsStateWithLifecycle()
+    val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
+    val selectedReportType by viewModel.selectedReportType.collectAsStateWithLifecycle()
+    val selectedTimeRange by viewModel.selectedTimeRange.collectAsStateWithLifecycle()
+    val selectedFormat by viewModel.selectedFormat.collectAsStateWithLifecycle()
+    
+    LaunchedEffect(selectedReportType, selectedTimeRange) {
+        viewModel.loadReportsData()
+    }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Header
+        ReportsHeader(
+            selectedReportType = selectedReportType,
+            onReportTypeChanged = viewModel::setReportType,
+            selectedTimeRange = selectedTimeRange,
+            onTimeRangeChanged = viewModel::setTimeRange,
+            selectedFormat = selectedFormat,
+            onFormatChanged = viewModel::setFormat,
+            onRefresh = viewModel::refreshReports,
+            isLoading = isLoading
+        )
+        
+        // Error message
+        errorMessage?.let { error ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = ErrorRed.copy(alpha = 0.1f)
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            ) {
+                Text(
+                    text = error,
+                    modifier = Modifier.padding(16.dp),
+                    color = ErrorRed,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+        }
+        
+        // Reports Content
+        reportsData?.let { data ->
+            // Quick Actions
+            QuickActionsSection(
+                reportType = selectedReportType,
+                timeRange = selectedTimeRange,
+                format = selectedFormat,
+                onGenerateReport = viewModel::generateReport,
+                onScheduleReport = viewModel::scheduleReport,
+                onPreviewReport = viewModel::previewReport
+            )
+            
+            // Report Templates
+            ReportTemplatesSection(
+                templates = data.templates,
+                selectedTemplate = data.selectedTemplate,
+                onTemplateSelected = viewModel::selectTemplate
+            )
+            
+            // Report Customization
+            ReportCustomizationSection(
+                customization = data.customization,
+                onCustomizationChanged = viewModel::updateCustomization
+            )
+            
+            // Report History
+            ReportHistorySection(
+                history = data.history,
+                onDownloadReport = viewModel::downloadReport,
+                onShareReport = viewModel::shareReport,
+                onDeleteReport = viewModel::deleteReport
+            )
+            
+            // Scheduled Reports
+            ScheduledReportsSection(
+                scheduledReports = data.scheduledReports,
+                onEditSchedule = viewModel::editSchedule,
+                onDeleteSchedule = viewModel::deleteSchedule,
+                onToggleSchedule = viewModel::toggleSchedule
+            )
+        }
+        
+        // Loading indicator
+        if (isLoading) {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(
+                    color = EdhamOrange,
+                    strokeWidth = 3.dp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ReportsHeader(
+    selectedReportType: ReportType,
+    onReportTypeChanged: (ReportType) -> Unit,
+    selectedTimeRange: TimeRange,
+    onTimeRangeChanged: (TimeRange) -> Unit,
+    selectedFormat: ExportFormat,
+    onFormatChanged: (ExportFormat) -> Unit,
+    onRefresh: () -> Unit,
+    isLoading: Boolean
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Exportable Reports",
+                style = MaterialTheme.typography.headlineMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            // Report type selector
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(ReportType.values()) { type ->
+                    FilterChip(
+                        selected = selectedReportType == type,
+                        onClick = { onReportTypeChanged(type) },
+                        label = {
+                            Text(
+                                text = type.displayName,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = EdhamOrange,
+                            selectedLabelColor = Color.White
+                        )
+                    )
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(12.dp))
+            
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Time range selector
+                TimeRangeSelector(
+                    selectedTimeRange = selectedTimeRange,
+                    onTimeRangeChanged = onTimeRangeChanged
+                )
+                
+                // Format selector
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(ExportFormat.values()) { format ->
+                        FilterChip(
+                            selected = selectedFormat == format,
+                            onClick = { onFormatChanged(format) },
+                            label = {
+                                Text(
+                                    text = format.displayName,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = IceBlue,
+                                selectedLabelColor = Color.White
+                            )
+                        )
+                    }
+                }
+                
+                // Refresh button
+                IconButton(
+                    onClick = onRefresh,
+                    enabled = !isLoading
+                ) {
+                    Icon(
+                        painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_rotate),
+                        contentDescription = "Refresh",
+                        tint = EdhamOrange
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun QuickActionsSection(
+    reportType: ReportType,
+    timeRange: TimeRange,
+    format: ExportFormat,
+    onGenerateReport: () -> Unit,
+    onScheduleReport: () -> Unit,
+    onPreviewReport: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Quick Actions",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    Button(
+                        onClick = onGenerateReport,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = EdhamOrange
+                        ),
+                        modifier = Modifier.height(48.dp)
+                    ) {
+                        Icon(
+                            painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_save),
+                            contentDescription = "Generate",
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Generate")
+                    }
+                }
+                
+                item {
+                    OutlinedButton(
+                        onClick = onScheduleReport,
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = IceBlue,
+                            borderColor = IceBlue
+                        ),
+                        modifier = Modifier.height(48.dp)
+                    ) {
+                        Icon(
+                            painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_recent_history),
+                            contentDescription = "Schedule",
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Schedule")
+                    }
+                }
+                
+                item {
+                    OutlinedButton(
+                        onClick = onPreviewReport,
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = SuccessGreen,
+                            borderColor = SuccessGreen
+                        ),
+                        modifier = Modifier.height(48.dp)
+                    ) {
+                        Icon(
+                            painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_zoom),
+                            contentDescription = "Preview",
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Preview")
+                    }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(12.dp))
+            
+            Text(
+                text = "Report: ${reportType.displayName} | ${timeRange.displayName} | ${format.displayName}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+            )
+        }
+    }
+}
+
+@Composable
+fun ReportTemplatesSection(
+    templates: List<ReportTemplate>,
+    selectedTemplate: ReportTemplate?,
+    onTemplateSelected: (ReportTemplate) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Report Templates",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(templates) { template ->
+                    ReportTemplateItem(
+                        template = template,
+                        isSelected = selectedTemplate == template,
+                        onSelected = onTemplateSelected
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ReportTemplateItem(
+    template: ReportTemplate,
+    isSelected: Boolean,
+    onSelected: (ReportTemplate) -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable { onSelected(template) },
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) EdhamOrange.copy(alpha = 0.1f) 
+                            else MaterialTheme.colorScheme.surfaceVariant
+        ),
+        elevation = CardDefaults.cardElevation(
+            defaultElevation = if (isSelected) 2.dp else 1.dp
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = template.name,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = if (isSelected) EdhamOrange else MaterialTheme.colorScheme.onSurface,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                )
+                
+                Text(
+                    text = template.description,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+                
+                Spacer(modifier = Modifier.height(4.dp))
+                
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    items(template.tags) { tag ->
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer
+                            ),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text(
+                                text = tag,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+                    }
+                }
+            }
+            
+            if (isSelected) {
+                Icon(
+                    painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_info_details),
+                    contentDescription = "Selected",
+                    tint = EdhamOrange,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ReportCustomizationSection(
+    customization: ReportCustomization,
+    onCustomizationChanged: (ReportCustomization) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Report Customization",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    CustomizationToggle(
+                        title = "Include Charts",
+                        subtitle = "Add visual charts to the report",
+                        value = customization.includeCharts,
+                        onValueChanged = { 
+                            onCustomizationChanged(customization.copy(includeCharts = it))
+                        }
+                    )
+                }
+                
+                item {
+                    CustomizationToggle(
+                        title = "Include Summary",
+                        subtitle = "Add executive summary section",
+                        value = customization.includeSummary,
+                        onValueChanged = { 
+                            onCustomizationChanged(customization.copy(includeSummary = it))
+                        }
+                    )
+                }
+                
+                item {
+                    CustomizationToggle(
+                        title = "Include Raw Data",
+                        subtitle = "Include detailed data tables",
+                        value = customization.includeRawData,
+                        onValueChanged = { 
+                            onCustomizationChanged(customization.copy(includeRawData = it))
+                        }
+                    )
+                }
+                
+                item {
+                    CustomizationToggle(
+                        title = "Include Recommendations",
+                        subtitle = "Add AI-powered recommendations",
+                        value = customization.includeRecommendations,
+                        onValueChanged = { 
+                            onCustomizationChanged(customization.copy(includeRecommendations = it))
+                        }
+                    )
+                }
+                
+                item {
+                    CustomizationToggle(
+                        title = "Watermark",
+                        subtitle = "Add company watermark",
+                        value = customization.watermark,
+                        onValueChanged = { 
+                            onCustomizationChanged(customization.copy(watermark = it))
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CustomizationToggle(
+    title: String,
+    subtitle: String,
+    value: Boolean,
+    onValueChanged: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Medium
+            )
+            
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+            )
+        }
+        
+        Switch(
+            checked = value,
+            onCheckedChange = onValueChanged,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = EdhamOrange,
+                checkedTrackColor = EdhamOrange.copy(alpha = 0.3f)
+            )
+        )
+    }
+}
+
+@Composable
+fun ReportHistorySection(
+    history: List<ReportHistoryItem>,
+    onDownloadReport: (ReportHistoryItem) -> Unit,
+    onShareReport: (ReportHistoryItem) -> Unit,
+    onDeleteReport: (ReportHistoryItem) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Report History",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(history.take(5)) { report ->
+                    ReportHistoryItem(
+                        report = report,
+                        onDownload = onDownloadReport,
+                        onShare = onShareReport,
+                        onDelete = onDeleteReport
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ReportHistoryItem(
+    report: ReportHistoryItem,
+    onDownload: (ReportHistoryItem) -> Unit,
+    onShare: (ReportHistoryItem) -> Unit,
+    onDelete: (ReportHistoryItem) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = report.name,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Medium
+                )
+                
+                Text(
+                    text = "${report.type.displayName} • ${report.format.displayName}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+                
+                Text(
+                    text = report.generatedAt,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                )
+            }
+            
+            Row {
+                IconButton(
+                    onClick = { onDownload(report) },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.stat_sys_download),
+                        contentDescription = "Download",
+                        tint = EdhamOrange,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                
+                IconButton(
+                    onClick = { onShare(report) },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_share),
+                        contentDescription = "Share",
+                        tint = IceBlue,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                
+                IconButton(
+                    onClick = { onDelete(report) },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_delete),
+                        contentDescription = "Delete",
+                        tint = ErrorRed,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ScheduledReportsSection(
+    scheduledReports: List<ScheduledReport>,
+    onEditSchedule: (ScheduledReport) -> Unit,
+    onDeleteSchedule: (ScheduledReport) -> Unit,
+    onToggleSchedule: (ScheduledReport) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Scheduled Reports",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(scheduledReports.take(3)) { schedule ->
+                    ScheduledReportItem(
+                        schedule = schedule,
+                        onEdit = onEditSchedule,
+                        onDelete = onDeleteSchedule,
+                        onToggle = onToggleSchedule
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ScheduledReportItem(
+    schedule: ScheduledReport,
+    onEdit: (ScheduledReport) -> Unit,
+    onDelete: (ScheduledReport) -> Unit,
+    onToggle: (ScheduledReport) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (schedule.isActive) SuccessGreen.copy(alpha = 0.1f) 
+                            else MaterialTheme.colorScheme.surfaceVariant
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = schedule.name,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Medium
+                )
+                
+                Text(
+                    text = "${schedule.type.displayName} • ${schedule.frequency}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+                
+                Text(
+                    text = "Next: ${schedule.nextRun}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                )
+            }
+            
+            Row {
+                Switch(
+                    checked = schedule.isActive,
+                    onCheckedChange = { onToggle(schedule) },
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = SuccessGreen,
+                        checkedTrackColor = SuccessGreen.copy(alpha = 0.3f)
+                    ),
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+                
+                IconButton(
+                    onClick = { onEdit(schedule) },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_edit),
+                        contentDescription = "Edit",
+                        tint = IceBlue,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                
+                IconButton(
+                    onClick = { onDelete(schedule) },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_delete),
+                        contentDescription = "Delete",
+                        tint = ErrorRed,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+// Data classes and enums
+enum class ReportType(val displayName: String) {
+    FLEET_ANALYTICS("Fleet Analytics"),
+    SHIPMENT_ANALYTICS("Shipment Analytics"),
+    DRIVER_PERFORMANCE("Driver Performance"),
+    FUEL_ANALYTICS("Fuel Analytics"),
+    REVENUE_ANALYTICS("Revenue Analytics"),
+    TEMPERATURE_ANALYTICS("Temperature Analytics"),
+    DELAY_ANALYTICS("Delay Analytics"),
+    INCIDENT_ANALYTICS("Incident Analytics"),
+    FINANCIAL_SUMMARY("Financial Summary"),
+    OPERATIONAL_OVERVIEW("Operational Overview")
+}
+
+enum class ExportFormat(val displayName: String) {
+    PDF("PDF"),
+    EXCEL("Excel"),
+    CSV("CSV"),
+    WORD("Word"),
+    POWERPOINT("PowerPoint")
+}
+
+data class ReportTemplate(
+    val id: String,
+    val name: String,
+    val description: String,
+    val tags: List<String>,
+    val type: ReportType
+)
+
+data class ReportCustomization(
+    val includeCharts: Boolean,
+    val includeSummary: Boolean,
+    val includeRawData: Boolean,
+    val includeRecommendations: Boolean,
+    val watermark: Boolean
+)
+
+data class ReportHistoryItem(
+    val id: String,
+    val name: String,
+    val type: ReportType,
+    val format: ExportFormat,
+    val generatedAt: String,
+    val fileSize: String
+)
+
+data class ScheduledReport(
+    val id: String,
+    val name: String,
+    val type: ReportType,
+    val frequency: String,
+    val nextRun: String,
+    val isActive: Boolean
+)
+
+data class ReportsData(
+    val templates: List<ReportTemplate>,
+    val selectedTemplate: ReportTemplate?,
+    val customization: ReportCustomization,
+    val history: List<ReportHistoryItem>,
+    val scheduledReports: List<ScheduledReport>
+)

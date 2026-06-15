@@ -29,13 +29,13 @@ class CustomerRechargeActivity : BaseActivity() {
         val amt2000 = findViewById<View>(R.id.amt_2000)
 
         amt1000.setOnClickListener {
-            amt1000.setBackgroundResource(R.drawable.ed_teal_15)
-            amt2000.setBackgroundResource(0)
+            amt1000.alpha = 1.0f
+            amt2000.alpha = 0.5f
         }
 
         amt2000.setOnClickListener {
-            amt2000.setBackgroundResource(R.drawable.ed_teal_15)
-            amt1000.setBackgroundResource(0)
+            amt2000.alpha = 1.0f
+            amt1000.alpha = 0.5f
         }
     }
 }

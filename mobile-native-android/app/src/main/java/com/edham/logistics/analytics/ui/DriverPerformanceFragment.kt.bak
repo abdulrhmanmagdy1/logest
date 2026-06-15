@@ -1,0 +1,855 @@
+package com.edham.logistics.analytics.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.edham.logistics.analytics.AnalyticsEngineService
+import com.edham.logistics.analytics.DriverPerformanceAnalytics
+import com.edham.logistics.core.ui.OverviewMetric
+import com.edham.logistics.ui.theme.*
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Driver Performance Fragment - Comprehensive driver performance analytics
+ * 
+ * Features:
+ * - Driver performance overview
+ * - Performance metrics and KPIs
+ * - Driver rankings and leaderboards
+ * - Performance trends
+ * - Individual driver details
+ * - Performance comparisons
+ * - Interactive charts
+ */
+@AndroidEntryPoint
+class DriverPerformanceFragment : Fragment() {
+    
+    @Inject
+    lateinit var analyticsEngineService: AnalyticsEngineService
+    
+    private val viewModel: DriverPerformanceViewModel by viewModels()
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        return ComposeView(requireContext()).apply {
+            setContent {
+                EdhamLogisticsTheme {
+                    DriverPerformanceScreen(
+                        viewModel = viewModel,
+                        analyticsEngineService = analyticsEngineService
+                    )
+                }
+            }
+        }
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Initialize analytics engine
+        lifecycleScope.launch {
+            analyticsEngineService.initialize()
+        }
+        
+        // Load driver performance analytics
+        viewModel.loadDriverPerformanceAnalytics()
+    }
+}
+
+@Composable
+fun DriverPerformanceScreen(
+    viewModel: DriverPerformanceViewModel,
+    analyticsEngineService: AnalyticsEngineService
+) {
+    val driverAnalytics by viewModel.driverAnalytics.collectAsStateWithLifecycle()
+    val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
+    val selectedTimeRange by viewModel.selectedTimeRange.collectAsStateWithLifecycle()
+    val selectedDriver by viewModel.selectedDriver.collectAsStateWithLifecycle()
+    
+    LaunchedEffect(selectedTimeRange) {
+        viewModel.loadDriverPerformanceAnalytics()
+    }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Header with time range selector
+        DriverPerformanceHeader(
+            selectedTimeRange = selectedTimeRange,
+            onTimeRangeChanged = viewModel::setTimeRange,
+            onRefresh = viewModel::refreshAnalytics,
+            isLoading = isLoading
+        )
+        
+        // Error message
+        errorMessage?.let { error ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = ErrorRed.copy(alpha = 0.1f)
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            ) {
+                Text(
+                    text = error,
+                    modifier = Modifier.padding(16.dp),
+                    color = ErrorRed,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+        }
+        
+        // Driver Analytics Content
+        driverAnalytics?.let { analytics ->
+            // Performance Overview
+            PerformanceOverviewSection(analytics = analytics)
+            
+            // Top Performers
+            TopPerformersSection(analytics = analytics, onDriverSelected = viewModel::selectDriver)
+            
+            // Performance Metrics
+            PerformanceMetricsSection(analytics = analytics)
+            
+            // Driver Rankings
+            DriverRankingsSection(analytics = analytics, onDriverSelected = viewModel::selectDriver)
+            
+            // Performance Trends
+            PerformanceTrendsSection(analytics = analytics)
+            
+            // Selected Driver Details
+            selectedDriver?.let { driver ->
+                SelectedDriverDetailsSection(
+                    driver = driver,
+                    analytics = analytics
+                )
+            }
+        }
+        
+        // Loading indicator
+        if (isLoading) {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(
+                    color = EdhamOrange,
+                    strokeWidth = 3.dp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun DriverPerformanceHeader(
+    selectedTimeRange: TimeRange,
+    onTimeRangeChanged: (TimeRange) -> Unit,
+    onRefresh: () -> Unit,
+    isLoading: Boolean
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Driver Performance Analytics",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = EdhamOrange,
+                    fontWeight = FontWeight.Bold
+                )
+                
+                Row {
+                    // Time range selector
+                    TimeRangeSelector(
+                        selectedTimeRange = selectedTimeRange,
+                        onTimeRangeChanged = onTimeRangeChanged
+                    )
+                    
+                    Spacer(modifier = Modifier.width(8.dp))
+                    
+                    // Refresh button
+                    IconButton(
+                        onClick = onRefresh,
+                        enabled = !isLoading
+                    ) {
+                        Icon(
+                            painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_rotate),
+                            contentDescription = "Refresh",
+                            tint = EdhamOrange
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PerformanceOverviewSection(analytics: DriverPerformanceAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Performance Overview",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    OverviewMetric(
+                        title = "Total Active Drivers",
+                        value = analytics.totalActiveDrivers.toString(),
+                        subtitle = "Currently active",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_myplaces),
+                        color = EdhamOrange,
+                        change = analytics.activeDriversChange
+                    )
+                }
+                
+                item {
+                    OverviewMetric(
+                        title = "Average Performance Score",
+                        value = String.format("%.1f", analytics.averagePerformanceScore),
+                        subtitle = "Out of 100",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_star),
+                        color = if (analytics.averagePerformanceScore >= 80) SuccessGreen else WarningYellow,
+                        change = analytics.averageScoreChange
+                    )
+                }
+                
+                item {
+                    OverviewMetric(
+                        title = "On-Time Delivery Rate",
+                        value = "${String.format("%.1f", analytics.averageOnTimeDeliveryRate)}%",
+                        subtitle = "Fleet average",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_recent_history),
+                        color = if (analytics.averageOnTimeDeliveryRate >= 90) SuccessGreen else WarningYellow,
+                        change = analytics.onTimeDeliveryChange
+                    )
+                }
+                
+                item {
+                    OverviewMetric(
+                        title = "Average Daily Deliveries",
+                        value = String.format("%.1f", analytics.averageDailyDeliveries),
+                        subtitle = "Per driver",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_agenda),
+                        color = IceBlue,
+                        change = analytics.dailyDeliveriesChange
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TopPerformersSection(
+    analytics: DriverPerformanceAnalytics,
+    onDriverSelected: (String) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Top Performers",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(analytics.topPerformers.take(5)) { driver ->
+                    TopPerformerItem(
+                        driver = driver,
+                        onDriverSelected = onDriverSelected
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TopPerformerItem(
+    driver: DriverPerformanceData,
+    onDriverSelected: (String) -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp)),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp)
+                .clickable { onDriverSelected(driver.driverId) },
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Rank badge
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = when (driver.rank) {
+                            1 -> SuccessGreen
+                            2 -> EdhamOrange
+                            3 -> WarningYellow
+                            else -> IceBlue
+                        }
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = "#${driver.rank}",
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                
+                Spacer(modifier = Modifier.width(12.dp))
+                
+                Column {
+                    Text(
+                        text = driver.driverName,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontWeight = FontWeight.Medium
+                    )
+                    
+                    Text(
+                        text = driver.vehicleType,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                    )
+                }
+            }
+            
+            Column(
+                horizontalAlignment = Alignment.End
+            ) {
+                Text(
+                    text = String.format("%.1f", driver.performanceScore),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = EdhamOrange,
+                    fontWeight = FontWeight.Bold
+                )
+                
+                Text(
+                    text = "Score",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun PerformanceMetricsSection(analytics: DriverPerformanceAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Performance Metrics",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    PerformanceMetric(
+                        title = "Average Speed",
+                        value = "${String.format("%.1f", analytics.averageSpeed)} km/h",
+                        subtitle = "During deliveries",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_directions),
+                        color = IceBlue
+                    )
+                }
+                
+                item {
+                    PerformanceMetric(
+                        title = "Fuel Efficiency",
+                        value = "${String.format("%.1f", analytics.averageFuelEfficiency)} km/L",
+                        subtitle = "Per driver average",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_save),
+                        color = SuccessGreen
+                    )
+                }
+                
+                item {
+                    PerformanceMetric(
+                        title = "Customer Rating",
+                        value = String.format("%.1f", analytics.averageCustomerRating),
+                        subtitle = "Out of 5.0",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_star),
+                        color = EdhamOrange
+                    )
+                }
+                
+                item {
+                    PerformanceMetric(
+                        title = "Safety Score",
+                        value = String.format("%.1f", analytics.averageSafetyScore),
+                        subtitle = "Safety compliance metric",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_preferences),
+                        color = if (analytics.averageSafetyScore >= 90) SuccessGreen else WarningYellow
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PerformanceMetric(
+    title: String,
+    value: String,
+    subtitle: String,
+    icon: androidx.compose.ui.graphics.painter.Painter,
+    color: Color
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Card(
+            modifier = Modifier.size(40.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = color.copy(alpha = 0.1f)
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    painter = icon,
+                    contentDescription = null,
+                    tint = color,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
+        
+        Spacer(modifier = Modifier.width(12.dp))
+        
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            
+            Text(
+                text = value,
+                style = MaterialTheme.typography.titleMedium,
+                color = color,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+            )
+        }
+    }
+}
+
+@Composable
+fun DriverRankingsSection(
+    analytics: DriverPerformanceAnalytics,
+    onDriverSelected: (String) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Driver Rankings",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(analytics.driverRankings.take(10)) { driver ->
+                    DriverRankingItem(
+                        driver = driver,
+                        onDriverSelected = onDriverSelected
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DriverRankingItem(
+    driver: DriverPerformanceData,
+    onDriverSelected: (String) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onDriverSelected(driver.driverId) }
+            .padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Rank
+            Text(
+                text = "#${driver.rank}",
+                style = MaterialTheme.typography.bodyLarge,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.width(40.dp)
+            )
+            
+            Spacer(modifier = Modifier.width(12.dp))
+            
+            Column {
+                Text(
+                    text = driver.driverName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Medium
+                )
+                
+                Text(
+                    text = "${driver.totalDeliveries} deliveries",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+            }
+        }
+        
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = String.format("%.1f", driver.performanceScore),
+                style = MaterialTheme.typography.bodyLarge,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.width(8.dp))
+            
+            // Performance indicator
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = when {
+                        driver.performanceScore >= 90 -> SuccessGreen
+                        driver.performanceScore >= 75 -> EdhamOrange
+                        driver.performanceScore >= 60 -> WarningYellow
+                        else -> ErrorRed
+                    }
+                ),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text(
+                    text = when {
+                        driver.performanceScore >= 90 -> "Excellent"
+                        driver.performanceScore >= 75 -> "Good"
+                        driver.performanceScore >= 60 -> "Average"
+                        else -> "Poor"
+                    },
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.White,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun PerformanceTrendsSection(analytics: DriverPerformanceAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Performance Trends",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            // Trends chart placeholder
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(200.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_gallery),
+                        contentDescription = "Chart",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Text(
+                        text = "Performance Trends Chart",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    
+                    Text(
+                        text = "Interactive chart coming soon",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SelectedDriverDetailsSection(
+    driver: String,
+    analytics: DriverPerformanceAnalytics
+) {
+    // Find driver details from analytics
+    val driverDetails = analytics.driverRankings.find { it.driverId == driver }
+    
+    driverDetails?.let { details ->
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = EdhamOrange.copy(alpha = 0.1f)
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Selected Driver",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = EdhamOrange,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    IconButton(
+                        onClick = { /* Clear selection */ }
+                    ) {
+                        Icon(
+                            painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_close_clear_cancel),
+                            contentDescription = "Clear",
+                            tint = EdhamOrange
+                        )
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    item {
+                        DriverDetailMetric(
+                            title = "Driver Name",
+                            value = details.driverName
+                        )
+                    }
+                    
+                    item {
+                        DriverDetailMetric(
+                            title = "Performance Score",
+                            value = String.format("%.1f", details.performanceScore)
+                        )
+                    }
+                    
+                    item {
+                        DriverDetailMetric(
+                            title = "Total Deliveries",
+                            value = details.totalDeliveries.toString()
+                        )
+                    }
+                    
+                    item {
+                        DriverDetailMetric(
+                            title = "On-Time Rate",
+                            value = "${String.format("%.1f", details.onTimeDeliveryRate)}%"
+                        )
+                    }
+                    
+                    item {
+                        DriverDetailMetric(
+                            title = "Customer Rating",
+                            value = String.format("%.1f", details.customerRating)
+                        )
+                    }
+                    
+                    item {
+                        DriverDetailMetric(
+                            title = "Safety Score",
+                            value = String.format("%.1f", details.safetyScore)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DriverDetailMetric(
+    title: String,
+    value: String
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+        )
+        
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyLarge,
+            color = EdhamOrange,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+// Data classes
+data class DriverPerformanceData(
+    val driverId: String,
+    val driverName: String,
+    val rank: Int,
+    val performanceScore: Float,
+    val totalDeliveries: Int,
+    val onTimeDeliveryRate: Float,
+    val customerRating: Float,
+    val safetyScore: Float,
+    val vehicleType: String
+)

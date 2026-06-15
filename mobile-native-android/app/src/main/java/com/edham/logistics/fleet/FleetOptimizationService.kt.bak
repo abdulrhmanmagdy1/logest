@@ -1,0 +1,885 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import android.util.Log
+import com.edham.logistics.domain.model.ShipmentStatus
+import com.edham.logistics.domain.model.DriverStatus
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.time.*
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Android Fleet Optimization Service - Mobile fleet management
+ */
+class FleetOptimizationService(private val context: Context) {
+    
+    private val TAG = "FleetOptimizationService"
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    // Fleet data caches
+    private val fleetDataCache = MutableStateFlow<FleetData?>(null)
+    private val utilizationDataCache = MutableStateFlow<Map<String, Double>>(emptyMap())
+    private val maintenanceAlertsCache = MutableStateFlow<List<MaintenanceAlert>>(emptyList())
+    private val idleVehiclesCache = MutableStateFlow<List<IdleVehicle>>(emptyList())
+    
+    // Configuration
+    private companion object {
+        const val IDLE_THRESHOLD_HOURS = 2.0
+        const val HIGH_UTILIZATION_THRESHOLD = 0.8
+        const val LOW_UTILIZATION_THRESHOLD = 0.3
+        const val MAINTENANCE_REMINDER_KM = 1000
+        const val FUEL_EFFICIENCY_THRESHOLD = 0.85
+    }
+    
+    /**
+     * Get comprehensive fleet optimization data
+     */
+    fun getFleetOptimizationData(): StateFlow<FleetOptimizationData> {
+        return serviceScope.async {
+            val fleetData = fleetDataCache.value ?: refreshFleetData()
+            val utilizationData = analyzeUtilization()
+            val maintenanceAlerts = analyzeMaintenanceNeeds()
+            val idleVehicles = detectIdleVehicles()
+            
+            FleetOptimizationData(
+                fleetData = fleetData,
+                utilizationAnalysis = utilizationData,
+                maintenanceAlerts = maintenanceAlerts,
+                idleVehicles = idleVehicles,
+                healthScore = calculateFleetHealthScore(fleetData),
+                recommendations = generateRecommendations(fleetData, utilizationData, maintenanceAlerts),
+                lastUpdated = LocalDateTime.now()
+            )
+        }.asStateFlow(serviceScope)
+    }
+    
+    /**
+     * Get vehicle utilization analysis
+     */
+    fun getVehicleUtilization(): StateFlow<VehicleUtilizationAnalysis> {
+        return serviceScope.async {
+            analyzeUtilization()
+        }.asStateFlow(serviceScope)
+    }
+    
+    /**
+     * Get idle vehicles
+     */
+    fun getIdleVehicles(): StateFlow<List<IdleVehicle>> {
+        return serviceScope.async {
+            detectIdleVehicles()
+        }.asStateFlow(serviceScope)
+    }
+    
+    /**
+     * Get maintenance alerts
+     */
+    fun getMaintenanceAlerts(): StateFlow<List<MaintenanceAlert>> {
+        return serviceScope.async {
+            analyzeMaintenanceNeeds()
+        }.asStateFlow(serviceScope)
+    }
+    
+    /**
+     * Get fleet health score
+     */
+    fun getFleetHealthScore(): StateFlow<FleetHealthScore> {
+        return serviceScope.async {
+            val fleetData = fleetDataCache.value ?: refreshFleetData()
+            calculateFleetHealthScore(fleetData)
+        }.asStateFlow(serviceScope)
+    }
+    
+    /**
+     * Assign vehicle to shipment
+     */
+    suspend fun assignVehicleToShipment(shipmentId: String, requirements: ShipmentRequirements): VehicleAssignmentResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                val availableVehicles = getAvailableVehicles()
+                val bestVehicle = findBestVehicle(requirements, availableVehicles)
+                
+                if (bestVehicle != null) {
+                    // Perform assignment
+                    val assignment = VehicleAssignment(
+                        shipmentId = shipmentId,
+                        vehicleId = bestVehicle.id,
+                        assignedAt = LocalDateTime.now(),
+                        score = bestVehicle.score,
+                        reasoning = bestVehicle.reasoning
+                    )
+                    
+                    // Update local cache
+                    updateVehicleAssignment(bestVehicle.id, shipmentId)
+                    
+                    VehicleAssignmentResult(
+                        success = true,
+                        assignment = assignment,
+                        message = "Vehicle assigned successfully"
+                    )
+                } else {
+                    VehicleAssignmentResult(
+                        success = false,
+                        message = "No suitable vehicle available"
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error assigning vehicle to shipment", e)
+                VehicleAssignmentResult(
+                    success = false,
+                    message = "Assignment failed: ${e.message}"
+                )
+            }
+        }
+    }
+    
+    /**
+     * Schedule maintenance
+     */
+    suspend fun scheduleMaintenance(vehicleId: String, maintenanceType: MaintenanceType, scheduledDate: LocalDateTime): MaintenanceScheduleResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                val maintenance = MaintenanceSchedule(
+                    id = generateId(),
+                    vehicleId = vehicleId,
+                    type = maintenanceType,
+                    scheduledDate = scheduledDate,
+                    status = MaintenanceStatus.SCHEDULED,
+                    createdAt = LocalDateTime.now()
+                )
+                
+                // Update local cache
+                updateMaintenanceSchedule(maintenance)
+                
+                MaintenanceScheduleResult(
+                    success = true,
+                    maintenanceId = maintenance.id,
+                    message = "Maintenance scheduled successfully"
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Error scheduling maintenance", e)
+                MaintenanceScheduleResult(
+                    success = false,
+                    message = "Scheduling failed: ${e.message}"
+                )
+            }
+        }
+    }
+    
+    /**
+     * Refresh fleet data
+     */
+    suspend fun refreshFleetData(): FleetData {
+        return withContext(Dispatchers.IO) {
+            try {
+                // This would typically fetch from API
+                // For now, we'll simulate with local data
+                val vehicles = generateMockVehicles()
+                val drivers = generateMockDrivers()
+                val shipments = generateMockShipments()
+                
+                val fleetData = FleetData(
+                    vehicles = vehicles,
+                    drivers = drivers,
+                    activeShipments = shipments.filter { it.status == ShipmentStatus.IN_TRANSIT },
+                    totalVehicles = vehicles.size,
+                    activeVehicles = vehicles.count { it.status == VehicleStatus.AVAILABLE },
+                    vehiclesInMaintenance = vehicles.count { it.status == VehicleStatus.MAINTENANCE },
+                    lastUpdated = LocalDateTime.now()
+                )
+                
+                fleetDataCache.value = fleetData
+                fleetData
+            } catch (e: Exception) {
+                Log.e(TAG, "Error refreshing fleet data", e)
+                fleetDataCache.value ?: FleetData()
+            }
+        }
+    }
+    
+    // Private methods
+    
+    private suspend fun analyzeUtilization(): VehicleUtilizationAnalysis {
+        val fleetData = fleetDataCache.value ?: refreshFleetData()
+        val now = LocalDateTime.now()
+        val weekAgo = now.minusWeeks(1)
+        
+        val utilizationMap = mutableMapOf<String, Double>()
+        val typeUtilizationMap = mutableMapOf<String, Double>()
+        var totalUtilization = 0.0
+        var activeCount = 0
+        
+        fleetData.vehicles.forEach { vehicle ->
+            if (vehicle.status != VehicleStatus.DECOMMISSIONED) {
+                val utilization = calculateVehicleUtilization(vehicle, weekAgo, now)
+                utilizationMap[vehicle.id] = utilization
+                
+                // Aggregate by type
+                val type = vehicle.type.name
+                typeUtilizationMap[type] = (typeUtilizationMap[type] ?: 0.0) + utilization
+                
+                totalUtilization += utilization
+                activeCount++
+            }
+        }
+        
+        // Calculate averages by type
+        val typeCounts = fleetData.vehicles.groupingBy { it.type }.eachCount()
+        val averageUtilizationByType = typeUtilizationMap.mapValues { (type, total) ->
+            total / (typeCounts[VehicleType.valueOf(type)] ?: 1)
+        }
+        
+        return VehicleUtilizationAnalysis(
+            vehicleUtilizations = utilizationMap,
+            averageUtilizationByType = averageUtilizationByType,
+            overallUtilization = if (activeCount > 0) totalUtilization / activeCount else 0.0,
+            totalActiveVehicles = activeCount,
+            analysisTimestamp = now
+        )
+    }
+    
+    private fun calculateVehicleUtilization(vehicle: Vehicle, start: LocalDateTime, end: LocalDateTime): Double {
+        // Calculate active time in the period
+        val activeMinutes = vehicle.activeMinutes ?: 0L
+        val totalMinutes = Duration.between(start, end).toMinutes()
+        
+        return if (totalMinutes > 0) {
+            activeMinutes.toDouble() / totalMinutes.toDouble()
+        } else {
+            0.0
+        }
+    }
+    
+    private suspend fun detectIdleVehicles(): List<IdleVehicle> {
+        val fleetData = fleetDataCache.value ?: refreshFleetData()
+        val now = LocalDateTime.now()
+        val idleThreshold = now.minusHours(IDLE_THRESHOLD_HOURS.toLong())
+        
+        return fleetData.vehicles
+            .filter { it.status == VehicleStatus.AVAILABLE }
+            .filter { it.lastActivity?.isBefore(idleThreshold) == true }
+            .map { vehicle ->
+                IdleVehicle(
+                    vehicleId = vehicle.id,
+                    licensePlate = vehicle.licensePlate,
+                    vehicleType = vehicle.type,
+                    lastActivity = vehicle.lastActivity ?: now,
+                    idleDuration = Duration.between(vehicle.lastActivity ?: now, now),
+                    currentLocation = vehicle.currentLocation,
+                    priority = calculateIdlePriority(vehicle)
+                )
+            }
+            .sortedByDescending { it.priority }
+    }
+    
+    private fun calculateIdlePriority(vehicle: Vehicle): Double {
+        val idleHours = vehicle.lastActivity?.let { 
+            Duration.between(it, LocalDateTime.now()).toHours().toDouble() 
+        } ?: 0.0
+        
+        var priority = idleHours / 24.0 // 1 point per day
+        
+        // Higher priority for expensive vehicles
+        if (vehicle.type == VehicleType.HEAVY_TRUCK) {
+            priority += 0.5
+        }
+        
+        // Lower priority if maintenance is needed
+        if (isMaintenanceNeeded(vehicle)) {
+            priority -= 0.3
+        }
+        
+        return maxOf(0.0, priority)
+    }
+    
+    private suspend fun analyzeMaintenanceNeeds(): List<MaintenanceAlert> {
+        val fleetData = fleetData.cache.value ?: refreshFleetData()
+        val now = LocalDateTime.now()
+        val alerts = mutableListOf<MaintenanceAlert>()
+        
+        fleetData.vehicles.forEach { vehicle ->
+            if (vehicle.status != VehicleStatus.DECOMMISSIONED) {
+                // Check mileage-based maintenance
+                if (vehicle.mileage > 0 && vehicle.nextMaintenanceMileage > 0) {
+                    val mileageUntilMaintenance = vehicle.nextMaintenanceMileage - vehicle.mileage
+                    
+                    if (mileageUntilMaintenance <= MAINTENANCE_REMINDER_KM) {
+                        alerts.add(MaintenanceAlert(
+                            vehicleId = vehicle.id,
+                            licensePlate = vehicle.licensePlate,
+                            alertType = MaintenanceAlertType.SCHEDULED,
+                            priority = if (mileageUntilMaintenance <= 100) Priority.HIGH else Priority.MEDIUM,
+                            description = "Scheduled maintenance due in ${mileageUntilMaintenance.toInt()} km",
+                            recommendedDate = now.plusDays(7),
+                            estimatedCost = calculateMaintenanceCost(vehicle.type, MaintenanceType.SCHEDULED)
+                        ))
+                    }
+                }
+                
+                // Check time-based maintenance
+                vehicle.lastMaintenanceDate?.let { lastMaintenance ->
+                    val nextMaintenanceByTime = lastMaintenance.plusMonths(6)
+                    if (nextMaintenanceByTime.isBefore(now.plusDays(7))) {
+                        alerts.add(MaintenanceAlert(
+                            vehicleId = vehicle.id,
+                            licensePlate = vehicle.licensePlate,
+                            alertType = MaintenanceAlertType.TIME_BASED,
+                            priority = Priority.MEDIUM,
+                            description = "Time-based maintenance due",
+                            recommendedDate = nextMaintenanceByTime,
+                            estimatedCost = calculateMaintenanceCost(vehicle.type, MaintenanceType.SCHEDULED)
+                        ))
+                    }
+                }
+                
+                // Check performance issues
+                vehicle.fuelEfficiency?.let { efficiency ->
+                    val expectedEfficiency = getExpectedFuelEfficiency(vehicle.type)
+                    if (efficiency < expectedEfficiency * FUEL_EFFICIENCY_THRESHOLD) {
+                        alerts.add(MaintenanceAlert(
+                            vehicleId = vehicle.id,
+                            licensePlate = vehicle.licensePlate,
+                            alertType = MaintenanceAlertType.PERFORMANCE,
+                            priority = Priority.MEDIUM,
+                            description = "Low fuel efficiency: ${String.format("%.1f", efficiency)} km/l (expected: ${String.format("%.1f", expectedEfficiency)} km/l)",
+                            estimatedCost = calculateMaintenanceCost(vehicle.type, MaintenanceType.REPAIR)
+                        ))
+                    }
+                }
+                
+                // Check engine temperature
+                vehicle.engineTemperature?.let { temp ->
+                    if (temp > 95) {
+                        alerts.add(MaintenanceAlert(
+                            vehicleId = vehicle.id,
+                            licensePlate = vehicle.licensePlate,
+                            alertType = MaintenanceAlertType.EMERGENCY,
+                            priority = Priority.HIGH,
+                            description = "High engine temperature: ${String.format("%.1f", temp)}°C",
+                            estimatedCost = calculateMaintenanceCost(vehicle.type, MaintenanceType.EMERGENCY)
+                        ))
+                    }
+                }
+            }
+        }
+        
+        return alerts.sortedWith(compareBy({ it.priority.ordinal }, { it.recommendedDate }))
+    }
+    
+    private fun calculateFleetHealthScore(fleetData: FleetData): FleetHealthScore {
+        val totalVehicles = fleetData.totalVehicles
+        if (totalVehicles == 0) {
+            return FleetHealthScore()
+        }
+        
+        val availableRate = fleetData.activeVehicles.toDouble() / totalVehicles
+        val maintenanceRate = fleetData.vehiclesInMaintenance.toDouble() / totalVehicles
+        val averageHealthScore = fleetData.vehicles.map { it.healthScore ?: 0.5 }.average()
+        val averageUtilization = utilizationDataCache.value.values.average()
+        
+        val overallScore = (
+            availableRate * 30 +
+            (1.0 - maintenanceRate) * 25 +
+            averageHealthScore * 25 +
+            averageUtilization * 20
+        )
+        
+        return FleetHealthScore(
+            availabilityRate = availableRate,
+            maintenanceNeedRate = maintenanceRate,
+            averageHealthScore = averageHealthScore,
+            averageUtilization = averageUtilization,
+            overallHealthScore = overallScore,
+            totalVehicles = totalVehicles,
+            analysisTimestamp = LocalDateTime.now()
+        )
+    }
+    
+    private fun generateRecommendations(
+        fleetData: FleetData,
+        utilizationData: VehicleUtilizationAnalysis,
+        maintenanceAlerts: List<MaintenanceAlert>
+    ): List<FleetRecommendation> {
+        val recommendations = mutableListOf<FleetRecommendation>()
+        
+        // Utilization recommendations
+        if (utilizationData.overallUtilization < LOW_UTILIZATION_THRESHOLD) {
+            recommendations.add(FleetRecommendation(
+                type = RecommendationType.OPTIMIZE_UTILIZATION,
+                priority = Priority.HIGH,
+                title = "Low Fleet Utilization",
+                description = "Overall fleet utilization is ${String.format("%.1f", utilizationData.overallUtilization * 100)}%. Consider reducing fleet size or increasing marketing efforts."
+            ))
+        }
+        
+        // Idle vehicle recommendations
+        val idleVehicles = idleVehiclesCache.value
+        if (idleVehicles.isNotEmpty()) {
+            recommendations.add(FleetRecommendation(
+                type = RecommendationType.REDUCE_IDLE_TIME,
+                priority = Priority.MEDIUM,
+                title = "Idle Vehicles Detected",
+                description = "${idleVehicles.size} vehicles have been idle for more than ${IDLE_THRESHOLD_HOURS} hours. Consider reassigning or scheduling maintenance."
+            ))
+        }
+        
+        // Maintenance recommendations
+        val urgentMaintenance = maintenanceAlerts.count { it.priority == Priority.HIGH }
+        if (urgentMaintenance > 0) {
+            recommendations.add(FleetRecommendation(
+                type = RecommendationType.MAINTENANCE_SCHEDULING,
+                priority = Priority.HIGH,
+                title = "Urgent Maintenance Required",
+                description = "$urgentMaintenance vehicles require urgent maintenance to prevent breakdowns."
+            ))
+        }
+        
+        return recommendations
+    }
+    
+    private fun findBestVehicle(requirements: ShipmentRequirements, availableVehicles: List<Vehicle>): VehicleCandidate? {
+        return availableVehicles
+            .map { vehicle ->
+                val score = calculateAssignmentScore(requirements, vehicle)
+                VehicleCandidate(
+                    id = vehicle.id,
+                    licensePlate = vehicle.licensePlate,
+                    type = vehicle.type,
+                    score = score,
+                    reasoning = getAssignmentReasoning(requirements, vehicle, score)
+                )
+            }
+            .maxByOrNull { it.score }
+    }
+    
+    private fun calculateAssignmentScore(requirements: ShipmentRequirements, vehicle: Vehicle): Double {
+        var score = 0.0
+        
+        // Capacity match (40% weight)
+        if (requirements.weight > 0 && vehicle.capacity > 0) {
+            val capacityRatio = requirements.weight.toDouble() / vehicle.capacity
+            if (capacityRatio <= 1.0) {
+                score += 0.4 * (1.0 - kotlin.math.abs(capacityRatio - 0.8))
+            }
+        }
+        
+        // Vehicle type match (30% weight)
+        if (isVehicleTypeSuitable(vehicle.type, requirements.cargoType)) {
+            score += 0.3
+        }
+        
+        // Location proximity (20% weight)
+        if (vehicle.currentLocation != null && requirements.pickupLocation != null) {
+            val distance = calculateDistance(
+                vehicle.currentLocation!!,
+                requirements.pickupLocation
+            )
+            score += 0.2 * kotlin.math.exp(-distance / 50.0)
+        }
+        
+        // Vehicle condition (10% weight)
+        if (vehicle.status == VehicleStatus.AVAILABLE && (vehicle.healthScore ?: 0.5) > 0.7) {
+            score += 0.1
+        }
+        
+        return score
+    }
+    
+    private fun getAssignmentReasoning(requirements: ShipmentRequirements, vehicle: Vehicle, score: Double): String {
+        val reasoning = StringBuilder()
+        reasoning.append("Score: ${String.format("%.2f", score)}. ")
+        
+        if (requirements.weight > 0 && vehicle.capacity > 0) {
+            val capacityRatio = requirements.weight.toDouble() / vehicle.capacity
+            reasoning.append("Capacity utilization: ${String.format("%.1f", capacityRatio * 100)}%. ")
+        }
+        
+        reasoning.append("Vehicle type: ${vehicle.type}. ")
+        
+        return reasoning.toString()
+    }
+    
+    private fun isMaintenanceNeeded(vehicle: Vehicle): Boolean {
+        if (vehicle.mileage > 0 && vehicle.nextMaintenanceMileage > 0) {
+            if (vehicle.mileage >= vehicle.nextMaintenanceMileage) {
+                return true
+            }
+        }
+        
+        vehicle.lastMaintenanceDate?.let { lastMaintenance ->
+            val nextMaintenance = lastMaintenance.plusMonths(6)
+            if (LocalDateTime.now().isAfter(nextMaintenance)) {
+                return true
+            }
+        }
+        
+        return false
+    }
+    
+    private fun isVehicleTypeSuitable(vehicleType: VehicleType, cargoType: String?): Boolean {
+        if (cargoType == null) return true
+        
+        return when (vehicleType) {
+            VehicleType.HEAVY_TRUCK -> cargoType.lowercase().contains("heavy") || 
+                                       cargoType.lowercase().contains("bulk")
+            VehicleType.VAN -> cargoType.lowercase().contains("parcel") || 
+                                cargoType.lowercase().contains("package")
+            VehicleType.LIGHT_TRUCK -> true // General purpose
+        }
+    }
+    
+    private fun calculateDistance(location1: Location, location2: Location): Double {
+        val R = 6371 // Earth's radius in kilometers
+        
+        val latDistance = Math.toRadians(location2.latitude - location1.latitude)
+        val lngDistance = Math.toRadians(location2.longitude - location1.longitude)
+        
+        val a = (kotlin.math.sin(latDistance / 2) * kotlin.math.sin(latDistance / 2)) +
+                (kotlin.math.cos(Math.toRadians(location1.latitude)) * kotlin.math.cos(Math.toRadians(location2.latitude)) *
+                 kotlin.math.sin(lngDistance / 2) * kotlin.math.sin(lngDistance / 2))
+        
+        val c = 2 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
+        
+        return R * c
+    }
+    
+    private fun getExpectedFuelEfficiency(vehicleType: VehicleType): Double {
+        return when (vehicleType) {
+            VehicleType.LIGHT_TRUCK -> 8.0 // km/l
+            VehicleType.HEAVY_TRUCK -> 4.0 // km/l
+            VehicleType.VAN -> 10.0 // km/l
+        }
+    }
+    
+    private fun calculateMaintenanceCost(vehicleType: VehicleType, maintenanceType: MaintenanceType): Double {
+        return when (vehicleType) {
+            VehicleType.LIGHT_TRUCK -> when (maintenanceType) {
+                MaintenanceType.SCHEDULED -> 500.0
+                MaintenanceType.REPAIR -> 800.0
+                MaintenanceType.EMERGENCY -> 1200.0
+            }
+            VehicleType.HEAVY_TRUCK -> when (maintenanceType) {
+                MaintenanceType.SCHEDULED -> 800.0
+                MaintenanceType.REPAIR -> 1500.0
+                MaintenanceType.EMERGENCY -> 2500.0
+            }
+            VehicleType.VAN -> when (maintenanceType) {
+                MaintenanceType.SCHEDULED -> 300.0
+                MaintenanceType.REPAIR -> 500.0
+                MaintenanceType.EMERGENCY -> 800.0
+            }
+        }
+    }
+    
+    private fun getAvailableVehicles(): List<Vehicle> {
+        val fleetData = fleetDataCache.value ?: return emptyList()
+        return fleetData.vehicles.filter { it.status == VehicleStatus.AVAILABLE }
+    }
+    
+    private fun updateVehicleAssignment(vehicleId: String, shipmentId: String) {
+        // Update local cache - in real implementation, this would sync with server
+        fleetDataCache.value?.let { fleetData ->
+            val updatedVehicles = fleetData.vehicles.map { vehicle ->
+                if (vehicle.id == vehicleId) {
+                    vehicle.copy(status = VehicleStatus.ASSIGNED, currentShipmentId = shipmentId)
+                } else {
+                    vehicle
+                }
+            }
+            
+            fleetDataCache.value = fleetData.copy(vehicles = updatedVehicles)
+        }
+    }
+    
+    private fun updateMaintenanceSchedule(maintenance: MaintenanceSchedule) {
+        // Update local cache - in real implementation, this would sync with server
+        // This would typically involve updating a local database or cache
+    }
+    
+    private fun generateId(): String {
+        return "FLT${System.currentTimeMillis()}"
+    }
+    
+    // Mock data generation methods
+    private suspend fun generateMockVehicles(): List<Vehicle> {
+        return withContext(Dispatchers.Default) {
+            (1..10).map { index ->
+                Vehicle(
+                    id = "V$index",
+                    licensePlate = "ABC-${1000 + index}",
+                    type = when (index % 3) {
+                        0 -> VehicleType.LIGHT_TRUCK
+                        1 -> VehicleType.HEAVY_TRUCK
+                        else -> VehicleType.VAN
+                    },
+                    status = when (index % 4) {
+                        0 -> VehicleStatus.AVAILABLE
+                        1 -> VehicleStatus.IN_USE
+                        2 -> VehicleStatus.MAINTENANCE
+                        else -> VehicleStatus.AVAILABLE
+                    },
+                    capacity = 1000 + index * 500,
+                    mileage = 50000L + index * 10000L,
+                    nextMaintenanceMileage = 60000L + index * 10000L,
+                    lastMaintenanceDate = LocalDateTime.now().minusMonths(index * 2),
+                    healthScore = 0.8 + (index % 5) * 0.04,
+                    fuelEfficiency = 7.5 + (index % 3) * 0.5,
+                    engineTemperature = 85.0 + (index % 10) * 2.0,
+                    activeMinutes = (index * 60 * 24).toLong(), // Simulated active minutes
+                    lastActivity = LocalDateTime.now().minusHours(index * 2),
+                    currentLocation = Location(
+                        latitude = 24.7136 + index * 0.01,
+                        longitude = 46.6753 + index * 0.01
+                    )
+                )
+            }
+        }
+    }
+    
+    private suspend fun generateMockDrivers(): List<Driver> {
+        return withContext(Dispatchers.Default) {
+            (1..8).map { index ->
+                Driver(
+                    id = "D$index",
+                    name = "Driver $index",
+                    status = when (index % 3) {
+                        0 -> DriverStatus.AVAILABLE
+                        1 -> DriverStatus.ON_DUTY
+                        else -> DriverStatus.OFF_DUTY
+                    },
+                    currentVehicleId = if (index <= 5) "V$index" else null,
+                    totalDeliveries = 100 + index * 50,
+                    rating = 4.5 + (index % 5) * 0.1
+                )
+            }
+        }
+    }
+    
+    private suspend fun generateMockShipments(): List<Shipment> {
+        return withContext(Dispatchers.Default) {
+            (1..15).map { index ->
+                Shipment(
+                    id = "S$index",
+                    status = when (index % 4) {
+                        0 -> ShipmentStatus.CREATED
+                        1 -> ShipmentStatus.IN_TRANSIT
+                        2 -> ShipmentStatus.DELIVERED
+                        else -> ShipmentStatus.DELAYED
+                    },
+                    vehicleId = if (index <= 10) "V${index % 10 + 1}" else null,
+                    weight = 500 + index * 200,
+                    cargoType = when (index % 3) {
+                        0 -> "General"
+                        1 -> "Heavy"
+                        else -> "Parcel"
+                    },
+                    createdAt = LocalDateTime.now().minusHours(index * 2),
+                    updatedAt = LocalDateTime.now().minusHours(index),
+                    pickupLocation = Location(
+                        latitude = 24.7136 + index * 0.01,
+                        longitude = 46.6753 + index * 0.01
+                    ),
+                    deliveryLocation = Location(
+                        latitude = 24.7236 + index * 0.01,
+                        longitude = 46.6853 + index * 0.01
+                    )
+                )
+            }
+        }
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        serviceScope.cancel()
+    }
+}
+
+// Data classes for mobile fleet optimization
+data class FleetOptimizationData(
+    val fleetData: FleetData,
+    val utilizationAnalysis: VehicleUtilizationAnalysis,
+    val maintenanceAlerts: List<MaintenanceAlert>,
+    val idleVehicles: List<IdleVehicle>,
+    val healthScore: FleetHealthScore,
+    val recommendations: List<FleetRecommendation>,
+    val lastUpdated: LocalDateTime
+)
+
+data class FleetData(
+    val vehicles: List<Vehicle> = emptyList(),
+    val drivers: List<Driver> = emptyList(),
+    val activeShipments: List<Shipment> = emptyList(),
+    val totalVehicles: Int = 0,
+    val activeVehicles: Int = 0,
+    val vehiclesInMaintenance: Int = 0,
+    val lastUpdated: LocalDateTime = LocalDateTime.now()
+)
+
+data class VehicleUtilizationAnalysis(
+    val vehicleUtilizations: Map<String, Double>,
+    val averageUtilizationByType: Map<String, Double>,
+    val overallUtilization: Double,
+    val totalActiveVehicles: Int,
+    val analysisTimestamp: LocalDateTime
+)
+
+data class IdleVehicle(
+    val vehicleId: String,
+    val licensePlate: String,
+    val vehicleType: VehicleType,
+    val lastActivity: LocalDateTime,
+    val idleDuration: Duration,
+    val currentLocation: Location?,
+    val priority: Double
+)
+
+data class MaintenanceAlert(
+    val vehicleId: String,
+    val licensePlate: String,
+    val alertType: MaintenanceAlertType,
+    val priority: Priority,
+    val description: String,
+    val recommendedDate: LocalDateTime,
+    val estimatedCost: Double
+)
+
+data class FleetHealthScore(
+    val availabilityRate: Double = 0.0,
+    val maintenanceNeedRate: Double = 0.0,
+    val averageHealthScore: Double = 0.0,
+    val averageUtilization: Double = 0.0,
+    val overallHealthScore: Double = 0.0,
+    val totalVehicles: Int = 0,
+    val analysisTimestamp: LocalDateTime = LocalDateTime.now()
+)
+
+data class FleetRecommendation(
+    val type: RecommendationType,
+    val priority: Priority,
+    val title: String,
+    val description: String
+)
+
+data class VehicleAssignmentResult(
+    val success: Boolean,
+    val assignment: VehicleAssignment? = null,
+    val message: String
+)
+
+data class VehicleAssignment(
+    val shipmentId: String,
+    val vehicleId: String,
+    val assignedAt: LocalDateTime,
+    val score: Double,
+    val reasoning: String
+)
+
+data class MaintenanceScheduleResult(
+    val success: Boolean,
+    val maintenanceId: String? = null,
+    val message: String
+)
+
+data class MaintenanceSchedule(
+    val id: String,
+    val vehicleId: String,
+    val type: MaintenanceType,
+    val scheduledDate: LocalDateTime,
+    val status: MaintenanceStatus,
+    val createdAt: LocalDateTime
+)
+
+data class ShipmentRequirements(
+    val weight: Double,
+    val cargoType: String,
+    val pickupLocation: Location,
+    val deliveryLocation: Location,
+    val priority: Priority = Priority.MEDIUM
+)
+
+data class VehicleCandidate(
+    val id: String,
+    val licensePlate: String,
+    val type: VehicleType,
+    val score: Double,
+    val reasoning: String
+)
+
+// Enums
+enum class VehicleType {
+    LIGHT_TRUCK, HEAVY_TRUCK, VAN
+}
+
+enum class VehicleStatus {
+    AVAILABLE, IN_USE, MAINTENANCE, DECOMMISSIONED, ASSIGNED
+}
+
+// ShipmentStatus and DriverStatus are now imported from domain.model
+
+enum class MaintenanceAlertType {
+    SCHEDULED, TIME_BASED, PERFORMANCE, EMERGENCY
+}
+
+enum class MaintenanceType {
+    SCHEDULED, REPAIR, EMERGENCY
+}
+
+enum class MaintenanceStatus {
+    SCHEDULED, IN_PROGRESS, COMPLETED, CANCELLED
+}
+
+enum class RecommendationType {
+    OPTIMIZE_UTILIZATION, REDUCE_IDLE_TIME, MAINTENANCE_SCHEDULING, IMPROVE_FLEET_HEALTH
+}
+
+enum class Priority {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+// Supporting data classes
+data class Vehicle(
+    val id: String,
+    val licensePlate: String,
+    val type: VehicleType,
+    val status: VehicleStatus,
+    val capacity: Int,
+    val mileage: Long,
+    val nextMaintenanceMileage: Long,
+    val lastMaintenanceDate: LocalDateTime?,
+    val healthScore: Double?,
+    val fuelEfficiency: Double?,
+    val engineTemperature: Double?,
+    val activeMinutes: Long?,
+    val lastActivity: LocalDateTime?,
+    val currentLocation: Location?,
+    val currentShipmentId: String? = null
+)
+
+data class Driver(
+    val id: String,
+    val name: String,
+    val status: DriverStatus,
+    val currentVehicleId: String?,
+    val totalDeliveries: Int,
+    val rating: Double
+)
+
+data class Shipment(
+    val id: String,
+    val status: ShipmentStatus,
+    val vehicleId: String?,
+    val weight: Double,
+    val cargoType: String,
+    val createdAt: LocalDateTime,
+    val updatedAt: LocalDateTime,
+    val pickupLocation: Location,
+    val deliveryLocation: Location
+)
+
+data class Location(
+    val latitude: Double,
+    val longitude: Double
+)

@@ -1,0 +1,657 @@
+package com.edham.logistics.finance.refund
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.RefundApi
+import com.edham.logistics.data.remote.api.PaymentGatewayApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Refund Service - Manages refund processing and management
+ * 
+ * Features:
+ * - Refund request processing
+ * - Multiple refund methods
+ * - Refund approval workflow
+ * - Refund tracking and status updates
+ * - Refund analytics and reporting
+ * - Refund policy enforcement
+ * - Automated refund processing
+ * - Refund audit logging
+ */
+@Singleton
+class RefundService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val refundApi: RefundApi,
+    private val paymentGatewayApi: PaymentGatewayApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _refundState = MutableStateFlow<RefundState>(RefundState.Idle)
+    val refundState: StateFlow<RefundState> = _refundState.asStateFlow()
+    
+    private val _refunds = MutableStateFlow<List<Refund>>(emptyList())
+    val refunds: StateFlow<List<Refund>> = _refunds.asStateFlow()
+    
+    private val _refundStats = MutableStateFlow<RefundStats>(RefundStats())
+    val refundStats: StateFlow<RefundStats> = _refundStats.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "RefundService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val REFUND_TIMEOUT_MS = 30000L
+        private const val MAX_RETRY_ATTEMPTS = 3
+        private const val AUTO_APPROVAL_THRESHOLD = 500f // Auto-approve refunds below this amount
+        private const val REFUND_PROCESSING_DAYS = 7 // Standard processing time
+    }
+    
+    /**
+     * Initialize refund service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _refundState.value = RefundState.Initializing
+                
+                // Load refund configuration
+                loadRefundConfiguration()
+                
+                // Load recent refunds
+                loadRecentRefunds()
+                
+                isInitialized = true
+                _refundState.value = RefundState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _refundState.value = RefundState.Error("Failed to initialize refund service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create refund request
+     */
+    suspend fun createRefundRequest(
+        refundRequest: RefundRequest
+    ): Result<Refund> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Refund service not initialized")
+                }
+                
+                _refundState.value = RefundState.Processing
+                
+                // Validate refund request
+                validateRefundRequest(refundRequest)
+                
+                // Get original transaction
+                val originalTransaction = database.paymentTransactionDao()
+                    .getTransactionById(refundRequest.originalTransactionId.toLong())
+                    ?.toDomainModel()
+                    ?: throw Exception("Original transaction not found")
+                
+                // Validate against original transaction
+                validateRefundAgainstTransaction(refundRequest, originalTransaction)
+                
+                // Create refund
+                val refund = Refund(
+                    id = UUID.randomUUID().toString(),
+                    originalTransactionId = refundRequest.originalTransactionId,
+                    amount = refundRequest.amount,
+                    reason = refundRequest.reason,
+                    refundMethod = refundRequest.refundMethod,
+                    status = RefundStatus.PENDING,
+                    metadata = refundRequest.metadata,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save to database
+                val savedRefund = database.refundDao().insertRefund(refund.toEntity())
+                    .let { id -> refund.copy(id = id.toString()) }
+                
+                // Add to refunds list
+                addToRefunds(savedRefund)
+                
+                // Check for auto-approval
+                if (shouldAutoApprove(refundRequest, originalTransaction)) {
+                    processAutoApproval(savedRefund)
+                } else {
+                    // Submit for manual approval
+                    submitForApproval(savedRefund)
+                }
+                
+                // Update stats
+                updateRefundStats()
+                
+                _refundState.value = RefundState.Ready
+                Result.success(savedRefund)
+                
+            } catch (e: Exception) {
+                _refundState.value = RefundState.Error("Refund request creation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process refund approval
+     */
+    suspend fun processRefundApproval(
+        refundId: String,
+        approved: Boolean,
+        approverId: String,
+        notes: String? = null
+    ): Result<Refund> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Refund service not initialized")
+                }
+                
+                val refund = _refunds.value.find { it.id == refundId }
+                    ?: throw Exception("Refund not found")
+                
+                if (refund.status != RefundStatus.PENDING) {
+                    throw Exception("Refund is not pending approval")
+                }
+                
+                _refundState.value = RefundState.Processing
+                
+                val updatedRefund = if (approved) {
+                    // Approve refund
+                    processRefundPayment(refund, approverId, notes)
+                } else {
+                    // Reject refund
+                    refund.copy(
+                        status = RefundStatus.REJECTED,
+                        rejectedBy = approverId,
+                        rejectionReason = notes,
+                        updatedAt = Date()
+                    )
+                }
+                
+                // Update in database
+                database.refundDao().updateRefund(updatedRefund.toEntity())
+                
+                // Update in list
+                updateRefundInList(updatedRefund)
+                
+                // Update stats
+                updateRefundStats()
+                
+                _refundState.value = RefundState.Ready
+                Result.success(updatedRefund)
+                
+            } catch (e: Exception) {
+                _refundState.value = RefundState.Error("Refund approval processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process refund payment
+     */
+    suspend fun processRefundPayment(
+        refund: Refund,
+        approverId: String,
+        notes: String? = null
+    ): Refund {
+        return try {
+            // Get original transaction
+            val originalTransaction = database.paymentTransactionDao()
+                .getTransactionById(refund.originalTransactionId.toLong())
+                ?.toDomainModel()
+                ?: throw Exception("Original transaction not found")
+            
+            // Process refund through payment gateway
+            val gatewayResult = paymentGatewayApi.processRefund(
+                RefundRequest(
+                    originalTransactionId = refund.originalTransactionId,
+                    amount = refund.amount,
+                    reason = refund.reason,
+                    refundMethod = refund.refundMethod,
+                    metadata = refund.metadata
+                ),
+                originalTransaction
+            )
+            
+            if (gatewayResult.success) {
+                val gatewayResponse = gatewayResult.data
+                
+                refund.copy(
+                    status = RefundStatus.PROCESSED,
+                    approvedBy = approverId,
+                    approvalNotes = notes,
+                    gatewayTransactionId = gatewayResponse?.transactionId,
+                    gatewayResponse = gatewayResponse,
+                    processedAt = Date(),
+                    updatedAt = Date()
+                )
+            } else {
+                refund.copy(
+                    status = RefundStatus.FAILED,
+                    approvedBy = approverId,
+                    approvalNotes = notes,
+                    errorMessage = gatewayResult.message,
+                    updatedAt = Date()
+                )
+            }
+            
+        } catch (e: Exception) {
+            refund.copy(
+                status = RefundStatus.FAILED,
+                approvedBy = approverId,
+                approvalNotes = notes,
+                errorMessage = e.message,
+                updatedAt = Date()
+            )
+        }
+    }
+    
+    /**
+     * Get refund by ID
+     */
+    suspend fun getRefund(refundId: String): Refund? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _refunds.value.find { it.id == refundId }
+                    ?: database.refundDao().getRefundById(refundId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get refund history
+     */
+    suspend fun getRefundHistory(
+        userId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        status: RefundStatus? = null
+    ): Result<List<Refund>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val refunds = database.refundDao().getRefundHistory(
+                    userId = userId?.toLong(),
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    status = status
+                ).map { it.toDomainModel() }
+                
+                Result.success(refunds)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get pending refunds
+     */
+    suspend fun getPendingRefunds(): Result<List<Refund>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val refunds = database.refundDao().getRefundsByStatus(RefundStatus.PENDING)
+                    .map { it.toDomainModel() }
+                
+                Result.success(refunds)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get refund analytics
+     */
+    suspend fun getRefundAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<RefundAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val refunds = getRefundHistory(null, dateRange).getOrThrow()
+                
+                val analytics = RefundAnalytics(
+                    totalRefunds = refunds.size,
+                    totalRefundAmount = refunds.sumOf { it.amount.toDouble() }.toFloat(),
+                    pendingRefunds = refunds.count { it.status == RefundStatus.PENDING },
+                    processedRefunds = refunds.count { it.status == RefundStatus.PROCESSED },
+                    rejectedRefunds = refunds.count { it.status == RefundStatus.REJECTED },
+                    failedRefunds = refunds.count { it.status == RefundStatus.FAILED },
+                    averageRefundAmount = if (refunds.isNotEmpty()) refunds.map { it.amount }.average().toFloat() else 0f,
+                    refundMethodStats = refunds.groupBy { it.refundMethod }.mapValues { it.value.size },
+                    reasonStats = refunds.groupBy { it.reason }.mapValues { it.value.size },
+                    monthlyStats = calculateMonthlyRefundStats(refunds),
+                    processingTimeStats = calculateProcessingTimeStats(refunds)
+                )
+                
+                Result.success(analytics)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Cancel refund request
+     */
+    suspend fun cancelRefundRequest(
+        refundId: String,
+        cancelledBy: String,
+        reason: String
+    ): Result<Refund> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val refund = _refunds.value.find { it.id == refundId }
+                    ?: throw Exception("Refund not found")
+                
+                if (refund.status != RefundStatus.PENDING) {
+                    throw Exception("Cannot cancel refund that is not pending")
+                }
+                
+                _refundState.value = RefundState.Processing
+                
+                val cancelledRefund = refund.copy(
+                    status = RefundStatus.CANCELLED,
+                    cancelledBy = cancelledBy,
+                    cancellationReason = reason,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.refundDao().updateRefund(cancelledRefund.toEntity())
+                
+                // Update in list
+                updateRefundInList(cancelledRefund)
+                
+                // Update stats
+                updateRefundStats()
+                
+                _refundState.value = RefundState.Ready
+                Result.success(cancelledRefund)
+                
+            } catch (e: Exception) {
+                _refundState.value = RefundState.Error("Refund cancellation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadRefundConfiguration() {
+        // Load refund configuration from API or local storage
+    }
+    
+    private suspend fun loadRecentRefunds() {
+        try {
+            val refunds = database.refundDao().getRecentRefunds(50)
+                .map { it.toDomainModel() }
+            
+            _refunds.value = refunds
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun validateRefundRequest(request: RefundRequest) {
+        if (request.amount <= 0) throw Exception("Refund amount must be positive")
+        if (request.originalTransactionId.isBlank()) throw Exception("Original transaction ID is required")
+        if (request.reason.isBlank()) throw Exception("Refund reason is required")
+        if (request.refundMethod == null) throw Exception("Refund method is required")
+    }
+    
+    private suspend fun validateRefundAgainstTransaction(
+        request: RefundRequest,
+        transaction: PaymentTransaction
+    ) {
+        if (request.amount > transaction.amount) {
+            throw Exception("Refund amount cannot exceed original transaction amount")
+        }
+        
+        if (transaction.status != PaymentStatus.COMPLETED) {
+            throw Exception("Can only refund completed transactions")
+        }
+        
+        // Check if refund already exists
+        val existingRefunds = database.refundDao()
+            .getRefundsByOriginalTransaction(request.originalTransactionId.toLong())
+            .map { it.toDomainModel() }
+        
+        val totalRefunded = existingRefunds.sumOf { it.amount.toDouble() }.toFloat()
+        if (totalRefunded + request.amount > transaction.amount) {
+            throw Exception("Total refund amount cannot exceed original transaction amount")
+        }
+    }
+    
+    private fun shouldAutoApprove(request: RefundRequest, transaction: PaymentTransaction): Boolean {
+        // Auto-approve if amount is below threshold and transaction is recent
+        val isRecentTransaction = (Date().time - transaction.createdAt.time) < 30 * 24 * 60 * 60 * 1000L // 30 days
+        return request.amount <= AUTO_APPROVAL_THRESHOLD && isRecentTransaction
+    }
+    
+    private suspend fun processAutoApproval(refund: Refund) {
+        try {
+            val approvedRefund = processRefundPayment(refund, "SYSTEM", "Auto-approved")
+            
+            // Update in database
+            database.refundDao().updateRefund(approvedRefund.toEntity())
+            
+            // Update in list
+            updateRefundInList(approvedRefund)
+            
+            // Update stats
+            updateRefundStats()
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun submitForApproval(refund: Refund) {
+        try {
+            // Send notification to approvers
+            // This would integrate with the notification system
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun addToRefunds(refund: Refund) {
+        val currentRefunds = _refunds.value.toMutableList()
+        currentRefunds.add(0, refund) // Add to beginning
+        
+        // Keep only last 100 refunds in cache
+        if (currentRefunds.size > 100) {
+            currentRefunds.removeAt(currentRefunds.size - 1)
+        }
+        
+        _refunds.value = currentRefunds
+    }
+    
+    private fun updateRefundInList(refund: Refund) {
+        val currentRefunds = _refunds.value.toMutableList()
+        val index = currentRefunds.indexOfFirst { it.id == refund.id }
+        
+        if (index != -1) {
+            currentRefunds[index] = refund
+            _refunds.value = currentRefunds
+        }
+    }
+    
+    private suspend fun updateRefundStats() {
+        try {
+            val refunds = _refunds.value
+            val stats = RefundStats(
+                totalRefunds = refunds.size,
+                pendingRefunds = refunds.count { it.status == RefundStatus.PENDING },
+                processedRefunds = refunds.count { it.status == RefundStatus.PROCESSED },
+                rejectedRefunds = refunds.count { it.status == RefundStatus.REJECTED },
+                failedRefunds = refunds.count { it.status == RefundStatus.FAILED },
+                cancelledRefunds = refunds.count { it.status == RefundStatus.CANCELLED },
+                totalRefundAmount = refunds.sumOf { it.amount.toDouble() }.toFloat(),
+                averageRefundAmount = if (refunds.isNotEmpty()) refunds.map { it.amount }.average().toFloat() else 0f
+            )
+            
+            _refundStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun calculateMonthlyRefundStats(refunds: List<Refund>): Map<String, MonthlyRefundStats> {
+        return refunds.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.createdAt
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { (_, monthRefunds) ->
+            MonthlyRefundStats(
+                refundCount = monthRefunds.size,
+                totalAmount = monthRefunds.sumOf { it.amount.toDouble() }.toFloat(),
+                averageAmount = if (monthRefunds.isNotEmpty()) monthRefunds.map { it.amount }.average().toFloat() else 0f,
+                processedRefunds = monthRefunds.count { it.status == RefundStatus.PROCESSED }
+            )
+        }
+    }
+    
+    private fun calculateProcessingTimeStats(refunds: List<Refund>): ProcessingTimeStats {
+        val processedRefunds = refunds.filter { it.status == RefundStatus.PROCESSED && it.processedAt != null }
+        
+        if (processedRefunds.isEmpty()) {
+            return ProcessingTimeStats(0f, 0f, 0f, 0f)
+        }
+        
+        val processingTimes = processedRefunds.map { refund ->
+            (refund.processedAt!!.time - refund.createdAt.time) / (1000 * 60 * 60 * 24f) // days
+        }
+        
+        return ProcessingTimeStats(
+            averageProcessingDays = processingTimes.average().toFloat(),
+            minProcessingDays = processingTimes.minOrNull() ?: 0f,
+            maxProcessingDays = processingTimes.maxOrNull() ?: 0f,
+            medianProcessingDays = processingTimes.sorted()[processingTimes.size / 2]
+        )
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class RefundRequest(
+    val originalTransactionId: String,
+    val amount: Float,
+    val reason: String,
+    val refundMethod: PaymentMethod,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class Refund(
+    val id: String = "",
+    val originalTransactionId: String,
+    val amount: Float,
+    val reason: String,
+    val refundMethod: PaymentMethod,
+    val status: RefundStatus,
+    val metadata: Map<String, String> = emptyMap(),
+    val gatewayTransactionId: String? = null,
+    val gatewayResponse: Map<String, Any>? = null,
+    val approvedBy: String? = null,
+    val approvalNotes: String? = null,
+    val rejectedBy: String? = null,
+    val rejectionReason: String? = null,
+    val cancelledBy: String? = null,
+    val cancellationReason: String? = null,
+    val errorMessage: String? = null,
+    val createdAt: Date = Date(),
+    val updatedAt: Date = Date(),
+    val processedAt: Date? = null
+)
+
+data class RefundAnalytics(
+    val totalRefunds: Int,
+    val totalRefundAmount: Float,
+    val pendingRefunds: Int,
+    val processedRefunds: Int,
+    val rejectedRefunds: Int,
+    val failedRefunds: Int,
+    val averageRefundAmount: Float,
+    val refundMethodStats: Map<PaymentMethod, Int>,
+    val reasonStats: Map<String, Int>,
+    val monthlyStats: Map<String, MonthlyRefundStats>,
+    val processingTimeStats: ProcessingTimeStats
+)
+
+data class RefundStats(
+    val totalRefunds: Int = 0,
+    val pendingRefunds: Int = 0,
+    val processedRefunds: Int = 0,
+    val rejectedRefunds: Int = 0,
+    val failedRefunds: Int = 0,
+    val cancelledRefunds: Int = 0,
+    val totalRefundAmount: Float = 0f,
+    val averageRefundAmount: Float = 0f
+)
+
+data class MonthlyRefundStats(
+    val refundCount: Int,
+    val totalAmount: Float,
+    val averageAmount: Float,
+    val processedRefunds: Int
+)
+
+data class ProcessingTimeStats(
+    val averageProcessingDays: Float,
+    val minProcessingDays: Float,
+    val maxProcessingDays: Float,
+    val medianProcessingDays: Float
+)
+
+/**
+ * Enums
+ */
+enum class RefundState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class RefundStatus {
+    PENDING,
+    PROCESSED,
+    REJECTED,
+    FAILED,
+    CANCELLED
+}

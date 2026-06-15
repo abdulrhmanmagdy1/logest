@@ -1,0 +1,984 @@
+package com.edham.logistics.feature.admin
+
+import android.content.Context
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import com.edham.logistics.data.local.database.AdminDatabase
+import com.edham.logistics.data.local.entity.User
+import com.edham.logistics.data.local.entity.Role
+import com.edham.logistics.data.local.entity.Permission
+import com.edham.logistics.data.local.entity.ActivityLog
+import com.edham.logistics.data.local.entity.SystemSetting
+import com.edham.logistics.data.remote.api.AdminApi
+import kotlinx.coroutines.*
+import timber.log.Timber
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Admin Management Service
+ * Complete admin system with user management, role management, permissions, and monitoring
+ */
+class AdminManagementService(
+    private val context: Context,
+    private val api: AdminApi,
+    private val database: AdminDatabase
+) {
+    
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    // LiveData for real-time updates
+    private val _users = MutableLiveData<List<User>>()
+    val users: LiveData<List<User>> = _users
+    
+    private val _roles = MutableLiveData<List<Role>>()
+    val roles: LiveData<List<Role>> = _roles
+    
+    private val _permissions = MutableLiveData<List<Permission>>()
+    val permissions: LiveData<List<Permission>> = _permissions
+    
+    private val _activityLogs = MutableLiveData<List<ActivityLog>>()
+    val activityLogs: LiveData<List<ActivityLog>> = _activityLogs
+    
+    private val _systemSettings = MutableLiveData<List<SystemSetting>>()
+    val systemSettings: LiveData<List<SystemSetting>> = _systemSettings
+    
+    private val _systemOverview = MutableLiveData<SystemOverview>()
+    val systemOverview: LiveData<SystemOverview> = _systemOverview
+    
+    private val _kpiMetrics = MutableLiveData<KPIMetrics>()
+    val kpiMetrics: LiveData<KPIMetrics> = _kpiMetrics
+    
+    // Admin state
+    private val userMap = ConcurrentHashMap<String, User>()
+    private val roleMap = ConcurrentHashMap<String, Role>()
+    private val permissionMap = ConcurrentHashMap<String, Permission>()
+    private val activityLogHistory = mutableListOf<ActivityLog>()
+    private val systemSettingMap = ConcurrentHashMap<String, SystemSetting>()
+    
+    // Permissions engine
+    private val permissionsEngine = PermissionsEngine()
+    
+    // Monitoring services
+    private val monitoringService = MonitoringService(context, api, database)
+    
+    companion object {
+        private const val SYNC_INTERVAL = 60000L // 1 minute
+        private const val BATCH_SIZE = 50
+        private const val MAX_LOG_HISTORY = 10000
+    }
+    
+    /**
+     * Initialize admin management
+     */
+    suspend fun initializeAdminSystem() {
+        try {
+            // Load admin data
+            loadAdminData()
+            
+            // Start real-time monitoring
+            startRealTimeMonitoring()
+            
+            // Initialize permissions engine
+            initializePermissionsEngine()
+            
+            // Start activity logging
+            startActivityLogging()
+            
+            Timber.d("Admin management system initialized")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error initializing admin management")
+        }
+    }
+    
+    /**
+     * Load admin data from local database and API
+     */
+    private suspend fun loadAdminData() {
+        try {
+            // Load from local database first
+            val localUsers = database.userDao().getAllUsers()
+            val localRoles = database.roleDao().getAllRoles()
+            val localPermissions = database.permissionDao().getAllPermissions()
+            val localActivityLogs = database.activityLogDao().getAllLogs()
+            val localSettings = database.settingDao().getAllSettings()
+            
+            // Update local maps
+            localUsers.forEach { user ->
+                userMap[user.id] = user
+            }
+            
+            localRoles.forEach { role ->
+                roleMap[role.id] = role
+            }
+            
+            localPermissions.forEach { permission ->
+                permissionMap[permission.id] = permission
+            }
+            
+            localActivityLogs.forEach { log ->
+                activityLogHistory.add(log)
+            }
+            
+            localSettings.forEach { setting ->
+                systemSettingMap[setting.key] = setting
+            }
+            
+            // Update LiveData
+            _users.postValue(localUsers)
+            _roles.postValue(localRoles)
+            _permissions.postValue(localPermissions)
+            _activityLogs.postValue(localActivityLogs)
+            _systemSettings.postValue(localSettings)
+            
+            // Sync with API
+            syncWithAPI()
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error loading admin data")
+        }
+    }
+    
+    /**
+     * Sync data with API
+     */
+    private suspend fun syncWithAPI() {
+        try {
+            // Get latest data from API
+            val apiUsers = api.getAllUsers()
+            val apiRoles = api.getAllRoles()
+            val apiPermissions = api.getAllPermissions()
+            val apiSystemSettings = api.getSystemSettings()
+            
+            // Update local database
+            database.userDao().insertAll(apiUsers)
+            database.roleDao().insertAll(apiRoles)
+            database.permissionDao().insertAll(apiPermissions)
+            database.settingDao().insertAll(apiSystemSettings)
+            
+            // Update maps
+            apiUsers.forEach { user ->
+                userMap[user.id] = user
+            }
+            
+            apiRoles.forEach { role ->
+                roleMap[role.id] = role
+            }
+            
+            apiPermissions.forEach { permission ->
+                permissionMap[permission.id] = permission
+            }
+            
+            apiSystemSettings.forEach { setting ->
+                systemSettingMap[setting.key] = setting
+            }
+            
+            // Update LiveData
+            _users.postValue(apiUsers)
+            _roles.postValue(apiRoles)
+            _permissions.postValue(apiPermissions)
+            _systemSettings.postValue(apiSystemSettings)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing with API")
+        }
+    }
+    
+    /**
+     * Start real-time monitoring
+     */
+    private fun startRealTimeMonitoring() {
+        serviceScope.launch {
+            while (true) {
+                try {
+                    // Update system overview
+                    updateSystemOverview()
+                    
+                    // Update KPI metrics
+                    updateKPIMetrics()
+                    
+                    // Sync pending logs
+                    syncPendingLogs()
+                    
+                    delay(SYNC_INTERVAL)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in real-time monitoring")
+                    delay(5000) // Wait before retrying
+                }
+            }
+        }
+    }
+    
+    /**
+     * Initialize permissions engine
+     */
+    private fun initializePermissionsEngine() {
+        permissionsEngine.initialize(permissionMap.values.toList())
+    }
+    
+    /**
+     * Start activity logging
+     */
+    private fun startActivityLogging() {
+        // Log system startup
+        logActivity(
+            userId = "system",
+            action = "ADMIN_SYSTEM_STARTED",
+            resourceType = "SYSTEM",
+            resourceId = "admin_system",
+            details = "Admin management system initialized",
+            ipAddress = "127.0.0.1",
+            userAgent = "Android Admin Service"
+        )
+    }
+    
+    /**
+     * User Management
+     */
+    suspend fun createUser(user: User): UserCreationResult {
+        return try {
+            // Validate user data
+            if (user.email.isBlank() || user.password.isBlank()) {
+                return UserCreationResult.INVALID_DATA
+            }
+            
+            // Check if email already exists
+            if (userMap.values.any { it.email == user.email }) {
+                return UserCreationResult.EMAIL_EXISTS
+            }
+            
+            // Create user
+            val newUser = user.copy(
+                id = UUID.randomUUID().toString(),
+                createdAt = System.currentTimeMillis(),
+                lastUpdated = System.currentTimeMillis(),
+                isActive = true
+            )
+            
+            // Save to database
+            database.userDao().insert(newUser)
+            
+            // Update maps
+            userMap[newUser.id] = newUser
+            
+            // Update LiveData
+            _users.postValue(userMap.values.toList())
+            
+            // Log activity
+            logActivity(
+                userId = getCurrentUserId(),
+                action = "USER_CREATED",
+                resourceType = "USER",
+                resourceId = newUser.id,
+                details = "Created user: ${newUser.email}"
+            )
+            
+            UserCreationResult.SUCCESS(newUser)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error creating user")
+            UserCreationResult.ERROR
+        }
+    }
+    
+    suspend fun updateUser(userId: String, updates: UserUpdateRequest): UserUpdateResult {
+        return try {
+            val user = userMap[userId]
+                ?: return UserUpdateResult.USER_NOT_FOUND
+            
+            // Apply updates
+            val updatedUser = user.copy(
+                email = updates.email ?: user.email,
+                firstName = updates.firstName ?: user.firstName,
+                lastName = updates.lastName ?: user.lastName,
+                roleId = updates.roleId ?: user.roleId,
+                isActive = updates.isActive ?: user.isActive,
+                lastUpdated = System.currentTimeMillis()
+            )
+            
+            // Save to database
+            database.userDao().update(updatedUser)
+            
+            // Update maps
+            userMap[userId] = updatedUser
+            
+            // Update LiveData
+            _users.postValue(userMap.values.toList())
+            
+            // Log activity
+            logActivity(
+                userId = getCurrentUserId(),
+                action = "USER_UPDATED",
+                resourceType = "USER",
+                resourceId = userId,
+                details = "Updated user: ${updatedUser.email}"
+            )
+            
+            UserUpdateResult.SUCCESS
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating user")
+            UserUpdateResult.ERROR
+        }
+    }
+    
+    suspend fun deleteUser(userId: String): UserDeletionResult {
+        return try {
+            val user = userMap[userId]
+                ?: return UserDeletionResult.USER_NOT_FOUND
+            
+            // Cannot delete currently active users
+            if (user.isActive) {
+                return UserDeletionResult.USER_ACTIVE
+            }
+            
+            // Delete from database
+            database.userDao().delete(user)
+            
+            // Remove from maps
+            userMap.remove(userId)
+            
+            // Update LiveData
+            _users.postValue(userMap.values.toList())
+            
+            // Log activity
+            logActivity(
+                userId = getCurrentUserId(),
+                action = "USER_DELETED",
+                resourceType = "USER",
+                resourceId = userId,
+                details = "Deleted user: ${user.email}"
+            )
+            
+            UserDeletionResult.SUCCESS
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error deleting user")
+            UserDeletionResult.ERROR
+        }
+    }
+    
+    /**
+     * Role Management
+     */
+    suspend fun createRole(role: Role): RoleCreationResult {
+        return try {
+            // Validate role data
+            if (role.name.isBlank()) {
+                return RoleCreationResult.INVALID_DATA
+            }
+            
+            // Check if role name already exists
+            if (roleMap.values.any { it.name == role.name }) {
+                return RoleCreationResult.ROLE_EXISTS
+            }
+            
+            // Create role
+            val newRole = role.copy(
+                id = UUID.randomUUID().toString(),
+                createdAt = System.currentTimeMillis(),
+                lastUpdated = System.currentTimeMillis()
+            )
+            
+            // Save to database
+            database.roleDao().insert(newRole)
+            
+            // Update maps
+            roleMap[newRole.id] = newRole
+            
+            // Update LiveData
+            _roles.postValue(roleMap.values.toList())
+            
+            // Log activity
+            logActivity(
+                userId = getCurrentUserId(),
+                action = "ROLE_CREATED",
+                resourceType = "ROLE",
+                resourceId = newRole.id,
+                details = "Created role: ${newRole.name}"
+            )
+            
+            RoleCreationResult.SUCCESS(newRole)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error creating role")
+            RoleCreationResult.ERROR
+        }
+    }
+    
+    suspend fun updateRole(roleId: String, updates: RoleUpdateRequest): RoleUpdateResult {
+        return try {
+            val role = roleMap[roleId]
+                ?: return RoleUpdateResult.ROLE_NOT_FOUND
+            
+            // Apply updates
+            val updatedRole = role.copy(
+                name = updates.name ?: role.name,
+                description = updates.description ?: role.description,
+                permissions = updates.permissions ?: role.permissions,
+                lastUpdated = System.currentTimeMillis()
+            )
+            
+            // Save to database
+            database.roleDao().update(updatedRole)
+            
+            // Update maps
+            roleMap[roleId] = updatedRole
+            
+            // Update LiveData
+            _roles.postValue(roleMap.values.toList())
+            
+            // Update permissions engine
+            permissionsEngine.updateRole(updatedRole)
+            
+            // Log activity
+            logActivity(
+                userId = getCurrentUserId(),
+                action = "ROLE_UPDATED",
+                resourceType = "ROLE",
+                resourceId = roleId,
+                details = "Updated role: ${updatedRole.name}"
+            )
+            
+            RoleUpdateResult.SUCCESS
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating role")
+            RoleUpdateResult.ERROR
+        }
+    }
+    
+    suspend fun deleteRole(roleId: String): RoleDeletionResult {
+        return try {
+            val role = roleMap[roleId]
+                ?: return RoleDeletionResult.ROLE_NOT_FOUND
+            
+            // Check if role is assigned to users
+            if (userMap.values.any { it.roleId == roleId }) {
+                return RoleDeletionResult.ROLE_IN_USE
+            }
+            
+            // Delete from database
+            database.roleDao().delete(role)
+            
+            // Remove from maps
+            roleMap.remove(roleId)
+            
+            // Update LiveData
+            _roles.postValue(roleMap.values.toList())
+            
+            // Update permissions engine
+            permissionsEngine.removeRole(roleId)
+            
+            // Log activity
+            logActivity(
+                userId = getCurrentUserId(),
+                action = "ROLE_DELETED",
+                resourceType = "ROLE",
+                resourceId = roleId,
+                details = "Deleted role: ${role.name}"
+            )
+            
+            RoleDeletionResult.SUCCESS
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error deleting role")
+            RoleDeletionResult.ERROR
+        }
+    }
+    
+    /**
+     * Permissions Management
+     */
+    suspend fun createPermission(permission: Permission): PermissionCreationResult {
+        return try {
+            // Validate permission data
+            if (permission.name.isBlank() || permission.key.isBlank()) {
+                return PermissionCreationResult.INVALID_DATA
+            }
+            
+            // Check if permission key already exists
+            if (permissionMap.values.any { it.key == permission.key }) {
+                return PermissionCreationResult.PERMISSION_EXISTS
+            }
+            
+            // Create permission
+            val newPermission = permission.copy(
+                id = UUID.randomUUID().toString(),
+                createdAt = System.currentTimeMillis()
+            )
+            
+            // Save to database
+            database.permissionDao().insert(newPermission)
+            
+            // Update maps
+            permissionMap[newPermission.id] = newPermission
+            
+            // Update LiveData
+            _permissions.postValue(permissionMap.values.toList())
+            
+            // Update permissions engine
+            permissionsEngine.addPermission(newPermission)
+            
+            // Log activity
+            logActivity(
+                userId = getCurrentUserId(),
+                action = "PERMISSION_CREATED",
+                resourceType = "PERMISSION",
+                resourceId = newPermission.id,
+                details = "Created permission: ${newPermission.name}"
+            )
+            
+            PermissionCreationResult.SUCCESS(newPermission)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error creating permission")
+            PermissionCreationResult.ERROR
+        }
+    }
+    
+    /**
+     * Check user permissions
+     */
+    fun hasPermission(userId: String, permissionKey: String): Boolean {
+        val user = userMap[userId] ?: return false
+        return permissionsEngine.hasPermission(user.roleId, permissionKey)
+    }
+    
+    /**
+     * Get user permissions
+     */
+    fun getUserPermissions(userId: String): List<String> {
+        val user = userMap[userId] ?: return emptyList()
+        return permissionsEngine.getRolePermissions(user.roleId)
+    }
+    
+    /**
+     * System Overview
+     */
+    private suspend fun updateSystemOverview() {
+        try {
+            val overview = SystemOverview(
+                totalUsers = userMap.size,
+                activeUsers = userMap.values.count { it.isActive },
+                totalRoles = roleMap.size,
+                totalPermissions = permissionMap.size,
+                activeDrivers = monitoringService.getActiveDriversCount(),
+                totalVehicles = monitoringService.getTotalVehiclesCount(),
+                activeShipments = monitoringService.getActiveShipmentsCount(),
+                systemUptime = getSystemUptime(),
+                lastSync = System.currentTimeMillis()
+            )
+            
+            _systemOverview.postValue(overview)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating system overview")
+        }
+    }
+    
+    /**
+     * KPI Metrics
+     */
+    private suspend fun updateKPIMetrics() {
+        try {
+            val metrics = KPIMetrics(
+                userGrowthRate = calculateUserGrowthRate(),
+                driverUtilizationRate = monitoringService.getDriverUtilizationRate(),
+                vehicleUtilizationRate = monitoringService.getVehicleUtilizationRate(),
+                shipmentCompletionRate = monitoringService.getShipmentCompletionRate(),
+                averageResponseTime = monitoringService.getAverageResponseTime(),
+                systemPerformance = monitoringService.getSystemPerformance(),
+                errorRate = monitoringService.getErrorRate(),
+                lastUpdated = System.currentTimeMillis()
+            )
+            
+            _kpiMetrics.postValue(metrics)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating KPI metrics")
+        }
+    }
+    
+    /**
+     * Activity Logging
+     */
+    suspend fun logActivity(
+        userId: String,
+        action: String,
+        resourceType: String,
+        resourceId: String,
+        details: String,
+        ipAddress: String = "unknown",
+        userAgent: String = "unknown"
+    ) {
+        try {
+            val log = ActivityLog(
+                id = UUID.randomUUID().toString(),
+                userId = userId,
+                action = action,
+                resourceType = resourceType,
+                resourceId = resourceId,
+                details = details,
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                timestamp = System.currentTimeMillis()
+            )
+            
+            // Save to database
+            database.activityLogDao().insert(log)
+            
+            // Add to history
+            activityLogHistory.add(log)
+            maintainLogHistorySize()
+            
+            // Update LiveData
+            _activityLogs.postValue(activityLogHistory.toList())
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error logging activity")
+        }
+    }
+    
+    /**
+     * System Settings
+     */
+    suspend fun updateSetting(key: String, value: String): SettingUpdateResult {
+        return try {
+            val setting = systemSettingMap[key]
+                ?: SystemSetting(
+                    id = UUID.randomUUID().toString(),
+                    key = key,
+                    value = value,
+                    updatedAt = System.currentTimeMillis()
+                )
+            
+            val updatedSetting = setting.copy(
+                value = value,
+                updatedAt = System.currentTimeMillis()
+            )
+            
+            // Save to database
+            database.settingDao().insert(updatedSetting)
+            
+            // Update maps
+            systemSettingMap[key] = updatedSetting
+            
+            // Update LiveData
+            _systemSettings.postValue(systemSettingMap.values.toList())
+            
+            // Log activity
+            logActivity(
+                userId = getCurrentUserId(),
+                action = "SETTING_UPDATED",
+                resourceType = "SETTING",
+                resourceId = key,
+                details = "Updated setting: $key = $value"
+            )
+            
+            SettingUpdateResult.SUCCESS
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating setting")
+            SettingUpdateResult.ERROR
+        }
+    }
+    
+    /**
+     * Get system setting
+     */
+    fun getSetting(key: String): String? {
+        return systemSettingMap[key]?.value
+    }
+    
+    /**
+     * Analytics
+     */
+    suspend fun getSystemAnalytics(): SystemAnalytics {
+        return try {
+            val userAnalytics = getUserAnalytics()
+            val roleAnalytics = getRoleAnalytics()
+            val activityAnalytics = getActivityAnalytics()
+            val performanceAnalytics = getPerformanceAnalytics()
+            
+            SystemAnalytics(
+                userAnalytics = userAnalytics,
+                roleAnalytics = roleAnalytics,
+                activityAnalytics = activityAnalytics,
+                performanceAnalytics = performanceAnalytics,
+                generatedAt = System.currentTimeMillis()
+            )
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting system analytics")
+            SystemAnalytics()
+        }
+    }
+    
+    private fun getUserAnalytics(): UserAnalytics {
+        val totalUsers = userMap.size
+        val activeUsers = userMap.values.count { it.isActive }
+        val usersByRole = roleMap.values.map { role ->
+            RoleUserCount(
+                roleId = role.id,
+                roleName = role.name,
+                userCount = userMap.values.count { it.roleId == role.id }
+            )
+        }
+        val recentUsers = userMap.values.filter { 
+            System.currentTimeMillis() - it.createdAt < 7 * 24 * 60 * 60 * 1000 // Last 7 days
+        }.size
+        
+        return UserAnalytics(
+            totalUsers = totalUsers,
+            activeUsers = activeUsers,
+            inactiveUsers = totalUsers - activeUsers,
+            usersByRole = usersByRole,
+            recentUsers = recentUsers,
+            userGrowthRate = calculateUserGrowthRate()
+        )
+    }
+    
+    private fun getRoleAnalytics(): RoleAnalytics {
+        return RoleAnalytics(
+            totalRoles = roleMap.size,
+            rolesWithUsers = roleMap.values.count { role ->
+                userMap.values.any { it.roleId == role.id }
+            },
+            averageUsersPerRole = if (roleMap.isNotEmpty()) {
+                userMap.size.toDouble() / roleMap.size
+            } else 0.0,
+            mostUsedRole = roleMap.values.maxByOrNull { role ->
+                userMap.values.count { it.roleId == role.id }
+            }?.name
+        )
+    }
+    
+    private fun getActivityAnalytics(): ActivityAnalytics {
+        val recentActivities = activityLogHistory.takeLast(1000)
+        val activitiesByAction = recentActivities.groupBy { it.action }
+            .mapValues { it.value.size }
+        val activitiesByUser = recentActivities.groupBy { it.userId }
+            .mapValues { it.value.size }
+        
+        return ActivityAnalytics(
+            totalActivities = activityLogHistory.size,
+            recentActivities = recentActivities.size,
+            activitiesByAction = activitiesByAction,
+            activitiesByUser = activitiesByUser,
+            mostActiveUser = activitiesByUser.maxByOrNull { it.value }?.key
+        )
+    }
+    
+    private fun getPerformanceAnalytics(): PerformanceAnalytics {
+        return PerformanceAnalytics(
+            systemUptime = getSystemUptime(),
+            averageResponseTime = monitoringService.getAverageResponseTime(),
+            errorRate = monitoringService.getErrorRate(),
+            databasePerformance = monitoringService.getDatabasePerformance(),
+            apiPerformance = monitoringService.getApiPerformance()
+        )
+    }
+    
+    /**
+     * Utility functions
+     */
+    private fun getCurrentUserId(): String {
+        // Implementation would get current user from authentication
+        return "current_admin_user"
+    }
+    
+    private fun getSystemUptime(): Long {
+        // Implementation would calculate system uptime
+        return System.currentTimeMillis() - (24 * 60 * 60 * 1000) // 24 hours ago for demo
+    }
+    
+    private fun calculateUserGrowthRate(): Double {
+        // Implementation would calculate growth rate based on historical data
+        return 15.5 // 15.5% growth rate
+    }
+    
+    private fun syncPendingLogs() {
+        try {
+            val pendingLogs = database.activityLogDao().getPendingLogs()
+            
+            pendingLogs.chunked(BATCH_SIZE).forEach { batch ->
+                api.syncActivityLogs(batch)
+                
+                // Mark as synced
+                batch.forEach { log ->
+                    log.synced = true
+                }
+                
+                database.activityLogDao().updateAll(pendingLogs)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing pending logs")
+        }
+    }
+    
+    private fun maintainLogHistorySize() {
+        if (activityLogHistory.size > MAX_LOG_HISTORY) {
+            activityLogHistory.removeAt(0)
+        }
+    }
+    
+    /**
+     * Search functionality
+     */
+    suspend fun searchUsers(query: String): List<User> {
+        return try {
+            userMap.values.filter { user ->
+                user.email.contains(query, ignoreCase = true) ||
+                user.firstName.contains(query, ignoreCase = true) ||
+                user.lastName.contains(query, ignoreCase = true)
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error searching users")
+            emptyList()
+        }
+    }
+    
+    suspend fun searchActivityLogs(query: String): List<ActivityLog> {
+        return try {
+            activityLogHistory.filter { log ->
+                log.action.contains(query, ignoreCase = true) ||
+                log.resourceType.contains(query, ignoreCase = true) ||
+                log.details.contains(query, ignoreCase = true)
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error searching activity logs")
+            emptyList()
+        }
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        serviceScope.cancel()
+        monitoringService.cleanup()
+        
+        Timber.d("Admin management service cleaned up")
+    }
+}
+
+// Data classes
+data class UserUpdateRequest(
+    val email: String? = null,
+    val firstName: String? = null,
+    val lastName: String? = null,
+    val roleId: String? = null,
+    val isActive: Boolean? = null
+)
+
+data class RoleUpdateRequest(
+    val name: String? = null,
+    val description: String? = null,
+    val permissions: List<String>? = null
+)
+
+data class SystemOverview(
+    val totalUsers: Int = 0,
+    val activeUsers: Int = 0,
+    val totalRoles: Int = 0,
+    val totalPermissions: Int = 0,
+    val activeDrivers: Int = 0,
+    val totalVehicles: Int = 0,
+    val activeShipments: Int = 0,
+    val systemUptime: Long = 0,
+    val lastSync: Long = 0
+)
+
+data class KPIMetrics(
+    val userGrowthRate: Double = 0.0,
+    val driverUtilizationRate: Double = 0.0,
+    val vehicleUtilizationRate: Double = 0.0,
+    val shipmentCompletionRate: Double = 0.0,
+    val averageResponseTime: Long = 0,
+    val systemPerformance: Double = 0.0,
+    val errorRate: Double = 0.0,
+    val lastUpdated: Long = 0
+)
+
+data class SystemAnalytics(
+    val userAnalytics: UserAnalytics = UserAnalytics(),
+    val roleAnalytics: RoleAnalytics = RoleAnalytics(),
+    val activityAnalytics: ActivityAnalytics = ActivityAnalytics(),
+    val performanceAnalytics: PerformanceAnalytics = PerformanceAnalytics(),
+    val generatedAt: Long = System.currentTimeMillis()
+)
+
+data class UserAnalytics(
+    val totalUsers: Int = 0,
+    val activeUsers: Int = 0,
+    val inactiveUsers: Int = 0,
+    val usersByRole: List<RoleUserCount> = emptyList(),
+    val recentUsers: Int = 0,
+    val userGrowthRate: Double = 0.0
+)
+
+data class RoleUserCount(
+    val roleId: String,
+    val roleName: String,
+    val userCount: Int
+)
+
+data class RoleAnalytics(
+    val totalRoles: Int = 0,
+    val rolesWithUsers: Int = 0,
+    val averageUsersPerRole: Double = 0.0,
+    val mostUsedRole: String? = null
+)
+
+data class ActivityAnalytics(
+    val totalActivities: Int = 0,
+    val recentActivities: Int = 0,
+    val activitiesByAction: Map<String, Int> = emptyMap(),
+    val activitiesByUser: Map<String, Int> = emptyMap(),
+    val mostActiveUser: String? = null
+)
+
+data class PerformanceAnalytics(
+    val systemUptime: Long = 0,
+    val averageResponseTime: Long = 0,
+    val errorRate: Double = 0.0,
+    val databasePerformance: Double = 0.0,
+    val apiPerformance: Double = 0.0
+)
+
+// Enums
+enum class UserCreationResult {
+    SUCCESS, INVALID_DATA, EMAIL_EXISTS, ERROR
+}
+
+enum class UserUpdateResult {
+    SUCCESS, USER_NOT_FOUND, ERROR
+}
+
+enum class UserDeletionResult {
+    SUCCESS, USER_NOT_FOUND, USER_ACTIVE, ERROR
+}
+
+enum class RoleCreationResult {
+    SUCCESS, INVALID_DATA, ROLE_EXISTS, ERROR
+}
+
+enum class RoleUpdateResult {
+    SUCCESS, ROLE_NOT_FOUND, ERROR
+}
+
+enum class RoleDeletionResult {
+    SUCCESS, ROLE_NOT_FOUND, ROLE_IN_USE, ERROR
+}
+
+enum class PermissionCreationResult {
+    SUCCESS, INVALID_DATA, PERMISSION_EXISTS, ERROR
+}
+
+enum class SettingUpdateResult {
+    SUCCESS, ERROR
+}

@@ -1,0 +1,852 @@
+package com.edham.logistics.feature.dispatch
+
+import android.util.Log
+import com.edham.logistics.data.model.Driver
+import com.edham.logistics.data.model.Shipment
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Route-Based Assignment Service - Advanced route optimization for driver assignments
+ * Optimizes assignments based on geographic proximity and route efficiency
+ */
+class RouteBasedAssignmentService {
+    
+    companion object {
+        private const val TAG = "RouteBasedAssignmentService"
+        
+        // Route optimization parameters
+        private const val MAX_ROUTE_DISTANCE = 200.0 // Maximum route distance in km
+        private const val MAX_ROUTE_TIME = 8.0 // Maximum route time in hours
+        private const val ROUTE_EFFICIENCY_THRESHOLD = 0.7 // Minimum efficiency score
+        private const val PROXIMITY_WEIGHT = 0.40 // Geographic proximity weight
+        private const val ROUTE_EFFICIENCY_WEIGHT = 0.30 // Route efficiency weight
+        private const val DRIVER_PREFERENCE_WEIGHT = 0.20 // Driver preference weight
+        private const val WORKLOAD_WEIGHT = 0.10 // Current workload weight
+        
+        // Assignment strategies
+        enum class Strategy {
+            CLOSEST_DRIVER,         // Assign to geographically closest driver
+            OPTIMAL_ROUTE,          // Optimize for route efficiency
+            DRIVER_PREFERENCE,       // Respect driver route preferences
+            MINIMIZE_TOTAL_DISTANCE, // Minimize total route distance
+            HYBRID                 // Combine multiple factors
+        }
+    }
+    
+    /**
+     * Assign shipments to drivers based on route optimization
+     */
+    suspend fun assignShipmentsByRoute(
+        shipments: List<Shipment>,
+        drivers: List<Driver>,
+        strategy: Strategy = Strategy.HYBRID,
+        currentRoutes: Map<String, DriverRoute> = emptyMap()
+    ): RouteAssignmentResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Assigning ${shipments.size} shipments by route optimization")
+                
+                // Initialize driver routes
+                val driverRoutes = drivers.map { driver ->
+                    DriverRoute(
+                        driver = driver,
+                        currentRoute = currentRoutes[driver.id] ?: DriverRoute.createEmpty(),
+                        preferredRoutes = driver.preferredRoutes ?: emptyList(),
+                        maxRouteDistance = MAX_ROUTE_DISTANCE,
+                        maxRouteTime = MAX_ROUTE_TIME,
+                        currentWorkload = driver.activeShipments ?: 0,
+                        maxCapacity = driver.maxConcurrentShipments
+                    )
+                }
+                
+                // Apply route-based assignment strategy
+                val assignments = when (strategy) {
+                    Strategy.CLOSEST_DRIVER -> applyClosestDriverStrategy(shipments, driverRoutes)
+                    Strategy.OPTIMAL_ROUTE -> applyOptimalRouteStrategy(shipments, driverRoutes)
+                    Strategy.DRIVER_PREFERENCE -> applyDriverPreferenceStrategy(shipments, driverRoutes)
+                    Strategy.MINIMIZE_TOTAL_DISTANCE -> applyMinimizeDistanceStrategy(shipments, driverRoutes)
+                    Strategy.HYBRID -> applyHybridStrategy(shipments, driverRoutes)
+                }
+                
+                // Calculate route metrics
+                val metrics = calculateRouteMetrics(assignments, driverRoutes)
+                
+                // Generate recommendations
+                val recommendations = generateRouteRecommendations(metrics, driverRoutes)
+                
+                val result = RouteAssignmentResult(
+                    assignments = assignments,
+                    metrics = metrics,
+                    recommendations = recommendations,
+                    strategy = strategy,
+                    totalShipments = shipments.size,
+                    totalDrivers = drivers.size,
+                    calculatedAt = LocalDateTime.now()
+                )
+                
+                Log.d(TAG, "Route-based assignment completed with ${metrics.efficiencyScore} efficiency score")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in route-based assignment", e)
+                RouteAssignmentResult.createDefault(shipments.size, drivers.size)
+            }
+        }
+    }
+    
+    /**
+     * Apply closest driver strategy
+     */
+    private fun applyClosestDriverStrategy(
+        shipments: List<Shipment>,
+        driverRoutes: List<DriverRoute>
+    ): List<RouteAssignment> {
+        val assignments = mutableListOf<RouteAssignment>()
+        val availableDrivers = driverRoutes.filter { it.hasCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort drivers by distance to shipment pickup
+                availableDrivers.sortBy { driverRoute ->
+                    calculateDistanceToShipment(driverRoute.driver, shipment)
+                }
+                
+                val bestDriver = availableDrivers.firstOrNull { it.canAcceptShipment(shipment) }
+                
+                if (bestDriver != null) {
+                    val assignment = RouteAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        strategy = "CLOSEST_DRIVER",
+                        distanceToPickup = calculateDistanceToShipment(bestDriver.driver, shipment),
+                        routeEfficiency = calculateRouteEfficiency(bestDriver, shipment),
+                        confidenceScore = calculateConfidenceScore(bestDriver, shipment),
+                        estimatedTravelTime = calculateTravelTime(bestDriver.driver, shipment),
+                        routeOptimization = "Geographically closest driver"
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addShipment(shipment)
+                    
+                    // Update driver capacity
+                    if (!bestDriver.hasCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply optimal route strategy
+     */
+    private fun applyOptimalRouteStrategy(
+        shipments: List<Shipment>,
+        driverRoutes: List<DriverRoute>
+    ): List<RouteAssignment> {
+        val assignments = mutableListOf<RouteAssignment>()
+        val availableDrivers = driverRoutes.filter { it.hasCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort drivers by route efficiency
+                availableDrivers.sortByDescending { driverRoute ->
+                    calculateRouteEfficiency(driverRoute, shipment)
+                }
+                
+                val bestDriver = availableDrivers.firstOrNull { it.canAcceptShipment(shipment) }
+                
+                if (bestDriver != null) {
+                    val assignment = RouteAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        strategy = "OPTIMAL_ROUTE",
+                        distanceToPickup = calculateDistanceToShipment(bestDriver.driver, shipment),
+                        routeEfficiency = calculateRouteEfficiency(bestDriver, shipment),
+                        confidenceScore = calculateConfidenceScore(bestDriver, shipment),
+                        estimatedTravelTime = calculateTravelTime(bestDriver.driver, shipment),
+                        routeOptimization = "Optimal route efficiency"
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addShipment(shipment)
+                    
+                    // Update driver capacity
+                    if (!bestDriver.hasCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply driver preference strategy
+     */
+    private fun applyDriverPreferenceStrategy(
+        shipments: List<Shipment>,
+        driverRoutes: List<DriverRoute>
+    ): List<RouteAssignment> {
+        val assignments = mutableListOf<RouteAssignment>()
+        val availableDrivers = driverRoutes.filter { it.hasCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort drivers by preference score
+                availableDrivers.sortByDescending { driverRoute ->
+                    calculatePreferenceScore(driverRoute, shipment)
+                }
+                
+                val bestDriver = availableDrivers.firstOrNull { it.canAcceptShipment(shipment) }
+                
+                if (bestDriver != null) {
+                    val assignment = RouteAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        strategy = "DRIVER_PREFERENCE",
+                        distanceToPickup = calculateDistanceToShipment(bestDriver.driver, shipment),
+                        routeEfficiency = calculateRouteEfficiency(bestDriver, shipment),
+                        confidenceScore = calculateConfidenceScore(bestDriver, shipment),
+                        estimatedTravelTime = calculateTravelTime(bestDriver.driver, shipment),
+                        routeOptimization = "Driver route preference"
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addShipment(shipment)
+                    
+                    // Update driver capacity
+                    if (!bestDriver.hasCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply minimize total distance strategy
+     */
+    private fun applyMinimizeDistanceStrategy(
+        shipments: List<Shipment>,
+        driverRoutes: List<DriverRoute>
+    ): List<RouteAssignment> {
+        val assignments = mutableListOf<RouteAssignment>()
+        val availableDrivers = driverRoutes.filter { it.hasCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Calculate total route distance for each driver
+                val driverRouteScores = availableDrivers.map { driverRoute ->
+                    val currentRouteDistance = driverRoute.currentRoute.totalDistance
+                    val additionalDistance = calculateDistanceToShipment(driverRoute.driver, shipment)
+                    val totalDistance = currentRouteDistance + additionalDistance
+                    
+                    Triple(driverRoute, totalDistance, additionalDistance)
+                }
+                
+                // Select driver with minimum total route distance
+                val bestDriver = driverRouteScores.minByOrNull { it.second }?.first
+                
+                if (bestDriver != null && bestDriver.canAcceptShipment(shipment)) {
+                    val assignment = RouteAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        strategy = "MINIMIZE_TOTAL_DISTANCE",
+                        distanceToPickup = calculateDistanceToShipment(bestDriver.driver, shipment),
+                        routeEfficiency = calculateRouteEfficiency(bestDriver, shipment),
+                        confidenceScore = calculateConfidenceScore(bestDriver, shipment),
+                        estimatedTravelTime = calculateTravelTime(bestDriver.driver, shipment),
+                        routeOptimization = "Minimize total route distance"
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addShipment(shipment)
+                    
+                    // Update driver capacity
+                    if (!bestDriver.hasCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply hybrid strategy (combines multiple factors)
+     */
+    private fun applyHybridStrategy(
+        shipments: List<Shipment>,
+        driverRoutes: List<DriverRoute>
+    ): List<RouteAssignment> {
+        val assignments = mutableListOf<RouteAssignment>()
+        val availableDrivers = driverRoutes.filter { it.hasCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Calculate composite scores for all available drivers
+                val driverScores = availableDrivers.map { driverRoute ->
+                    val proximityScore = calculateProximityScore(driverRoute.driver, shipment) * PROXIMITY_WEIGHT
+                    val efficiencyScore = calculateRouteEfficiency(driverRoute, shipment) * ROUTE_EFFICIENCY_WEIGHT
+                    val preferenceScore = calculatePreferenceScore(driverRoute, shipment) * DRIVER_PREFERENCE_WEIGHT
+                    val workloadScore = calculateWorkloadScore(driverRoute) * WORKLOAD_WEIGHT
+                    
+                    val totalScore = proximityScore + efficiencyScore + preferenceScore + workloadScore
+                    
+                    Pair(driverRoute, totalScore)
+                }
+                
+                // Select driver with highest composite score
+                val bestDriver = driverScores.maxByOrNull { it.second }?.first
+                
+                if (bestDriver != null && bestDriver.canAcceptShipment(shipment)) {
+                    val assignment = RouteAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        strategy = "HYBRID",
+                        distanceToPickup = calculateDistanceToShipment(bestDriver.driver, shipment),
+                        routeEfficiency = calculateRouteEfficiency(bestDriver, shipment),
+                        confidenceScore = calculateConfidenceScore(bestDriver, shipment),
+                        estimatedTravelTime = calculateTravelTime(bestDriver.driver, shipment),
+                        routeOptimization = "Optimized composite score"
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addShipment(shipment)
+                    
+                    // Update driver capacity
+                    if (!bestDriver.hasCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Calculate distance between driver and shipment
+     */
+    private fun calculateDistanceToShipment(driver: Driver, shipment: Shipment): Double {
+        val driverLocation = driver.currentLocation
+        val shipmentLocation = shipment.pickupLocation
+        
+        return if (driverLocation != null && shipmentLocation != null) {
+            // Simplified distance calculation (would use actual distance API)
+            val latDiff = abs(driverLocation.latitude - shipmentLocation.latitude)
+            val lonDiff = abs(driverLocation.longitude - shipmentLocation.longitude)
+            kotlin.math.sqrt((latDiff * latDiff + lonDiff * lonDiff)) * 111.0 // Approximate km
+        } else {
+            50.0 // Default distance
+        }
+    }
+    
+    /**
+     * Calculate route efficiency for driver with shipment
+     */
+    private fun calculateRouteEfficiency(driverRoute: DriverRoute, shipment: Shipment): Double {
+        val currentRouteDistance = driverRoute.currentRoute.totalDistance
+        val additionalDistance = calculateDistanceToShipment(driverRoute.driver, shipment)
+        val newTotalDistance = currentRouteDistance + additionalDistance
+        
+        // Check if within route limits
+        if (newTotalDistance > driverRoute.maxRouteDistance) {
+            return 0.0
+        }
+        
+        // Calculate efficiency based on route continuity
+        val routeContinuityScore = calculateRouteContinuity(driverRoute, shipment)
+        val distanceEfficiencyScore = maxOf(0.0, 1.0 - (additionalDistance / MAX_ROUTE_DISTANCE))
+        val capacityUtilizationScore = (driverRoute.currentWorkload.toDouble() / driverRoute.maxCapacity)
+        
+        return (routeContinuityScore * 0.5) + (distanceEfficiencyScore * 0.3) + (capacityUtilizationScore * 0.2)
+    }
+    
+    /**
+     * Calculate route continuity score
+     */
+    private fun calculateRouteContinuity(driverRoute: DriverRoute, shipment: Shipment): Double {
+        // Check if shipment is on driver's preferred route
+        val isOnPreferredRoute = driverRoute.preferredRoutes.any { route ->
+            shipment.pickupAddress.contains(route) || shipment.deliveryAddress.contains(route)
+        }
+        
+        if (isOnPreferredRoute) {
+            return 100.0
+        }
+        
+        // Check geographic continuity with current route
+        val currentRouteLocations = driverRoute.currentRoute.shipments.map { it.pickupLocation }
+        val shipmentLocation = shipment.pickupLocation
+        
+        if (currentRouteLocations.isNotEmpty() && shipmentLocation != null) {
+            val minDistance = currentRouteLocations.minOfOrNull { location ->
+                if (location != null) {
+                    val latDiff = location.latitude - shipmentLocation.latitude
+                    val lonDiff = location.longitude - shipmentLocation.longitude
+                    kotlin.math.sqrt(latDiff * latDiff + lonDiff * lonDiff) * 111.0
+                } else {
+                    100.0
+                }
+            } ?: 100.0
+            
+            return when {
+                minDistance <= 10 -> 80.0
+                minDistance <= 25 -> 60.0
+                minDistance <= 50 -> 40.0
+                else -> 20.0
+            }
+        }
+        
+        return 50.0 // Default score
+    }
+    
+    /**
+     * Calculate preference score
+     */
+    private fun calculatePreferenceScore(driverRoute: DriverRoute, shipment: Shipment): Double {
+        var score = 50.0 // Base score
+        
+        // Route preference
+        val isOnPreferredRoute = driverRoute.preferredRoutes.any { route ->
+            shipment.pickupAddress.contains(route) || shipment.deliveryAddress.contains(route)
+        }
+        
+        if (isOnPreferredRoute) {
+            score += 30.0
+        }
+        
+        // Shipment type preference
+        val preferredShipmentTypes = driverRoute.driver.preferredShipmentTypes ?: emptyList()
+        if (preferredShipmentTypes.contains(shipment.type)) {
+            score += 15.0
+        }
+        
+        // Time window preference
+        val preferredStartTime = driverRoute.driver.preferredStartTime
+        val preferredEndTime = driverRoute.driver.preferredEndTime
+        
+        if (preferredStartTime != null && preferredEndTime != null) {
+            val now = LocalDateTime.now()
+            if (now.isAfter(preferredStartTime) && now.isBefore(preferredEndTime)) {
+                score += 5.0
+            }
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate proximity score
+     */
+    private fun calculateProximityScore(driver: Driver, shipment: Shipment): Double {
+        val distance = calculateDistanceToShipment(driver, shipment)
+        
+        return when {
+            distance <= 5 -> 100.0
+            distance <= 10 -> 80.0
+            distance <= 20 -> 60.0
+            distance <= 50 -> 40.0
+            else -> 20.0
+        }
+    }
+    
+    /**
+     * Calculate workload score
+     */
+    private fun calculateWorkloadScore(driverRoute: DriverRoute): Double {
+        val utilizationRate = (driverRoute.currentWorkload.toDouble() / driverRoute.maxCapacity) * 100.0
+        
+        return when {
+            utilizationRate <= 30.0 -> 100.0
+            utilizationRate <= 50.0 -> 80.0
+            utilizationRate <= 70.0 -> 60.0
+            utilizationRate <= 85.0 -> 40.0
+            else -> 20.0
+        }
+    }
+    
+    /**
+     * Calculate confidence score
+     */
+    private fun calculateConfidenceScore(driverRoute: DriverRoute, shipment: Shipment): Double {
+        var confidence = 80.0 // Base confidence
+        
+        // Data completeness
+        if (driverRoute.driver.currentLocation != null) confidence += 10.0
+        if (shipment.pickupAddress.isNotBlank()) confidence += 5.0
+        if (shipment.deliveryAddress.isNotBlank()) confidence += 5.0
+        
+        return confidence.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate travel time
+     */
+    private fun calculateTravelTime(driver: Driver, shipment: Shipment): Double {
+        val distance = calculateDistanceToShipment(driver, shipment)
+        
+        // Consider traffic conditions (simplified)
+        val trafficFactor = when {
+            LocalDateTime.now().hour in 7..9 || LocalDateTime.now().hour in 17..19 -> 1.5 // Rush hour
+            LocalDateTime.now().hour in 10..16 -> 1.2 // Daytime
+            else -> 1.0 // Night/early morning
+        }
+        
+        return (distance / 50.0) * trafficFactor // Assuming 50 km/h average speed
+    }
+    
+    /**
+     * Calculate route metrics
+     */
+    private fun calculateRouteMetrics(
+        assignments: List<RouteAssignment>,
+        driverRoutes: List<DriverRoute>
+    ): RouteMetrics {
+        val totalAssignments = assignments.size
+        val assignedDrivers = assignments.map { it.driverId }.distinct().size
+        
+        // Calculate distance metrics
+        val totalDistance = assignments.sumOf { it.distanceToPickup }
+        val averageDistance = if (assignments.isNotEmpty()) totalDistance / assignments.size else 0.0
+        val maxDistance = assignments.maxOfOrNull { it.distanceToPickup } ?: 0.0
+        val minDistance = assignments.minOfOrNull { it.distanceToPickup } ?: 0.0
+        
+        // Calculate efficiency metrics
+        val averageEfficiency = if (assignments.isNotEmpty()) {
+            assignments.map { it.routeEfficiency }.average()
+        } else {
+            0.0
+        }
+        
+        val averageConfidence = if (assignments.isNotEmpty()) {
+            assignments.map { it.confidenceScore }.average()
+        } else {
+            0.0
+        }
+        
+        // Calculate travel time metrics
+        val totalTravelTime = assignments.sumOf { it.estimatedTravelTime }
+        val averageTravelTime = if (assignments.isNotEmpty()) totalTravelTime / assignments.size else 0.0
+        
+        // Calculate strategy distribution
+        val strategyDistribution = assignments.groupBy { it.strategy }
+            .mapValues { it.value.size }
+        
+        return RouteMetrics(
+            totalAssignments = totalAssignments,
+            assignedDrivers = assignedDrivers,
+            totalDistance = totalDistance,
+            averageDistance = averageDistance,
+            maxDistance = maxDistance,
+            minDistance = minDistance,
+            averageEfficiency = averageEfficiency,
+            averageConfidence = averageConfidence,
+            totalTravelTime = totalTravelTime,
+            averageTravelTime = averageTravelTime,
+            strategyDistribution = strategyDistribution,
+            calculatedAt = LocalDateTime.now()
+        )
+    }
+    
+    /**
+     * Generate route recommendations
+     */
+    private fun generateRouteRecommendations(
+        metrics: RouteMetrics,
+        driverRoutes: List<DriverRoute>
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (metrics.averageEfficiency < ROUTE_EFFICIENCY_THRESHOLD * 100) {
+            recommendations.add("Consider using optimal route strategy for better efficiency")
+        }
+        
+        if (metrics.averageDistance > 50.0) {
+            recommendations.add("High average distance - consider driver location optimization")
+        }
+        
+        if (metrics.averageTravelTime > 2.0) {
+            recommendations.add("Long travel times - consider traffic-aware routing")
+        }
+        
+        val underutilizedDrivers = driverRoutes.count { it.currentWorkload < it.maxCapacity * 0.3 }
+        if (underutilizedDrivers > driverRoutes.size / 2) {
+            recommendations.add("Many drivers underutilized - consider reducing driver pool")
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Optimize existing routes
+     */
+    suspend fun optimizeExistingRoutes(
+        currentRoutes: Map<String, DriverRoute>,
+        newShipments: List<Shipment>
+    ): RouteOptimizationResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Optimizing existing routes with ${newShipments.size} new shipments")
+                
+                val optimizedRoutes = mutableMapOf<String, DriverRoute>()
+                val improvements = mutableListOf<String>()
+                
+                currentRoutes.forEach { (driverId, driverRoute) ->
+                    // Get new shipments that could be added to this driver's route
+                    val applicableShipments = newShipments.filter { shipment ->
+                        calculateDistanceToShipment(driverRoute.driver, shipment) <= MAX_ROUTE_DISTANCE
+                    }
+                    
+                    if (applicableShipments.isNotEmpty()) {
+                        // Optimize route by adding new shipments
+                        val optimizedRoute = optimizeDriverRoute(driverRoute, applicableShipments)
+                        optimizedRoutes[driverId] = optimizedRoute
+                        
+                        val improvement = calculateRouteImprovement(driverRoute, optimizedRoute)
+                        improvements.add("Driver ${driverRoute.driver.name}: ${improvement}% route efficiency improvement")
+                    } else {
+                        optimizedRoutes[driverId] = driverRoute
+                    }
+                }
+                
+                RouteOptimizationResult(
+                    originalRoutes = currentRoutes,
+                    optimizedRoutes = optimizedRoutes,
+                    improvements = improvements,
+                    totalImprovement = calculateTotalImprovement(currentRoutes, optimizedRoutes),
+                    calculatedAt = LocalDateTime.now()
+                )
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error optimizing existing routes", e)
+                RouteOptimizationResult.createDefault(currentRoutes)
+            }
+        }
+    }
+    
+    /**
+     * Optimize individual driver route
+     */
+    private fun optimizeDriverRoute(
+        currentRoute: DriverRoute,
+        newShipments: List<Shipment>
+    ): DriverRoute {
+        // Combine current and new shipments
+        val allShipments = currentRoute.currentRoute.shipments + newShipments
+        
+        // Sort by proximity and efficiency
+        val optimizedShipments = allShipments.sortedWith { a, b ->
+            val scoreA = calculateRouteEfficiency(currentRoute, a)
+            val scoreB = calculateRouteEfficiency(currentRoute, b)
+            scoreB.compareTo(scoreA)
+        }
+        
+        return currentRoute.copy(
+            currentRoute = currentRoute.currentRoute.copy(
+                shipments = optimizedShipments,
+                totalDistance = optimizedShipments.sumOf { shipment ->
+                    calculateDistanceToShipment(currentRoute.driver, shipment)
+                }
+            )
+        )
+    }
+    
+    /**
+     * Calculate route improvement percentage
+     */
+    private fun calculateRouteImprovement(original: DriverRoute, optimized: DriverRoute): Double {
+        val originalEfficiency = calculateRouteEfficiency(original, null)
+        val optimizedEfficiency = calculateRouteEfficiency(optimized, null)
+        
+        return if (originalEfficiency > 0) {
+            ((optimizedEfficiency - originalEfficiency) / originalEfficiency) * 100.0
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Calculate total improvement
+     */
+    private fun calculateTotalImprovement(
+        originalRoutes: Map<String, DriverRoute>,
+        optimizedRoutes: Map<String, DriverRoute>
+    ): Double {
+        val improvements = originalRoutes.mapNotNull { (driverId, originalRoute) ->
+            optimizedRoutes[driverId]?.let { optimizedRoute ->
+                calculateRouteImprovement(originalRoute, optimizedRoute)
+            }
+        }
+        
+        return if (improvements.isNotEmpty()) {
+            improvements.average()
+        } else {
+            0.0
+        }
+    }
+}
+
+/**
+ * Driver route data class
+ */
+data class DriverRoute(
+    val driver: Driver,
+    val currentRoute: CurrentRoute,
+    val preferredRoutes: List<String>,
+    val maxRouteDistance: Double,
+    val maxRouteTime: Double,
+    val currentWorkload: Int,
+    val maxCapacity: Int
+) {
+    fun hasCapacity(): Boolean {
+        return currentWorkload < maxCapacity && 
+               currentRoute.totalDistance < maxRouteDistance &&
+               currentRoute.totalTime < maxRouteTime
+    }
+    
+    fun canAcceptShipment(shipment: Shipment): Boolean {
+        val additionalDistance = calculateDistanceToShipment(driver, shipment)
+        val newTotalDistance = currentRoute.totalDistance + additionalDistance
+        
+        return hasCapacity() && newTotalDistance <= maxRouteDistance
+    }
+    
+    fun addShipment(shipment: Shipment) {
+        currentRoute.shipments.add(shipment)
+        currentRoute.totalDistance += calculateDistanceToShipment(driver, shipment)
+    }
+    
+    companion object {
+        fun createEmpty(): CurrentRoute {
+            return CurrentRoute(
+                shipments = mutableListOf(),
+                totalDistance = 0.0,
+                totalTime = 0.0
+            )
+        }
+        
+        private fun calculateDistanceToShipment(driver: Driver, shipment: Shipment): Double {
+            val driverLocation = driver.currentLocation
+            val shipmentLocation = shipment.pickupLocation
+            
+            return if (driverLocation != null && shipmentLocation != null) {
+                val latDiff = abs(driverLocation.latitude - shipmentLocation.latitude)
+                val lonDiff = abs(driverLocation.longitude - shipmentLocation.longitude)
+                kotlin.math.sqrt(latDiff * latDiff + lonDiff * lonDiff) * 111.0
+            } else {
+                50.0
+            }
+        }
+    }
+}
+
+/**
+ * Current route data class
+ */
+data class CurrentRoute(
+    val shipments: MutableList<Shipment>,
+    var totalDistance: Double,
+    var totalTime: Double
+)
+
+/**
+ * Route assignment data class
+ */
+data class RouteAssignment(
+    val shipmentId: String,
+    val driverId: String,
+    val driverName: String,
+    val strategy: String,
+    val distanceToPickup: Double,
+    val routeEfficiency: Double,
+    val confidenceScore: Double,
+    val estimatedTravelTime: Double,
+    val routeOptimization: String
+)
+
+/**
+ * Route metrics data class
+ */
+data class RouteMetrics(
+    val totalAssignments: Int,
+    val assignedDrivers: Int,
+    val totalDistance: Double,
+    val averageDistance: Double,
+    val maxDistance: Double,
+    val minDistance: Double,
+    val averageEfficiency: Double,
+    val averageConfidence: Double,
+    val totalTravelTime: Double,
+    val averageTravelTime: Double,
+    val strategyDistribution: Map<String, Int>,
+    val calculatedAt: LocalDateTime
+)
+
+/**
+ * Route assignment result data class
+ */
+data class RouteAssignmentResult(
+    val assignments: List<RouteAssignment>,
+    val metrics: RouteMetrics,
+    val recommendations: List<String>,
+    val strategy: RouteBasedAssignmentService.Strategy,
+    val totalShipments: Int,
+    val totalDrivers: Int,
+    val calculatedAt: LocalDateTime
+) {
+    companion object {
+        fun createDefault(totalShipments: Int, totalDrivers: Int): RouteAssignmentResult {
+            return RouteAssignmentResult(
+                assignments = emptyList(),
+                metrics = RouteMetrics.createDefault(),
+                recommendations = emptyList(),
+                strategy = RouteBasedAssignmentService.Strategy.HYBRID,
+                totalShipments = totalShipments,
+                totalDrivers = totalDrivers,
+                calculatedAt = LocalDateTime.now()
+            )
+        }
+    }
+}
+
+/**
+ * Route optimization result data class
+ */
+data class RouteOptimizationResult(
+    val originalRoutes: Map<String, DriverRoute>,
+    val optimizedRoutes: Map<String, DriverRoute>,
+    val improvements: List<String>,
+    val totalImprovement: Double,
+    val calculatedAt: LocalDateTime
+) {
+    companion object {
+        fun createDefault(originalRoutes: Map<String, DriverRoute>): RouteOptimizationResult {
+            return RouteOptimizationResult(
+                originalRoutes = originalRoutes,
+                optimizedRoutes = originalRoutes,
+                improvements = emptyList(),
+                totalImprovement = 0.0,
+                calculatedAt = LocalDateTime.now()
+            )
+        }
+    }
+}

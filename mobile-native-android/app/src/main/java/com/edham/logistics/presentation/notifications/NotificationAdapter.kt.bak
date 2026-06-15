@@ -1,0 +1,302 @@
+package com.edham.logistics.presentation.notifications.adapter
+
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Filter
+import android.widget.Filterable
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ListAdapter
+import androidx.recyclerview.widget.RecyclerView
+import com.edham.logistics.R
+import com.edham.logistics.core.notifications.*
+import com.edham.logistics.databinding.ItemNotificationBinding
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * Notification Adapter - RecyclerView adapter for smart notifications
+ * Provides filtering, grouping, and efficient notification display
+ */
+class NotificationAdapter(
+    private val onNotificationClick: (SmartNotification) -> Unit,
+    private val onNotificationDelete: (SmartNotification) -> Unit
+) : ListAdapter<SmartNotification, NotificationAdapter.NotificationViewHolder>(NotificationDiffCallback()), Filterable {
+
+    private val allNotifications = mutableListOf<SmartNotification>()
+    private val filteredNotifications = mutableListOf<SmartNotification>()
+    private var currentEventFilter: NotificationEvent? = null
+    private var currentPriorityFilter: NotificationPriority? = null
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): NotificationViewHolder {
+        val binding = ItemNotificationBinding.inflate(
+            LayoutInflater.from(parent.context),
+            parent,
+            false
+        )
+        return NotificationViewHolder(binding)
+    }
+
+    override fun onBindViewHolder(holder: NotificationViewHolder, position: Int) {
+        val notification = filteredNotifications[position]
+        holder.bind(notification)
+        
+        holder.itemView.setOnClickListener {
+            onNotificationClick(notification)
+        }
+        
+        holder.binding.imageViewMore.setOnClickListener {
+            toggleActions(holder)
+        }
+        
+        holder.binding.imageViewMarkRead.setOnClickListener {
+            onNotificationClick(notification) // Mark as read
+        }
+        
+        holder.binding.imageViewDelete.setOnClickListener {
+            onNotificationDelete(notification)
+        }
+    }
+
+    override fun getItemCount(): Int = filteredNotifications.size
+
+    override fun submitList(list: List<SmartNotification>?) {
+        allNotifications.clear()
+        allNotifications.addAll(list ?: emptyList())
+        applyFilters()
+    }
+
+    override fun getFilter(): Filter {
+        return notificationFilter
+    }
+
+    /**
+     * Filter by event type
+     */
+    fun filterByEvent(event: NotificationEvent?) {
+        currentEventFilter = event
+        applyFilters()
+    }
+
+    /**
+     * Filter by priority
+     */
+    fun filterByPriority(priority: NotificationPriority?) {
+        currentPriorityFilter = priority
+        applyFilters()
+    }
+
+    /**
+     * Clear all filters
+     */
+    fun clearFilters() {
+        currentEventFilter = null
+        currentPriorityFilter = null
+        applyFilters()
+    }
+
+    /**
+     * Apply current filters
+     */
+    private fun applyFilters() {
+        filteredNotifications.clear()
+        filteredNotifications.addAll(allNotifications.filter { notification ->
+            val eventMatch = currentEventFilter == null || notification.event == currentEventFilter
+            val priorityMatch = currentPriorityFilter == null || notification.priority == currentPriorityFilter
+            eventMatch && priorityMatch
+        })
+        
+        super.submitList(filteredNotifications)
+    }
+
+    /**
+     * Toggle action buttons visibility
+     */
+    private fun toggleActions(holder: NotificationViewHolder) {
+        val isVisible = holder.binding.layoutActions.visibility == View.VISIBLE
+        holder.binding.layoutActions.visibility = if (isVisible) View.GONE else View.VISIBLE
+    }
+
+    /**
+     * Custom filter implementation
+     */
+    private val notificationFilter = object : Filter() {
+        override fun performFiltering(constraint: CharSequence?): FilterResults {
+            val filteredList = if (constraint.isNullOrBlank()) {
+                allNotifications
+            } else {
+                allNotifications.filter { notification ->
+                    val query = constraint.toString().lowercase(Locale.getDefault())
+                    notification.title.lowercase(Locale.getDefault()).contains(query) ||
+                    notification.message.lowercase(Locale.getDefault()).contains(query) ||
+                    notification.data.values.any { value ->
+                        value.toString().lowercase(Locale.getDefault()).contains(query)
+                    }
+                }
+            }
+            
+            val results = FilterResults()
+            results.values = filteredList
+            results.count = filteredList.size
+            return results
+        }
+
+        override fun publishResults(constraint: CharSequence?, results: FilterResults?) {
+            @Suppress("UNCHECKED_CAST")
+            val filtered = results?.values as? List<SmartNotification> ?: emptyList()
+            filteredNotifications.clear()
+            filteredNotifications.addAll(filtered)
+            applyFilters()
+        }
+    }
+
+    /**
+     * ViewHolder for notification items
+     */
+    class NotificationViewHolder(
+        val binding: ItemNotificationBinding
+    ) : RecyclerView.ViewHolder(binding.root) {
+
+        private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
+        private val dateFormat = SimpleDateFormat("MMM dd, yyyy", Locale.getDefault())
+
+        fun bind(notification: SmartNotification) {
+            // Set title and message
+            binding.tvNotifTitle.text = notification.title
+            binding.tvNotifMessage.text = notification.message
+            
+            // Set time
+            binding.tvNotifTime.text = formatTime(notification.timestamp)
+            
+            // Set event type chip
+            binding.tvNotifType.text = getEventTypeName(notification.event)
+            binding.tvNotifType.setChipBackgroundColor(getEventTypeColor(notification.event))
+            
+            // Set priority chip
+            binding.chipPriority.text = getPriorityName(notification.priority)
+            binding.chipPriority.setChipBackgroundColor(getPriorityColor(notification.priority))
+            
+            // Set priority indicator
+            binding.viewPriorityIndicator.setBackgroundColor(getPriorityColor(notification.priority))
+            
+            // Set unread indicator
+            binding.viewUnreadIndicator.visibility = if (notification.isRead) View.GONE else View.VISIBLE
+            
+            // Set additional info if available
+            setupAdditionalInfo(notification)
+            
+            // Set group indicator if applicable
+            setupGroupIndicator(notification)
+            
+            // Set action buttons visibility
+            binding.layoutActions.visibility = View.GONE
+        }
+
+        private fun formatTime(timestamp: Long): String {
+            val now = System.currentTimeMillis()
+            val diff = now - timestamp
+            
+            return when {
+                diff < 60 * 1000 -> "الآن"
+                diff < 60 * 60 * 1000 -> "${diff / (60 * 1000)} دقيقة"
+                diff < 24 * 60 * 60 * 1000 -> "${diff / (60 * 60 * 1000)} ساعة"
+                diff < 7 * 24 * 60 * 60 * 1000 -> "${diff / (24 * 60 * 60 * 1000)} يوم"
+                else -> dateFormat.format(Date(timestamp))
+            }
+        }
+
+        private fun getEventTypeName(event: NotificationEvent): String {
+            return when (event) {
+                NotificationEvent.SHIPMENT_DELAYED -> "شحنات"
+                NotificationEvent.SHIPMENT_DELIVERED -> "تسليم"
+                NotificationEvent.SHIPMENT_PICKED_UP -> "استلام"
+                NotificationEvent.TEMPERATURE_ISSUE -> "حرارة"
+                NotificationEvent.PAYMENT_OVERDUE -> "مدفوعات"
+                NotificationEvent.PAYMENT_RECEIVED -> "دفع"
+                NotificationEvent.SYSTEM_UPDATE -> "نظام"
+                NotificationEvent.MAINTENANCE_SCHEDULED -> "صيانة"
+            }
+        }
+
+        private fun getPriorityName(priority: NotificationPriority): String {
+            return when (priority) {
+                NotificationPriority.CRITICAL -> "حرج"
+                NotificationPriority.HIGH -> "عالي"
+                NotificationPriority.NORMAL -> "عادي"
+                NotificationPriority.LOW -> "منخفض"
+            }
+        }
+
+        private fun getEventTypeColor(event: NotificationEvent): Int {
+            return when (event) {
+                NotificationEvent.SHIPMENT_DELAYED -> R.color.shipment_delay_color
+                NotificationEvent.SHIPMENT_DELIVERED -> R.color.shipment_delivered_color
+                NotificationEvent.SHIPMENT_PICKED_UP -> R.color.shipment_picked_up_color
+                NotificationEvent.TEMPERATURE_ISSUE -> R.color.temperature_issue_color
+                NotificationEvent.PAYMENT_OVERDUE -> R.color.payment_overdue_color
+                NotificationEvent.PAYMENT_RECEIVED -> R.color.payment_received_color
+                NotificationEvent.SYSTEM_UPDATE -> R.color.system_update_color
+                NotificationEvent.MAINTENANCE_SCHEDULED -> R.color.maintenance_scheduled_color
+            }
+        }
+
+        private fun getPriorityColor(priority: NotificationPriority): Int {
+            return when (priority) {
+                NotificationPriority.CRITICAL -> R.color.priority_critical
+                NotificationPriority.HIGH -> R.color.priority_high
+                NotificationPriority.NORMAL -> R.color.priority_normal
+                NotificationPriority.LOW -> R.color.priority_low
+            }
+        }
+
+        private fun setupAdditionalInfo(notification: SmartNotification) {
+            val additionalInfo = mutableListOf<String>()
+            
+            // Add shipment ID if available
+            notification.data["shipmentId"]?.let {
+                additionalInfo.add("الشحنة: $it")
+            }
+            
+            // Add invoice ID if available
+            notification.data["invoiceId"]?.let {
+                additionalInfo.add("الفاتورة: $it")
+            }
+            
+            // Add location if available
+            notification.data["location"]?.let {
+                additionalInfo.add("الموقع: $it")
+            }
+            
+            // Add amount if available
+            notification.data["amount"]?.let {
+                additionalInfo.add("المبلغ: $it ريال")
+            }
+            
+            if (additionalInfo.isNotEmpty()) {
+                binding.textViewAdditionalInfo.text = additionalInfo.join(" | ")
+                binding.layoutAdditionalInfo.visibility = View.VISIBLE
+            } else {
+                binding.layoutAdditionalInfo.visibility = View.GONE
+            }
+        }
+
+        private fun setupGroupIndicator(notification: SmartNotification) {
+            // This would check if notification is part of a group
+            // For now, we'll hide it by default
+            binding.layoutGroupIndicator.visibility = View.GONE
+        }
+    }
+
+    /**
+     * DiffUtil callback for efficient list updates
+     */
+    private class NotificationDiffCallback : DiffUtil.ItemCallback<SmartNotification>() {
+        override fun areItemsTheSame(oldItem: SmartNotification, newItem: SmartNotification): Boolean {
+            return oldItem.id == newItem.id
+        }
+
+        override fun areContentsTheSame(oldItem: SmartNotification, newItem: SmartNotification): Boolean {
+            return oldItem == newItem
+        }
+    }
+}

@@ -11,6 +11,7 @@
 
 ### 1. المجلدات الرئيسية (Root Directories)
 - **`app/`**: المجلد الأساسي لتطبيق الأندرويد (Kotlin).
+- **`iosApp/`**: المجلد الأساسي لتطبيق الأيفون (Swift/SwiftUI).
 - **`backend-api/`**: الكود المصدري للواجهة الخلفية (Backend) والخدمات.
 - **`docs/`**: التقارير الفنية وخطط التطوير.
 - **`disabled-files/`**: ملفات احتياطية أو معطلة تحتاج مراجعة.
@@ -36,6 +37,19 @@
 - **`core/network/`**: إعدادات الاتصال بالسيرفر ومراقبة جودة الشبكة.
 - **`core/voice/`**: نظام المساعد الصوتي للسائق.
 - **`core/utils/`**: دوال مساعدة جغرافية وزمنية.
+
+---
+
+### 3. تفاصيل تطبيق الأيفون (`iosApp/EdhamLogistics/`)
+
+#### **A. هيكلية الكود (SwiftUI)**
+- **`EdhamLogisticsApp.swift`**: الملف الرئيسي ونظام التوجيه (Routing).
+- **`UI/`**: المجلد الذي يحتوي على كافة الشاشات مقسمة حسب الأدوار (Accountant, Driver, etc.).
+- **`Core/`**: يحتوي على الـ Network Layer ونظام الـ Location.
+
+#### **B. إدارة الحالة (State Management)**
+- يعتمد التطبيق على **ObservableObjects** و **StateObject** لربط الـ ViewModels بالواجهات.
+- يتم إدارة الجلسة عبر `SessionManager.shared`.
 
 ---
 

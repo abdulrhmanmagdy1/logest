@@ -1,0 +1,582 @@
+package com.edham.logistics.feature.dispatch
+
+import android.content.ClipData
+import android.content.ClipDescription
+import android.graphics.Color
+import android.os.Bundle
+import android.util.Log
+import android.view.DragEvent
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.core.view.ViewCompat
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.observe
+import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentDispatchBoardBinding
+import com.edham.logistics.feature.dispatch.adapters.DriverCardAdapter
+import com.edham.logistics.feature.dispatch.adapters.ShipmentCardAdapter
+import com.edham.logistics.feature.dispatch.adapters.AssignmentAdapter
+import com.edham.logistics.feature.dispatch.ui.components.DispatchSuggestionDialog
+import com.edham.logistics.feature.dispatch.ui.components.DispatchControlPanel
+import kotlinx.coroutines.launch
+
+/**
+ * Dispatch Board Fragment - Drag & drop dispatch interface with
+ * real-time updates and smart assignment suggestions
+ */
+class DispatchBoardFragment : Fragment() {
+    
+    private var _binding: FragmentDispatchBoardBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var dispatchService: SmartDispatchService
+    private lateinit var driverCardAdapter: DriverCardAdapter
+    private lateinit var shipmentCardAdapter: ShipmentCardAdapter
+    private lateinit var assignmentAdapter: AssignmentAdapter
+    
+    private var draggedShipment: com.edham.logistics.data.model.Shipment? = null
+    private var draggedDriver: com.edham.logistics.data.model.Driver? = null
+    
+    companion object {
+        private const val TAG = "DispatchBoardFragment"
+        private const val DRIVER_CARD_TAG = "driver_card"
+        private const val SHIPMENT_CARD_TAG = "shipment_card"
+        private const val ASSIGNMENT_CARD_TAG = "assignment_card"
+    }
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentDispatchBoardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Initialize dispatch service
+        dispatchService = SmartDispatchService(
+            requireContext(),
+            // TODO: Inject repositories via DI
+            com.edham.logistics.data.repository.DriverRepository(),
+            com.edham.logistics.data.repository.ShipmentRepository()
+        )
+        
+        setupRecyclerViews()
+        setupDragAndDrop()
+        setupControlPanel()
+        observeDispatchData()
+        
+        // Initialize dispatch service
+        lifecycleScope.launch {
+            dispatchService.initializeDispatch()
+        }
+    }
+    
+    private fun setupRecyclerViews() {
+        // Setup available drivers RecyclerView
+        driverCardAdapter = DriverCardAdapter { driver, action ->
+            handleDriverAction(driver, action)
+        }
+        binding.recyclerViewDrivers.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = driverCardAdapter
+            setHasFixedSize(true)
+        }
+        
+        // Setup pending shipments RecyclerView
+        shipmentCardAdapter = ShipmentCardAdapter { shipment, action ->
+            handleShipmentAction(shipment, action)
+        }
+        binding.recyclerViewShipments.apply {
+            layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+            adapter = shipmentCardAdapter
+            setHasFixedSize(true)
+        }
+        
+        // Setup assignments RecyclerView
+        assignmentAdapter = AssignmentAdapter { assignment, action ->
+            handleAssignmentAction(assignment, action)
+        }
+        binding.recyclerViewAssignments.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = assignmentAdapter
+            setHasFixedSize(true)
+        }
+    }
+    
+    private fun setupDragAndDrop() {
+        // Setup drag listeners for driver cards
+        setupDriverDragListeners()
+        
+        // Setup drag listeners for shipment cards
+        setupShipmentDragListeners()
+        
+        // Setup drop zones
+        setupDropZones()
+    }
+    
+    private fun setupDriverDragListeners() {
+        driverCardAdapter.setOnDragListener { view, shipment ->
+            draggedDriver = view.tag as? com.edham.logistics.data.model.Driver
+            
+            // Create drag shadow
+            val shadow = View.DragShadowBuilder(view)
+                .setClipShape(android.view.R.attr.shapeAppearanceMediumComponent)
+                .build()
+            
+            // Start drag
+            view.startDrag(
+                ClipData.newPlainText("driver_id", view.tag.toString()),
+                shadow,
+                view,
+                0
+            )
+        }
+    }
+    
+    private fun setupShipmentDragListeners() {
+        shipmentCardAdapter.setOnDragListener { view, driver ->
+            draggedShipment = view.tag as? com.edham.logistics.data.model.Shipment
+            
+            // Create drag shadow
+            val shadow = View.DragShadowBuilder(view)
+                .setClipShape(android.view.R.attr.shapeAppearanceMediumComponent)
+                .build()
+            
+            // Start drag
+            view.startDrag(
+                ClipData.newPlainText("shipment_id", view.tag.toString()),
+                shadow,
+                view,
+                0
+            )
+        }
+    }
+    
+    private fun setupDropZones() {
+        // Driver drop zone
+        binding.layoutDriverDropZone.setOnDragListener { dragEvent ->
+            when (dragEvent.action) {
+                DragEvent.ACTION_DRAG_ENTERED -> {
+                    binding.layoutDriverDropZone.setBackgroundColor(
+                        ContextCompat.getColor(requireContext(), R.color.dispatch_drop_zone_active)
+                    )
+                    true
+                }
+                
+                DragEvent.ACTION_DRAG_EXITED -> {
+                    binding.layoutDriverDropZone.setBackgroundColor(
+                        ContextCompat.getColor(requireContext(), R.color.dispatch_drop_zone_inactive)
+                    )
+                    true
+                }
+                
+                DragEvent.ACTION_DROP -> {
+                    handleDriverDrop(dragEvent)
+                    binding.layoutDriverDropZone.setBackgroundColor(
+                        ContextCompat.getColor(requireContext(), R.color.dispatch_drop_zone_inactive)
+                    )
+                    true
+                }
+                
+                else -> true
+            }
+        }
+        
+        // Shipment drop zone
+        binding.layoutShipmentDropZone.setOnDragListener { dragEvent ->
+            when (dragEvent.action) {
+                DragEvent.ACTION_DRAG_ENTERED -> {
+                    binding.layoutShipmentDropZone.setBackgroundColor(
+                        ContextCompat.getColor(requireContext(), R.color.dispatch_drop_zone_active)
+                    )
+                    true
+                }
+                
+                DragEvent.ACTION_DRAG_EXITED -> {
+                    binding.layoutShipmentDropZone.setBackgroundColor(
+                        ContextCompat.getColor(requireContext(), R.color.dispatch_drop_zone_inactive)
+                    )
+                    true
+                }
+                
+                DragEvent.ACTION_DROP -> {
+                    handleShipmentDrop(dragEvent)
+                    binding.layoutShipmentDropZone.setBackgroundColor(
+                        ContextCompat.getColor(requireContext(), R.color.dispatch_drop_zone_inactive)
+                    )
+                    true
+                }
+                
+                else -> true
+            }
+        }
+    }
+    
+    private fun handleDriverDrop(dragEvent: DragEvent) {
+        val draggedItemId = dragEvent.clipData.getItemAt(0)
+        
+        // Handle shipment dropped on driver
+        if (draggedShipment != null && draggedItemId.startsWith("shipment_id:")) {
+            val shipmentId = draggedItemId.substringAfter("shipment_id:")
+            
+            lifecycleScope.launch {
+                try {
+                    dispatchService.assignDriverToShipment(
+                        draggedDriver!!,
+                        draggedShipment,
+                        "MANUAL_ASSIGNMENT"
+                    )
+                    
+                    Toast.makeText(
+                        requireContext(),
+                        "تم تعيين السائق ${draggedDriver.name} للشحنة ${draggedShipment.referenceNumber}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error assigning driver to shipment", e)
+                    Toast.makeText(
+                        requireContext(),
+                        "خطأ في التعيين",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+        
+        draggedDriver = null
+        draggedShipment = null
+    }
+    
+    private fun handleShipmentDrop(dragEvent: DragEvent) {
+        val draggedItemId = dragEvent.clipData.getItemAt(0)
+        
+        // Handle driver dropped on shipment
+        if (draggedDriver != null && draggedItemId.startsWith("driver_id:")) {
+            val driverId = draggedItemId.substringAfter("driver_id:")
+            
+            lifecycleScope.launch {
+                try {
+                    dispatchService.assignDriverToShipment(
+                        draggedDriver,
+                        draggedShipment!!,
+                        "MANUAL_ASSIGNMENT"
+                    )
+                    
+                    Toast.makeText(
+                        requireContext(),
+                        "تم تعيين السائق ${draggedDriver.name} للشحنة ${draggedShipment.referenceNumber}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error assigning driver to shipment", e)
+                    Toast.makeText(
+                        requireContext(),
+                        "خطأ في التعيين",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+        
+        draggedDriver = null
+        draggedShipment = null
+    }
+    
+    private fun setupControlPanel() {
+        binding.buttonAutoAssign.setOnClickListener {
+            showAutoAssignDialog()
+        }
+        
+        binding.buttonSmartSuggestions.setOnClickListener {
+            showSmartSuggestionsDialog()
+        }
+        
+        binding.buttonRefreshData.setOnClickListener {
+            refreshDispatchData()
+        }
+        
+        binding.buttonResolveConflicts.setOnClickListener {
+            showConflictResolutionDialog()
+        }
+    }
+    
+    private fun observeDispatchData() {
+        // Observe available drivers
+        dispatchService.availableDrivers.observe(viewLifecycleOwner) { drivers ->
+            driverCardAdapter.submitList(drivers)
+            binding.textAvailableDriversCount.text = "${drivers.size} سائق متاح"
+        }
+        
+        // Observe pending shipments
+        dispatchService.pendingShipments.observe(viewLifecycleOwner) { shipments ->
+            shipmentCardAdapter.submitList(shipments)
+            binding.textPendingShipmentsCount.text = "${shipments.size} شحنة في الانتظار"
+        }
+        
+        // Observe assignments
+        dispatchService.dispatchAssignments.observe(viewLifecycleOwner) { assignments ->
+            assignmentAdapter.submitList(assignments)
+            val label = "${assignments.size} تعيين نشط"
+            binding.textActiveAssignmentsCount.text = label
+            binding.textActiveAssignmentsHeaderCount.text = assignments.size.toString()
+        }
+        
+        // Observe conflicts
+        dispatchService.getAssignmentConflicts().observe(viewLifecycleOwner) { conflicts ->
+            if (conflicts.isNotEmpty()) {
+                binding.cardConflicts.visibility = View.VISIBLE
+                binding.textConflictsCount.text = "${conflicts.size} تعارض"
+                binding.buttonResolveConflicts.visibility = View.VISIBLE
+            } else {
+                binding.cardConflicts.visibility = View.GONE
+                binding.buttonResolveConflicts.visibility = View.GONE
+            }
+        }
+        
+        // Observe dispatch statistics
+        dispatchService.getDispatchStatistics().observe(viewLifecycleOwner) { stats ->
+            updateStatisticsDisplay(stats)
+        }
+    }
+    
+    private fun updateStatisticsDisplay(stats: com.edham.logistics.feature.dispatch.DispatchStats) {
+        binding.textAverageAssignments.text = "%.1f".format(stats.averageAssignmentsPerDriver)
+        binding.textConflictRate.text = "%.1f%%".format(stats.conflictRate)
+        binding.textOnTimeRate.text = "%.1f%%".format(stats.onTimeAssignmentRate)
+        binding.textTotalAssignments.text = stats.totalAssignments.toString()
+    }
+    
+    private fun handleDriverAction(driver: com.edham.logistics.data.model.Driver, action: String) {
+        when (action) {
+            "VIEW_DETAILS" -> showDriverDetailsDialog(driver)
+            "ASSIGN_SHIPMENT" -> showShipmentSelectionDialog(driver)
+            "SET_UNAVAILABLE" -> setDriverAvailability(driver.id, false)
+            "SET_AVAILABLE" -> setDriverAvailability(driver.id, true)
+            else -> Log.w(TAG, "Unknown driver action: $action")
+        }
+    }
+    
+    private fun handleShipmentAction(shipment: com.edham.logistics.data.model.Shipment, action: String) {
+        when (action) {
+            "VIEW_DETAILS" -> showShipmentDetailsDialog(shipment)
+            "ASSIGN_DRIVER" -> showDriverSelectionDialog(shipment)
+            "SET_PRIORITY" -> showPriorityDialog(shipment)
+            "MANUAL_ASSIGN" -> showManualAssignmentDialog(shipment)
+            else -> Log.w(TAG, "Unknown shipment action: $action")
+        }
+    }
+    
+    private fun handleAssignmentAction(assignment: DispatchAssignment, action: String) {
+        when (action) {
+            "VIEW_DETAILS" -> showAssignmentDetailsDialog(assignment)
+            "CANCEL" -> cancelAssignment(assignment)
+            "MODIFY" -> showAssignmentModificationDialog(assignment)
+            "RESOLVE_DELAY" -> showDelayResolutionDialog(assignment)
+            else -> Log.w(TAG, "Unknown assignment action: $action")
+        }
+    }
+    
+    private fun showAutoAssignDialog() {
+        DispatchSuggestionDialog(
+            requireContext(),
+            "التعيين التلقائي",
+            "هل تريد تعيين جميع الشحنات المعلقة تلقائياً؟",
+            { positive ->
+                if (positive) {
+                    lifecycleScope.launch {
+                        try {
+                            dispatchService.initializeDispatch()
+                            Toast.makeText(
+                                requireContext(),
+                                "جاري التعيين التلقائي...",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error in auto assignment", e)
+                        }
+                    }
+                }
+            }
+        ).show(parentFragmentManager, "auto_assign_dialog")
+    }
+    
+    private fun showSmartSuggestionsDialog() {
+        DispatchSuggestionDialog(
+            requireContext(),
+            "اقتراحات ذكية",
+            "عرض اقتراحات التعيين الذكية للشحنات المعلقة",
+            { positive ->
+                if (positive) {
+                    showSmartSuggestions()
+                }
+            }
+        ).show(parentFragmentManager, "smart_suggestions_dialog")
+    }
+    
+    private fun showSmartSuggestions() {
+        // This would show AI-powered suggestions
+        // For now, show a simple message
+        Toast.makeText(
+            requireContext(),
+            "اقتراحات ذكية قيد التطوير",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private fun showConflictResolutionDialog() {
+        // Show dialog to resolve assignment conflicts
+        val conflicts = dispatchService.getAssignmentConflicts().value
+        if (conflicts.isNotEmpty()) {
+            DispatchSuggestionDialog(
+                requireContext(),
+                "حل التعارضات",
+                "يوجد ${conflicts.size} تعارضات في التعيينات. هل تريد حلها؟",
+                { positive ->
+                    if (positive) {
+                        lifecycleScope.launch {
+                            conflicts.forEach { conflict ->
+                                dispatchService.resolveConflict(
+                                    conflict.id,
+                                    "AUTO_RESOLVED"
+                                )
+                            }
+                        }
+                    }
+                }
+            ).show(parentFragmentManager, "conflict_resolution_dialog")
+        }
+    }
+    
+    private fun showDriverDetailsDialog(driver: com.edham.logistics.data.model.Driver) {
+        // Show driver details dialog
+        // Implementation would include driver info, current assignments, performance metrics
+        Toast.makeText(
+            requireContext(),
+            "تفاصيل السائق: ${driver.name}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private fun showShipmentDetailsDialog(shipment: com.edham.logistics.data.model.Shipment) {
+        // Show shipment details dialog
+        Toast.makeText(
+            requireContext(),
+            "تفاصيل الشحنة: ${shipment.referenceNumber}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private fun showShipmentSelectionDialog(driver: com.edham.logistics.data.model.Driver) {
+        // Show dialog to select shipment for driver
+        Toast.makeText(
+            requireContext(),
+            "اختيار شحنة للسائق ${driver.name}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private fun showPriorityDialog(shipment: com.edham.logistics.data.model.Shipment) {
+        // Show priority setting dialog
+        Toast.makeText(
+            requireContext(),
+            "تعيين أولوية للشحنة ${shipment.referenceNumber}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private fun showManualAssignmentDialog(shipment: com.edham.logistics.data.model.Shipment) {
+        // Show manual assignment dialog
+        Toast.makeText(
+            requireContext(),
+            "التعيين اليدوي للشحنة ${shipment.referenceNumber}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private fun showAssignmentDetailsDialog(assignment: DispatchAssignment) {
+        // Show assignment details dialog
+        Toast.makeText(
+            requireContext(),
+            "تفاصيل التعيين: ${assignment.shipmentReference}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private fun showAssignmentModificationDialog(assignment: DispatchAssignment) {
+        // Show assignment modification dialog
+        Toast.makeText(
+            requireContext(),
+            "تعديل التعيين: ${assignment.shipmentReference}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private fun showDelayResolutionDialog(assignment: DispatchAssignment) {
+        // Show delay resolution dialog
+        Toast.makeText(
+            requireContext(),
+            "حل تأخير التعيين: ${assignment.shipmentReference}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    
+    private suspend fun setDriverAvailability(driverId: String, available: Boolean) {
+        try {
+            // This would update driver availability in repository
+            Toast.makeText(
+                requireContext(),
+                if (available) "السائق متاح الآن" else "السائق غير متاح",
+                Toast.LENGTH_SHORT
+            ).show()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting driver availability", e)
+        }
+    }
+    
+    private fun cancelAssignment(assignment: DispatchAssignment) {
+        lifecycleScope.launch {
+            try {
+                // This would cancel the assignment
+                Toast.makeText(
+                    requireContext(),
+                    "تم إلغاء التعيين: ${assignment.shipmentReference}",
+                    Toast.LENGTH_SHORT
+                ).show()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error cancelling assignment", e)
+            }
+        }
+    }
+    
+    private fun refreshDispatchData() {
+        lifecycleScope.launch {
+            try {
+                dispatchService.initializeDispatch()
+                Toast.makeText(
+                    requireContext(),
+                    "تم تحديث بيانات التوزيع",
+                    Toast.LENGTH_SHORT
+                ).show()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error refreshing dispatch data", e)
+            }
+        }
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

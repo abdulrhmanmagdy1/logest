@@ -1,0 +1,971 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.InsurancePolicyEntity
+import com.edham.logistics.data.local.entity.InsuranceClaimEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Insurance Tracker - Comprehensive insurance management and tracking system
+ * 
+ * Features:
+ * - Insurance policy management
+ * - Policy renewal tracking
+ * - Claims management
+ * - Premium tracking
+ * - Coverage analysis
+ * - Risk assessment
+ * - Cost optimization
+ * - Compliance monitoring
+ */
+@Singleton
+class InsuranceTracker @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _insuranceState = MutableStateFlow<InsuranceState>(InsuranceState.Idle)
+    val insuranceState: StateFlow<InsuranceState> = _insuranceState.asStateFlow()
+    
+    private val _insurancePolicies = MutableStateFlow<List<InsurancePolicyEntity>>(emptyList())
+    val insurancePolicies: StateFlow<List<InsurancePolicyEntity>> = _insurancePolicies.asStateFlow()
+    
+    private val _insuranceClaims = MutableStateFlow<List<InsuranceClaimEntity>>(emptyList())
+    val insuranceClaims: StateFlow<List<InsuranceClaimEntity>> = _insuranceClaims.asStateFlow()
+    
+    private val _insuranceAnalytics = MutableStateFlow<InsuranceAnalytics?>(null)
+    val insuranceAnalytics: StateFlow<InsuranceAnalytics?> = _insuranceAnalytics.asStateFlow()
+    
+    private val _insuranceAlerts = MutableStateFlow<List<InsuranceAlert>>(emptyList())
+    val insuranceAlerts: StateFlow<List<InsuranceAlert>> = _insuranceAlerts.asStateFlow()
+    
+    private val _renewalSchedule = MutableStateFlow<List<PolicyRenewal>>(emptyList())
+    val renewalSchedule: StateFlow<List<PolicyRenewal>> = _renewalSchedule.asStateFlow()
+    
+    private var isMonitoring = false
+    private val insuranceListeners = mutableListOf<InsuranceManagementListener>()
+    
+    companion object {
+        private const val TAG = "InsuranceTracker"
+        private const val MONITORING_INTERVAL = 86400000L // 24 hours
+        private const val RENEWAL_WARNING_DAYS = 30
+        private const val CRITICAL_RENEWAL_DAYS = 7
+        private const val MAX_CLAIM_HISTORY = 100
+    }
+    
+    /**
+     * Initialize insurance tracking system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _insuranceState.value = InsuranceState.Initializing
+                
+                // Load insurance policies
+                loadInsurancePolicies()
+                
+                // Load insurance claims
+                loadInsuranceClaims()
+                
+                // Generate renewal schedule
+                generateRenewalSchedule()
+                
+                // Start monitoring
+                startInsuranceMonitoring()
+                
+                // Check for alerts
+                checkInsuranceAlerts()
+                
+                _insuranceState.value = InsuranceState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _insuranceState.value = InsuranceState.Error("Failed to initialize insurance tracking: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create insurance policy
+     */
+    suspend fun createInsurancePolicy(request: CreateInsurancePolicyRequest): Result<InsurancePolicyEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _insuranceState.value = InsuranceState.CreatingPolicy
+                
+                // Validate request
+                validateInsurancePolicyRequest(request)
+                
+                // Create policy entity
+                val policy = InsurancePolicyEntity(
+                    id = 0,
+                    policyNumber = generatePolicyNumber(),
+                    vehicleId = request.vehicleId,
+                    provider = request.provider,
+                    policyType = request.policyType,
+                    coverageType = request.coverageType,
+                    coverageAmount = request.coverageAmount,
+                    deductible = request.deductible,
+                    premiumAmount = request.premiumAmount,
+                    premiumFrequency = request.premiumFrequency,
+                    startDate = request.startDate,
+                    endDate = request.endDate,
+                    renewalDate = calculateRenewalDate(request.startDate, request.endDate),
+                    status = InsuranceStatus.ACTIVE,
+                    paymentStatus = PaymentStatus.PAID,
+                    lastPaymentDate = request.startDate,
+                    nextPaymentDate = calculateNextPaymentDate(request.startDate, request.premiumFrequency),
+                    coverageDetails = request.coverageDetails,
+                    exclusions = request.exclusions,
+                    contactInfo = request.contactInfo,
+                    documents = request.documents,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save policy
+                val policyId = database.insurancePolicyDao().insertPolicy(policy)
+                val savedPolicy = policy.copy(id = policyId)
+                
+                // Update vehicle insurance expiry
+                updateVehicleInsuranceExpiry(request.vehicleId, request.endDate)
+                
+                // Update policies list
+                updateInsurancePolicies()
+                
+                // Update renewal schedule
+                updateRenewalSchedule()
+                
+                // Notify listeners
+                notifyPolicyCreated(savedPolicy)
+                
+                _insuranceState.value = InsuranceState.PolicyCreated
+                Result.success(savedPolicy)
+                
+            } catch (e: Exception) {
+                _insuranceState.value = InsuranceState.Error("Failed to create policy: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update insurance policy
+     */
+    suspend fun updateInsurancePolicy(policyId: Long, request: UpdateInsurancePolicyRequest): Result<InsurancePolicyEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingPolicy = database.insurancePolicyDao().getPolicyById(policyId)
+                    ?: throw Exception("Policy not found")
+                
+                // Update policy
+                val updatedPolicy = existingPolicy.copy(
+                    coverageAmount = request.coverageAmount ?: existingPolicy.coverageAmount,
+                    deductible = request.deductible ?: existingPolicy.deductible,
+                    premiumAmount = request.premiumAmount ?: existingPolicy.premiumAmount,
+                    endDate = request.endDate ?: existingPolicy.endDate,
+                    renewalDate = request.endDate?.let { calculateRenewalDate(existingPolicy.startDate, it) } ?: existingPolicy.renewalDate,
+                    coverageDetails = request.coverageDetails ?: existingPolicy.coverageDetails,
+                    exclusions = request.exclusions ?: existingPolicy.exclusions,
+                    contactInfo = request.contactInfo ?: existingPolicy.contactInfo,
+                    documents = request.documents ?: existingPolicy.documents,
+                    updatedAt = Date()
+                )
+                
+                database.insurancePolicyDao().updatePolicy(updatedPolicy)
+                
+                // Update vehicle insurance expiry
+                updateVehicleInsuranceExpiry(existingPolicy.vehicleId, updatedPolicy.endDate)
+                
+                // Update policies list
+                updateInsurancePolicies()
+                
+                // Update renewal schedule
+                updateRenewalSchedule()
+                
+                Result.success(updatedPolicy)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * File insurance claim
+     */
+    suspend fun fileInsuranceClaim(request: FileInsuranceClaimRequest): Result<InsuranceClaimEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _insuranceState.value = InsuranceState.FilingClaim
+                
+                // Validate request
+                validateClaimRequest(request)
+                
+                // Create claim entity
+                val claim = InsuranceClaimEntity(
+                    id = 0,
+                    claimNumber = generateClaimNumber(),
+                    policyId = request.policyId,
+                    vehicleId = request.vehicleId,
+                    claimType = request.claimType,
+                    incidentDate = request.incidentDate,
+                    incidentDescription = request.incidentDescription,
+                    incidentLocation = request.incidentLocation,
+                    estimatedCost = request.estimatedCost,
+                    actualCost = null,
+                    claimStatus = ClaimStatus.SUBMITTED,
+                    priority = request.priority,
+                    assignedAdjuster = null,
+                    submittedDate = Date(),
+                    lastUpdated = Date(),
+                    resolutionDate = null,
+                    settlementAmount = null,
+                    documents = request.documents,
+                    photos = request.photos,
+                    witnesses = request.witnesses,
+                    policeReport = request.policeReport,
+                    notes = request.notes,
+                    createdAt = Date()
+                )
+                
+                // Save claim
+                val claimId = database.insuranceClaimDao().insertClaim(claim)
+                val savedClaim = claim.copy(id = claimId)
+                
+                // Update claims list
+                updateInsuranceClaims()
+                
+                // Notify listeners
+                notifyClaimFiled(savedClaim)
+                
+                _insuranceState.value = InsuranceState.ClaimFiled
+                Result.success(savedClaim)
+                
+            } catch (e: Exception) {
+                _insuranceState.value = InsuranceState.Error("Failed to file claim: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update claim status
+     */
+    suspend fun updateClaimStatus(claimId: Long, status: ClaimStatus, notes: String): Result<InsuranceClaimEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingClaim = database.insuranceClaimDao().getClaimById(claimId)
+                    ?: throw Exception("Claim not found")
+                
+                // Update claim
+                val updatedClaim = existingClaim.copy(
+                    claimStatus = status,
+                    lastUpdated = Date(),
+                    resolutionDate = if (status == ClaimStatus.RESOLVED) Date() else existingClaim.resolutionDate,
+                    notes = if (notes.isNotBlank()) notes else existingClaim.notes
+                )
+                
+                database.insuranceClaimDao().updateClaim(updatedClaim)
+                
+                // Update claims list
+                updateInsuranceClaims()
+                
+                // Notify listeners
+                notifyClaimUpdated(updatedClaim)
+                
+                Result.success(updatedClaim)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process claim payment
+     */
+    suspend fun processClaimPayment(claimId: Long, settlementAmount: Float, paymentDate: Date): Result<InsuranceClaimEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingClaim = database.insuranceClaimDao().getClaimById(claimId)
+                    ?: throw Exception("Claim not found")
+                
+                // Update claim with payment
+                val updatedClaim = existingClaim.copy(
+                    actualCost = settlementAmount,
+                    settlementAmount = settlementAmount,
+                    claimStatus = ClaimStatus.PAID,
+                    lastUpdated = Date(),
+                    resolutionDate = paymentDate
+                )
+                
+                database.insuranceClaimDao().updateClaim(updatedClaim)
+                
+                // Update claims list
+                updateInsuranceClaims()
+                
+                // Notify listeners
+                notifyClaimPaid(updatedClaim)
+                
+                Result.success(updatedClaim)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get insurance policies for vehicle
+     */
+    suspend fun getVehicleInsurancePolicies(vehicleId: Long): List<InsurancePolicyEntity> {
+        return withContext(Dispatchers.IO) {
+            database.insurancePolicyDao().getPoliciesByVehicle(vehicleId)
+        }
+    }
+    
+    /**
+     * Get insurance claims for vehicle
+     */
+    suspend fun getVehicleInsuranceClaims(vehicleId: Long, limit: Int = 50): List<InsuranceClaimEntity> {
+        return withContext(Dispatchers.IO) {
+            database.insuranceClaimDao().getClaimsByVehicle(vehicleId, limit)
+        }
+    }
+    
+    /**
+     * Get insurance analytics
+     */
+    suspend fun getInsuranceAnalytics(dateRange: DateRange = DateRange.last12Months()): InsuranceAnalytics {
+        return withContext(Dispatchers.IO) {
+            try {
+                val allPolicies = database.insurancePolicyDao().getAllPolicies()
+                val allClaims = database.insuranceClaimDao().getAllClaims()
+                
+                val totalPolicies = allPolicies.size
+                val activePolicies = allPolicies.count { it.status == InsuranceStatus.ACTIVE }
+                val expiredPolicies = allPolicies.count { it.status == InsuranceStatus.EXPIRED }
+                
+                val totalPremiums = allPolicies.sumOf { it.premiumAmount.toDouble() }.toFloat()
+                val averagePremium = if (allPolicies.isNotEmpty()) totalPremiums / allPolicies.size else 0f
+                
+                val totalClaims = allClaims.size
+                val openClaims = allClaims.count { it.claimStatus == ClaimStatus.OPEN || it.claimStatus == ClaimStatus.IN_PROGRESS }
+                val resolvedClaims = allClaims.count { it.claimStatus == ClaimStatus.RESOLVED }
+                
+                val totalClaimAmount = allClaims.filter { it.settlementAmount != null }
+                    .sumOf { it.settlementAmount!!.toDouble() }.toFloat()
+                val averageClaimAmount = if (resolvedClaims > 0) totalClaimAmount / resolvedClaims else 0f
+                
+                val policiesByProvider = allPolicies.groupBy { it.provider }.mapValues { it.value.size }
+                val claimsByType = allClaims.groupBy { it.claimType }.mapValues { it.value.size }
+                val costTrends = calculateCostTrends(allPolicies, allClaims, dateRange)
+                val riskAssessment = calculateRiskAssessment(allPolicies, allClaims)
+                val renewalAnalysis = calculateRenewalAnalysis(allPolicies)
+                
+                InsuranceAnalytics(
+                    totalPolicies = totalPolicies,
+                    activePolicies = activePolicies,
+                    expiredPolicies = expiredPolicies,
+                    totalPremiums = totalPremiums,
+                    averagePremium = averagePremium,
+                    totalClaims = totalClaims,
+                    openClaims = openClaims,
+                    resolvedClaims = resolvedClaims,
+                    totalClaimAmount = totalClaimAmount,
+                    averageClaimAmount = averageClaimAmount,
+                    policiesByProvider = policiesByProvider,
+                    claimsByType = claimsByType,
+                    costTrends = costTrends,
+                    riskAssessment = riskAssessment,
+                    renewalAnalysis = renewalAnalysis,
+                    dateRange = dateRange
+                )
+                
+            } catch (e: Exception) {
+                InsuranceAnalytics()
+            }
+        }
+    }
+    
+    /**
+     * Get renewal schedule
+     */
+    suspend fun getRenewalSchedule(monthsAhead: Int = 12): List<PolicyRenewal> {
+        return withContext(Dispatchers.IO) {
+            val endDate = Date(System.currentTimeMillis() + monthsAhead * 30L * 24 * 60 * 60 * 1000)
+            val renewals = database.insurancePolicyDao().getPoliciesRenewingBetween(Date(), endDate)
+                .map { policy ->
+                    PolicyRenewal(
+                        policyId = policy.id,
+                        policyNumber = policy.policyNumber,
+                        vehicleId = policy.vehicleId,
+                        renewalDate = policy.renewalDate,
+                        daysUntilRenewal = ((policy.renewalDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt(),
+                        premiumAmount = policy.premiumAmount,
+                        provider = policy.provider,
+                        coverageType = policy.coverageType,
+                        status = determineRenewalStatus(policy.renewalDate)
+                    )
+                }
+            renewals
+        }
+    }
+    
+    /**
+     * Add insurance management listener
+     */
+    fun addInsuranceManagementListener(listener: InsuranceManagementListener) {
+        insuranceListeners.add(listener)
+    }
+    
+    /**
+     * Remove insurance management listener
+     */
+    fun removeInsuranceManagementListener(listener: InsuranceManagementListener) {
+        insuranceListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadInsurancePolicies() {
+        val policies = database.insurancePolicyDao().getAllPolicies()
+        _insurancePolicies.value = policies
+    }
+    
+    private suspend fun loadInsuranceClaims() {
+        val claims = database.insuranceClaimDao().getAllClaims()
+        _insuranceClaims.value = claims.take(MAX_CLAIM_HISTORY)
+    }
+    
+    private suspend fun generateRenewalSchedule() {
+        val schedule = getRenewalSchedule()
+        _renewalSchedule.value = schedule
+    }
+    
+    private fun startInsuranceMonitoring() {
+        isMonitoring = true
+        // Implementation would start periodic insurance monitoring
+    }
+    
+    private suspend fun checkInsuranceAlerts() {
+        val policies = _insurancePolicies.value
+        val alerts = mutableListOf<InsuranceAlert>()
+        
+        policies.forEach { policy ->
+            val policyAlerts = checkPolicyAlerts(policy)
+            alerts.addAll(policyAlerts)
+        }
+        
+        _insuranceAlerts.value = alerts
+    }
+    
+    private suspend fun checkPolicyAlerts(policy: InsurancePolicyEntity): List<InsuranceAlert> {
+        val alerts = mutableListOf<InsuranceAlert>()
+        val daysUntilExpiry = ((policy.endDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+        
+        // Critical expiry alert
+        if (daysUntilExpiry <= CRITICAL_RENEWAL_DAYS) {
+            alerts.add(InsuranceAlert(
+                id = 0,
+                policyId = policy.id,
+                type = InsuranceAlertType.POLICY_EXPIRY,
+                message = "Policy expires in $daysUntilExpiry days",
+                severity = AlertSeverity.CRITICAL,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        // Warning expiry alert
+        else if (daysUntilExpiry <= RENEWAL_WARNING_DAYS) {
+            alerts.add(InsuranceAlert(
+                id = 0,
+                policyId = policy.id,
+                type = InsuranceAlertType.POLICY_EXPIRY,
+                message = "Policy expires in $daysUntilExpiry days",
+                severity = AlertSeverity.HIGH,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        // Payment due alert
+        val daysUntilPayment = ((policy.nextPaymentDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+        if (daysUntilPayment <= 7) {
+            alerts.add(InsuranceAlert(
+                id = 0,
+                policyId = policy.id,
+                type = InsuranceAlertType.PAYMENT_DUE,
+                message = "Premium payment due in $daysUntilPayment days",
+                severity = AlertSeverity.MEDIUM,
+                timestamp = Date(),
+                resolved = false
+            ))
+        }
+        
+        return alerts
+    }
+    
+    private fun validateInsurancePolicyRequest(request: CreateInsurancePolicyRequest) {
+        if (request.vehicleId <= 0) throw Exception("Valid vehicle ID is required")
+        if (request.provider.isBlank()) throw Exception("Insurance provider is required")
+        if (request.coverageAmount <= 0) throw Exception("Coverage amount must be positive")
+        if (request.premiumAmount <= 0) throw Exception("Premium amount must be positive")
+        if (request.startDate.after(request.endDate)) throw Exception("Start date must be before end date")
+    }
+    
+    private fun validateClaimRequest(request: FileInsuranceClaimRequest) {
+        if (request.policyId <= 0) throw Exception("Valid policy ID is required")
+        if (request.vehicleId <= 0) throw Exception("Valid vehicle ID is required")
+        if (request.incidentDescription.isBlank()) throw Exception("Incident description is required")
+        if (request.estimatedCost <= 0) throw Exception("Estimated cost must be positive")
+    }
+    
+    private fun generatePolicyNumber(): String {
+        val timestamp = System.currentTimeMillis()
+        val random = (1000..9999).random()
+        return "POL-$timestamp-$random"
+    }
+    
+    private fun generateClaimNumber(): String {
+        val timestamp = System.currentTimeMillis()
+        val random = (1000..9999).random()
+        return "CLM-$timestamp-$random"
+    }
+    
+    private fun calculateRenewalDate(startDate: Date, endDate: Date): Date {
+        val calendar = Calendar.getInstance()
+        calendar.time = endDate
+        calendar.add(Calendar.DAY_OF_MONTH, 1) // Next day after expiry
+        return calendar.time
+    }
+    
+    private fun calculateNextPaymentDate(startDate: Date, frequency: PremiumFrequency): Date {
+        val calendar = Calendar.getInstance()
+        calendar.time = startDate
+        
+        when (frequency) {
+            PremiumFrequency.MONTHLY -> calendar.add(Calendar.MONTH, 1)
+            PremiumFrequency.QUARTERLY -> calendar.add(Calendar.MONTH, 3)
+            PremiumFrequency.SEMI_ANNUALLY -> calendar.add(Calendar.MONTH, 6)
+            PremiumFrequency.ANNUALLY -> calendar.add(Calendar.YEAR, 1)
+        }
+        
+        return calendar.time
+    }
+    
+    private suspend fun updateVehicleInsuranceExpiry(vehicleId: Long, expiryDate: Date) {
+        val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+        vehicle?.let {
+            val updatedVehicle = it.copy(insuranceExpiry = expiryDate, updatedAt = Date())
+            database.vehicleDao().updateVehicle(updatedVehicle)
+        }
+    }
+    
+    private suspend fun updateInsurancePolicies() {
+        loadInsurancePolicies()
+    }
+    
+    private suspend fun updateInsuranceClaims() {
+        loadInsuranceClaims()
+    }
+    
+    private suspend fun updateRenewalSchedule() {
+        generateRenewalSchedule()
+    }
+    
+    private fun determineRenewalStatus(renewalDate: Date): RenewalStatus {
+        val daysUntilRenewal = ((renewalDate.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toInt()
+        
+        return when {
+            daysUntilRenewal < 0 -> RenewalStatus.OVERDUE
+            daysUntilRenewal <= CRITICAL_RENEWAL_DAYS -> RenewalStatus.CRITICAL
+            daysUntilRenewal <= RENEWAL_WARNING_DAYS -> RenewalStatus.WARNING
+            else -> RenewalStatus.SCHEDULED
+        }
+    }
+    
+    private fun calculateCostTrends(
+        policies: List<InsurancePolicyEntity>,
+        claims: List<InsuranceClaimEntity>,
+        dateRange: DateRange
+    ): CostTrends {
+        // Implementation would calculate premium and claim cost trends
+        return CostTrends(
+            premiumTrend = TrendDirection.STABLE,
+            claimTrend = TrendDirection.STABLE,
+            averageMonthlyPremium = 1000f,
+            averageMonthlyClaims = 500f
+        )
+    }
+    
+    private fun calculateRiskAssessment(
+        policies: List<InsurancePolicyEntity>,
+        claims: List<InsuranceClaimEntity>
+    ): RiskAssessment {
+        val totalClaims = claims.size
+        val highValueClaims = claims.count { it.estimatedCost > 10000 }
+        val recentClaims = claims.count { 
+            it.incidentDate.after(Date(System.currentTimeMillis() - 365L * 24 * 60 * 60 * 1000))
+        }
+        
+        val riskScore = calculateRiskScore(totalClaims, highValueClaims, recentClaims)
+        val riskLevel = determineRiskLevel(riskScore)
+        
+        return RiskAssessment(
+            overallRiskScore = riskScore,
+            riskLevel = riskLevel,
+            riskFactors = identifyRiskFactors(policies, claims),
+            recommendations = generateRiskRecommendations(riskLevel)
+        )
+    }
+    
+    private fun calculateRiskScore(totalClaims: Int, highValueClaims: Int, recentClaims: Int): Float {
+        var score = 50f // Base score
+        
+        score -= (totalClaims * 2f)
+        score -= (highValueClaims * 5f)
+        score -= (recentClaims * 3f)
+        
+        return maxOf(0f, minOf(100f, score))
+    }
+    
+    private fun determineRiskLevel(score: Float): RiskLevel {
+        return when {
+            score >= 80 -> RiskLevel.LOW
+            score >= 60 -> RiskLevel.MEDIUM
+            score >= 40 -> RiskLevel.HIGH
+            else -> RiskLevel.CRITICAL
+        }
+    }
+    
+    private fun identifyRiskFactors(policies: List<InsurancePolicyEntity>, claims: List<InsuranceClaimEntity>): List<String> {
+        val factors = mutableListOf<String>()
+        
+        if (claims.size > 5) factors.add("High claim frequency")
+        if (claims.any { it.claimType == ClaimType.ACCIDENT }) factors.add("Accident claims")
+        if (claims.any { it.claimType == ClaimType.THEFT }) factors.add("Theft claims")
+        
+        return factors
+    }
+    
+    private fun generateRiskRecommendations(riskLevel: RiskLevel): List<String> {
+        return when (riskLevel) {
+            RiskLevel.LOW -> listOf("Maintain current coverage", "Continue safe driving practices")
+            RiskLevel.MEDIUM -> listOf("Consider driver training", "Review coverage limits")
+            RiskLevel.HIGH -> listOf("Increase deductibles", "Implement safety programs")
+            RiskLevel.CRITICAL -> listOf("Comprehensive risk assessment", "Consider alternative providers")
+        }
+    }
+    
+    private fun calculateRenewalAnalysis(policies: List<InsurancePolicyEntity>): RenewalAnalysis {
+        val upcomingRenewals = policies.count { 
+            it.renewalDate.after(Date()) && it.renewalDate.before(Date(System.currentTimeMillis() + 90L * 24 * 60 * 60 * 1000))
+        }
+        
+        val averagePremiumIncrease = 5.5f // Would calculate from historical data
+        
+        return RenewalAnalysis(
+            upcomingRenewals = upcomingRenewals,
+            averagePremiumIncrease = averagePremiumIncrease,
+            renewalRecommendations = generateRenewalRecommendations(upcomingRenewals)
+        )
+    }
+    
+    private fun generateRenewalRecommendations(upcomingRenewals: Int): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (upcomingRenewals > 5) {
+            recommendations.add("Consider bulk renewal discounts")
+        }
+        
+        recommendations.add("Compare rates with other providers")
+        recommendations.add("Review coverage needs")
+        
+        return recommendations
+    }
+    
+    private fun notifyPolicyCreated(policy: InsurancePolicyEntity) {
+        insuranceListeners.forEach { listener ->
+            listener.onPolicyCreated(policy)
+        }
+    }
+    
+    private fun notifyClaimFiled(claim: InsuranceClaimEntity) {
+        insuranceListeners.forEach { listener ->
+            listener.onClaimFiled(claim)
+        }
+    }
+    
+    private fun notifyClaimUpdated(claim: InsuranceClaimEntity) {
+        insuranceListeners.forEach { listener ->
+            listener.onClaimUpdated(claim)
+        }
+    }
+    
+    private fun notifyClaimPaid(claim: InsuranceClaimEntity) {
+        insuranceListeners.forEach { listener ->
+            listener.onClaimPaid(claim)
+        }
+    }
+    
+    /**
+     * Get monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+}
+
+/**
+ * Data classes
+ */
+data class CreateInsurancePolicyRequest(
+    val vehicleId: Long,
+    val provider: String,
+    val policyType: InsuranceType,
+    val coverageType: CoverageType,
+    val coverageAmount: Float,
+    val deductible: Float,
+    val premiumAmount: Float,
+    val premiumFrequency: PremiumFrequency,
+    val startDate: Date,
+    val endDate: Date,
+    val coverageDetails: List<String>,
+    val exclusions: List<String>,
+    val contactInfo: ContactInfo,
+    val documents: List<String>
+)
+
+data class UpdateInsurancePolicyRequest(
+    val coverageAmount: Float? = null,
+    val deductible: Float? = null,
+    val premiumAmount: Float? = null,
+    val endDate: Date? = null,
+    val coverageDetails: List<String>? = null,
+    val exclusions: List<String>? = null,
+    val contactInfo: ContactInfo? = null,
+    val documents: List<String>? = null
+)
+
+data class FileInsuranceClaimRequest(
+    val policyId: Long,
+    val vehicleId: Long,
+    val claimType: ClaimType,
+    val incidentDate: Date,
+    val incidentDescription: String,
+    val incidentLocation: String,
+    val estimatedCost: Float,
+    val priority: ClaimPriority,
+    val documents: List<String>,
+    val photos: List<String>,
+    val witnesses: List<String>,
+    val policeReport: String?,
+    val notes: String?
+)
+
+data class InsuranceAnalytics(
+    val totalPolicies: Int = 0,
+    val activePolicies: Int = 0,
+    val expiredPolicies: Int = 0,
+    val totalPremiums: Float = 0f,
+    val averagePremium: Float = 0f,
+    val totalClaims: Int = 0,
+    val openClaims: Int = 0,
+    val resolvedClaims: Int = 0,
+    val totalClaimAmount: Float = 0f,
+    val averageClaimAmount: Float = 0f,
+    val policiesByProvider: Map<String, Int> = emptyMap(),
+    val claimsByType: Map<ClaimType, Int> = emptyMap(),
+    val costTrends: CostTrends = CostTrends(),
+    val riskAssessment: RiskAssessment = RiskAssessment(),
+    val renewalAnalysis: RenewalAnalysis = RenewalAnalysis(),
+    val dateRange: DateRange = DateRange()
+)
+
+data class PolicyRenewal(
+    val policyId: Long,
+    val policyNumber: String,
+    val vehicleId: Long,
+    val renewalDate: Date,
+    val daysUntilRenewal: Int,
+    val premiumAmount: Float,
+    val provider: String,
+    val coverageType: CoverageType,
+    val status: RenewalStatus
+)
+
+data class CostTrends(
+    val premiumTrend: TrendDirection,
+    val claimTrend: TrendDirection,
+    val averageMonthlyPremium: Float,
+    val averageMonthlyClaims: Float
+)
+
+data class RiskAssessment(
+    val overallRiskScore: Float,
+    val riskLevel: RiskLevel,
+    val riskFactors: List<String>,
+    val recommendations: List<String>
+)
+
+data class RenewalAnalysis(
+    val upcomingRenewals: Int,
+    val averagePremiumIncrease: Float,
+    val renewalRecommendations: List<String>
+)
+
+data class ContactInfo(
+    val name: String,
+    val phone: String,
+    val email: String,
+    val address: String
+)
+
+data class InsuranceAlert(
+    val id: Long,
+    val policyId: Long,
+    val type: InsuranceAlertType,
+    val message: String,
+    val severity: AlertSeverity,
+    val timestamp: Date,
+    val resolved: Boolean
+)
+
+/**
+ * Interfaces
+ */
+interface InsuranceManagementListener {
+    fun onPolicyCreated(policy: InsurancePolicyEntity)
+    fun onPolicyUpdated(policy: InsurancePolicyEntity)
+    fun onPolicyExpired(policyId: Long)
+    fun onClaimFiled(claim: InsuranceClaimEntity)
+    fun onClaimUpdated(claim: InsuranceClaimEntity)
+    fun onClaimPaid(claim: InsuranceClaimEntity)
+    fun onInsuranceAlert(alert: InsuranceAlert)
+}
+
+/**
+ * Enums
+ */
+enum class InsuranceState {
+    Idle,
+    Initializing,
+    Ready,
+    CreatingPolicy,
+    PolicyCreated,
+    UpdatingPolicy,
+    PolicyUpdated,
+    FilingClaim,
+    ClaimFiled,
+    Error
+}
+
+enum class InsuranceType {
+    LIABILITY,
+    COMPREHENSIVE,
+    COLLISION,
+    UNINSURED_MOTORIST,
+    PERSONAL_INJURY,
+    COMMERCIAL,
+    FLEET
+}
+
+enum class CoverageType {
+    BASIC,
+    STANDARD,
+    PREMIUM,
+    CUSTOM
+}
+
+enum class PremiumFrequency {
+    MONTHLY,
+    QUARTERLY,
+    SEMI_ANNUALLY,
+    ANNUALLY
+}
+
+enum class InsuranceStatus {
+    ACTIVE,
+    EXPIRED,
+    CANCELLED,
+    SUSPENDED,
+    PENDING
+}
+
+enum class PaymentStatus {
+    PAID,
+    PENDING,
+    OVERDUE,
+    CANCELLED
+}
+
+enum class ClaimType {
+    ACCIDENT,
+    THEFT,
+    VANDALISM,
+    NATURAL_DISASTER,
+    LIABILITY,
+    MEDICAL,
+    PROPERTY_DAMAGE,
+    COMMERCIAL
+}
+
+enum class ClaimStatus {
+    SUBMITTED,
+    UNDER_REVIEW,
+    IN_PROGRESS,
+    APPROVED,
+    DENIED,
+    PAID,
+    RESOLVED,
+    OPEN,
+    CLOSED
+}
+
+enum class ClaimPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class InsuranceAlertType {
+    POLICY_EXPIRY,
+    PAYMENT_DUE,
+    CLAIM_UPDATE,
+    COVERAGE_CHANGE,
+    RATE_INCREASE,
+    DOCUMENT_MISSING
+}
+
+enum class RenewalStatus {
+    SCHEDULED,
+    WARNING,
+    CRITICAL,
+    OVERDUE,
+    COMPLETED
+}
+
+enum class RiskLevel {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

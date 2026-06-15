@@ -1,0 +1,484 @@
+package com.edham.logistics.domain.notifications
+
+import com.edham.logistics.core.notifications.*
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Smart Notification Use Cases - Domain layer for smart notifications
+ * Provides business logic for notification operations
+ */
+@Singleton
+class SmartNotificationUseCases @Inject constructor(
+    private val smartNotificationManager: SmartNotificationManager,
+    private val eventTriggerManager: EventTriggerManager,
+    private val notificationGroupingManager: NotificationGroupingManager,
+    private val userPreferencesManager: UserPreferencesManager
+) {
+
+    /**
+     * Show smart notification use case
+     */
+    suspend fun showSmartNotification(
+        event: NotificationEvent,
+        data: Map<String, Any> = emptyMap(),
+        priority: NotificationPriority = NotificationPriority.NORMAL
+    ): Result<SmartNotification> {
+        return try {
+            // Check user preferences
+            val shouldShow = userPreferencesManager.shouldShowNotification(event, priority)
+            if (!shouldShow) {
+                return Result.failure(Exception("Notification blocked by user preferences"))
+            }
+            
+            // Process event through trigger manager
+            eventTriggerManager.processEvent(event, data)
+            
+            // Show notification
+            smartNotificationManager.showSmartNotification(event, data, priority)
+            
+            // Create notification record
+            val notification = SmartNotification(
+                id = java.util.UUID.randomUUID().toString(),
+                event = event,
+                title = generateNotificationTitle(event, data),
+                message = generateNotificationMessage(event, data),
+                priority = priority,
+                channelId = getChannelForEvent(event),
+                timestamp = System.currentTimeMillis(),
+                data = data,
+                isRead = false
+            )
+            
+            // Add to grouping manager
+            notificationGroupingManager.addNotificationToGroup(notification)
+            
+            Result.success(notification)
+            
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Show delay notification use case
+     */
+    suspend fun showDelayNotification(
+        shipmentId: String,
+        delayMinutes: Int,
+        estimatedDelivery: java.util.Date
+    ): Result<SmartNotification> {
+        return smartNotificationManager.showDelayNotification(
+            shipmentId = shipmentId,
+            delayMinutes = delayMinutes,
+            estimatedDelivery = estimatedDelivery
+        ).let {
+            // Convert to SmartNotification result
+            val notification = SmartNotification(
+                id = java.util.UUID.randomUUID().toString(),
+                event = NotificationEvent.SHIPMENT_DELAYED,
+                title = "تأخير في الشحنة",
+                message = "الشحنة $shipmentId متأخرة $delayMinutes دقيقة",
+                priority = if (delayMinutes > 60) NotificationPriority.HIGH else NotificationPriority.NORMAL,
+                channelId = "delay_notifications",
+                timestamp = System.currentTimeMillis(),
+                data = mapOf(
+                    "shipmentId" to shipmentId,
+                    "delayMinutes" to delayMinutes,
+                    "estimatedDelivery" to estimatedDelivery.time
+                ),
+                isRead = false
+            )
+            Result.success(notification)
+        }
+    }
+
+    /**
+     * Show temperature notification use case
+     */
+    suspend fun showTemperatureNotification(
+        shipmentId: String,
+        currentTemp: Double,
+        minTemp: Double,
+        maxTemp: Double,
+        location: String
+    ): Result<SmartNotification> {
+        return smartNotificationManager.showTemperatureNotification(
+            shipmentId = shipmentId,
+            currentTemp = currentTemp,
+            minTemp = minTemp,
+            maxTemp = maxTemp,
+            location = location
+        ).let {
+            val priority = when {
+                currentTemp < minTemp - 5 || currentTemp > maxTemp + 5 -> NotificationPriority.CRITICAL
+                currentTemp < minTemp || currentTemp > maxTemp -> NotificationPriority.HIGH
+                else -> NotificationPriority.NORMAL
+            }
+            
+            val notification = SmartNotification(
+                id = java.util.UUID.randomUUID().toString(),
+                event = NotificationEvent.TEMPERATURE_ISSUE,
+                title = "مشكلة في درجة الحرارة",
+                message = "درجة الحرارة الحالية $currentTemp°C في $location خارج النطاق المسموح",
+                priority = priority,
+                channelId = "temperature_notifications",
+                timestamp = System.currentTimeMillis(),
+                data = mapOf(
+                    "shipmentId" to shipmentId,
+                    "currentTemp" to currentTemp,
+                    "minTemp" to minTemp,
+                    "maxTemp" to maxTemp,
+                    "location" to location
+                ),
+                isRead = false
+            )
+            Result.success(notification)
+        }
+    }
+
+    /**
+     * Show payment overdue notification use case
+     */
+    suspend fun showPaymentOverdueNotification(
+        invoiceId: String,
+        amount: Double,
+        dueDate: java.util.Date,
+        daysOverdue: Int
+    ): Result<SmartNotification> {
+        return smartNotificationManager.showPaymentOverdueNotification(
+            invoiceId = invoiceId,
+            amount = amount,
+            dueDate = dueDate,
+            daysOverdue = daysOverdue
+        ).let {
+            val priority = when {
+                daysOverdue > 30 -> NotificationPriority.CRITICAL
+                daysOverdue > 14 -> NotificationPriority.HIGH
+                else -> NotificationPriority.NORMAL
+            }
+            
+            val notification = SmartNotification(
+                id = java.util.UUID.randomUUID().toString(),
+                event = NotificationEvent.PAYMENT_OVERDUE,
+                title = "دفع متأخر",
+                message = "دفع بقيمة $amount ريال متأخر $daysOverdue يوم",
+                priority = priority,
+                channelId = "payment_notifications",
+                timestamp = System.currentTimeMillis(),
+                data = mapOf(
+                    "invoiceId" to invoiceId,
+                    "amount" to amount,
+                    "dueDate" to dueDate.time,
+                    "daysOverdue" to daysOverdue
+                ),
+                isRead = false
+            )
+            Result.success(notification)
+        }
+    }
+
+    /**
+     * Update user preferences use case
+     */
+    suspend fun updateUserPreferences(preferences: NotificationPreferences): Result<Unit> {
+        return try {
+            userPreferencesManager.updatePreferences(preferences)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get notification history use case
+     */
+    fun getNotificationHistory(): Flow<List<SmartNotification>> {
+        return smartNotificationManager.notificationHistory
+    }
+
+    /**
+     * Get notification statistics use case
+     */
+    fun getNotificationStatistics(): NotificationStatistics {
+        return smartNotificationManager.getNotificationStatistics()
+    }
+
+    /**
+     * Get notification groups use case
+     */
+    fun getNotificationGroups(): Map<String, List<SmartNotification>> {
+        return smartNotificationManager.getNotificationGroups()
+    }
+
+    /**
+     * Get trigger statistics use case
+     */
+    fun getTriggerStatistics(): TriggerStatistics {
+        return eventTriggerManager.getTriggerStatistics()
+    }
+
+    /**
+     * Get grouping statistics use case
+     */
+    fun getGroupingStatistics(): GroupingStatistics {
+        return notificationGroupingManager.getGroupingStatistics()
+    }
+
+    /**
+     * Get user preferences use case
+     */
+    fun getUserPreferences(): StateFlow<NotificationPreferences> {
+        return userPreferencesManager.preferences
+    }
+
+    /**
+     * Clear notification history use case
+     */
+    suspend fun clearNotificationHistory(): Result<Unit> {
+        return try {
+            smartNotificationManager.clearNotificationHistory()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Clear notification groups use case
+     */
+    suspend fun clearNotificationGroups(): Result<Unit> {
+        return try {
+            notificationGroupingManager.clearAllGroups()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Reset preferences to defaults use case
+     */
+    suspend fun resetPreferencesToDefaults(): Result<Unit> {
+        return try {
+            userPreferencesManager.resetToDefaults()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Export preferences use case
+     */
+    suspend fun exportPreferences(): Result<String> {
+        return try {
+            val preferencesJson = userPreferencesManager.exportPreferences()
+            Result.success(preferencesJson)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Import preferences use case
+     */
+    suspend fun importPreferences(preferencesJson: String): Result<Unit> {
+        return try {
+            val success = userPreferencesManager.importPreferences(preferencesJson)
+            if (success) {
+                Result.success(Unit)
+            } else {
+                Result.failure(Exception("Failed to import preferences"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get notification insights use case
+     */
+    suspend fun getNotificationInsights(): NotificationInsights {
+        val notificationStats = getNotificationStatistics()
+        val triggerStats = getTriggerStatistics()
+        val groupingStats = getGroupingStatistics()
+        val preferences = userPreferencesManager.preferences.value
+        
+        return NotificationInsights(
+            totalNotifications = notificationStats.totalNotifications,
+            averageResponseTime = notificationStats.averageResponseTime,
+            mostActiveHour = calculateMostActiveHour(notificationStats.byType),
+            mostCommonEvent = calculateMostCommonEvent(notificationStats.byType),
+            groupingEfficiency = calculateGroupingEfficiency(groupingStats),
+            triggerSuccessRate = calculateTriggerSuccessRate(triggerStats),
+            userEngagementScore = calculateUserEngagementScore(notificationStats),
+            recommendations = generateRecommendations(notificationStats, preferences)
+        )
+    }
+
+    /**
+     * Generate notification title
+     */
+    private fun generateNotificationTitle(event: NotificationEvent, data: Map<String, Any>): String {
+        return when (event) {
+            NotificationEvent.SHIPMENT_DELAYED -> "تأخير في الشحنة"
+            NotificationEvent.SHIPMENT_DELIVERED -> "تم تسليم الشحنة"
+            NotificationEvent.SHIPMENT_PICKED_UP -> "تم استلام الشحنة"
+            NotificationEvent.TEMPERATURE_ISSUE -> "مشكلة في درجة الحرارة"
+            NotificationEvent.PAYMENT_OVERDUE -> "دفع متأخر"
+            NotificationEvent.PAYMENT_RECEIVED -> "تم استلام الدفع"
+            NotificationEvent.SYSTEM_UPDATE -> "تحديث النظام"
+            NotificationEvent.MAINTENANCE_SCHEDULED -> "صيانة مجدولة"
+            else -> "إشعار جديد"
+        }
+    }
+
+    /**
+     * Generate notification message
+     */
+    private fun generateNotificationMessage(event: NotificationEvent, data: Map<String, Any>): String {
+        return when (event) {
+            NotificationEvent.SHIPMENT_DELAYED -> {
+                val shipmentId = data["shipmentId"] as? String ?: ""
+                val delayMinutes = data["delayMinutes"] as? Int ?: 0
+                "الشحنة $shipmentId متأخرة $delayMinutes دقيقة"
+            }
+            
+            NotificationEvent.SHIPMENT_DELIVERED -> {
+                val shipmentId = data["shipmentId"] as? String ?: ""
+                "تم تسليم الشحنة $shipmentId بنجاح"
+            }
+            
+            NotificationEvent.TEMPERATURE_ISSUE -> {
+                val currentTemp = data["currentTemp"] as? Double ?: 0.0
+                val location = data["location"] as? String ?: ""
+                "درجة الحرارة الحالية $currentTemp°C في $location خارج النطاق المسموح"
+            }
+            
+            NotificationEvent.PAYMENT_OVERDUE -> {
+                val amount = data["amount"] as? Double ?: 0.0
+                val daysOverdue = data["daysOverdue"] as? Int ?: 0
+                "دفع بقيمة $amount ريال متأخر $daysOverdue يوم"
+            }
+            
+            else -> "لديك إشعار جديد"
+        }
+    }
+
+    /**
+     * Get channel for event
+     */
+    private fun getChannelForEvent(event: NotificationEvent): String {
+        return when (event) {
+            NotificationEvent.SHIPMENT_DELAYED,
+            NotificationEvent.SHIPMENT_DELIVERED,
+            NotificationEvent.SHIPMENT_PICKED_UP -> "shipment_notifications"
+            
+            NotificationEvent.PAYMENT_OVERDUE,
+            NotificationEvent.PAYMENT_RECEIVED -> "payment_notifications"
+            
+            NotificationEvent.TEMPERATURE_ISSUE -> "temperature_notifications"
+            
+            else -> "system_notifications"
+        }
+    }
+
+    /**
+     * Calculate most active hour
+     */
+    private fun calculateMostActiveHour(byType: Map<NotificationEvent, List<SmartNotification>>): Int {
+        val allNotifications = byType.values.flatten()
+        if (allNotifications.isEmpty()) return 12 // Default to noon
+        
+        val hourCounts = allNotifications.groupingBy { notification ->
+            val calendar = java.util.Calendar.getInstance()
+            calendar.timeInMillis = notification.timestamp
+            calendar.get(java.util.Calendar.HOUR_OF_DAY)
+        }
+        
+        return hourCounts.maxByOrNull { it.value.size }?.key ?: 12
+    }
+
+    /**
+     * Calculate most common event
+     */
+    private fun calculateMostCommonEvent(byType: Map<NotificationEvent, List<SmartNotification>>): NotificationEvent {
+        return byType.maxByOrNull { it.value.size }?.key ?: NotificationEvent.SYSTEM_UPDATE
+    }
+
+    /**
+     * Calculate grouping efficiency
+     */
+    private fun calculateGroupingEfficiency(groupingStats: GroupingStatistics): Double {
+        if (groupingStats.totalNotifications == 0) return 0.0
+        return (groupingStats.totalNotifications.toDouble() / groupingStats.totalGroups) * 100
+    }
+
+    /**
+     * Calculate trigger success rate
+     */
+    private fun calculateTriggerSuccessRate(triggerStats: TriggerStatistics): Double {
+        if (triggerStats.totalEvents == 0) return 0.0
+        return (triggerStats.completedTriggers.toDouble() / triggerStats.totalEvents) * 100
+    }
+
+    /**
+     * Calculate user engagement score
+     */
+    private fun calculateUserEngagementScore(notificationStats: NotificationStatistics): Double {
+        if (notificationStats.totalNotifications == 0) return 0.0
+        
+        val avgResponseTimeMinutes = notificationStats.averageResponseTime / (1000 * 60)
+        val engagementScore = maxOf(0.0, 100.0 - avgResponseTimeMinutes / 10.0 * 100)
+        
+        return minOf(100.0, engagementScore)
+    }
+
+    /**
+     * Generate recommendations
+     */
+    private fun generateRecommendations(
+        stats: NotificationStatistics,
+        preferences: NotificationPreferences
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        // Check notification frequency
+        if (stats.last24Hours > 20) {
+            recommendations.add("عدد الإشعارات مرتفع، فكر في تفعيل الساعات الهادئة")
+        }
+        
+        // Check response time
+        if (stats.averageResponseTime > 30 * 60 * 1000) { // 30 minutes
+            recommendations.add("وقت الاستجابة للإشعارات بطيء، فكر في تخصيص الأولويات")
+        }
+        
+        // Check preferences
+        if (!preferences.groupSimilar) {
+            recommendations.add("تفعيل تجميع الإشعارات المشابهة يمكن أن يقلل من الفوضى")
+        }
+        
+        if (!preferences.quietHours) {
+            recommendations.add("تفعيل الساعات الهادئة يمكن أن يحسن من جودة النوم")
+        }
+        
+        return recommendations
+    }
+}
+
+/**
+ * Data classes for insights
+ */
+data class NotificationInsights(
+    val totalNotifications: Int,
+    val averageResponseTime: Long,
+    val mostActiveHour: Int,
+    val mostCommonEvent: NotificationEvent,
+    val groupingEfficiency: Double,
+    val triggerSuccessRate: Double,
+    val userEngagementScore: Double,
+    val recommendations: List<String>
+)

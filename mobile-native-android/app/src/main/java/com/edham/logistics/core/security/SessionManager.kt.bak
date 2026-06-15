@@ -1,0 +1,714 @@
+package com.edham.logistics.core.security
+
+import android.content.Context
+import android.os.Build
+import com.edham.logistics.core.utils.DeviceInfo
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Advanced session management with security features
+ */
+@Singleton
+class SessionManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val secureTokenManager: SecureTokenManager,
+    private val deviceInfo: DeviceInfo
+) {
+    
+    companion object {
+        private const val SESSION_TIMEOUT = 30 * 60 * 1000L // 30 minutes
+        private const val INACTIVITY_TIMEOUT = 15 * 60 * 1000L // 15 minutes
+        private const val WARNING_TIMEOUT = 5 * 60 * 1000L // 5 minutes before timeout
+        private const val MAX_CONCURRENT_SESSIONS = 3
+        private const val SESSION_CHECK_INTERVAL = 60_000L // 1 minute
+    }
+    
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val activeSessions = ConcurrentHashMap<String, UserSession>()
+    private val sessionHistory = mutableListOf<SessionEvent>()
+    
+    private val _sessionState = MutableStateFlow<SessionState>(SessionState.Inactive)
+    val sessionState: StateFlow<SessionState> = _sessionState.asStateFlow()
+    
+    private val _currentSession = MutableStateFlow<UserSession?>(null)
+    val currentSession: StateFlow<UserSession?> = _currentSession.asStateFlow()
+    
+    private val _sessionAlerts = MutableStateFlow<List<SessionAlert>>(emptyList())
+    val sessionAlerts: StateFlow<List<SessionAlert>> = _sessionAlerts.asStateFlow()
+    
+    private val _sessionTimeout = MutableStateFlow<Long?>(null)
+    val sessionTimeout: StateFlow<Long?> = _sessionTimeout.asStateFlow()
+    
+    private var lastActivityTime = 0L
+    private var sessionStartTime = 0L
+    private var isSessionMonitoring = false
+    
+    init {
+        initializeSessionManager()
+    }
+    
+    /**
+     * Initialize session manager
+     */
+    private fun initializeSessionManager() {
+        scope.launch {
+            try {
+                // Load existing session if available
+                loadExistingSession()
+                
+                // Start session monitoring
+                startSessionMonitoring()
+                
+                // Monitor token changes
+                monitorTokenChanges()
+                
+            } catch (e: Exception) {
+                handleSessionError("Session manager initialization failed", e)
+            }
+        }
+    }
+    
+    /**
+     * Create new session
+     */
+    suspend fun createSession(
+        userId: String,
+        userEmail: String,
+        userRole: String,
+        deviceId: String? = null
+    ): Result<UserSession> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Check for existing sessions
+                val existingSessions = getActiveSessionsForUser(userId)
+                if (existingSessions.size >= MAX_CONCURRENT_SESSIONS) {
+                    // Terminate oldest session
+                    terminateOldestSession(userId)
+                }
+                
+                // Generate session ID
+                val sessionId = UUID.randomUUID().toString()
+                val actualDeviceId = deviceId ?: deviceInfo.getDeviceId()
+                val currentTime = System.currentTimeMillis()
+                
+                // Create session
+                val session = UserSession(
+                    sessionId = sessionId,
+                    userId = userId,
+                    userEmail = userEmail,
+                    userRole = userRole,
+                    deviceId = actualDeviceId,
+                    startTime = currentTime,
+                    lastActivity = currentTime,
+                    expiryTime = currentTime + SESSION_TIMEOUT,
+                    ipAddress = getIpAddress(),
+                    userAgent = getUserAgent(),
+                    isActive = true
+                )
+                
+                // Store session
+                activeSessions[sessionId] = session
+                sessionHistory.add(SessionEvent(
+                    type = SessionEventType.CREATED,
+                    sessionId = sessionId,
+                    userId = userId,
+                    timestamp = currentTime,
+                    details = mapOf(
+                        "deviceId" to actualDeviceId,
+                        "userRole" to userRole
+                    )
+                ))
+                
+                // Update current session
+                _currentSession.value = session
+                _sessionState.value = SessionState.Active
+                
+                // Update timeouts
+                lastActivityTime = currentTime
+                sessionStartTime = currentTime
+                _sessionTimeout.value = session.expiryTime
+                
+                // Start monitoring
+                if (!isSessionMonitoring) {
+                    startSessionMonitoring()
+                }
+                
+                // Log session event
+                logSessionEvent("SESSION_CREATED", mapOf(
+                    "sessionId" to sessionId,
+                    "userId" to userId,
+                    "userRole" to userRole
+                ))
+                
+                Result.Success(session)
+                
+            } catch (e: Exception) {
+                handleSessionError("Failed to create session", e)
+                Result.Error(e)
+            }
+        }
+    }
+    
+    /**
+     * Validate session
+     */
+    suspend fun validateSession(sessionId: String): Result<UserSession> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val session = activeSessions[sessionId]
+                if (session == null) {
+                    return@withContext Result.Error(SessionException("Session not found"))
+                }
+                
+                if (!session.isActive) {
+                    return@withContext Result.Error(SessionException("Session is inactive"))
+                }
+                
+                if (isSessionExpired(session)) {
+                    terminateSession(sessionId)
+                    return@withContext Result.Error(SessionException("Session expired"))
+                }
+                
+                // Update last activity
+                updateSessionActivity(sessionId)
+                
+                Result.Success(session)
+                
+            } catch (e: Exception) {
+                handleSessionError("Failed to validate session", e)
+                Result.Error(e)
+            }
+        }
+    }
+    
+    /**
+     * Update session activity
+     */
+    suspend fun updateSessionActivity(sessionId: String) {
+        withContext(Dispatchers.IO) {
+            try {
+                val session = activeSessions[sessionId]
+                if (session != null && session.isActive) {
+                    val updatedSession = session.copy(
+                        lastActivity = System.currentTimeMillis(),
+                        expiryTime = System.currentTimeMillis() + SESSION_TIMEOUT
+                    )
+                    
+                    activeSessions[sessionId] = updatedSession
+                    _currentSession.value = updatedSession
+                    _sessionTimeout.value = updatedSession.expiryTime
+                    lastActivityTime = System.currentTimeMillis()
+                    
+                    // Log activity
+                    logSessionEvent("SESSION_ACTIVITY", mapOf(
+                        "sessionId" to sessionId,
+                        "userId" to session.userId
+                    ))
+                }
+            } catch (e: Exception) {
+                handleSessionError("Failed to update session activity", e)
+            }
+        }
+    }
+    
+    /**
+     * Terminate session
+     */
+    suspend fun terminateSession(sessionId: String) {
+        withContext(Dispatchers.IO) {
+            try {
+                val session = activeSessions[sessionId]
+                if (session != null) {
+                    // Mark as inactive
+                    val inactiveSession = session.copy(isActive = false)
+                    activeSessions[sessionId] = inactiveSession
+                    
+                    // Add to history
+                    sessionHistory.add(SessionEvent(
+                        type = SessionEventType.TERMINATED,
+                        sessionId = sessionId,
+                        userId = session.userId,
+                        timestamp = System.currentTimeMillis(),
+                        details = mapOf(
+                            "duration" to (System.currentTimeMillis() - session.startTime)
+                        )
+                    ))
+                    
+                    // Update current session if needed
+                    if (_currentSession.value?.sessionId == sessionId) {
+                        _currentSession.value = null
+                        _sessionState.value = SessionState.Inactive
+                        _sessionTimeout.value = null
+                    }
+                    
+                    // Log termination
+                    logSessionEvent("SESSION_TERMINATED", mapOf(
+                        "sessionId" to sessionId,
+                        "userId" to session.userId
+                    ))
+                    
+                    // Add alert
+                    addSessionAlert(SessionAlert(
+                        type = SessionAlertType.SESSION_TERMINATED,
+                        message = "Session terminated: $sessionId",
+                        severity = SessionAlertSeverity.INFO,
+                        timestamp = System.currentTimeMillis()
+                    ))
+                }
+            } catch (e: Exception) {
+                handleSessionError("Failed to terminate session", e)
+            }
+        }
+    }
+    
+    /**
+     * Terminate all user sessions
+     */
+    suspend fun terminateAllUserSessions(userId: String) {
+        withContext(Dispatchers.IO) {
+            try {
+                val userSessions = getActiveSessionsForUser(userId)
+                userSessions.forEach { session ->
+                    terminateSession(session.sessionId)
+                }
+                
+                // Log bulk termination
+                logSessionEvent("ALL_USER_SESSIONS_TERMINATED", mapOf(
+                    "userId" to userId,
+                    "sessionCount" to userSessions.size
+                ))
+                
+            } catch (e: Exception) {
+                handleSessionError("Failed to terminate all user sessions", e)
+            }
+        }
+    }
+    
+    /**
+     * Terminate oldest session for user
+     */
+    private suspend fun terminateOldestSession(userId: String) {
+        try {
+            val userSessions = getActiveSessionsForUser(userId)
+            if (userSessions.isNotEmpty()) {
+                val oldestSession = userSessions.minByOrNull { it.startTime }
+                oldestSession?.let {
+                    terminateSession(it.sessionId)
+                }
+            }
+        } catch (e: Exception) {
+            handleSessionError("Failed to terminate oldest session", e)
+        }
+    }
+    
+    /**
+     * Get active sessions for user
+     */
+    private fun getActiveSessionsForUser(userId: String): List<UserSession> {
+        return activeSessions.values.filter { 
+            it.userId == userId && it.isActive 
+        }
+    }
+    
+    /**
+     * Check if session is expired
+     */
+    private fun isSessionExpired(session: UserSession): Boolean {
+        val currentTime = System.currentTimeMillis()
+        return currentTime > session.expiryTime
+    }
+    
+    /**
+     * Start session monitoring
+     */
+    private fun startSessionMonitoring() {
+        if (isSessionMonitoring) return
+        
+        isSessionMonitoring = true
+        scope.launch {
+            while (isSessionMonitoring) {
+                try {
+                    checkSessionTimeouts()
+                    checkInactivityTimeouts()
+                    delay(SESSION_CHECK_INTERVAL)
+                } catch (e: Exception) {
+                    delay(SESSION_CHECK_INTERVAL)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Check session timeouts
+     */
+    private suspend fun checkSessionTimeouts() {
+        try {
+            val currentTime = System.currentTimeMillis()
+            val sessionsToTerminate = mutableListOf<String>()
+            
+            activeSessions.forEach { (sessionId, session) ->
+                if (session.isActive && currentTime > session.expiryTime) {
+                    sessionsToTerminate.add(sessionId)
+                }
+            }
+            
+            sessionsToTerminate.forEach { sessionId ->
+                terminateSession(sessionId)
+                addSessionAlert(SessionAlert(
+                    type = SessionAlertType.SESSION_TIMEOUT,
+                    message = "Session expired due to timeout",
+                    severity = SessionAlertSeverity.WARNING,
+                    timestamp = currentTime
+                ))
+            }
+            
+        } catch (e: Exception) {
+            handleSessionError("Session timeout check failed", e)
+        }
+    }
+    
+    /**
+     * Check inactivity timeouts
+     */
+    private suspend fun checkInactivityTimeouts() {
+        try {
+            val currentTime = System.currentTimeMillis()
+            val sessionsToWarn = mutableListOf<String>()
+            val sessionsToTerminate = mutableListOf<String>()
+            
+            activeSessions.forEach { (sessionId, session) ->
+                if (session.isActive) {
+                    val inactivityDuration = currentTime - session.lastActivity
+                    val timeUntilExpiry = session.expiryTime - currentTime
+                    
+                    when {
+                        inactivityDuration > INACTIVITY_TIMEOUT -> {
+                            sessionsToTerminate.add(sessionId)
+                        }
+                        timeUntilExpiry < WARNING_TIMEOUT -> {
+                            sessionsToWarn.add(sessionId)
+                        }
+                    }
+                }
+            }
+            
+            // Send warnings
+            sessionsToWarn.forEach { sessionId ->
+                val session = activeSessions[sessionId]
+                session?.let {
+                    addSessionAlert(SessionAlert(
+                        type = SessionAlertType.SESSION_WARNING,
+                        message = "Session will expire soon",
+                        severity = SessionAlertSeverity.INFO,
+                        timestamp = currentTime,
+                        details = "Session expires in ${timeUntilExpiry / 1000} seconds"
+                    ))
+                }
+            }
+            
+            // Terminate inactive sessions
+            sessionsToTerminate.forEach { sessionId ->
+                terminateSession(sessionId)
+                addSessionAlert(SessionAlert(
+                    type = SessionAlertType.INACTIVITY_TIMEOUT,
+                    message = "Session terminated due to inactivity",
+                    severity = SessionAlertSeverity.WARNING,
+                    timestamp = currentTime
+                ))
+            }
+            
+        } catch (e: Exception) {
+            handleSessionError("Inactivity timeout check failed", e)
+        }
+    }
+    
+    /**
+     * Monitor token changes
+     */
+    private fun monitorTokenChanges() {
+        scope.launch {
+            secureTokenManager.authState.collect { authState ->
+                when (authState) {
+                    AuthState.LoggedOut -> {
+                        // Terminate all sessions when logged out
+                        terminateAllSessions()
+                    }
+                    AuthState.TokenExpired -> {
+                        // Mark sessions as expired
+                        markSessionsAsExpired()
+                    }
+                    AuthState.SessionExpired -> {
+                        // Terminate all sessions
+                        terminateAllSessions()
+                    }
+                    else -> {
+                        // No action needed
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Terminate all sessions
+     */
+    private suspend fun terminateAllSessions() {
+        try {
+            val sessionIds = activeSessions.keys.toList()
+            sessionIds.forEach { sessionId ->
+                terminateSession(sessionId)
+            }
+        } catch (e: Exception) {
+            handleSessionError("Failed to terminate all sessions", e)
+        }
+    }
+    
+    /**
+     * Mark sessions as expired
+     */
+    private suspend fun markSessionsAsExpired() {
+        try {
+            activeSessions.forEach { (sessionId, session) ->
+                if (session.isActive) {
+                    val expiredSession = session.copy(
+                        isActive = false,
+                        expiryTime = System.currentTimeMillis()
+                    )
+                    activeSessions[sessionId] = expiredSession
+                }
+            }
+            
+            addSessionAlert(SessionAlert(
+                type = SessionAlertType.SESSION_EXPIRED,
+                message = "All sessions marked as expired",
+                severity = SessionAlertSeverity.WARNING,
+                timestamp = System.currentTimeMillis()
+            ))
+            
+        } catch (e: Exception) {
+            handleSessionError("Failed to mark sessions as expired", e)
+        }
+    }
+    
+    /**
+     * Load existing session
+     */
+    private suspend fun loadExistingSession() {
+        try {
+            val userId = secureTokenManager.getUserId()
+            val userEmail = secureTokenManager.getUserEmail()
+            val userRole = secureTokenManager.getUserRole()
+            
+            if (userId != null && userEmail != null && userRole != null) {
+                // Create session from stored token info
+                createSession(userId, userEmail, userRole)
+            }
+        } catch (e: Exception) {
+            handleSessionError("Failed to load existing session", e)
+        }
+    }
+    
+    /**
+     * Add session alert
+     */
+    private fun addSessionAlert(alert: SessionAlert) {
+        val currentAlerts = _sessionAlerts.value.toMutableList()
+        currentAlerts.add(alert)
+        
+        // Keep only recent alerts
+        if (currentAlerts.size > 100) {
+            currentAlerts.removeAt(0)
+        }
+        
+        _sessionAlerts.value = currentAlerts
+    }
+    
+    /**
+     * Handle session error
+     */
+    private fun handleSessionError(message: String, error: Exception) {
+        addSessionAlert(SessionAlert(
+            type = SessionAlertType.SESSION_ERROR,
+            message = message,
+            severity = SessionAlertSeverity.ERROR,
+            timestamp = System.currentTimeMillis(),
+            details = error.message
+        ))
+    }
+    
+    /**
+     * Log session event
+     */
+    private fun logSessionEvent(eventType: String, details: Map<String, Any>) {
+        // Log to secure logging system
+        // This would integrate with your logging infrastructure
+    }
+    
+    /**
+     * Get IP address
+     */
+    private fun getIpAddress(): String {
+        // Implementation would get actual IP address
+        return "0.0.0.0"
+    }
+    
+    /**
+     * Get user agent
+     */
+    private fun getUserAgent(): String {
+        return "EdhamLogistics/${BuildConfig.VERSION_NAME} (Android ${Build.VERSION.RELEASE})"
+    }
+    
+    /**
+     * Get session statistics
+     */
+    fun getSessionStatistics(): SessionStatistics {
+        val activeSessionCount = activeSessions.values.count { it.isActive }
+        val totalSessionCount = activeSessions.size
+        val averageSessionDuration = if (sessionHistory.isNotEmpty()) {
+            sessionHistory.map { it.timestamp }.average().toLong()
+        } else 0L
+        
+        return SessionStatistics(
+            activeSessionCount = activeSessionCount,
+            totalSessionCount = totalSessionCount,
+            averageSessionDuration = averageSessionDuration,
+            currentSession = _currentSession.value,
+            sessionState = _sessionState.value
+        )
+    }
+    
+    /**
+     * Get session history
+     */
+    fun getSessionHistory(limit: Int = 100): List<SessionEvent> {
+        return sessionHistory.takeLast(limit)
+    }
+    
+    /**
+     * Clear session history
+     */
+    fun clearSessionHistory() {
+        sessionHistory.clear()
+    }
+    
+    /**
+     * Stop session monitoring
+     */
+    fun stopSessionMonitoring() {
+        isSessionMonitoring = false
+    }
+}
+
+/**
+ * Session state enum
+ */
+enum class SessionState {
+    Inactive,
+    Active,
+    Expired,
+    Suspended
+}
+
+/**
+ * User session data class
+ */
+data class UserSession(
+    val sessionId: String,
+    val userId: String,
+    val userEmail: String,
+    val userRole: String,
+    val deviceId: String,
+    val startTime: Long,
+    val lastActivity: Long,
+    val expiryTime: Long,
+    val ipAddress: String,
+    val userAgent: String,
+    val isActive: Boolean
+)
+
+/**
+ * Session event data class
+ */
+data class SessionEvent(
+    val type: SessionEventType,
+    val sessionId: String,
+    val userId: String,
+    val timestamp: Long,
+    val details: Map<String, Any>
+)
+
+/**
+ * Session event types
+ */
+enum class SessionEventType {
+    CREATED,
+    TERMINATED,
+    EXPIRED,
+    SUSPENDED,
+    RESUMED
+}
+
+/**
+ * Session alert data class
+ */
+data class SessionAlert(
+    val type: SessionAlertType,
+    val message: String,
+    val severity: SessionAlertSeverity,
+    val timestamp: Long,
+    val details: String? = null
+)
+
+/**
+ * Session alert types
+ */
+enum class SessionAlertType {
+    SESSION_CREATED,
+    SESSION_TERMINATED,
+    SESSION_EXPIRED,
+    SESSION_TIMEOUT,
+    INACTIVITY_TIMEOUT,
+    SESSION_WARNING,
+    SESSION_ERROR,
+    SUSPICIOUS_ACTIVITY
+}
+
+/**
+ * Session alert severity
+ */
+enum class SessionAlertSeverity {
+    INFO,
+    WARNING,
+    ERROR,
+    CRITICAL
+}
+
+/**
+ * Session statistics data class
+ */
+data class SessionStatistics(
+    val activeSessionCount: Int,
+    val totalSessionCount: Int,
+    val averageSessionDuration: Long,
+    val currentSession: UserSession?,
+    val sessionState: SessionState
+)
+
+/**
+ * Session exception
+ */
+class SessionException(message: String, cause: Throwable? = null) : Exception(message, cause)

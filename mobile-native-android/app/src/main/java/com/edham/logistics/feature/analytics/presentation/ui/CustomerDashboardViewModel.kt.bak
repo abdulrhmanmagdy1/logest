@@ -1,0 +1,115 @@
+package com.edham.logistics.feature.analytics.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.analytics.domain.model.*
+import com.edham.logistics.feature.analytics.domain.usecase.GetDashboardDataUseCase
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class CustomerDashboardViewModel @Inject constructor(
+    private val getDashboardDataUseCase: GetDashboardDataUseCase
+) : BaseViewModel<CustomerDashboardViewModel.CustomerDashboardUiState>() {
+
+    private val _uiState = MutableStateFlow(CustomerDashboardUiState())
+    val uiState: StateFlow<CustomerDashboardUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): CustomerDashboardUiState = CustomerDashboardUiState()
+
+    fun initialize(userId: String) {
+        _uiState.value = _uiState.value.copy(userId = userId)
+        loadDashboardData()
+        observeDashboardUpdates()
+    }
+
+    fun loadDashboardData() {
+        viewModelScope.launch {
+            val request = GetDashboardDataRequest(
+                userId = _uiState.value.userId,
+                userRole = "customer",
+                filters = null
+            )
+            
+            when (val result = getDashboardDataUseCase(request)) {
+                is Result.Success -> {
+                    when (val data = result.data) {
+                        is DashboardData.CustomerData -> {
+                            updateUiState { copy(
+                                dashboardData = data.data,
+                                isLoading = false,
+                                error = null
+                            )}
+                        }
+                        else -> {
+                            updateUiState { copy(
+                                isLoading = false,
+                                error = "Invalid dashboard data type"
+                            )}
+                        }
+                    }
+                }
+                is Result.Error -> {
+                    updateUiState { copy(
+                        isLoading = false,
+                        error = result.exception.message ?: "فشل تحميل بيانات لوحة التحكم"
+                    )}
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    private fun observeDashboardUpdates() {
+        viewModelScope.launch {
+            getDashboardDataUseCase.observeDashboardUpdates(_uiState.value.userId, "customer")
+                .collect { result ->
+                    when (result) {
+                        is Result.Success -> {
+                            when (val data = result.data) {
+                                is DashboardData.CustomerData -> {
+                                    updateUiState { copy(
+                                        dashboardData = data.data,
+                                        error = null
+                                    )}
+                                }
+                                else -> {}
+                            }
+                        }
+                        is Result.Error -> {
+                            updateUiState { copy(error = result.exception.message ?: "خطأ في تحديثات لوحة التحكم") }
+                        }
+                        is Result.Loading -> {
+                            // Handle loading state if needed
+                        }
+                    }
+                }
+        }
+    }
+
+    fun refresh() {
+        loadDashboardData()
+    }
+
+    fun clearError() {
+        updateUiState { copy(error = null) }
+    }
+
+    data class CustomerDashboardUiState(
+        val isLoading: Boolean = false,
+        val userId: String = "",
+        val dashboardData: CustomerDashboardData? = null,
+        val error: String? = null
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = this
+    }
+}

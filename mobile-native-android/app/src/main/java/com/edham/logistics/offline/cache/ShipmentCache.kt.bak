@@ -1,0 +1,407 @@
+package com.edham.logistics.offline.cache
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Shipment Cache - Optimized caching for shipment data
+ * Implements LRU eviction, memory management, and cache statistics
+ */
+
+// Temporarily disabled due to missing dependencies
+// @Singleton
+// class ShipmentCache @Inject constructor(
+//     private val offlineDatabase: OfflineDatabase,
+//     private val cacheMetrics: CacheMetrics
+// ) {
+class ShipmentCache {
+
+    private val cacheScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val memoryCache = ConcurrentHashMap<String, CachedShipment>()
+    private val maxMemoryCacheSize = 100 // Maximum shipments in memory
+    private val cacheAccessOrder = mutableListOf<String>()
+    
+    // Cache configuration
+    private val defaultExpiryTime = 30 * 60 * 1000L // 30 minutes
+    private val maxCacheSize = 50 * 1024 * 1024L // 50MB
+    
+    init {
+        startCacheMaintenance()
+    }
+
+    /**
+     * Get shipment from cache (memory first, then database)
+     */
+    suspend fun getShipment(shipmentId: String): ShipmentEntity? {
+        return try {
+            // Check memory cache first
+            val cached = memoryCache[shipmentId]
+            if (cached != null && !isExpired(cached)) {
+                updateAccessOrder(shipmentId)
+                cacheMetrics.recordCacheHit("shipment")
+                return cached.shipment
+            }
+            
+            // Check database cache
+            val dbShipment = offlineDatabase.shipmentDao().getShipmentById(shipmentId)
+            if (dbShipment != null && !isExpired(dbShipment)) {
+                // Add to memory cache
+                addToMemoryCache(dbShipment)
+                cacheMetrics.recordCacheHit("shipment")
+                return dbShipment
+            }
+            
+            cacheMetrics.recordCacheMiss("shipment")
+            null
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting shipment from cache")
+            null
+        }
+    }
+
+    /**
+     * Put shipment in cache
+     */
+    suspend fun putShipment(shipment: ShipmentEntity) {
+        try {
+            // Update in database
+            offlineDatabase.shipmentDao().insertShipment(shipment)
+            
+            // Add to memory cache
+            addToMemoryCache(shipment)
+            
+            cacheMetrics.recordCachePut("shipment")
+            Timber.d("Cached shipment: ${shipment.id}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching shipment")
+        }
+    }
+
+    /**
+     * Get multiple shipments
+     */
+    suspend fun getShipments(shipmentIds: List<String>): List<ShipmentEntity> {
+        return try {
+            val results = mutableListOf<ShipmentEntity>()
+            
+            for (id in shipmentIds) {
+                getShipment(id)?.let { results.add(it) }
+            }
+            
+            results
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting multiple shipments from cache")
+            emptyList()
+        }
+    }
+
+    /**
+     * Put multiple shipments
+     */
+    suspend fun putShipments(shipments: List<ShipmentEntity>) {
+        try {
+            // Batch insert to database
+            offlineDatabase.shipmentDao().insertShipments(shipments)
+            
+            // Add to memory cache
+            shipments.forEach { addToMemoryCache(it) }
+            
+            cacheMetrics.recordCachePut("shipment", shipments.size)
+            Timber.d("Cached ${shipments.size} shipments")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching multiple shipments")
+        }
+    }
+
+    /**
+     * Invalidate shipment cache
+     */
+    suspend fun invalidateShipment(shipmentId: String) {
+        try {
+            // Remove from memory cache
+            memoryCache.remove(shipmentId)
+            cacheAccessOrder.remove(shipmentId)
+            
+            // Update sync status in database
+            offlineDatabase.shipmentDao().updateShipmentSyncStatus(shipmentId, "INVALIDATED")
+            
+            cacheMetrics.recordCacheEviction("shipment")
+            Timber.d("Invalidated shipment cache: $shipmentId")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error invalidating shipment cache")
+        }
+    }
+
+    /**
+     * Clear all shipment cache
+     */
+    suspend fun clearCache() {
+        try {
+            // Clear memory cache
+            memoryCache.clear()
+            cacheAccessOrder.clear()
+            
+            // Clear database cache (mark as invalidated)
+            val shipments = offlineDatabase.shipmentDao().getAllShipments().first()
+            shipments.forEach { 
+                offlineDatabase.shipmentDao().updateShipmentSyncStatus(it.id, "INVALIDATED")
+            }
+            
+            cacheMetrics.recordCacheClear("shipment")
+            Timber.d("Cleared shipment cache")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error clearing shipment cache")
+        }
+    }
+
+    /**
+     * Get cache statistics
+     */
+    fun getCacheStats(): ShipmentCacheStats {
+        return try {
+            val memorySize = memoryCache.size
+            val totalSize = cacheAccessOrder.size
+            val hitRate = cacheMetrics.getHitRate("shipment")
+            val memoryUsage = estimateMemoryUsage()
+            
+            ShipmentCacheStats(
+                memoryCacheSize = memorySize,
+                totalCacheSize = totalSize,
+                hitRate = hitRate,
+                memoryUsageBytes = memoryUsage,
+                maxMemoryCacheSize = maxMemoryCacheSize,
+                oldestEntry = cacheAccessOrder.firstOrNull(),
+                newestEntry = cacheAccessOrder.lastOrNull()
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting cache stats")
+            ShipmentCacheStats(0, 0, 0.0, 0L, maxMemoryCacheSize, null, null)
+        }
+    }
+
+    /**
+     * Preload cache with shipments
+     */
+    suspend fun preloadCache(shipmentIds: List<String>) {
+        try {
+            val shipments = offlineDatabase.shipmentDao().getAllShipments().first()
+                .filter { it.id in shipmentIds }
+            
+            putShipments(shipments)
+            Timber.d("Preloaded cache with ${shipments.size} shipments")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error preloading shipment cache")
+        }
+    }
+
+    /**
+     * Get shipments by status
+     */
+    suspend fun getShipmentsByStatus(status: String): List<ShipmentEntity> {
+        return try {
+            // Try memory cache first
+            val memoryResults = memoryCache.values
+                .filter { it.shipment.status == status && !isExpired(it) }
+                .map { it.shipment }
+            
+            if (memoryResults.isNotEmpty()) {
+                cacheMetrics.recordCacheHit("shipment")
+                return memoryResults
+            }
+            
+            // Fallback to database
+            val dbResults = offlineDatabase.shipmentDao().getAllShipments().first()
+                .filter { it.status == status && !isExpired(it) }
+            
+            // Add to memory cache
+            dbResults.forEach { addToMemoryCache(it) }
+            
+            cacheMetrics.recordCacheMiss("shipment")
+            dbResults
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting shipments by status from cache")
+            emptyList()
+        }
+    }
+
+    /**
+     * Get shipments by customer
+     */
+    suspend fun getShipmentsByCustomer(customerId: String): List<ShipmentEntity> {
+        return try {
+            // Try memory cache first
+            val memoryResults = memoryCache.values
+                .filter { it.shipment.customerId == customerId && !isExpired(it) }
+                .map { it.shipment }
+            
+            if (memoryResults.isNotEmpty()) {
+                cacheMetrics.recordCacheHit("shipment")
+                return memoryResults
+            }
+            
+            // Fallback to database
+            val dbResults = offlineDatabase.shipmentDao().getShipmentsByCustomer(customerId).first()
+                .filter { !isExpired(it) }
+            
+            // Add to memory cache
+            dbResults.forEach { addToMemoryCache(it) }
+            
+            cacheMetrics.recordCacheMiss("shipment")
+            dbResults
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting shipments by customer from cache")
+            emptyList()
+        }
+    }
+
+    /**
+     * Refresh cache for specific shipment
+     */
+    suspend fun refreshShipment(shipmentId: String) {
+        try {
+            // Remove from memory cache
+            memoryCache.remove(shipmentId)
+            cacheAccessOrder.remove(shipmentId)
+            
+            // Update sync time in database
+            offlineDatabase.shipmentDao().updateShipmentSyncTime(shipmentId, System.currentTimeMillis())
+            
+            Timber.d("Refreshed shipment cache: $shipmentId")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error refreshing shipment cache")
+        }
+    }
+
+    // Private methods
+
+    private fun addToMemoryCache(shipment: ShipmentEntity) {
+        val cachedShipment = CachedShipment(
+            shipment = shipment,
+            cachedAt = System.currentTimeMillis(),
+            expiresAt = System.currentTimeMillis() + defaultExpiryTime
+        )
+        
+        // Check if cache is full
+        if (memoryCache.size >= maxMemoryCacheSize) {
+            evictLRU()
+        }
+        
+        memoryCache[shipment.id] = cachedShipment
+        updateAccessOrder(shipment.id)
+    }
+
+    private fun evictLRU() {
+        if (cacheAccessOrder.isNotEmpty()) {
+            val lruId = cacheAccessOrder.removeFirst()
+            memoryCache.remove(lruId)
+            cacheMetrics.recordCacheEviction("shipment")
+        }
+    }
+
+    private fun updateAccessOrder(shipmentId: String) {
+        cacheAccessOrder.remove(shipmentId)
+        cacheAccessOrder.add(shipmentId)
+    }
+
+    private fun isExpired(cachedShipment: CachedShipment): Boolean {
+        return System.currentTimeMillis() > cachedShipment.expiresAt
+    }
+
+    private fun isExpired(shipment: ShipmentEntity): Boolean {
+        return shipment.lastSyncTime > 0 && 
+               (System.currentTimeMillis() - shipment.lastSyncTime) > defaultExpiryTime
+    }
+
+    private fun estimateMemoryUsage(): Long {
+        return memoryCache.values.sumOf { 
+            // Rough estimation: 1KB per shipment
+            1024L 
+        }
+    }
+
+    private fun startCacheMaintenance() {
+        cacheScope.launch {
+            while (isActive) {
+                try {
+                    // Clean up expired entries
+                    cleanupExpiredEntries()
+                    
+                    // Update cache metrics
+                    updateCacheMetrics()
+                    
+                    delay(60000) // Run maintenance every minute
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in cache maintenance")
+                    delay(300000) // Wait longer on error
+                }
+            }
+        }
+    }
+
+    private suspend fun cleanupExpiredEntries() {
+        try {
+            val currentTime = System.currentTimeMillis()
+            val expiredIds = mutableListOf<String>()
+            
+            memoryCache.forEach { (id, cached) ->
+                if (currentTime > cached.expiresAt) {
+                    expiredIds.add(id)
+                }
+            }
+            
+            expiredIds.forEach { id ->
+                memoryCache.remove(id)
+                cacheAccessOrder.remove(id)
+                cacheMetrics.recordCacheEviction("shipment")
+            }
+            
+            if (expiredIds.isNotEmpty()) {
+                Timber.d("Cleaned up ${expiredIds.size} expired shipment cache entries")
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error cleaning up expired cache entries")
+        }
+    }
+
+    private fun updateCacheMetrics() {
+        try {
+            val stats = getCacheStats()
+            cacheMetrics.updateCacheStats("shipment", stats)
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating cache metrics")
+        }
+    }
+}
+
+// Data classes for shipment caching
+
+data class CachedShipment(
+    val shipment: ShipmentEntity,
+    val cachedAt: Long,
+    val expiresAt: Long
+)
+
+data class ShipmentCacheStats(
+    val memoryCacheSize: Int,
+    val totalCacheSize: Int,
+    val hitRate: Double,
+    val memoryUsageBytes: Long,
+    val maxMemoryCacheSize: Int,
+    val oldestEntry: String?,
+    val newestEntry: String?
+)

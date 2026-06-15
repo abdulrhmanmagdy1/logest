@@ -1,0 +1,295 @@
+package com.edham.logistics
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Spinner
+import android.widget.TextView
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.OnMapReadyCallback
+import com.google.android.gms.maps.SupportMapFragment
+import com.google.android.gms.maps.model.LatLng
+import com.google.android.gms.maps.model.LatLngBounds
+import com.google.android.gms.maps.model.Marker
+import com.google.android.gms.maps.model.MarkerOptions
+import kotlinx.coroutines.*
+
+class FleetManagementFragment : Fragment(), OnMapReadyCallback {
+    private lateinit var vehicleSpinner: Spinner
+    private lateinit var statusSpinner: Spinner
+    private lateinit var tvTotalVehicles: TextView
+    private lateinit var tvActiveVehicles: TextView
+    private lateinit var tvMaintenanceVehicles: TextView
+    private lateinit var tvInactiveVehicles: TextView
+    private lateinit var rvVehicleList: RecyclerView
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private lateinit var googleMap: GoogleMap
+    private val vehicleMarkers = mutableMapOf<String, Marker>()
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View? {
+        return inflater.inflate(R.layout.fragment_fleet_management, container, false)
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        // Initialize location client
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(requireContext())
+
+        // Initialize views
+        vehicleSpinner = view.findViewById(R.id.vehicle_spinner)
+        statusSpinner = view.findViewById(R.id.status_spinner)
+        tvTotalVehicles = view.findViewById(R.id.tv_total_vehicles)
+        tvActiveVehicles = view.findViewById(R.id.tv_active_vehicles)
+        tvMaintenanceVehicles = view.findViewById(R.id.tv_maintenance_vehicles)
+        tvInactiveVehicles = view.findViewById(R.id.tv_inactive_vehicles)
+        rvVehicleList = view.findViewById(R.id.rv_vehicle_list)
+
+        // Set Arabic titles
+        view.findViewById<TextView>(R.id.tv_fleet_title).text = "إدارة الأسطول"
+        view.findViewById<TextView>(R.id.tv_fleet_stats_title).text = "إحصائيات الأسطول"
+        view.findViewById<TextView>(R.id.tv_vehicle_filter_title).text = "فلترة المركبات"
+        view.findViewById<TextView>(R.id.tv_vehicle_list_title).text = "قائمة المركبات"
+        view.findViewById<TextView>(R.id.tv_fleet_map_title).text = "خريطة الأسطول"
+
+        // Setup spinners
+        setupSpinners()
+
+        // Setup map
+        initializeMap()
+
+        // Load data
+        loadFleetData()
+        setupVehicleList()
+    }
+
+    private fun setupSpinners() {
+        // Vehicle type spinner
+        val vehicleTypes = arrayOf("الكل", "شاحنات مبردة", "شاحنات عادية", "فان صغير")
+        val vehicleAdapter = ArrayAdapter(requireContext(), android.R.layout.simple_spinner_item, vehicleTypes)
+        vehicleAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        vehicleSpinner.adapter = vehicleAdapter
+
+        // Status spinner
+        val statuses = arrayOf("الكل", "نشط", "في رحلة", "صيانة", "غير نشط")
+        val statusAdapter = ArrayAdapter(requireContext(), android.R.layout.simple_spinner_item, statuses)
+        statusAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        statusSpinner.adapter = statusAdapter
+
+        // Set listeners
+        vehicleSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                filterVehicles()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+
+        statusSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                filterVehicles()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+    }
+
+    private fun initializeMap() {
+        val mapFragment = childFragmentManager.findFragmentById(R.id.fleet_map_fragment) as SupportMapFragment
+        mapFragment.getMapAsync(this)
+    }
+
+    override fun onMapReady(map: GoogleMap) {
+        googleMap = map
+        setupMap()
+    }
+
+    private fun setupMap() {
+        if (ActivityCompat.checkSelfPermission(
+                requireContext(),
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestLocationPermission()
+            return
+        }
+
+        googleMap.isMyLocationEnabled = true
+        googleMap.uiSettings.isZoomControlsEnabled = true
+        googleMap.uiSettings.isCompassEnabled = true
+
+        // Add vehicle markers
+        addVehicleMarkers()
+
+        // Move camera to show all vehicles
+        moveCameraToShowAllVehicles()
+
+        // Set marker click listener
+        googleMap.setOnMarkerClickListener { marker ->
+            showVehicleDetails(marker.tag as? String)
+            true
+        }
+    }
+
+    private fun requestLocationPermission() {
+        ActivityCompat.requestPermissions(
+            requireActivity(),
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+            LOCATION_PERMISSION_REQUEST_CODE
+        )
+    }
+
+    private fun addVehicleMarkers() {
+        MockData.vehicles.forEach { vehicle ->
+            val location = getRandomLocationForVehicle(vehicle.id)
+            val marker = googleMap.addMarker(
+                MarkerOptions()
+                    .position(location)
+                    .title(vehicle.name)
+                    .snippet("Status: ${vehicle.status}")
+            )
+            marker?.tag = vehicle.id
+            marker?.let { vehicleMarkers[vehicle.id] = it }
+        }
+    }
+
+    private fun moveCameraToShowAllVehicles() {
+        val boundsBuilder = LatLngBounds.Builder()
+        
+        vehicleMarkers.values.forEach { marker ->
+            boundsBuilder.include(marker.position)
+        }
+        
+        val bounds = boundsBuilder.build()
+        val cameraUpdate = CameraUpdateFactory.newLatLngBounds(bounds, 100)
+        googleMap.animateCamera(cameraUpdate)
+    }
+
+    private fun getRandomLocationForVehicle(vehicleId: String): LatLng {
+        // Generate random locations around Saudi Arabia
+        val locations = listOf(
+            LatLng(24.7136, 46.6753), // Riyadh
+            LatLng(21.3891, 39.8579), // Jeddah
+            LatLng(26.4262, 50.0888), // Dammam
+            LatLng(24.4584, 39.6142), // Medina
+            LatLng(21.4225, 39.8262), // Mecca
+            LatLng(24.4619, 39.6119), // Taif
+        )
+        return locations[vehicleId.hashCode() % locations.size]
+    }
+
+    private fun loadFleetData() {
+        val totalVehicles = MockData.vehicles.size
+        val activeVehicles = MockData.vehicles.count { it.status == "Available" }
+        val maintenanceVehicles = MockData.vehicles.count { it.status == "Maintenance" }
+        val inactiveVehicles = MockData.vehicles.count { it.status == "Inactive" }
+
+        tvTotalVehicles.text = totalVehicles.toString()
+        tvActiveVehicles.text = activeVehicles.toString()
+        tvMaintenanceVehicles.text = maintenanceVehicles.toString()
+        tvInactiveVehicles.text = inactiveVehicles.toString()
+    }
+
+    private fun setupVehicleList() {
+        rvVehicleList.layoutManager = LinearLayoutManager(requireContext())
+        rvVehicleList.adapter = VehicleAdapter(MockData.vehicles)
+    }
+
+    private fun filterVehicles() {
+        val vehicleType = vehicleSpinner.selectedItem.toString()
+        val status = statusSpinner.selectedItem.toString()
+
+        scope.launch {
+            try {
+                // Simulate API call
+                delay(500)
+
+                val filteredVehicles = MockData.vehicles.filter { vehicle ->
+                    val typeMatch = vehicleType == "الكل" || 
+                        when (vehicleType) {
+                            "شاحنات مبردة" -> vehicle.type == "refrigerated"
+                            "شاحنات عادية" -> vehicle.type == "regular"
+                            "فان صغير" -> vehicle.name.contains("Van", ignoreCase = true)
+                            else -> true
+                        }
+                    
+                    val statusMatch = status == "الكل" || vehicle.status == status
+                    typeMatch && statusMatch
+                }
+
+                withContext(Dispatchers.Main) {
+                    rvVehicleList.adapter = VehicleAdapter(filteredVehicles)
+                    updateMapMarkers(filteredVehicles)
+                    Toast.makeText(requireContext(), "تم تحديث الفلترة", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(requireContext(), "فشل تحديث الفلترة", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun updateMapMarkers(vehicles: List<Vehicle>) {
+        // Clear existing markers
+        vehicleMarkers.values.forEach { it.remove() }
+        vehicleMarkers.clear()
+
+        // Add new markers for filtered vehicles
+        vehicles.forEach { vehicle ->
+            val location = getRandomLocationForVehicle(vehicle.id)
+            val marker = googleMap.addMarker(
+                MarkerOptions()
+                    .position(location)
+                    .title(vehicle.name)
+                    .snippet("Status: ${vehicle.status}")
+            )
+            marker?.tag = vehicle.id
+            marker?.let { vehicleMarkers[vehicle.id] = it }
+        }
+
+        // Move camera to show filtered vehicles
+        if (vehicleMarkers.isNotEmpty()) {
+            moveCameraToShowAllVehicles()
+        }
+    }
+
+    private fun showVehicleDetails(vehicleId: String?) {
+        vehicleId?.let { id ->
+            val vehicle = MockData.vehicles.find { it.id == id }
+            vehicle?.let {
+                Toast.makeText(
+                    requireContext(),
+                    "المركبة: ${it.name}\nالسعة: ${it.capacity}\nالحالة: ${it.status}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    companion object {
+        private const val LOCATION_PERMISSION_REQUEST_CODE = 1002
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.cancel()
+    }
+}

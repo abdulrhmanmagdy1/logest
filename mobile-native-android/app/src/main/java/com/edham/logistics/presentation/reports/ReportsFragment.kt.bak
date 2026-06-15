@@ -1,0 +1,509 @@
+package com.edham.logistics.presentation.reports
+
+import android.app.DatePickerDialog
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.core.reports.data.*
+import com.edham.logistics.databinding.FragmentReportsBinding
+import com.edham.logistics.presentation.reports.adapter.ReportHistoryAdapter
+import com.edham.logistics.presentation.reports.dialog.ReportFilterDialog
+import com.edham.logistics.presentation.reports.dialog.ReportTypeSelectionDialog
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * Reports Fragment - Main fragment for business intelligence reports
+ * Provides comprehensive report generation, viewing, and management capabilities
+ */
+@AndroidEntryPoint
+class ReportsFragment : Fragment() {
+
+    private var _binding: FragmentReportsBinding? = null
+    private val binding get() = _binding!!
+
+    private val viewModel: ReportViewModel by viewModels()
+    private lateinit var reportHistoryAdapter: ReportHistoryAdapter
+
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+    private val calendar = Calendar.getInstance()
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentReportsBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupUI()
+        observeViewModel()
+        setupClickListeners()
+    }
+
+    private fun setupUI() {
+        // Setup RecyclerView
+        reportHistoryAdapter = ReportHistoryAdapter { reportHistory ->
+            viewModel.getReportById(reportHistory.reportId, reportHistory.reportType)
+        }
+        
+        binding.recyclerViewReportHistory.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = reportHistoryAdapter
+        }
+
+        // Setup initial UI state
+        updateDateDisplay()
+        updateReportTypeDisplay()
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Report History
+            viewModel.reportHistory.collectLatest { history ->
+                reportHistoryAdapter.submitList(history)
+                binding.textViewNoReports.visibility = if (history.isEmpty()) View.VISIBLE else View.GONE
+            }
+
+            // Revenue Report State
+            viewModel.revenueReportState.collectLatest { state ->
+                handleReportState(state, ReportType.REVENUE)
+            }
+
+            // Shipment Report State
+            viewModel.shipmentReportState.collectLatest { state ->
+                handleReportState(state, ReportType.SHIPMENT)
+            }
+
+            // Driver Report State
+            viewModel.driverReportState.collectLatest { state ->
+                handleReportState(state, ReportType.DRIVER)
+            }
+
+            // Customer Report State
+            viewModel.customerReportState.collectLatest { state ->
+                handleReportState(state, ReportType.CUSTOMER)
+            }
+
+            // Export State
+            viewModel.exportState.collectLatest { state ->
+                handleExportState(state)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        // Report Type Selection
+        binding.cardReportType.setOnClickListener {
+            showReportTypeSelectionDialog()
+        }
+
+        // Date Range Selection
+        binding.cardDateRange.setOnClickListener {
+            showDateRangeDialog()
+        }
+
+        // Filters
+        binding.cardFilters.setOnClickListener {
+            showFilterDialog()
+        }
+
+        // Generate Report Button
+        binding.buttonGenerateReport.setOnClickListener {
+            generateCurrentReport()
+        }
+
+        // Quick Report Buttons
+        binding.buttonTodayRevenue.setOnClickListener {
+            viewModel.generateTodayRevenueReport()
+        }
+
+        binding.buttonThisMonthShipment.setOnClickListener {
+            viewModel.generateThisMonthShipmentReport()
+        }
+
+        binding.buttonThisQuarterDriver.setOnClickListener {
+            viewModel.generateThisQuarterDriverReport()
+        }
+
+        binding.buttonThisYearCustomer.setOnClickListener {
+            viewModel.generateThisYearCustomerReport()
+        }
+
+        // Export Buttons
+        binding.buttonExportPDF.setOnClickListener {
+            exportCurrentReport(ExportFormat.PDF)
+        }
+
+        binding.buttonExportExcel.setOnClickListener {
+            exportCurrentReport(ExportFormat.EXCEL)
+        }
+
+        // Clear Button
+        binding.buttonClear.setOnClickListener {
+            clearCurrentReport()
+        }
+
+        // Refresh Button
+        binding.buttonRefresh.setOnClickListener {
+            refreshReports()
+        }
+    }
+
+    private fun showReportTypeSelectionDialog() {
+        val dialog = ReportTypeSelectionDialog { reportType ->
+            viewModel.updateSelectedReportType(reportType)
+            updateReportTypeDisplay()
+        }
+        dialog.show(childFragmentManager, "ReportTypeSelectionDialog")
+    }
+
+    private fun showDateRangeDialog() {
+        // Show start date picker
+        val startDatePicker = DatePickerDialog(
+            requireContext(),
+            { _, year, month, day ->
+                calendar.set(year, month, day)
+                val startDate = calendar.timeInMillis
+                
+                // Show end date picker
+                val endDatePicker = DatePickerDialog(
+                    requireContext(),
+                    { _, endYear, endMonth, endDay ->
+                        calendar.set(endYear, endMonth, endDay)
+                        val endDate = calendar.timeInMillis
+                        
+                        if (endDate >= startDate) {
+                            viewModel.updateDateRange(startDate, endDate)
+                            updateDateDisplay()
+                        } else {
+                            Toast.makeText(context, "End date must be after start date", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    calendar.get(Calendar.YEAR),
+                    calendar.get(Calendar.MONTH),
+                    calendar.get(Calendar.DAY_OF_MONTH)
+                )
+                endDatePicker.show()
+            },
+            calendar.get(Calendar.YEAR),
+            calendar.get(Calendar.MONTH),
+            calendar.get(Calendar.DAY_OF_MONTH)
+        )
+        startDatePicker.show()
+    }
+
+    private fun showFilterDialog() {
+        val currentFilters = viewModel.getCurrentFilters()
+        val dialog = ReportFilterDialog(currentFilters) { filters ->
+            viewModel.updateReportFilters(filters)
+            updateFilterDisplay()
+        }
+        dialog.show(childFragmentManager, "ReportFilterDialog")
+    }
+
+    private fun generateCurrentReport() {
+        val reportType = viewModel.getCurrentReportType()
+        val (startDate, endDate) = viewModel.getCurrentDateRange()
+
+        when (reportType) {
+            ReportType.REVENUE -> {
+                viewModel.generateRevenueReport(startDate, endDate, RevenueReportType.DETAILED)
+            }
+            ReportType.SHIPMENT -> {
+                viewModel.generateShipmentPerformanceReport(startDate, endDate, ShipmentReportType.COMPREHENSIVE)
+            }
+            ReportType.DRIVER -> {
+                viewModel.generateDriverPerformanceReport(startDate, endDate, DriverReportType.DETAILED)
+            }
+            ReportType.CUSTOMER -> {
+                viewModel.generateCustomerBehaviorReport(startDate, endDate, CustomerReportType.COMPREHENSIVE)
+            }
+        }
+    }
+
+    private fun exportCurrentReport(format: ExportFormat) {
+        val reportType = viewModel.getCurrentReportType()
+        val fileName = "${reportType.name.lowercase()}_report"
+        
+        when (reportType) {
+            ReportType.REVENUE -> {
+                viewModel.revenueReportState.value.let { state ->
+                    if (state is ReportState.Success) {
+                        if (format == ExportFormat.PDF) {
+                            viewModel.exportToPDF(state.data, fileName)
+                        } else {
+                            viewModel.exportToExcel(state.data, fileName)
+                        }
+                    }
+                }
+            }
+            ReportType.SHIPMENT -> {
+                viewModel.shipmentReportState.value.let { state ->
+                    if (state is ReportState.Success) {
+                        if (format == ExportFormat.PDF) {
+                            viewModel.exportToPDF(state.data, fileName)
+                        } else {
+                            viewModel.exportToExcel(state.data, fileName)
+                        }
+                    }
+                }
+            }
+            ReportType.DRIVER -> {
+                viewModel.driverReportState.value.let { state ->
+                    if (state is ReportState.Success) {
+                        if (format == ExportFormat.PDF) {
+                            viewModel.exportToPDF(state.data, fileName)
+                        } else {
+                            viewModel.exportToExcel(state.data, fileName)
+                        }
+                    }
+                }
+            }
+            ReportType.CUSTOMER -> {
+                viewModel.customerReportState.value.let { state ->
+                    if (state is ReportState.Success) {
+                        if (format == ExportFormat.PDF) {
+                            viewModel.exportToPDF(state.data, fileName)
+                        } else {
+                            viewModel.exportToExcel(state.data, fileName)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun clearCurrentReport() {
+        val reportType = viewModel.getCurrentReportType()
+        viewModel.clearReportState(reportType)
+        binding.scrollViewReportContent.visibility = View.GONE
+        binding.layoutLoading.visibility = View.GONE
+        binding.layoutError.visibility = View.GONE
+    }
+
+    private fun refreshReports() {
+        // Refresh report history
+        viewModel.clearReportState(ReportType.REVENUE)
+        viewModel.clearReportState(ReportType.SHIPMENT)
+        viewModel.clearReportState(ReportType.DRIVER)
+        viewModel.clearReportState(ReportType.CUSTOMER)
+        
+        binding.scrollViewReportContent.visibility = View.GONE
+        binding.layoutLoading.visibility = View.GONE
+        binding.layoutError.visibility = View.GONE
+    }
+
+    private fun handleReportState(state: ReportState<Any>, reportType: ReportType) {
+        when (state) {
+            is ReportState.Loading -> {
+                showLoading()
+            }
+            is ReportState.Success -> {
+                hideLoading()
+                showReportContent(state.data, reportType)
+            }
+            is ReportState.Error -> {
+                hideLoading()
+                showError(state.message)
+            }
+            is ReportState.Idle -> {
+                hideLoading()
+                binding.scrollViewReportContent.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun handleExportState(state: ExportState) {
+        when (state) {
+            is ExportState.Loading -> {
+                binding.buttonExportPDF.isEnabled = false
+                binding.buttonExportExcel.isEnabled = false
+                binding.progressBarExport.visibility = View.VISIBLE
+            }
+            is ExportState.Success -> {
+                binding.buttonExportPDF.isEnabled = true
+                binding.buttonExportExcel.isEnabled = true
+                binding.progressBarExport.visibility = View.GONE
+                Toast.makeText(context, "Report exported successfully: ${state.filePath}", Toast.LENGTH_LONG).show()
+                viewModel.clearExportState()
+            }
+            is ExportState.Error -> {
+                binding.buttonExportPDF.isEnabled = true
+                binding.buttonExportExcel.isEnabled = true
+                binding.progressBarExport.visibility = View.GONE
+                Toast.makeText(context, "Export failed: ${state.message}", Toast.LENGTH_LONG).show()
+                viewModel.clearExportState()
+            }
+            is ExportState.Idle -> {
+                binding.buttonExportPDF.isEnabled = true
+                binding.buttonExportExcel.isEnabled = true
+                binding.progressBarExport.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.layoutLoading.visibility = View.VISIBLE
+        binding.scrollViewReportContent.visibility = View.GONE
+        binding.layoutError.visibility = View.GONE
+    }
+
+    private fun hideLoading() {
+        binding.layoutLoading.visibility = View.GONE
+    }
+
+    private fun showReportContent(report: Any, reportType: ReportType) {
+        binding.scrollViewReportContent.visibility = View.VISIBLE
+        binding.layoutError.visibility = View.GONE
+
+        when (report) {
+            is RevenueReport -> {
+                displayRevenueReport(report)
+            }
+            is ShipmentPerformanceReport -> {
+                displayShipmentReport(report)
+            }
+            is DriverPerformanceReport -> {
+                displayDriverReport(report)
+            }
+            is CustomerBehaviorReport -> {
+                displayCustomerReport(report)
+            }
+        }
+    }
+
+    private fun showError(message: String) {
+        binding.layoutError.visibility = View.VISIBLE
+        binding.scrollViewReportContent.visibility = View.GONE
+        binding.textViewErrorMessage.text = message
+    }
+
+    private fun displayRevenueReport(report: RevenueReport) {
+        binding.textViewReportTitle.text = report.title
+        binding.textViewReportPeriod.text = "${dateFormat.format(Date(report.startDate))} - ${dateFormat.format(Date(report.endDate))}"
+        
+        // Display summary metrics
+        binding.layoutSummaryContent.removeAllViews()
+        
+        addSummaryMetric("Total Revenue", "${report.totalRevenue} SAR")
+        addSummaryMetric("Total Invoices", report.totalInvoices.toString())
+        addSummaryMetric("Paid Invoices", report.paidInvoices.toString())
+        addSummaryMetric("Unpaid Invoices", report.unpaidInvoices.toString())
+        addSummaryMetric("Average Invoice Value", "${report.averageInvoiceValue} SAR")
+        addSummaryMetric("Revenue Growth", "${report.revenueGrowth}%")
+        
+        // Enable export buttons
+        binding.buttonExportPDF.isEnabled = true
+        binding.buttonExportExcel.isEnabled = true
+    }
+
+    private fun displayShipmentReport(report: ShipmentPerformanceReport) {
+        binding.textViewReportTitle.text = report.title
+        binding.textViewReportPeriod.text = "${dateFormat.format(Date(report.startDate))} - ${dateFormat.format(Date(report.endDate))}"
+        
+        // Display summary metrics
+        binding.layoutSummaryContent.removeAllViews()
+        
+        addSummaryMetric("Total Shipments", report.totalShipments.toString())
+        addSummaryMetric("Delivered Shipments", report.deliveredShipments.toString())
+        addSummaryMetric("Delayed Shipments", report.delayedShipments.toString())
+        addSummaryMetric("Cancelled Shipments", report.cancelledShipments.toString())
+        addSummaryMetric("On-Time Delivery Rate", "${report.onTimeDeliveryRate}%")
+        addSummaryMetric("Average Delivery Time", "${report.averageDeliveryTime / (1000 * 60 * 60)} hours")
+        
+        // Enable export buttons
+        binding.buttonExportPDF.isEnabled = true
+        binding.buttonExportExcel.isEnabled = true
+    }
+
+    private fun displayDriverReport(report: DriverPerformanceReport) {
+        binding.textViewReportTitle.text = report.title
+        binding.textViewReportPeriod.text = "${dateFormat.format(Date(report.startDate))} - ${dateFormat.format(Date(report.endDate))}"
+        
+        // Display summary metrics
+        binding.layoutSummaryContent.removeAllViews()
+        
+        addSummaryMetric("Total Drivers", report.teamStatistics.totalDrivers.toString())
+        addSummaryMetric("Average On-Time Rate", "${report.teamStatistics.averageOnTimeDeliveryRate}%")
+        addSummaryMetric("Average Satisfaction", report.teamStatistics.averageCustomerSatisfaction.toString())
+        addSummaryMetric("Total Revenue Generated", "${report.teamStatistics.totalRevenueGenerated} SAR")
+        
+        // Enable export buttons
+        binding.buttonExportPDF.isEnabled = true
+        binding.buttonExportExcel.isEnabled = true
+    }
+
+    private fun displayCustomerReport(report: CustomerBehaviorReport) {
+        binding.textViewReportTitle.text = report.title
+        binding.textViewReportPeriod.text = "${dateFormat.format(Date(report.startDate))} - ${dateFormat.format(Date(report.endDate))}"
+        
+        // Display summary metrics
+        binding.layoutSummaryContent.removeAllViews()
+        
+        addSummaryMetric("Total Customers", report.marketSegmentation.totalCustomers.toString())
+        addSummaryMetric("Average CLV", "${report.customerLifetimeValue.averageLifetimeValue} SAR")
+        addSummaryMetric("Total CLV", "${report.customerLifetimeValue.totalLifetimeValue} SAR")
+        addSummaryMetric("Churn Rate", "${report.churnAnalysis.churnRate}%")
+        addSummaryMetric("Retention Rate", "${report.churnAnalysis.retentionRate}%")
+        
+        // Enable export buttons
+        binding.buttonExportPDF.isEnabled = true
+        binding.buttonExportExcel.isEnabled = true
+    }
+
+    private fun addSummaryMetric(label: String, value: String) {
+        val metricView = LayoutInflater.from(context).inflate(R.layout.item_summary_metric, binding.layoutSummaryContent, false)
+        // Set the metric values (implementation depends on layout)
+        binding.layoutSummaryContent.addView(metricView)
+    }
+
+    private fun updateDateDisplay() {
+        val (startDate, endDate) = viewModel.getCurrentDateRange()
+        binding.textViewDateRange.text = "${dateFormat.format(Date(startDate))} - ${dateFormat.format(Date(endDate))}"
+    }
+
+    private fun updateReportTypeDisplay() {
+        val reportType = viewModel.getCurrentReportType()
+        binding.textViewReportType.text = when (reportType) {
+            ReportType.REVENUE -> "Revenue Report"
+            ReportType.SHIPMENT -> "Shipment Performance"
+            ReportType.DRIVER -> "Driver Performance"
+            ReportType.CUSTOMER -> "Customer Behavior"
+        }
+    }
+
+    private fun updateFilterDisplay() {
+        val filters = viewModel.getCurrentFilters()
+        val activeFiltersCount = listOf(
+            filters.customerIds.isNotEmpty(),
+            filters.driverIds.isNotEmpty(),
+            filters.vehicleTypes.isNotEmpty(),
+            filters.serviceTypes.isNotEmpty(),
+            filters.locations.isNotEmpty(),
+            filters.statusFilters.isNotEmpty(),
+            filters.minAmount != null,
+            filters.maxAmount != null
+        ).count { it }
+        
+        binding.textViewFilterCount.text = if (activeFiltersCount > 0) "$activeFiltersCount filters active" else "No filters"
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

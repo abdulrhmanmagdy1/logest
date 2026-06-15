@@ -1,0 +1,613 @@
+package com.edham.logistics.financial
+
+import android.app.DownloadManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.util.Log
+import androidx.core.content.FileProvider
+import com.edham.logistics.network.RetrofitClient
+import com.edham.logistics.network.api.FinancialApi
+import com.edham.logistics.utils.SharedPreferencesHelper
+import kotlinx.coroutines.*
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * Financial service for Android
+ * Provides invoice management, payment tracking, and PDF export functionality
+ */
+class FinancialService(private val context: Context) {
+
+    companion object {
+        private const val TAG = "FinancialService"
+        private const val INVOICE_CACHE_SIZE = 50
+        private const val PAYMENT_CACHE_SIZE = 100
+        private const val PDF_CACHE_SIZE = 20
+        private const val CACHE_EXPIRY_HOURS = 24
+    }
+
+    private val financialApi = RetrofitClient.getInstance().create(FinancialApi::class.java)
+    private val sharedPreferences = SharedPreferencesHelper(context)
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Cache for invoices and payments
+    private val invoiceCache = mutableMapOf<String, Invoice>()
+    private val paymentCache = mutableMapOf<String, List<Payment>>()
+    private val pdfCache = mutableMapOf<String, File>()
+
+    /**
+     * Get customer invoices
+     */
+    suspend fun getCustomerInvoices(
+        customerId: Long,
+        page: Int = 0,
+        size: Int = 20
+    ): Result<InvoiceResponse> {
+        return try {
+            Log.d(TAG, "Getting invoices for customer: $customerId")
+            
+            val response = financialApi.getCustomerInvoices(customerId, page, size)
+            
+            if (response.isSuccessful) {
+                val invoiceResponse = response.body()
+                
+                // Cache invoices
+                invoiceResponse?.content?.forEach { invoice ->
+                    invoiceCache[invoice.id] = invoice
+                }
+                
+                Log.d(TAG, "Retrieved ${invoiceResponse?.content?.size ?: 0} invoices")
+                Result.success(invoiceResponse ?: InvoiceResponse(emptyList(), 0, 0, 0))
+            } else {
+                Log.e(TAG, "Failed to get invoices: ${response.code()}")
+                Result.failure(Exception("Failed to get invoices: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting customer invoices", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get invoice by ID
+     */
+    suspend fun getInvoice(invoiceId: String): Result<Invoice?> {
+        return try {
+            // Check cache first
+            invoiceCache[invoiceId]?.let { cachedInvoice ->
+                if (!isCacheExpired(cachedInvoice.createdAt)) {
+                    Log.d(TAG, "Retrieved invoice from cache: $invoiceId")
+                    return Result.success(cachedInvoice)
+                }
+            }
+
+            Log.d(TAG, "Getting invoice: $invoiceId")
+            
+            val response = financialApi.getInvoice(invoiceId)
+            
+            if (response.isSuccessful) {
+                val invoice = response.body()
+                
+                // Cache invoice
+                invoice?.let {
+                    invoiceCache[invoiceId] = it
+                    cleanCacheIfNeeded()
+                }
+                
+                Log.d(TAG, "Retrieved invoice: $invoiceId")
+                Result.success(invoice)
+            } else {
+                Log.e(TAG, "Failed to get invoice: ${response.code()}")
+                Result.failure(Exception("Failed to get invoice: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting invoice", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get invoice payments
+     */
+    suspend fun getInvoicePayments(invoiceId: String): Result<List<Payment>> {
+        return try {
+            // Check cache first
+            paymentCache[invoiceId]?.let { cachedPayments ->
+                if (cachedPayments.isNotEmpty() && !isCacheExpired(cachedPayments.first().createdAt)) {
+                    Log.d(TAG, "Retrieved payments from cache: $invoiceId")
+                    return Result.success(cachedPayments)
+                }
+            }
+
+            Log.d(TAG, "Getting payments for invoice: $invoiceId")
+            
+            val response = financialApi.getInvoicePayments(invoiceId)
+            
+            if (response.isSuccessful) {
+                val payments = response.body() ?: emptyList()
+                
+                // Cache payments
+                paymentCache[invoiceId] = payments
+                cleanPaymentCacheIfNeeded()
+                
+                Log.d(TAG, "Retrieved ${payments.size} payments for invoice: $invoiceId")
+                Result.success(payments)
+            } else {
+                Log.e(TAG, "Failed to get payments: ${response.code()}")
+                Result.failure(Exception("Failed to get payments: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting invoice payments", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get customer outstanding balance
+     */
+    suspend fun getCustomerBalance(customerId: Long): Result<CustomerBalance> {
+        return try {
+            Log.d(TAG, "Getting balance for customer: $customerId")
+            
+            val response = financialApi.getCustomerBalance(customerId)
+            
+            if (response.isSuccessful) {
+                val balance = response.body()
+                
+                Log.d(TAG, "Retrieved balance for customer: $customerId")
+                Result.success(balance ?: CustomerBalance(customerId, "", 0, 0.0, 0.0, 0.0))
+            } else {
+                Log.e(TAG, "Failed to get balance: ${response.code()}")
+                Result.failure(Exception("Failed to get balance: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting customer balance", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Generate and download invoice PDF
+     */
+    suspend fun downloadInvoicePDF(invoiceId: String): Result<String> {
+        return try {
+            // Check cache first
+            pdfCache[invoiceId]?.let { cachedFile ->
+                if (cachedFile.exists() && !isCacheExpired(System.currentTimeMillis() - cachedFile.lastModified())) {
+                    Log.d(TAG, "Retrieved PDF from cache: $invoiceId")
+                    return Result.success(cachedFile.absolutePath)
+                }
+            }
+
+            Log.d(TAG, "Downloading PDF for invoice: $invoiceId")
+            
+            val response = financialApi.generateInvoicePDF(invoiceId)
+            
+            if (response.isSuccessful) {
+                val pdfBytes = response.body()?.bytes()
+                
+                if (pdfBytes != null) {
+                    val pdfFile = savePDFToFile(invoiceId, pdfBytes)
+                    
+                    // Cache PDF
+                    pdfCache[invoiceId] = pdfFile
+                    cleanPDFCacheIfNeeded()
+                    
+                    Log.d(TAG, "PDF downloaded and saved: ${pdfFile.absolutePath}")
+                    Result.success(pdfFile.absolutePath)
+                } else {
+                    Result.failure(Exception("Empty PDF response"))
+                }
+            } else {
+                Log.e(TAG, "Failed to download PDF: ${response.code()}")
+                Result.failure(Exception("Failed to download PDF: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error downloading PDF", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Process payment
+     */
+    suspend fun processPayment(
+        invoiceId: String,
+        amount: Double,
+        paymentMethod: PaymentMethod,
+        transactionId: String? = null,
+        notes: String? = null
+    ): Result<Payment> {
+        return try {
+            Log.d(TAG, "Processing payment for invoice: $invoiceId, amount: $amount")
+            
+            val paymentRequest = PaymentRequest(
+                invoiceId = invoiceId,
+                amount = amount,
+                paymentMethod = paymentMethod,
+                transactionId = transactionId,
+                notes = notes,
+                processedBy = getCurrentUserId().toString()
+            )
+            
+            val response = financialApi.processPayment(paymentRequest)
+            
+            if (response.isSuccessful) {
+                val payment = response.body()
+                
+                // Clear payment cache for this invoice
+                paymentCache.remove(invoiceId)
+                
+                Log.d(TAG, "Payment processed successfully: ${payment?.paymentNumber}")
+                Result.success(payment!!)
+            } else {
+                Log.e(TAG, "Failed to process payment: ${response.code()}")
+                Result.failure(Exception("Failed to process payment: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing payment", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get invoice statistics
+     */
+    suspend fun getInvoiceStatistics(): Result<InvoiceStatistics> {
+        return try {
+            Log.d(TAG, "Getting invoice statistics")
+            
+            val response = financialApi.getInvoiceStatistics()
+            
+            if (response.isSuccessful) {
+                val statistics = response.body()
+                
+                Log.d(TAG, "Retrieved invoice statistics")
+                Result.success(statistics ?: InvoiceStatistics())
+            } else {
+                Log.e(TAG, "Failed to get statistics: ${response.code()}")
+                Result.failure(Exception("Failed to get statistics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting statistics", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Search invoices
+     */
+    suspend fun searchInvoices(
+        query: String,
+        page: Int = 0,
+        size: Int = 20
+    ): Result<InvoiceResponse> {
+        return try {
+            Log.d(TAG, "Searching invoices with query: $query")
+            
+            val response = financialApi.searchInvoices(query, page, size)
+            
+            if (response.isSuccessful) {
+                val searchResponse = response.body()
+                
+                Log.d(TAG, "Found ${searchResponse?.content?.size ?: 0} invoices")
+                Result.success(searchResponse ?: InvoiceResponse(emptyList(), 0, 0, 0))
+            } else {
+                Log.e(TAG, "Failed to search invoices: ${response.code()}")
+                Result.failure(Exception("Failed to search invoices: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error searching invoices", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get invoice summary
+     */
+    suspend fun getInvoiceSummary(invoiceId: String): Result<InvoiceSummary> {
+        return try {
+            Log.d(TAG, "Getting invoice summary: $invoiceId")
+            
+            val invoiceResult = getInvoice(invoiceId)
+            if (invoiceResult.isFailure) {
+                return Result.failure(invoiceResult.exceptionOrNull() ?: Exception("Failed to get invoice"))
+            }
+            
+            val invoice = invoiceResult.getOrNull() ?: return Result.failure(Exception("Invoice not found"))
+            
+            val paymentsResult = getInvoicePayments(invoiceId)
+            val payments = if (paymentsResult.isSuccess) paymentsResult.getOrNull() else emptyList()
+            
+            val summary = InvoiceSummary(
+                invoice = invoice,
+                payments = payments,
+                totalPaid = payments.sumOf { it.amount },
+                remainingBalance = invoice.totalAmount - payments.sumOf { it.amount },
+                paymentStatus = when {
+                    payments.sumOf { it.amount } >= invoice.totalAmount -> PaymentStatus.PAID
+                    payments.isNotEmpty() -> PaymentStatus.PARTIALLY_PAID
+                    invoice.dueDate < Date() -> PaymentStatus.OVERDUE
+                    else -> PaymentStatus.PENDING
+                }
+            )
+            
+            Log.d(TAG, "Generated invoice summary for: $invoiceId")
+            Result.success(summary)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting invoice summary", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Open PDF file
+     */
+    fun openPDFFile(filePath: String): Boolean {
+        return try {
+            val file = File(filePath)
+            if (!file.exists()) {
+                Log.e(TAG, "PDF file does not exist: $filePath")
+                return false
+            }
+
+            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    file
+                )
+            } else {
+                Uri.fromFile(file)
+            }
+
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/pdf")
+                flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+
+            context.startActivity(intent)
+            Log.d(TAG, "Opened PDF file: $filePath")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error opening PDF file", e)
+            false
+        }
+    }
+
+    /**
+     * Share invoice
+     */
+    fun shareInvoice(invoiceId: String): Boolean {
+        return try {
+            val invoiceResult = runBlocking { getInvoice(invoiceId) }
+            if (invoiceResult.isFailure) {
+                return false
+            }
+
+            val invoice = invoiceResult.getOrNull() ?: return false
+            
+            val shareText = """
+                Invoice: ${invoice.invoiceNumber}
+                Amount: ${invoice.currency} ${invoice.totalAmount}
+                Due Date: ${SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(invoice.dueDate)}
+                Status: ${invoice.status}
+                
+                Tracking Number: ${invoice.trackingNumber}
+            """.trimIndent()
+
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, shareText)
+                putExtra(Intent.EXTRA_SUBJECT, "Invoice ${invoice.invoiceNumber}")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+
+            context.startActivity(Intent.createChooser(intent, "Share Invoice"))
+            Log.d(TAG, "Shared invoice: $invoiceId")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error sharing invoice", e)
+            false
+        }
+    }
+
+    // Helper methods
+    private fun savePDFToFile(invoiceId: String, pdfBytes: ByteArray): File {
+        val fileName = "invoice_$invoiceId.pdf"
+        val downloadsDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "invoices")
+        
+        if (!downloadsDir.exists()) {
+            downloadsDir.mkdirs()
+        }
+        
+        val pdfFile = File(downloadsDir, fileName)
+        FileOutputStream(pdfFile).use { output ->
+            output.write(pdfBytes)
+        }
+        
+        return pdfFile
+    }
+
+    private fun isCacheExpired(timestamp: Date): Boolean {
+        val currentTime = System.currentTimeMillis()
+        val cacheTime = timestamp.time
+        return (currentTime - cacheTime) > (CACHE_EXPIRY_HOURS * 60 * 60 * 1000)
+    }
+
+    private fun isCacheExpired(timestamp: Long): Boolean {
+        val currentTime = System.currentTimeMillis()
+        return (currentTime - timestamp) > (CACHE_EXPIRY_HOURS * 60 * 60 * 1000)
+    }
+
+    private fun cleanCacheIfNeeded() {
+        if (invoiceCache.size > INVOICE_CACHE_SIZE) {
+            val sortedInvoices = invoiceCache.values.sortedBy { it.createdAt }
+            val toRemove = sortedInvoices.take(invoiceCache.size - INVOICE_CACHE_SIZE)
+            toRemove.forEach { invoice ->
+                invoiceCache.remove(invoice.id)
+            }
+            Log.d(TAG, "Cleaned invoice cache, removed ${toRemove.size} items")
+        }
+    }
+
+    private fun cleanPaymentCacheIfNeeded() {
+        if (paymentCache.size > PAYMENT_CACHE_SIZE) {
+            val oldestKey = paymentCache.keys.first()
+            paymentCache.remove(oldestKey)
+            Log.d(TAG, "Cleaned payment cache, removed oldest entry")
+        }
+    }
+
+    private fun cleanPDFCacheIfNeeded() {
+        if (pdfCache.size > PDF_CACHE_SIZE) {
+            val oldestKey = pdfCache.keys.first()
+            pdfCache[oldestKey]?.delete()
+            pdfCache.remove(oldestKey)
+            Log.d(TAG, "Cleaned PDF cache, removed oldest entry")
+        }
+    }
+
+    private fun getCurrentUserId(): Long {
+        return sharedPreferences.getCurrentUserId()
+    }
+
+    /**
+     * Clear all caches
+     */
+    fun clearCache() {
+        invoiceCache.clear()
+        paymentCache.clear()
+        
+        // Delete PDF files
+        pdfCache.values.forEach { it.delete() }
+        pdfCache.clear()
+        
+        Log.d(TAG, "All caches cleared")
+    }
+
+    /**
+     * Get cache statistics
+     */
+    fun getCacheStatistics(): Map<String, Any> {
+        return mapOf(
+            "invoiceCacheSize" to invoiceCache.size,
+            "paymentCacheSize" to paymentCache.size,
+            "pdfCacheSize" to pdfCache.size,
+            "maxInvoiceCache" to INVOICE_CACHE_SIZE,
+            "maxPaymentCache" to PAYMENT_CACHE_SIZE,
+            "maxPDFCache" to PDF_CACHE_SIZE
+        )
+    }
+}
+
+// Data classes
+data class InvoiceResponse(
+    val content: List<Invoice>,
+    val totalElements: Int,
+    val totalPages: Int,
+    val currentPage: Int
+)
+
+data class Invoice(
+    val id: String,
+    val invoiceNumber: String,
+    val shipmentId: Long,
+    val customerId: Long,
+    val trackingNumber: String,
+    val invoiceDate: Date,
+    val dueDate: Date,
+    val status: InvoiceStatus,
+    val subtotal: Double,
+    val taxAmount: Double,
+    val lateFee: Double,
+    val totalAmount: Double,
+    val paidAmount: Double,
+    val outstandingBalance: Double,
+    val currency: String,
+    val items: List<InvoiceItem>,
+    val billingAddress: String,
+    val shippingAddress: String,
+    val notes: String,
+    val createdAt: Date
+)
+
+data class InvoiceItem(
+    val description: String,
+    val quantity: Int,
+    val unitPrice: Double,
+    val total: Double
+)
+
+data class Payment(
+    val id: String,
+    val paymentNumber: String,
+    val invoiceId: String,
+    val customerId: Long,
+    val amount: Double,
+    val paymentMethod: PaymentMethod,
+    val paymentDate: Date,
+    val status: PaymentStatus,
+    val currency: String,
+    val transactionId: String?,
+    val notes: String?,
+    val processedBy: String,
+    val createdAt: Date
+)
+
+data class CustomerBalance(
+    val customerId: Long,
+    val customerName: String,
+    val totalInvoices: Int,
+    val totalAmount: Double,
+    val paidAmount: Double,
+    val outstandingBalance: Double
+)
+
+data class InvoiceSummary(
+    val invoice: Invoice,
+    val payments: List<Payment>,
+    val totalPaid: Double,
+    val remainingBalance: Double,
+    val paymentStatus: PaymentStatus
+)
+
+data class InvoiceStatistics(
+    val totalInvoices: Int = 0,
+    val draftInvoices: Int = 0,
+    val sentInvoices: Int = 0,
+    val paidInvoices: Int = 0,
+    val overdueInvoices: Int = 0,
+    val totalAmount: Double = 0.0,
+    val totalPaid: Double = 0.0,
+    val totalOutstanding: Double = 0.0,
+    val collectionRate: Double = 0.0
+)
+
+data class PaymentRequest(
+    val invoiceId: String,
+    val amount: Double,
+    val paymentMethod: PaymentMethod,
+    val transactionId: String? = null,
+    val notes: String? = null,
+    val processedBy: String
+)
+
+enum class InvoiceStatus {
+    DRAFT, SENT, PARTIALLY_PAID, PAID, OVERDUE, CANCELLED
+}
+
+enum class PaymentStatus {
+    PENDING, PROCESSING, COMPLETED, FAILED, REFUNDED
+}
+
+enum class PaymentMethod {
+    CASH, CREDIT_CARD, BANK_TRANSFER, MOBILE_MONEY, CHECK
+}

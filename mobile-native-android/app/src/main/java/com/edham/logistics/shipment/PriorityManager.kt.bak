@@ -1,0 +1,670 @@
+package com.edham.logistics.shipment
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.ShipmentEntity
+import com.edham.logistics.data.remote.api.ShipmentApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Priority Manager - Advanced priority shipment management system
+ * 
+ * Features:
+ * - Priority classification
+ * - Priority-based routing
+ * - Expedited handling
+ * - Priority notifications
+ * - Performance tracking
+ * - SLA management
+ */
+@Singleton
+class PriorityManager @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val shipmentApi: ShipmentApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _priorityState = MutableStateFlow<PriorityState>(PriorityState.Idle)
+    val priorityState: StateFlow<PriorityState> = _priorityState.asStateFlow()
+    
+    private val _priorityShipments = MutableStateFlow<List<PriorityShipment>>(emptyList())
+    val priorityShipments: StateFlow<List<PriorityShipment>> = _priorityState.asStateFlow()
+    
+    private val _priorityAnalytics = MutableStateFlow<PriorityAnalytics?>(null)
+    val priorityAnalytics: StateFlow<PriorityAnalytics?> = _priorityAnalytics.asStateFlow()
+    
+    private val _priorityAlerts = MutableStateFlow<List<PriorityAlert>>(emptyList())
+    val priorityAlerts: StateFlow<List<PriorityAlert>> = _priorityAlerts.asStateFlow()
+    
+    private var isMonitoring = false
+    private var slaThresholds: MutableMap<Priority, SLAThreshold> = mutableMapOf()
+    
+    companion object {
+        private const val TAG = "PriorityManager"
+        private const val PRIORITY_UPDATE_INTERVAL = 60000L // 1 minute
+        private const val CRITICAL_RESPONSE_TIME = 300000L // 5 minutes
+        private const val HIGH_RESPONSE_TIME = 900000L // 15 minutes
+        private const val NORMAL_RESPONSE_TIME = 1800000L // 30 minutes
+        private const val LOW_RESPONSE_TIME = 3600000L // 1 hour
+    }
+    
+    init {
+        initializeSLAThresholds()
+    }
+    
+    /**
+     * Initialize SLA thresholds
+     */
+    private fun initializeSLAThresholds() {
+        slaThresholds[Priority.CRITICAL] = SLAThreshold(
+            pickupTime = CRITICAL_RESPONSE_TIME,
+            deliveryTime = CRITICAL_RESPONSE_TIME * 2,
+            responseTime = CRITICAL_RESPONSE_TIME / 5,
+            notificationLevel = NotificationLevel.IMMEDIATE
+        )
+        
+        slaThresholds[Priority.HIGH] = SLAThreshold(
+            pickupTime = HIGH_RESPONSE_TIME,
+            deliveryTime = HIGH_RESPONSE_TIME * 2,
+            responseTime = HIGH_RESPONSE_TIME / 5,
+            notificationLevel = NotificationLevel.HIGH
+        )
+        
+        slaThresholds[Priority.NORMAL] = SLAThreshold(
+            pickupTime = NORMAL_RESPONSE_TIME,
+            deliveryTime = NORMAL_RESPONSE_TIME * 2,
+            responseTime = NORMAL_RESPONSE_TIME / 5,
+            notificationLevel = NotificationLevel.NORMAL
+        )
+        
+        slaThresholds[Priority.LOW] = SLAThreshold(
+            pickupTime = LOW_RESPONSE_TIME,
+            deliveryTime = LOW_RESPONSE_TIME * 2,
+            responseTime = LOW_RESPONSE_TIME / 5,
+            notificationLevel = NotificationLevel.LOW
+        )
+    }
+    
+    /**
+     * Start priority monitoring
+     */
+    fun startMonitoring() {
+        if (isMonitoring) return
+        
+        try {
+            _priorityState.value = PriorityState.Starting
+            isMonitoring = true
+            
+            // Load priority shipments
+            loadPriorityShipments()
+            
+            // Start SLA monitoring
+            startSLAMonitoring()
+            
+            _priorityState.value = PriorityState.Monitoring
+            
+        } catch (e: Exception) {
+            _priorityState.value = PriorityState.Error("Failed to start monitoring: ${e.message}")
+        }
+    }
+    
+    /**
+     * Stop priority monitoring
+     */
+    fun stopMonitoring() {
+        isMonitoring = false
+        _priorityState.value = PriorityState.Stopped
+    }
+    
+    /**
+     * Set shipment priority
+     */
+    suspend fun setShipmentPriority(
+        shipmentId: Long,
+        priority: Priority,
+        reason: String,
+        updatedBy: String
+    ): Result<ShipmentEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _priorityState.value = PriorityState.UpdatingPriority
+                
+                // Get shipment
+                val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                    ?: throw Exception("Shipment not found")
+                
+                // Validate priority change
+                validatePriorityChange(shipment.priority, priority)
+                
+                // Update shipment priority
+                val updatedShipment = shipment.copy(
+                    priority = priority,
+                    updatedAt = Date(),
+                    updatedBy = updatedBy
+                )
+                
+                database.shipmentDao().updateShipment(updatedShipment)
+                
+                // Create priority change record
+                createPriorityChangeRecord(shipmentId, shipment.priority, priority, reason, updatedBy)
+                
+                // Apply priority-based routing
+                applyPriorityRouting(updatedShipment)
+                
+                // Send notifications
+                sendPriorityNotifications(updatedShipment, reason)
+                
+                // Update priority shipments list
+                loadPriorityShipments()
+                
+                _priorityState.value = PriorityState.PriorityUpdated
+                Result.success(updatedShipment)
+                
+            } catch (e: Exception) {
+                _priorityState.value = PriorityState.Error("Failed to update priority: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get priority shipments
+     */
+    suspend fun getPriorityShipments(priority: Priority? = null): List<PriorityShipment> {
+        return withContext(Dispatchers.IO) {
+            val shipments = if (priority != null) {
+                database.shipmentDao().getShipmentsByPriority(priority)
+            } else {
+                database.shipmentDao().getShipmentsByPriorityIn(listOf(Priority.CRITICAL, Priority.HIGH))
+            }
+            
+            shipments.map { shipment ->
+                val slaThreshold = slaThresholds[shipment.priority] ?: SLAThreshold()
+                val slaStatus = calculateSLAStatus(shipment, slaThreshold)
+                
+                PriorityShipment(
+                    shipment = shipment,
+                    slaThreshold = slaThreshold,
+                    slaStatus = slaStatus,
+                    priorityScore = calculatePriorityScore(shipment),
+                    riskLevel = calculateRiskLevel(shipment, slaStatus)
+                )
+            }
+        }
+    }
+    
+    /**
+     * Get priority analytics
+     */
+    suspend fun getPriorityAnalytics(): PriorityAnalytics {
+        return withContext(Dispatchers.IO) {
+            val allShipments = database.shipmentDao().getAllShipments()
+            val priorityShipments = allShipments.filter { it.priority != Priority.NORMAL }
+            
+            val priorityDistribution = calculatePriorityDistribution(allShipments)
+            val slaComplianceRate = calculateSLAComplianceRate(priorityShipments)
+            val averageResponseTime = calculateAverageResponseTime(priorityShipments)
+            val priorityEfficiency = calculatePriorityEfficiency(priorityShipments)
+            val criticalAlerts = priorityShipments.count { it.priority == Priority.CRITICAL }
+            val overdueShipments = calculateOverdueShipments(priorityShipments)
+            
+            PriorityAnalytics(
+                totalPriorityShipments = priorityShipments.size,
+                priorityDistribution = priorityDistribution,
+                slaComplianceRate = slaComplianceRate,
+                averageResponseTime = averageResponseTime,
+                priorityEfficiency = priorityEfficiency,
+                criticalAlerts = criticalAlerts,
+                overdueShipments = overdueShipments,
+                handledOnTime = priorityShipments.count { isHandledOnTime(it) },
+                requiresAttention = priorityShipments.filter { requiresAttention(it) }
+            )
+        }
+    }
+    
+    /**
+     * Check SLA compliance
+     */
+    suspend fun checkSLACompliance(): List<SLAViolation> {
+        return withContext(Dispatchers.IO) {
+            val violations = mutableListOf<SLAViolation>()
+            val priorityShipments = database.shipmentDao().getShipmentsByPriorityIn(
+                listOf(Priority.CRITICAL, Priority.HIGH)
+            )
+            
+            priorityShipments.forEach { shipment ->
+                val slaThreshold = slaThresholds[shipment.priority] ?: return@forEach
+                val slaStatus = calculateSLAStatus(shipment, slaThreshold)
+                
+                if (slaStatus.isViolation) {
+                    violations.add(
+                        SLAViolation(
+                            shipmentId = shipment.id,
+                            shipmentIdString = shipment.shipmentId,
+                            priority = shipment.priority,
+                            violationType = slaStatus.violationType,
+                            expectedTime = slaStatus.expectedTime,
+                            actualTime = slaStatus.actualTime,
+                            delayDuration = slaStatus.delayDuration,
+                            severity = calculateViolationSeverity(shipment.priority, slaStatus),
+                            createdAt = Date()
+                        )
+                    )
+                }
+            }
+            
+            violations
+        }
+    }
+    
+    /**
+     * Expedite shipment
+     */
+    suspend fun expediteShipment(
+        shipmentId: Long,
+        expeditedBy: String,
+        reason: String
+    ): Result<ShipmentEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                    ?: throw Exception("Shipment not found")
+                
+                // Increase priority if not already critical
+                val newPriority = if (shipment.priority != Priority.CRITICAL) {
+                    when (shipment.priority) {
+                        Priority.LOW -> Priority.NORMAL
+                        Priority.NORMAL -> Priority.HIGH
+                        Priority.HIGH -> Priority.CRITICAL
+                        Priority.CRITICAL -> Priority.CRITICAL
+                    }
+                } else {
+                    shipment.priority
+                }
+                
+                // Update shipment
+                val updatedShipment = shipment.copy(
+                    priority = newPriority,
+                    updatedAt = Date(),
+                    updatedBy = expeditedBy
+                )
+                
+                database.shipmentDao().updateShipment(updatedShipment)
+                
+                // Apply expedited routing
+                applyExpeditedRouting(updatedShipment)
+                
+                // Send expedited notifications
+                sendExpeditedNotifications(updatedShipment, expeditedBy, reason)
+                
+                Result.success(updatedShipment)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadPriorityShipments() {
+        val priorityShipments = getPriorityShipments()
+        _priorityShipments.value = priorityShipments
+    }
+    
+    private fun startSLAMonitoring() {
+        // Implementation would start periodic SLA monitoring
+    }
+    
+    private fun validatePriorityChange(oldPriority: Priority, newPriority: Priority) {
+        // Validate that priority change is allowed
+        // Implementation would include business logic for priority changes
+    }
+    
+    private suspend fun createPriorityChangeRecord(
+        shipmentId: Long,
+        oldPriority: Priority,
+        newPriority: Priority,
+        reason: String,
+        updatedBy: String
+    ) {
+        // Implementation would create priority change record for audit trail
+    }
+    
+    private suspend fun applyPriorityRouting(shipment: ShipmentEntity) {
+        // Implementation would apply priority-based routing logic
+        // This could include:
+        // - Assigning best available driver
+        // - Optimizing route for speed
+        // - Prioritizing in dispatch queue
+    }
+    
+    private suspend fun sendPriorityNotifications(shipment: ShipmentEntity, reason: String) {
+        // Implementation would send notifications based on priority level
+        val notificationLevel = slaThresholds[shipment.priority]?.notificationLevel
+            ?: NotificationLevel.NORMAL
+        
+        when (notificationLevel) {
+            NotificationLevel.IMMEDIATE -> {
+                // Send immediate push notification, SMS, and email
+            }
+            NotificationLevel.HIGH -> {
+                // Send push notification and SMS
+            }
+            NotificationLevel.NORMAL -> {
+                // Send push notification
+            }
+            NotificationLevel.LOW -> {
+                // Send email notification
+            }
+        }
+    }
+    
+    private fun calculateSLAStatus(shipment: ShipmentEntity, slaThreshold: SLAThreshold): SLAStatus {
+        val now = Date()
+        val createdTime = shipment.createdAt.time
+        val elapsedTime = now.time - createdTime
+        
+        // Check pickup SLA
+        val pickupSLAStatus = if (shipment.pickedUpAt != null) {
+            val pickupTime = shipment.pickedUpAt!!.time - createdTime
+            SLAStatus(
+                type = SLAType.PICKUP,
+                expectedTime = slaThreshold.pickupTime,
+                actualTime = pickupTime,
+                isViolation = pickupTime > slaThreshold.pickupTime,
+                violationType = if (pickupTime > slaThreshold.pickupTime) ViolationType.DELAYED_PICKUP else null,
+                delayDuration = maxOf(0, pickupTime - slaThreshold.pickupTime)
+            )
+        } else {
+            SLAStatus(
+                type = SLAType.PICKUP,
+                expectedTime = slaThreshold.pickupTime,
+                actualTime = elapsedTime,
+                isViolation = elapsedTime > slaThreshold.pickupTime,
+                violationType = if (elapsedTime > slaThreshold.pickupTime) ViolationType.DELAYED_PICKUP else null,
+                delayDuration = maxOf(0, elapsedTime - slaThreshold.pickupTime)
+            )
+        }
+        
+        // Check delivery SLA
+        val deliverySLAStatus = if (shipment.deliveredAt != null) {
+            val deliveryTime = shipment.deliveredAt!!.time - createdTime
+            SLAStatus(
+                type = SLAType.DELIVERY,
+                expectedTime = slaThreshold.deliveryTime,
+                actualTime = deliveryTime,
+                isViolation = deliveryTime > slaThreshold.deliveryTime,
+                violationType = if (deliveryTime > slaThreshold.deliveryTime) ViolationType.DELAYED_DELIVERY else null,
+                delayDuration = maxOf(0, deliveryTime - slaThreshold.deliveryTime)
+            )
+        } else {
+            SLAStatus(
+                type = SLAType.DELIVERY,
+                expectedTime = slaThreshold.deliveryTime,
+                actualTime = elapsedTime,
+                isViolation = elapsedTime > slaThreshold.deliveryTime,
+                violationType = if (elapsedTime > slaThreshold.deliveryTime) ViolationType.DELAYED_DELIVERY else null,
+                delayDuration = maxOf(0, elapsedTime - slaThreshold.deliveryTime)
+            )
+        }
+        
+        // Return the most critical SLA status
+        return if (pickupSLAStatus.isViolation && deliverySLAStatus.isViolation) {
+            if (pickupSLAStatus.delayDuration > deliverySLAStatus.delayDuration) pickupSLAStatus else deliverySLAStatus
+        } else if (pickupSLAStatus.isViolation) {
+            pickupSLAStatus
+        } else {
+            deliverySLAStatus
+        }
+    }
+    
+    private fun calculatePriorityScore(shipment: ShipmentEntity): Int {
+        val baseScore = when (shipment.priority) {
+            Priority.CRITICAL -> 100
+            Priority.HIGH -> 75
+            Priority.NORMAL -> 50
+            Priority.LOW -> 25
+        }
+        
+        // Adjust score based on age and other factors
+        val ageFactor = calculateAgeFactor(shipment)
+        val valueFactor = calculateValueFactor(shipment)
+        
+        return (baseScore * ageFactor * valueFactor).toInt()
+    }
+    
+    private fun calculateAgeFactor(shipment: ShipmentEntity): Double {
+        val ageInHours = (System.currentTimeMillis() - shipment.createdAt.time) / (1000 * 60 * 60)
+        return when {
+            ageInHours < 1 -> 1.2
+            ageInHours < 6 -> 1.1
+            ageInHours < 24 -> 1.0
+            ageInHours < 48 -> 0.9
+            else -> 0.8
+        }
+    }
+    
+    private fun calculateValueFactor(shipment: ShipmentEntity): Double {
+        return when {
+            shipment.packageValue > 10000 -> 1.2
+            shipment.packageValue > 5000 -> 1.1
+            shipment.packageValue > 1000 -> 1.0
+            else -> 0.9
+        }
+    }
+    
+    private fun calculateRiskLevel(shipment: ShipmentEntity, slaStatus: SLAStatus): RiskLevel {
+        return when {
+            slaStatus.isViolation && shipment.priority == Priority.CRITICAL -> RiskLevel.CRITICAL
+            slaStatus.isViolation && shipment.priority == Priority.HIGH -> RiskLevel.HIGH
+            slaStatus.isViolation -> RiskLevel.MEDIUM
+            shipment.priority == Priority.CRITICAL -> RiskLevel.MEDIUM
+            else -> RiskLevel.LOW
+        }
+    }
+    
+    private fun calculatePriorityDistribution(shipments: List<ShipmentEntity>): Map<Priority, Int> {
+        return shipments.groupBy { it.priority }.mapValues { it.value.size }
+    }
+    
+    private fun calculateSLAComplianceRate(shipments: List<ShipmentEntity>): Float {
+        if (shipments.isEmpty()) return 1f
+        
+        val compliantShipments = shipments.count { shipment ->
+            val slaThreshold = slaThresholds[shipment.priority] ?: return@count false
+            val slaStatus = calculateSLAStatus(shipment, slaThreshold)
+            !slaStatus.isViolation
+        }
+        
+        return compliantShipments.toFloat() / shipments.size
+    }
+    
+    private fun calculateAverageResponseTime(shipments: List<ShipmentEntity>): Double {
+        // Implementation would calculate average response time for priority shipments
+        return 15.0 // Placeholder: 15 minutes average
+    }
+    
+    private fun calculatePriorityEfficiency(shipments: List<ShipmentEntity>): Float {
+        // Implementation would calculate efficiency based on SLA compliance and handling time
+        return 0.85f // Placeholder
+    }
+    
+    private fun calculateOverdueShipments(shipments: List<ShipmentEntity>): Int {
+        return shipments.count { shipment ->
+            val slaThreshold = slaThresholds[shipment.priority] ?: return@count false
+            val slaStatus = calculateSLAStatus(shipment, slaThreshold)
+            slaStatus.isViolation
+        }
+    }
+    
+    private fun isHandledOnTime(shipment: ShipmentEntity): Boolean {
+        val slaThreshold = slaThresholds[shipment.priority] ?: return false
+        val slaStatus = calculateSLAStatus(shipment, slaThreshold)
+        return !slaStatus.isViolation
+    }
+    
+    private fun requiresAttention(shipment: ShipmentEntity): Boolean {
+        val slaThreshold = slaThresholds[shipment.priority] ?: return false
+        val slaStatus = calculateSLAStatus(shipment, slaThreshold)
+        return slaStatus.isViolation || shipment.priority == Priority.CRITICAL
+    }
+    
+    private fun calculateViolationSeverity(priority: Priority, slaStatus: SLAStatus): ViolationSeverity {
+        return when {
+            priority == Priority.CRITICAL && slaStatus.delayDuration > CRITICAL_RESPONSE_TIME -> ViolationSeverity.CRITICAL
+            priority == Priority.HIGH && slaStatus.delayDuration > HIGH_RESPONSE_TIME -> ViolationSeverity.HIGH
+            slaStatus.delayDuration > slaStatus.expectedTime * 2 -> ViolationSeverity.HIGH
+            else -> ViolationSeverity.MEDIUM
+        }
+    }
+    
+    private suspend fun applyExpeditedRouting(shipment: ShipmentEntity) {
+        // Implementation would apply expedited routing logic
+        // This could include:
+        // - Re-optimizing route for minimum time
+        // - Assigning fastest available vehicle
+        // - Prioritizing in all systems
+    }
+    
+    private suspend fun sendExpeditedNotifications(shipment: ShipmentEntity, expeditedBy: String, reason: String) {
+        // Implementation would send expedited shipment notifications
+    }
+    
+    /**
+     * Get monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+}
+
+/**
+ * Data classes
+ */
+data class PriorityShipment(
+    val shipment: ShipmentEntity,
+    val slaThreshold: SLAThreshold,
+    val slaStatus: SLAStatus,
+    val priorityScore: Int,
+    val riskLevel: RiskLevel
+)
+
+data class PriorityAnalytics(
+    val totalPriorityShipments: Int,
+    val priorityDistribution: Map<Priority, Int>,
+    val slaComplianceRate: Float,
+    val averageResponseTime: Double,
+    val priorityEfficiency: Float,
+    val criticalAlerts: Int,
+    val overdueShipments: Int,
+    val handledOnTime: Int,
+    val requiresAttention: List<ShipmentEntity>
+)
+
+data class SLAThreshold(
+    val pickupTime: Long,
+    val deliveryTime: Long,
+    val responseTime: Long,
+    val notificationLevel: NotificationLevel
+)
+
+data class SLAStatus(
+    val type: SLAType,
+    val expectedTime: Long,
+    val actualTime: Long,
+    val isViolation: Boolean,
+    val violationType: ViolationType?,
+    val delayDuration: Long
+)
+
+data class SLAViolation(
+    val shipmentId: Long,
+    val shipmentIdString: String,
+    val priority: Priority,
+    val violationType: ViolationType,
+    val expectedTime: Long,
+    val actualTime: Long,
+    val delayDuration: Long,
+    val severity: ViolationSeverity,
+    val createdAt: Date
+)
+
+/**
+ * Enums
+ */
+enum class PriorityState {
+    Idle,
+    Starting,
+    Monitoring,
+    UpdatingPriority,
+    PriorityUpdated,
+    Stopped,
+    Error
+}
+
+enum class Priority {
+    CRITICAL,
+    HIGH,
+    NORMAL,
+    LOW
+}
+
+enum class SLAType {
+    PICKUP,
+    DELIVERY,
+    RESPONSE
+}
+
+enum class ViolationType {
+    DELAYED_PICKUP,
+    DELAYED_DELIVERY,
+    DELAYED_RESPONSE
+}
+
+enum class ViolationSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class NotificationLevel {
+    IMMEDIATE,
+    HIGH,
+    NORMAL,
+    LOW
+}
+
+enum class RiskLevel {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+data class PriorityAlert(
+    val type: PriorityAlertType,
+    val shipmentId: Long,
+    val message: String,
+    val severity: ViolationSeverity,
+    val timestamp: Date
+)
+
+enum class PriorityAlertType {
+    SLA_VIOLATION,
+    CRITICAL_SHIPMENT_DELAYED,
+    PRIORITY_ESCALATION,
+    RESOURCE_SHORTAGE,
+    AUTOMATED_ESCALATION
+}

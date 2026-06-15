@@ -1,0 +1,358 @@
+package com.edham.logistics.fleet
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.view.animation.AccelerateDecelerateInterpolator
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentFleetDashboardBinding
+import com.edham.logistics.fleet.adapters.RecentActivityAdapter
+import com.edham.logistics.fleet.adapters.AlertAdapter
+import com.edham.logistics.fleet.viewmodels.FleetDashboardViewModel
+import com.edham.logistics.utils.AnimUtils
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Fleet Dashboard Fragment - Main dashboard for fleet management
+ * 
+ * Features:
+ * - Real-time fleet statistics
+ * - Quick actions for common tasks
+ * - Recent activities feed
+ * - Active alerts display
+ * - Performance metrics
+ * - Interactive charts and graphs
+ */
+class FleetDashboardFragment @Inject constructor(
+    private val recentActivityAdapter: RecentActivityAdapter,
+    private val alertAdapter: AlertAdapter
+) : Fragment() {
+    
+    private var _binding: FragmentFleetDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: FleetDashboardViewModel
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentFleetDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupRecyclerViews()
+        setupClickListeners()
+        observeViewModel()
+        
+        // Load initial data
+        viewModel.loadDashboardData()
+    }
+    
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[FleetDashboardViewModel::class.java]
+    }
+    
+    private fun setupRecyclerViews() {
+        // Setup recent activities RecyclerView
+        binding.rvRecentActivities.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = recentActivityAdapter
+            isNestedScrollingEnabled = false
+        }
+        
+        // Setup alerts RecyclerView
+        binding.rvAlerts.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = alertAdapter
+            isNestedScrollingEnabled = false
+        }
+    }
+    
+    private fun setupClickListeners() {
+        // Quick actions
+        binding.btnAddVehicle.setOnClickListener {
+            navigateToAddVehicle()
+        }
+        
+        binding.btnAssignDriver.setOnClickListener {
+            navigateToDriverAssignment()
+        }
+        
+        binding.btnScheduleMaintenance.setOnClickListener {
+            navigateToMaintenanceSchedule()
+        }
+        
+        // View all activities
+        binding.btnViewAllActivities.setOnClickListener {
+            navigateToActivityHistory()
+        }
+        
+        // Floating action button
+        binding.fabQuickAction.setOnClickListener {
+            showQuickActionMenu()
+        }
+        
+        // Refresh on swipe
+        binding.root.setOnRefreshListener {
+            viewModel.refreshDashboardData()
+        }
+    }
+    
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.dashboardState.collect { state ->
+                when (state) {
+                    is FleetDashboardState.Loading -> {
+                        showLoadingState()
+                    }
+                    is FleetDashboardState.Success -> {
+                        showSuccessState(state.data)
+                    }
+                    is FleetDashboardState.Error -> {
+                        showErrorState(state.message)
+                    }
+                }
+            }
+        }
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.fleetStats.collect { stats ->
+                updateFleetStats(stats)
+            }
+        }
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.recentActivities.collect { activities ->
+                recentActivityAdapter.submitList(activities)
+                animateRecyclerView(binding.rvRecentActivities)
+            }
+        }
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.alerts.collect { alerts ->
+                alertAdapter.submitList(alerts)
+                updateAlertBadge(alerts.size)
+                animateRecyclerView(binding.rvAlerts)
+            }
+        }
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.performanceMetrics.collect { metrics ->
+                updatePerformanceMetrics(metrics)
+            }
+        }
+    }
+    
+    private fun showLoadingState() {
+        // Show loading indicators
+        binding.progressBar.visibility = View.VISIBLE
+        binding.contentGroup.visibility = View.GONE
+    }
+    
+    private fun showSuccessState(data: FleetDashboardData) {
+        // Hide loading and show content
+        binding.progressBar.visibility = View.GONE
+        binding.contentGroup.visibility = View.VISIBLE
+        
+        // Update all UI components
+        updateFleetStats(data.fleetStats)
+        recentActivityAdapter.submitList(data.recentActivities)
+        alertAdapter.submitList(data.alerts)
+        updatePerformanceMetrics(data.performanceMetrics)
+        
+        // Animate content appearance
+        animateContentAppearance()
+    }
+    
+    private fun showErrorState(message: String) {
+        binding.progressBar.visibility = View.GONE
+        binding.contentGroup.visibility = View.VISIBLE
+        
+        // Show error message
+        showErrorMessage(message)
+    }
+    
+    private fun updateFleetStats(stats: FleetStats) {
+        // Animate number changes
+        animateNumberChange(binding.tvTotalVehicles, stats.totalVehicles.toString())
+        animateNumberChange(binding.tvActiveVehicles, stats.activeVehicles.toString())
+        animateNumberChange(binding.tvAvailableVehicles, stats.availableVehicles.toString())
+        animateNumberChange(binding.tvMaintenanceVehicles, stats.maintenanceVehicles.toString())
+        
+        // Update utilization
+        binding.progressUtilization.progress = stats.utilizationPercentage.toInt()
+        binding.tvUtilizationPercentage.text = "${stats.utilizationPercentage}%"
+        binding.tvUtilizationRate.text = "${stats.utilizationRate}%"
+        
+        // Animate progress bar
+        animateProgressBar(binding.progressUtilization)
+    }
+    
+    private fun updatePerformanceMetrics(metrics: PerformanceMetrics) {
+        binding.tvFuelEfficiency.text = "${metrics.fuelEfficiency} كم/لتر"
+        binding.tvCostPerMile.text = "${metrics.costPerMile} ريال"
+        
+        // Add color coding based on performance
+        when {
+            metrics.fuelEfficiency >= 12f -> {
+                binding.tvFuelEfficiency.setTextColor(requireContext().getColor(R.color.green))
+            }
+            metrics.fuelEfficiency >= 8f -> {
+                binding.tvFuelEfficiency.setTextColor(requireContext().getColor(R.color.yellow))
+            }
+            else -> {
+                binding.tvFuelEfficiency.setTextColor(requireContext().getColor(R.color.red))
+            }
+        }
+        
+        when {
+            metrics.costPerMile <= 1.5f -> {
+                binding.tvCostPerMile.setTextColor(requireContext().getColor(R.color.green))
+            }
+            metrics.costPerMile <= 2.0f -> {
+                binding.tvCostPerMile.setTextColor(requireContext().getColor(R.color.yellow))
+            }
+            else -> {
+                binding.tvCostPerMile.setTextColor(requireContext().getColor(R.color.red))
+            }
+        }
+    }
+    
+    private fun updateAlertBadge(count: Int) {
+        if (count > 0) {
+            binding.badgeAlertCount.isVisible = true
+            binding.badgeAlertCount.text = count.toString()
+        } else {
+            binding.badgeAlertCount.isVisible = false
+        }
+    }
+    
+    private fun animateNumberChange(textView: android.widget.TextView, newValue: String) {
+        AnimUtils.animateNumberChange(textView, newValue)
+    }
+    
+    private fun animateProgressBar(progressBar: android.widget.ProgressBar) {
+        AnimUtils.animateProgressBar(progressBar)
+    }
+    
+    private fun animateRecyclerView(recyclerView: android.view.ViewGroup) {
+        recyclerView.alpha = 0f
+        recyclerView.translationY = 50f
+        
+        recyclerView.animate()
+            .alpha(1f)
+            .translationY(0f)
+            .setDuration(500)
+            .setInterpolator(AccelerateDecelerateInterpolator())
+            .start()
+    }
+    
+    private fun animateContentAppearance() {
+        binding.contentGroup.alpha = 0f
+        binding.contentGroup.translationY = 100f
+        
+        binding.contentGroup.animate()
+            .alpha(1f)
+            .translationY(0f)
+            .setDuration(600)
+            .setInterpolator(AccelerateDecelerateInterpolator())
+            .start()
+    }
+    
+    private fun showErrorMessage(message: String) {
+        // Show error snackbar or dialog
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_LONG
+        ).show()
+    }
+    
+    private fun navigateToAddVehicle() {
+        // Navigate to add vehicle screen
+        // Implementation depends on navigation architecture
+    }
+    
+    private fun navigateToDriverAssignment() {
+        // Navigate to driver assignment screen
+    }
+    
+    private fun navigateToMaintenanceSchedule() {
+        // Navigate to maintenance schedule screen
+    }
+    
+    private fun navigateToActivityHistory() {
+        // Navigate to activity history screen
+    }
+    
+    private fun navigateToLiveMap() {
+        // Navigate to live fleet map
+    }
+    
+    private fun navigateToAnalytics() {
+        // Navigate to analytics screen
+    }
+    
+    private fun navigateToAlerts() {
+        // Navigate to alerts screen
+    }
+    
+    private fun navigateToVehicleDetails(vehicleId: Long) {
+        // Navigate to vehicle details screen
+    }
+    
+    private fun showQuickActionMenu() {
+        // Show bottom sheet or dialog with quick actions
+        val actions = listOf(
+            QuickAction("إضافة مركبة", R.drawable.ic_truck) { navigateToAddVehicle() },
+            QuickAction("تعيين سائق", R.drawable.ic_person) { navigateToDriverAssignment() },
+            QuickAction("جدولة الصيانة", R.drawable.ic_build) { navigateToMaintenanceSchedule() },
+            QuickAction("الخريطة المباشرة", R.drawable.ic_map) { navigateToLiveMap() },
+            QuickAction("التحليلات", R.drawable.ic_analytics) { navigateToAnalytics() },
+            QuickAction("التنبيهات", R.drawable.ic_notifications) { navigateToAlerts() }
+        )
+        
+        // Show bottom sheet with actions
+        showQuickActionBottomSheet(actions)
+    }
+    
+    private fun showQuickActionBottomSheet(actions: List<QuickAction>) {
+        // Implementation for bottom sheet
+    }
+    
+    private fun refreshData() {
+        viewModel.refreshDashboardData()
+    }
+    
+    override fun onResume() {
+        super.onResume()
+        // Refresh data when fragment becomes visible
+        refreshData()
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+    
+    /**
+     * Data classes
+     */
+    data class QuickAction(
+        val title: String,
+        val icon: Int,
+        val action: () -> Unit
+    )
+}

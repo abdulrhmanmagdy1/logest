@@ -1,0 +1,708 @@
+package com.edham.logistics.core.security
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import com.edham.logistics.core.utils.DeviceInfo
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.nio.charset.StandardCharsets
+import java.security.KeyStore
+import java.util.*
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Secure token manager with encrypted storage and advanced security features
+ */
+@Singleton
+class SecureTokenManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val deviceInfo: DeviceInfo
+) {
+    
+    companion object {
+        private const val KEYSTORE_ALIAS = "EdhamLogisticsKeyStore"
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        private const val SHARED_PREFS_NAME = "secure_token_storage"
+        private const val AES_GCM_NO_PADDING = "AES/GCM/NoPadding"
+        private const val GCM_IV_LENGTH = 12
+        private const val GCM_TAG_LENGTH = 128
+        private const val TOKEN_EXPIRY_BUFFER = 300000L // 5 minutes buffer
+        
+        // Token keys
+        private const val KEY_ACCESS_TOKEN = "access_token"
+        private const val KEY_REFRESH_TOKEN = "refresh_token"
+        private const val KEY_ACCESS_TOKEN_EXPIRY = "access_token_expiry"
+        private const val KEY_REFRESH_TOKEN_EXPIRY = "refresh_token_expiry"
+        private const val KEY_USER_ID = "user_id"
+        private const val KEY_USER_EMAIL = "user_email"
+        private const val KEY_USER_ROLE = "user_role"
+        private const val KEY_SESSION_ID = "session_id"
+        private const val KEY_DEVICE_ID = "device_id"
+        private const val KEY_LOGIN_TIME = "login_time"
+        private const val KEY_LAST_ACTIVITY = "last_activity"
+        private const val KEY_SECURITY_VERSION = "security_version"
+        
+        // Security version for migration
+        private const val CURRENT_SECURITY_VERSION = 2
+    }
+    
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+    private val masterKeyAlias = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+    
+    private lateinit var encryptedSharedPreferences: SharedPreferences
+    private lateinit var secretKey: SecretKey
+    
+    private val _authState = MutableStateFlow<AuthState>(AuthState.LoggedOut)
+    val authState: StateFlow<AuthState> = _authState.asStateFlow()
+    
+    private val _sessionInfo = MutableStateFlow<SessionInfo?>(null)
+    val sessionInfo: StateFlow<SessionInfo?> = _sessionInfo.asStateFlow()
+    
+    private val _securityAlerts = MutableStateFlow<List<SecurityAlert>>(emptyList())
+    val securityAlerts: StateFlow<List<SecurityAlert>> = _securityAlerts.asStateFlow()
+    
+    init {
+        initializeSecurity()
+    }
+    
+    /**
+     * Initialize security components
+     */
+    private fun initializeSecurity() {
+        try {
+            // Initialize KeyStore
+            keyStore.load(null)
+            
+            // Generate or get secret key
+            secretKey = getOrCreateSecretKey()
+            
+            // Initialize encrypted SharedPreferences
+            encryptedSharedPreferences = EncryptedSharedPreferences.create(
+                context,
+                SHARED_PREFS_NAME,
+                masterKeyAlias,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+            
+            // Check for security migration
+            checkSecurityMigration()
+            
+            // Initialize session monitoring
+            initializeSessionMonitoring()
+            
+            // Check token expiry
+            checkTokenExpiry()
+            
+        } catch (e: Exception) {
+            handleSecurityError("Security initialization failed", e)
+        }
+    }
+    
+    /**
+     * Get or create secret key
+     */
+    private fun getOrCreateSecretKey(): SecretKey {
+        return try {
+            if (!keyStore.containsAlias(KEYSTORE_ALIAS)) {
+                generateSecretKey()
+            } else {
+                keyStore.getKey(KEYSTORE_ALIAS, null) as SecretKey
+            }
+        } catch (e: Exception) {
+            // Fallback to generated key if KeyStore fails
+            generateSecretKey()
+        }
+    }
+    
+    /**
+     * Generate secret key
+     */
+    private fun generateSecretKey(): SecretKey {
+        return try {
+            val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+            val keyGenParameterSpec = KeyGenParameterSpec.Builder(
+                KEYSTORE_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setRandomizedEncryptionRequired(true)
+                .build()
+            
+            keyGenerator.init(keyGenParameterSpec)
+            keyGenerator.generateKey()
+        } catch (e: Exception) {
+            // Fallback to standard key generation
+            val keyGenerator = KeyGenerator.getInstance("AES")
+            keyGenerator.init(256)
+            keyGenerator.generateKey()
+        }
+    }
+    
+    /**
+     * Encrypt sensitive data
+     */
+    private fun encrypt(data: String): String {
+        return try {
+            val cipher = Cipher.getInstance(AES_GCM_NO_PADDING)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            
+            val iv = cipher.iv
+            val encryptedData = cipher.doFinal(data.toByteArray(StandardCharsets.UTF_8))
+            
+            // Combine IV and encrypted data
+            val combined = ByteArray(iv.size + encryptedData.size)
+            System.arraycopy(iv, 0, combined, 0, iv.size)
+            System.arraycopy(encryptedData, 0, combined, iv.size, encryptedData.size)
+            
+            Base64.getEncoder().encodeToString(combined)
+        } catch (e: Exception) {
+            handleSecurityError("Encryption failed", e)
+            // Fallback to Base64 encoding (less secure but functional)
+            Base64.getEncoder().encodeToString(data.toByteArray(StandardCharsets.UTF_8))
+        }
+    }
+    
+    /**
+     * Decrypt sensitive data
+     */
+    private fun decrypt(encryptedData: String): String {
+        return try {
+            val combined = Base64.getDecoder().decode(encryptedData)
+            
+            if (combined.size < GCM_IV_LENGTH) {
+                throw IllegalArgumentException("Invalid encrypted data")
+            }
+            
+            val iv = combined.sliceArray(0 until GCM_IV_LENGTH)
+            val cipherText = combined.sliceArray(GCM_IV_LENGTH until combined.size)
+            
+            val cipher = Cipher.getInstance(AES_GCM_NO_PADDING)
+            val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
+            
+            val decryptedData = cipher.doFinal(cipherText)
+            String(decryptedData, StandardCharsets.UTF_8)
+        } catch (e: Exception) {
+            handleSecurityError("Decryption failed", e)
+            // Fallback to Base64 decoding (less secure but functional)
+            try {
+                String(Base64.getDecoder().decode(encryptedData), StandardCharsets.UTF_8)
+            } catch (fallbackException: Exception) {
+                ""
+            }
+        }
+    }
+    
+    /**
+     * Store tokens securely
+     */
+    suspend fun storeTokens(
+        accessToken: String,
+        refreshToken: String,
+        accessTokenExpiry: Long,
+        refreshTokenExpiry: Long,
+        userId: String,
+        userEmail: String,
+        userRole: String
+    ) {
+        withContext(Dispatchers.IO) {
+            try {
+                val editor = encryptedSharedPreferences.edit()
+                
+                // Encrypt sensitive data
+                val encryptedAccessToken = encrypt(accessToken)
+                val encryptedRefreshToken = encrypt(refreshToken)
+                val encryptedUserId = encrypt(userId)
+                val encryptedUserEmail = encrypt(userEmail)
+                val encryptedUserRole = encrypt(userRole)
+                
+                // Generate session ID
+                val sessionId = UUID.randomUUID().toString()
+                val deviceId = deviceInfo.getDeviceId()
+                val loginTime = System.currentTimeMillis()
+                
+                // Store encrypted data
+                editor.putString(KEY_ACCESS_TOKEN, encryptedAccessToken)
+                editor.putString(KEY_REFRESH_TOKEN, encryptedRefreshToken)
+                editor.putLong(KEY_ACCESS_TOKEN_EXPIRY, accessTokenExpiry)
+                editor.putLong(KEY_REFRESH_TOKEN_EXPIRY, refreshTokenExpiry)
+                editor.putString(KEY_USER_ID, encryptedUserId)
+                editor.putString(KEY_USER_EMAIL, encryptedUserEmail)
+                editor.putString(KEY_USER_ROLE, encryptedUserRole)
+                editor.putString(KEY_SESSION_ID, sessionId)
+                editor.putString(KEY_DEVICE_ID, deviceId)
+                editor.putLong(KEY_LOGIN_TIME, loginTime)
+                editor.putLong(KEY_LAST_ACTIVITY, loginTime)
+                editor.putInt(KEY_SECURITY_VERSION, CURRENT_SECURITY_VERSION)
+                
+                editor.apply()
+                
+                // Update auth state
+                val sessionInfo = SessionInfo(
+                    sessionId = sessionId,
+                    userId = userId,
+                    userEmail = userEmail,
+                    userRole = userRole,
+                    deviceId = deviceId,
+                    loginTime = loginTime,
+                    lastActivity = loginTime,
+                    accessTokenExpiry = accessTokenExpiry,
+                    refreshTokenExpiry = refreshTokenExpiry
+                )
+                
+                _sessionInfo.value = sessionInfo
+                _authState.value = AuthState.LoggedIn
+                
+                // Log security event
+                logSecurityEvent("TOKENS_STORED", mapOf(
+                    "userId" to userId,
+                    "userRole" to userRole,
+                    "sessionId" to sessionId
+                ))
+                
+            } catch (e: Exception) {
+                handleSecurityError("Failed to store tokens", e)
+                throw SecurityException("Failed to store tokens securely", e)
+            }
+        }
+    }
+    
+    /**
+     * Get access token
+     */
+    suspend fun getAccessToken(): String? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val encryptedToken = encryptedSharedPreferences.getString(KEY_ACCESS_TOKEN, null)
+                if (encryptedToken != null) {
+                    decrypt(encryptedToken)
+                } else null
+            } catch (e: Exception) {
+                handleSecurityError("Failed to get access token", e)
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get refresh token
+     */
+    suspend fun getRefreshToken(): String? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val encryptedToken = encryptedSharedPreferences.getString(KEY_REFRESH_TOKEN, null)
+                if (encryptedToken != null) {
+                    decrypt(encryptedToken)
+                } else null
+            } catch (e: Exception) {
+                handleSecurityError("Failed to get refresh token", e)
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get user ID
+     */
+    suspend fun getUserId(): String? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val encryptedUserId = encryptedSharedPreferences.getString(KEY_USER_ID, null)
+                if (encryptedUserId != null) {
+                    decrypt(encryptedUserId)
+                } else null
+            } catch (e: Exception) {
+                handleSecurityError("Failed to get user ID", e)
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get user email
+     */
+    suspend fun getUserEmail(): String? {
+        return withContext(DispatchERS.IO) {
+            try {
+                val encryptedEmail = encryptedSharedPreferences.getString(KEY_USER_EMAIL, null)
+                if (encryptedEmail != null) {
+                    decrypt(encryptedEmail)
+                } else null
+            } catch (e: Exception) {
+                handleSecurityError("Failed to get user email", e)
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get user role
+     */
+    suspend fun getUserRole(): String? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val encryptedRole = encryptedSharedPreferences.getString(KEY_USER_ROLE, null)
+                if (encryptedRole != null) {
+                    decrypt(encryptedRole)
+                } else null
+            } catch (e: Exception) {
+                handleSecurityError("Failed to get user role", e)
+                null
+            }
+        }
+    }
+    
+    /**
+     * Check if access token is valid
+     */
+    suspend fun isAccessTokenValid(): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val expiryTime = encryptedSharedPreferences.getLong(KEY_ACCESS_TOKEN_EXPIRY, 0)
+                val currentTime = System.currentTimeMillis()
+                
+                // Add buffer to prevent edge cases
+                expiryTime > (currentTime + TOKEN_EXPIRY_BUFFER)
+            } catch (e: Exception) {
+                handleSecurityError("Failed to check access token validity", e)
+                false
+            }
+        }
+    }
+    
+    /**
+     * Check if refresh token is valid
+     */
+    suspend fun isRefreshTokenValid(): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val expiryTime = encryptedSharedPreferences.getLong(KEY_REFRESH_TOKEN_EXPIRY, 0)
+                val currentTime = System.currentTimeMillis()
+                
+                expiryTime > (currentTime + TOKEN_EXPIRY_BUFFER)
+            } catch (e: Exception) {
+                handleSecurityError("Failed to check refresh token validity", e)
+                false
+            }
+        }
+    }
+    
+    /**
+     * Update last activity time
+     */
+    suspend fun updateLastActivity() {
+        withContext(Dispatchers.IO) {
+            try {
+                encryptedSharedPreferences.edit()
+                    .putLong(KEY_LAST_ACTIVITY, System.currentTimeMillis())
+                    .apply()
+                
+                // Update session info
+                _sessionInfo.value?.let { session ->
+                    _sessionInfo.value = session.copy(lastActivity = System.currentTimeMillis())
+                }
+            } catch (e: Exception) {
+                handleSecurityError("Failed to update last activity", e)
+            }
+        }
+    }
+    
+    /**
+     * Clear all tokens (logout)
+     */
+    suspend fun clearTokens() {
+        withContext(Dispatchers.IO) {
+            try {
+                encryptedSharedPreferences.edit().clear().apply()
+                
+                // Update auth state
+                _sessionInfo.value = null
+                _authState.value = AuthState.LoggedOut
+                
+                // Log security event
+                logSecurityEvent("TOKENS_CLEARED", emptyMap())
+                
+            } catch (e: Exception) {
+                handleSecurityError("Failed to clear tokens", e)
+                throw SecurityException("Failed to clear tokens", e)
+            }
+        }
+    }
+    
+    /**
+     * Check for security migration
+     */
+    private fun checkSecurityMigration() {
+        try {
+            val currentVersion = encryptedSharedPreferences.getInt(KEY_SECURITY_VERSION, 1)
+            if (currentVersion < CURRENT_SECURITY_VERSION) {
+                // Perform migration
+                performSecurityMigration(currentVersion)
+            }
+        } catch (e: Exception) {
+            handleSecurityError("Security migration check failed", e)
+        }
+    }
+    
+    /**
+     * Perform security migration
+     */
+    private fun performSecurityMigration(fromVersion: Int) {
+        try {
+            when (fromVersion) {
+                1 -> {
+                    // Migrate from version 1 to 2
+                    // Re-encrypt all sensitive data with new encryption method
+                    migrateToVersion2()
+                }
+            }
+            
+            // Update security version
+            encryptedSharedPreferences.edit()
+                .putInt(KEY_SECURITY_VERSION, CURRENT_SECURITY_VERSION)
+                .apply()
+            
+            logSecurityEvent("SECURITY_MIGRATION", mapOf("fromVersion" to fromVersion, "toVersion" to CURRENT_SECURITY_VERSION))
+            
+        } catch (e: Exception) {
+            handleSecurityError("Security migration failed", e)
+        }
+    }
+    
+    /**
+     * Migrate to version 2
+     */
+    private fun migrateToVersion2() {
+        // Implementation for migrating to version 2
+        // This would involve re-encrypting existing data with new methods
+    }
+    
+    /**
+     * Initialize session monitoring
+     */
+    private fun initializeSessionMonitoring() {
+        scope.launch {
+            while (true) {
+                try {
+                    checkSessionTimeout()
+                    checkTokenExpiry()
+                    delay(60000L) // Check every minute
+                } catch (e: Exception) {
+                    delay(60000L)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Check session timeout
+     */
+    private suspend fun checkSessionTimeout() {
+        try {
+            val lastActivity = encryptedSharedPreferences.getLong(KEY_LAST_ACTIVITY, 0)
+            val currentTime = System.currentTimeMillis()
+            val sessionTimeout = 30 * 60 * 1000L // 30 minutes
+            
+            if (currentTime - lastActivity > sessionTimeout) {
+                // Session expired
+                addSecurityAlert(SecurityAlert(
+                    type = SecurityAlertType.SESSION_TIMEOUT,
+                    message = "Session expired due to inactivity",
+                    severity = SecurityAlertSeverity.WARNING,
+                    timestamp = System.currentTimeMillis()
+                ))
+                
+                _authState.value = AuthState.SessionExpired
+            }
+        } catch (e: Exception) {
+            handleSecurityError("Session timeout check failed", e)
+        }
+    }
+    
+    /**
+     * Check token expiry
+     */
+    private suspend fun checkTokenExpiry() {
+        try {
+            if (!isAccessTokenValid()) {
+                when {
+                    isRefreshTokenValid() -> {
+                        // Access token expired but refresh token is valid
+                        addSecurityAlert(SecurityAlert(
+                            type = SecurityAlertType.TOKEN_EXPIRY,
+                            message = "Access token expired, refresh needed",
+                            severity = SecurityAlertSeverity.INFO,
+                            timestamp = System.currentTimeMillis()
+                        ))
+                        
+                        _authState.value = AuthState.TokenExpired
+                    }
+                    else -> {
+                        // Both tokens expired
+                        addSecurityAlert(SecurityAlert(
+                            type = SecurityAlertType.TOKEN_EXPIRY,
+                            message = "All tokens expired, re-authentication required",
+                            severity = SecurityAlertSeverity.ERROR,
+                            timestamp = System.currentTimeMillis()
+                        ))
+                        
+                        _authState.value = AuthState.LoggedOut
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            handleSecurityError("Token expiry check failed", e)
+        }
+    }
+    
+    /**
+     * Add security alert
+     */
+    private fun addSecurityAlert(alert: SecurityAlert) {
+        val currentAlerts = _securityAlerts.value.toMutableList()
+        currentAlerts.add(alert)
+        
+        // Keep only recent alerts
+        if (currentAlerts.size > 100) {
+            currentAlerts.removeAt(0)
+        }
+        
+        _securityAlerts.value = currentAlerts
+    }
+    
+    /**
+     * Handle security error
+     */
+    private fun handleSecurityError(message: String, error: Exception) {
+        addSecurityAlert(SecurityAlert(
+            type = SecurityAlertType.SECURITY_ERROR,
+            message = message,
+            severity = SecurityAlertSeverity.ERROR,
+            timestamp = System.currentTimeMillis(),
+            details = error.message
+        ))
+    }
+    
+    /**
+     * Log security event
+     */
+    private fun logSecurityEvent(eventType: String, details: Map<String, Any>) {
+        // Log to secure logging system
+        // This would integrate with your logging infrastructure
+    }
+    
+    /**
+     * Get security status
+     */
+    fun getSecurityStatus(): SecurityStatus {
+        return SecurityStatus(
+            authState = _authState.value,
+            sessionInfo = _sessionInfo.value,
+            securityAlerts = _securityAlerts.value,
+            isSecure = isSystemSecure()
+        )
+    }
+    
+    /**
+     * Check if system is secure
+     */
+    private fun isSystemSecure(): Boolean {
+        return try {
+            // Check if KeyStore is available and working
+            keyStore.containsAlias(KEYSTORE_ALIAS) && 
+            secretKey != null &&
+            _authState.value != AuthState.LoggedOut
+        } catch (e: Exception) {
+            false
+        }
+    }
+}
+
+/**
+ * Auth state enum
+ */
+enum class AuthState {
+    LoggedOut,
+    LoggedIn,
+    TokenExpired,
+    SessionExpired
+}
+
+/**
+ * Session info data class
+ */
+data class SessionInfo(
+    val sessionId: String,
+    val userId: String,
+    val userEmail: String,
+    val userRole: String,
+    val deviceId: String,
+    val loginTime: Long,
+    val lastActivity: Long,
+    val accessTokenExpiry: Long,
+    val refreshTokenExpiry: Long
+)
+
+/**
+ * Security alert data class
+ */
+data class SecurityAlert(
+    val type: SecurityAlertType,
+    val message: String,
+    val severity: SecurityAlertSeverity,
+    val timestamp: Long,
+    val details: String? = null
+)
+
+/**
+ * Security alert types
+ */
+enum class SecurityAlertType {
+    TOKEN_EXPIRY,
+    SESSION_TIMEOUT,
+    SECURITY_ERROR,
+    UNAUTHORIZED_ACCESS,
+    SUSPICIOUS_ACTIVITY,
+    DEVICE_CHANGE
+}
+
+/**
+ * Security alert severity
+ */
+enum class SecurityAlertSeverity {
+    INFO,
+    WARNING,
+    ERROR,
+    CRITICAL
+}
+
+/**
+ * Security status data class
+ */
+data class SecurityStatus(
+    val authState: AuthState,
+    val sessionInfo: SessionInfo?,
+    val securityAlerts: List<SecurityAlert>,
+    val isSecure: Boolean
+)

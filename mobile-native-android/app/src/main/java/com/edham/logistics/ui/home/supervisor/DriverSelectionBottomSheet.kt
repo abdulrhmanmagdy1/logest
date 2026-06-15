@@ -36,18 +36,49 @@ class DriverSelectionBottomSheet(
         observeViewModel()
         
         viewModel.loadDashboardData() // To fetch drivers list
+        viewModel.loadFleetData()     // To fetch vehicles for grounding check
     }
 
     private fun setupRecyclerView(view: View) {
         val rv = view.findViewById<RecyclerView>(R.id.rvDrivers)
         rv.layoutManager = LinearLayoutManager(requireContext())
-        adapter = DriverStatusAdapter(emptyList()) // We'll update the adapter to handle clicks
+        adapter = DriverStatusAdapter(emptyList()) { driver ->
+            onDriverSelected(driver)
+            dismiss()
+        }
         rv.adapter = adapter
     }
 
     private fun observeViewModel() {
         viewModel.drivers.observe(viewLifecycleOwner) { drivers ->
-            adapter.updateData(drivers)
+            val vehicles = viewModel.vehicles.value ?: emptyList()
+            
+            // Grounding Enforcement: Filter out drivers whose vehicles are in maintenance or grounded
+            val availableDrivers = drivers.filter { driver ->
+                val vehicle = vehicles.find { it.plateNumber == driver.plateNumber }
+                vehicle == null || (
+                    vehicle.status.uppercase() != "MAINTENANCE" && 
+                    vehicle.status.uppercase() != "GROUNDED" &&
+                    vehicle.status.uppercase() != "INACTIVE"
+                )
+            }
+            
+            adapter.updateData(availableDrivers)
+        }
+
+        viewModel.vehicles.observe(viewLifecycleOwner) { vehicles ->
+            // Re-trigger driver list update when vehicles are loaded
+            viewModel.drivers.value?.let { drivers ->
+                val availableDrivers = drivers.filter { driver ->
+                    val vehicle = vehicles.find { it.plateNumber == driver.plateNumber }
+                    vehicle == null || (
+                        vehicle.status.uppercase() != "MAINTENANCE" && 
+                        vehicle.status.uppercase() != "GROUNDED" &&
+                        vehicle.status.uppercase() != "INACTIVE"
+                    )
+                }
+                adapter.updateData(availableDrivers)
+            }
         }
     }
 }

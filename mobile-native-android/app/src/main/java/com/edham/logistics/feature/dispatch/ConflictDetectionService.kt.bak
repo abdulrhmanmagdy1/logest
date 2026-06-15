@@ -1,0 +1,899 @@
+package com.edham.logistics.feature.dispatch
+
+import android.util.Log
+import com.edham.logistics.data.model.Driver
+import com.edham.logistics.data.model.Shipment
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.temporal.ChronoUnit
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Conflict Detection Service - Advanced conflict identification and resolution
+ * Detects and resolves scheduling conflicts, resource conflicts, and assignment conflicts
+ */
+class ConflictDetectionService {
+    
+    companion object {
+        private const val TAG = "ConflictDetectionService"
+        
+        // Conflict types
+        enum class ConflictType {
+            TIME_CONFLICT,           // Time-based scheduling conflicts
+            RESOURCE_CONFLICT,        // Resource allocation conflicts
+            CAPACITY_CONFLICT,        // Capacity constraint conflicts
+            LOCATION_CONFLICT,        // Geographic location conflicts
+            SKILL_CONFLICT,          // Driver skill/experience conflicts
+            VEHICLE_CONFLICT,        // Vehicle capability conflicts
+            PRIORITY_CONFLICT,       // Priority-based conflicts
+            REGULATION_CONFLICT,     // Regulatory compliance conflicts
+            WORKLOAD_CONFLICT         // Workload balance conflicts
+        }
+        
+        // Conflict severity levels
+        enum class ConflictSeverity {
+            LOW,      // Minor conflict, easy to resolve
+            MEDIUM,   // Moderate conflict, requires attention
+            HIGH,     // Major conflict, requires immediate action
+            CRITICAL   // Severe conflict, blocks operations
+        }
+        
+        // Resolution strategies
+        enum class ResolutionStrategy {
+            AUTO_RESOLVE,           // Automatic resolution
+            MANUAL_REVIEW,          // Manual review required
+            ESCALATE,              // Escalate to supervisor
+            ALTERNATE_ASSIGNMENT,   // Alternative assignment
+            SCHEDULE_ADJUST,        // Schedule adjustment
+            RESOURCE_REALLOCATION,   // Resource reallocation
+            PRIORITY_OVERRIDE,       // Priority override
+            COMPENSATION,           // Compensation for affected parties
+            DEFER                  // Defer to later time
+        }
+    }
+    
+    /**
+     * Detect conflicts in driver assignments
+     */
+    suspend fun detectAssignmentConflicts(
+        assignments: List<Assignment>,
+        drivers: List<Driver>,
+        shipments: List<Shipment>,
+        currentTime: LocalDateTime = LocalDateTime.now()
+    ): ConflictDetectionResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Detecting conflicts in ${assignments.size} assignments")
+                
+                val conflicts = mutableListOf<Conflict>()
+                val conflictMetrics = mutableMapOf<ConflictType, Int>()
+                
+                // Check each assignment for conflicts
+                assignments.forEach { assignment ->
+                    val assignmentConflicts = detectAssignmentConflicts(
+                        assignment, assignments, drivers, shipments, currentTime
+                    )
+                    conflicts.addAll(assignmentConflicts)
+                    
+                    // Update conflict metrics
+                    assignmentConflicts.forEach { conflict ->
+                        conflictMetrics[conflict.type] = (conflictMetrics[conflict.type] ?: 0) + 1
+                    }
+                }
+                
+                // Check cross-assignment conflicts
+                val crossConflicts = detectCrossAssignmentConflicts(assignments, drivers, shipments)
+                conflicts.addAll(crossConflicts)
+                
+                // Calculate conflict statistics
+                val statistics = calculateConflictStatistics(conflicts, conflictMetrics)
+                
+                // Generate resolution recommendations
+                val recommendations = generateResolutionRecommendations(conflicts, statistics)
+                
+                val result = ConflictDetectionResult(
+                    totalAssignments = assignments.size,
+                    totalConflicts = conflicts.size,
+                    conflicts = conflicts,
+                    conflictStatistics = statistics,
+                    recommendations = recommendations,
+                    detectedAt = currentTime,
+                    requiresImmediateAction = conflicts.any { it.severity == ConflictSeverity.CRITICAL }
+                )
+                
+                Log.d(TAG, "Conflict detection completed: ${conflicts.size} conflicts found")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error detecting assignment conflicts", e)
+                ConflictDetectionResult.createEmpty(currentTime)
+            }
+        }
+    }
+    
+    /**
+     * Detect conflicts for a specific assignment
+     */
+    private fun detectAssignmentConflicts(
+        assignment: Assignment,
+        allAssignments: List<Assignment>,
+        drivers: List<Driver>,
+        shipments: List<Shipment>,
+        currentTime: LocalDateTime
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        // Get assignment details
+        val driver = drivers.find { it.id == assignment.driverId }
+        val shipment = shipments.find { it.id == assignment.shipmentId }
+        
+        if (driver == null || shipment == null) {
+            return conflicts
+        }
+        
+        // Check time conflicts
+        val timeConflicts = detectTimeConflicts(assignment, allAssignments, driver, shipment)
+        conflicts.addAll(timeConflicts)
+        
+        // Check resource conflicts
+        val resourceConflicts = detectResourceConflicts(assignment, allAssignments, driver, shipment)
+        conflicts.addAll(resourceConflicts)
+        
+        // Check capacity conflicts
+        val capacityConflicts = detectCapacityConflicts(assignment, allAssignments, driver, shipment)
+        conflicts.addAll(capacityConflicts)
+        
+        // Check location conflicts
+        val locationConflicts = detectLocationConflicts(assignment, allAssignments, driver, shipment)
+        conflicts.addAll(locationConflicts)
+        
+        // Check skill conflicts
+        val skillConflicts = detectSkillConflicts(assignment, driver, shipment)
+        conflicts.addAll(skillConflicts)
+        
+        // Check vehicle conflicts
+        val vehicleConflicts = detectVehicleConflicts(assignment, driver, shipment)
+        conflicts.addAll(vehicleConflicts)
+        
+        // Check priority conflicts
+        val priorityConflicts = detectPriorityConflicts(assignment, allAssignments, driver, shipment)
+        conflicts.addAll(priorityConflicts)
+        
+        // Check regulation conflicts
+        val regulationConflicts = detectRegulationConflicts(assignment, driver, shipment)
+        conflicts.addAll(regulationConflicts)
+        
+        // Check workload conflicts
+        val workloadConflicts = detectWorkloadConflicts(assignment, allAssignments, driver, shipment)
+        conflicts.addAll(workloadConflicts)
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect time-based conflicts
+     */
+    private fun detectTimeConflicts(
+        assignment: Assignment,
+        allAssignments: List<Assignment>,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        val otherAssignments = allAssignments.filter { 
+            it.driverId == assignment.driverId && it.id != assignment.id 
+        }
+        
+        otherAssignments.forEach { otherAssignment ->
+            val timeOverlap = calculateTimeOverlap(assignment, otherAssignment)
+            
+            if (timeOverlap > 0) {
+                val severity = when {
+                    timeOverlap > 120 -> ConflictSeverity.CRITICAL  // > 2 hours
+                    timeOverlap > 60 -> ConflictSeverity.HIGH      // > 1 hour
+                    timeOverlap > 30 -> ConflictSeverity.MEDIUM    // > 30 minutes
+                    else -> ConflictSeverity.LOW
+                }
+                
+                conflicts.add(
+                    Conflict(
+                        id = generateConflictId(),
+                        type = ConflictType.TIME_CONFLICT,
+                        severity = severity,
+                        assignmentId1 = assignment.id,
+                        assignmentId2 = otherAssignment.id,
+                        driverId = assignment.driverId,
+                        shipmentId1 = assignment.shipmentId,
+                        shipmentId2 = otherAssignment.shipmentId,
+                        description = "Time overlap of ${timeOverlap} minutes between assignments",
+                        detectedAt = LocalDateTime.now(),
+                        resolutionStrategy = ResolutionStrategy.SCHEDULE_ADJUST
+                    )
+                )
+            }
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect resource allocation conflicts
+     */
+    private fun detectResourceConflicts(
+        assignment: Assignment,
+        allAssignments: List<Assignment>,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        // Check if driver is already assigned to conflicting assignment
+        val conflictingAssignments = allAssignments.filter { 
+            it.driverId == assignment.driverId && 
+            it.id != assignment.id &&
+            (it.status == Assignment.Status.IN_PROGRESS || it.status == Assignment.Status.ASSIGNED)
+        }
+        
+        if (conflictingAssignments.isNotEmpty()) {
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.RESOURCE_CONFLICT,
+                    severity = ConflictSeverity.HIGH,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Driver already assigned to ${conflictingAssignments.size} active assignments",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.MANUAL_REVIEW
+                )
+            )
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect capacity constraint conflicts
+     */
+    private fun detectCapacityConflicts(
+        assignment: Assignment,
+        allAssignments: List<Assignment>,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        // Check driver capacity
+        val currentAssignments = allAssignments.count { 
+            it.driverId == assignment.driverId && 
+            it.status != Assignment.Status.COMPLETED 
+        }
+        
+        if (currentAssignments >= driver.maxConcurrentShipments) {
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.CAPACITY_CONFLICT,
+                    severity = ConflictSeverity.HIGH,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Driver capacity exceeded (${currentAssignments}/${driver.maxConcurrentShipments})",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.ALTERNATE_ASSIGNMENT
+                )
+            )
+        }
+        
+        // Check vehicle capacity
+        val vehicle = driver.vehicle
+        if (vehicle != null) {
+            if (shipment.weight > vehicle.maxWeight) {
+                conflicts.add(
+                    Conflict(
+                        id = generateConflictId(),
+                        type = ConflictType.VEHICLE_CONFLICT,
+                        severity = ConflictSeverity.CRITICAL,
+                        assignmentId1 = assignment.id,
+                        driverId = assignment.driverId,
+                        shipmentId1 = assignment.shipmentId,
+                        description = "Shipment weight (${shipment.weight}kg) exceeds vehicle capacity (${vehicle.maxWeight}kg)",
+                        detectedAt = LocalDateTime.now(),
+                        resolutionStrategy = ResolutionStrategy.ALTERNATE_ASSIGNMENT
+                    )
+                )
+            }
+            
+            if (shipment.volume > vehicle.maxVolume) {
+                conflicts.add(
+                    Conflict(
+                        id = generateConflictId(),
+                        type = ConflictType.VEHICLE_CONFLICT,
+                        severity = ConflictSeverity.CRITICAL,
+                        assignmentId1 = assignment.id,
+                        driverId = assignment.driverId,
+                        shipmentId1 = assignment.shipmentId,
+                        description = "Shipment volume (${shipment.volume}m³) exceeds vehicle capacity (${vehicle.maxVolume}m³)",
+                        detectedAt = LocalDateTime.now(),
+                        resolutionStrategy = ResolutionStrategy.ALTERNATE_ASSIGNMENT
+                    )
+                )
+            }
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect geographic location conflicts
+     */
+    private fun detectLocationConflicts(
+        assignment: Assignment,
+        allAssignments: List<Assignment>,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        val otherAssignments = allAssignments.filter { 
+            it.driverId == assignment.driverId && it.id != assignment.id 
+        }
+        
+        otherAssignments.forEach { otherAssignment ->
+            val distance = calculateDistanceBetweenAssignments(assignment, otherAssignment)
+            
+            // If assignments are too far apart geographically
+            if (distance > 200.0) { // More than 200km apart
+                conflicts.add(
+                    Conflict(
+                        id = generateConflictId(),
+                        type = ConflictType.LOCATION_CONFLICT,
+                        severity = ConflictSeverity.MEDIUM,
+                        assignmentId1 = assignment.id,
+                        assignmentId2 = otherAssignment.id,
+                        driverId = assignment.driverId,
+                        shipmentId1 = assignment.shipmentId,
+                        shipmentId2 = otherAssignment.shipmentId,
+                        description = "Geographic distance of ${distance.toInt()}km between assignments",
+                        detectedAt = LocalDateTime.now(),
+                        resolutionStrategy = ResolutionStrategy.RESOURCE_REALLOCATION
+                    )
+                )
+            }
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect driver skill/experience conflicts
+     */
+    private fun detectSkillConflicts(
+        assignment: Assignment,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        // Check if driver has required skills
+        val requiredSkills = shipment.requiredSkills ?: emptyList()
+        val driverSkills = driver.skills ?: emptyList()
+        
+        val missingSkills = requiredSkills.filter { skill ->
+            !driverSkills.any { it.equals(skill, ignoreCase = true) }
+        }
+        
+        if (missingSkills.isNotEmpty()) {
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.SKILL_CONFLICT,
+                    severity = ConflictSeverity.HIGH,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Driver missing required skills: ${missingSkills.joinToString(", ")}",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.ALTERNATE_ASSIGNMENT
+                )
+            )
+        }
+        
+        // Check driver experience level
+        val requiredExperience = shipment.minExperienceLevel ?: 0
+        if (driver.experienceYears < requiredExperience) {
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.SKILL_CONFLICT,
+                    severity = ConflictSeverity.MEDIUM,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Driver experience (${driver.experienceYears} years) below required level (${requiredExperience} years)",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.MANUAL_REVIEW
+                )
+            )
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect vehicle capability conflicts
+     */
+    private fun detectVehicleConflicts(
+        assignment: Assignment,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        val vehicle = driver.vehicle ?: return conflicts
+        
+        // Check refrigeration requirement
+        if (shipment.requiresRefrigeration && !vehicle.hasRefrigeration) {
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.VEHICLE_CONFLICT,
+                    severity = ConflictSeverity.CRITICAL,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Shipment requires refrigeration but vehicle not equipped",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.ALTERNATE_ASSIGNMENT
+                )
+            )
+        }
+        
+        // Check hazardous material certification
+        if (shipment.isHazardous && !vehicle.isHazardousCertified) {
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.VEHICLE_CONFLICT,
+                    severity = ConflictSeverity.CRITICAL,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Shipment is hazardous but vehicle not certified",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.ALTERNATE_ASSIGNMENT
+                )
+            )
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect priority-based conflicts
+     */
+    private fun detectPriorityConflicts(
+        assignment: Assignment,
+        allAssignments: List<Assignment>,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        val otherAssignments = allAssignments.filter { 
+            it.driverId == assignment.driverId && it.id != assignment.id 
+        }
+        
+        otherAssignments.forEach { otherAssignment ->
+            val otherShipment = allAssignments
+                .map { it.shipment }
+                .find { it?.id == otherAssignment.shipmentId }
+            
+            if (otherShipment != null) {
+                val priorityComparison = comparePriorities(shipment, otherShipment)
+                
+                // If lower priority assignment conflicts with higher priority
+                if (priorityComparison < 0 && assignment.scheduledTime.isAfter(otherAssignment.scheduledTime)) {
+                    conflicts.add(
+                        Conflict(
+                            id = generateConflictId(),
+                            type = ConflictType.PRIORITY_CONFLICT,
+                            severity = ConflictSeverity.MEDIUM,
+                            assignmentId1 = assignment.id,
+                            assignmentId2 = otherAssignment.id,
+                            driverId = assignment.driverId,
+                            shipmentId1 = assignment.shipmentId,
+                            shipmentId2 = otherAssignment.shipmentId,
+                            description = "Lower priority assignment scheduled after higher priority assignment",
+                            detectedAt = LocalDateTime.now(),
+                            resolutionStrategy = ResolutionStrategy.PRIORITY_OVERRIDE
+                        )
+                    )
+                }
+            }
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect regulatory compliance conflicts
+     */
+    private fun detectRegulationConflicts(
+        assignment: Assignment,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        // Check working hours compliance
+        val hoursWorkedToday = driver.hoursWorkedToday ?: 0.0
+        if (hoursWorkedToday > 12.0) { // Exceeds daily limit
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.REGULATION_CONFLICT,
+                    severity = ConflictSeverity.HIGH,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Driver exceeds daily working hours limit (${hoursWorkedToday}h)",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.ESCALATE
+                )
+            )
+        }
+        
+        // Check rest period compliance
+        val hoursSinceLastRest = driver.hoursSinceLastRest ?: 0.0
+        if (hoursSinceLastRest < 8.0) { // Insufficient rest
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.REGULATION_CONFLICT,
+                    severity = ConflictSeverity.MEDIUM,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Insufficient rest period since last break (${hoursSinceLastRest}h)",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.DEFER
+                )
+            )
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect workload balance conflicts
+     */
+    private fun detectWorkloadConflicts(
+        assignment: Assignment,
+        allAssignments: List<Assignment>,
+        driver: Driver,
+        shipment: Shipment
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        // Check if this assignment creates workload imbalance
+        val driverWorkloads = mutableMapOf<String, Int>()
+        allAssignments.forEach { assignment ->
+            driverWorkloads[assignment.driverId] = (driverWorkloads[assignment.driverId] ?: 0) + 1
+        }
+        
+        val averageWorkload = driverWorkloads.values.average()
+        val thisDriverWorkload = driverWorkloads[assignment.driverId] ?: 0
+        
+        if (thisDriverWorkload > averageWorkload * 1.5) { // 50% above average
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.WORKLOAD_CONFLICT,
+                    severity = ConflictSeverity.LOW,
+                    assignmentId1 = assignment.id,
+                    driverId = assignment.driverId,
+                    shipmentId1 = assignment.shipmentId,
+                    description = "Assignment creates workload imbalance (${thisDriverWorkload} vs avg ${averageWorkload.toInt()})",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.RESOURCE_REALLOCATION
+                )
+            )
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Detect cross-assignment conflicts
+     */
+    private fun detectCrossAssignmentConflicts(
+        assignments: List<Assignment>,
+        drivers: List<Driver>,
+        shipments: List<Shipment>
+    ): List<Conflict> {
+        val conflicts = mutableListOf<Conflict>()
+        
+        // Check for duplicate assignments
+        val duplicateAssignments = assignments.groupBy { it.shipmentId }
+            .filter { it.value.size > 1 }
+            .flatMap { it.value.drop(1) }
+        
+        duplicateAssignments.forEach { duplicate ->
+            conflicts.add(
+                Conflict(
+                    id = generateConflictId(),
+                    type = ConflictType.RESOURCE_CONFLICT,
+                    severity = ConflictSeverity.CRITICAL,
+                    assignmentId1 = duplicate.id,
+                    shipmentId1 = duplicate.shipmentId,
+                    description = "Duplicate assignment for shipment ${duplicate.shipmentId}",
+                    detectedAt = LocalDateTime.now(),
+                    resolutionStrategy = ResolutionStrategy.MANUAL_REVIEW
+                )
+            )
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Calculate time overlap between assignments
+     */
+    private fun calculateTimeOverlap(assignment1: Assignment, assignment2: Assignment): Long {
+        val start1 = assignment1.scheduledTime
+        val end1 = assignment1.estimatedCompletionTime
+        val start2 = assignment2.scheduledTime
+        val end2 = assignment2.estimatedCompletionTime
+        
+        val overlapStart = maxOf(start1, start2)
+        val overlapEnd = minOf(end1, end2)
+        
+        return if (overlapEnd.isAfter(overlapStart)) {
+            ChronoUnit.MINUTES.between(overlapStart, overlapEnd)
+        } else {
+            0
+        }
+    }
+    
+    /**
+     * Calculate distance between assignments
+     */
+    private fun calculateDistanceBetweenAssignments(assignment1: Assignment, assignment2: Assignment): Double {
+        // Simplified distance calculation (would use actual distance API)
+        return 100.0 // Placeholder
+    }
+    
+    /**
+     * Compare shipment priorities
+     */
+    private fun comparePriorities(shipment1: Shipment, shipment2: Shipment): Int {
+        val priorityOrder = mapOf(
+            "URGENT" to 4,
+            "HIGH" to 3,
+            "NORMAL" to 2,
+            "LOW" to 1
+        )
+        
+        val priority1 = priorityOrder[shipment1.priority.uppercase()] ?: 2
+        val priority2 = priorityOrder[shipment2.priority.uppercase()] ?: 2
+        
+        return priority2.compareTo(priority1)
+    }
+    
+    /**
+     * Generate unique conflict ID
+     */
+    private fun generateConflictId(): String {
+        return "conflict_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    }
+    
+    /**
+     * Calculate conflict statistics
+     */
+    private fun calculateConflictStatistics(
+        conflicts: List<Conflict>,
+        conflictMetrics: Map<ConflictType, Int>
+    ): ConflictStatistics {
+        val severityDistribution = ConflictSeverity.values().associateWith { severity ->
+            conflicts.count { it.severity == severity }
+        }
+        
+        val typeDistribution = conflictMetrics.toMutableMap()
+        
+        return ConflictStatistics(
+            totalConflicts = conflicts.size,
+            severityDistribution = severityDistribution,
+            typeDistribution = typeDistribution,
+            criticalConflicts = conflicts.count { it.severity == ConflictSeverity.CRITICAL },
+            highConflicts = conflicts.count { it.severity == ConflictSeverity.HIGH },
+            mediumConflicts = conflicts.count { it.severity == ConflictSeverity.MEDIUM },
+            lowConflicts = conflicts.count { it.severity == ConflictSeverity.LOW },
+            calculatedAt = LocalDateTime.now()
+        )
+    }
+    
+    /**
+     * Generate resolution recommendations
+     */
+    private fun generateResolutionRecommendations(
+        conflicts: List<Conflict>,
+        statistics: ConflictStatistics
+    ): List<ResolutionRecommendation> {
+        val recommendations = mutableListOf<ResolutionRecommendation>()
+        
+        // Critical conflicts - immediate action required
+        if (statistics.criticalConflicts > 0) {
+            recommendations.add(
+                ResolutionRecommendation(
+                    priority = ResolutionRecommendation.Priority.URGENT,
+                    description = "Resolve ${statistics.criticalConflicts} critical conflicts immediately",
+                    suggestedActions = listOf(
+                        "Review conflicting assignments",
+                        "Reassign affected shipments",
+                        "Contact drivers for availability"
+                    ),
+                    estimatedTime = "30 minutes",
+                    requiresManualIntervention = true
+                )
+            )
+        }
+        
+        // High severity conflicts - prompt action required
+        if (statistics.highConflicts > 0) {
+            recommendations.add(
+                ResolutionRecommendation(
+                    priority = ResolutionRecommendation.Priority.HIGH,
+                    description = "Address ${statistics.highConflicts} high-priority conflicts",
+                    suggestedActions = listOf(
+                        "Adjust scheduling",
+                        "Reallocate resources",
+                        "Update driver availability"
+                    ),
+                    estimatedTime = "1 hour",
+                    requiresManualIntervention = true
+                )
+            )
+        }
+        
+        // Medium severity conflicts - scheduled action
+        if (statistics.mediumConflicts > 0) {
+            recommendations.add(
+                ResolutionRecommendation(
+                    priority = ResolutionRecommendation.Priority.MEDIUM,
+                    description = "Resolve ${statistics.mediumConflicts} medium-priority conflicts",
+                    suggestedActions = listOf(
+                        "Optimize assignment order",
+                        "Balance workload",
+                        "Review skill requirements"
+                    ),
+                    estimatedTime = "2 hours",
+                    requiresManualIntervention = false
+                )
+            )
+        }
+        
+        // Low severity conflicts - optimization opportunity
+        if (statistics.lowConflicts > 0) {
+            recommendations.add(
+                ResolutionRecommendation(
+                    priority = ResolutionRecommendation.Priority.LOW,
+                    description = "Optimize ${statistics.lowConflicts} low-priority conflicts",
+                    suggestedActions = listOf(
+                        "Fine-tune scheduling",
+                        "Improve resource allocation",
+                        "Update priority rules"
+                    ),
+                    estimatedTime = "4 hours",
+                    requiresManualIntervention = false
+                )
+            )
+        }
+        
+        return recommendations
+    }
+}
+
+/**
+ * Assignment data class
+ */
+data class Assignment(
+    val id: String,
+    val driverId: String,
+    val shipmentId: String,
+    val scheduledTime: LocalDateTime,
+    val estimatedCompletionTime: LocalDateTime,
+    val status: Status
+) {
+    enum class Status {
+        ASSIGNED, IN_PROGRESS, COMPLETED, CANCELLED
+    }
+}
+
+/**
+ * Conflict data class
+ */
+data class Conflict(
+    val id: String,
+    val type: ConflictDetectionService.ConflictType,
+    val severity: ConflictDetectionService.ConflictSeverity,
+    val assignmentId1: String,
+    val assignmentId2: String? = null,
+    val driverId: String,
+    val shipmentId1: String,
+    val shipmentId2: String? = null,
+    val description: String,
+    val detectedAt: LocalDateTime,
+    val resolutionStrategy: ConflictDetectionService.ResolutionStrategy,
+    val resolvedAt: LocalDateTime? = null,
+    val resolutionNotes: String? = null
+)
+
+/**
+ * Conflict statistics data class
+ */
+data class ConflictStatistics(
+    val totalConflicts: Int,
+    val severityDistribution: Map<ConflictDetectionService.ConflictSeverity, Int>,
+    val typeDistribution: Map<ConflictDetectionService.ConflictType, Int>,
+    val criticalConflicts: Int,
+    val highConflicts: Int,
+    val mediumConflicts: Int,
+    val lowConflicts: Int,
+    val calculatedAt: LocalDateTime
+)
+
+/**
+ * Resolution recommendation data class
+ */
+data class ResolutionRecommendation(
+    val priority: Priority,
+    val description: String,
+    val suggestedActions: List<String>,
+    val estimatedTime: String,
+    val requiresManualIntervention: Boolean
+) {
+    enum class Priority {
+        URGENT, HIGH, MEDIUM, LOW
+    }
+}
+
+/**
+ * Conflict detection result data class
+ */
+data class ConflictDetectionResult(
+    val totalAssignments: Int,
+    val totalConflicts: Int,
+    val conflicts: List<Conflict>,
+    val conflictStatistics: ConflictStatistics,
+    val recommendations: List<ResolutionRecommendation>,
+    val detectedAt: LocalDateTime,
+    val requiresImmediateAction: Boolean
+) {
+    companion object {
+        fun createEmpty(currentTime: LocalDateTime): ConflictDetectionResult {
+            return ConflictDetectionResult(
+                totalAssignments = 0,
+                totalConflicts = 0,
+                conflicts = emptyList(),
+                conflictStatistics = ConflictStatistics(
+                    totalConflicts = 0,
+                    severityDistribution = emptyMap(),
+                    typeDistribution = emptyMap(),
+                    criticalConflicts = 0,
+                    highConflicts = 0,
+                    mediumConflicts = 0,
+                    lowConflicts = 0,
+                    calculatedAt = currentTime
+                ),
+                recommendations = emptyList(),
+                detectedAt = currentTime,
+                requiresImmediateAction = false
+            )
+        }
+    }
+}

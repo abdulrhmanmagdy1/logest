@@ -13,7 +13,8 @@ import com.edham.logistics.core.network.api.DriverExpense
 class DriverSettlementAdapter(
     private var items: List<DriverSettlement>,
     private val onExpenseApprove: (DriverExpense) -> Unit,
-    private val onExpenseReject: (DriverExpense) -> Unit
+    private val onExpenseReject: (DriverExpense) -> Unit,
+    private val onImageClick: (String) -> Unit
 ) : RecyclerView.Adapter<DriverSettlementAdapter.ViewHolder>() {
 
     fun updateData(newItems: List<DriverSettlement>) {
@@ -23,7 +24,7 @@ class DriverSettlementAdapter(
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val view = LayoutInflater.from(parent.context)
-            .inflate(R.layout.item_driver_settlement, parent, false)
+            .inflate(R.layout.item_driver_settlement_premium, parent, false)
         return ViewHolder(view)
     }
 
@@ -49,7 +50,7 @@ class DriverSettlementAdapter(
             remaining.text = "${(item.advanceAmount - item.approvedExpenses).toInt()} ج"
 
             rvExpenses.layoutManager = LinearLayoutManager(itemView.context)
-            val adapter = ExpenseAdapter(item.expenses, onExpenseApprove, onExpenseReject)
+            val adapter = ExpenseAdapter(item.expenses, onExpenseApprove, onExpenseReject, onImageClick)
             rvExpenses.adapter = adapter
         }
     }

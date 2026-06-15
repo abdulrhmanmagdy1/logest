@@ -1,0 +1,680 @@
+package com.edham.logistics.production
+
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import com.edham.logistics.BuildConfig
+import com.edham.logistics.utils.SharedPreferencesHelper
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import java.io.File
+import java.security.MessageDigest
+import java.util.*
+
+/**
+ * Production Build Manager
+ * Manages signed release builds and Play Store preparation
+ */
+class ProductionBuildManager(private val context: Context) {
+
+    companion object {
+        private const val BUILD_INFO_KEY = "build_info"
+        private const val SIGNATURE_KEY = "app_signature"
+        private const val PLAY_STORE_READY_KEY = "play_store_ready"
+        private const val RELEASE_CONFIG_KEY = "release_config"
+    }
+
+    private val sharedPreferences = SharedPreferencesHelper(context)
+    private val buildScope = CoroutineScope(Dispatchers.IO)
+
+    /**
+     * Prepare signed release build
+     */
+    fun prepareSignedReleaseBuild(): ReleaseBuildResult {
+        if (BuildConfig.DEBUG) {
+            return ReleaseBuildResult(
+                success = false,
+                message = "Cannot prepare release build in debug mode",
+                buildInfo = null
+            )
+        }
+
+        try {
+            // Generate build information
+            val buildInfo = generateBuildInfo()
+            
+            // Verify build signature
+            val signatureResult = verifyBuildSignature()
+            if (!signatureResult.isValid) {
+                return ReleaseBuildResult(
+                    success = false,
+                    message = "Build signature verification failed: ${signatureResult.message}",
+                    buildInfo = null
+                )
+            }
+            
+            // Validate build configuration
+            val configValidation = validateReleaseConfiguration()
+            if (!configValidation.isValid) {
+                return ReleaseBuildResult(
+                    success = false,
+                    message = "Release configuration validation failed: ${configValidation.issues.joinToString(", ")}",
+                    buildInfo = null
+                )
+            }
+            
+            // Generate build hash
+            val buildHash = generateBuildHash()
+            
+            // Save build information
+            saveBuildInfo(buildInfo, buildHash)
+            
+            return ReleaseBuildResult(
+                success = true,
+                message = "Release build prepared successfully",
+                buildInfo = buildInfo
+            )
+            
+        } catch (e: Exception) {
+            return ReleaseBuildResult(
+                success = false,
+                message = "Exception during release build preparation: ${e.message}",
+                buildInfo = null
+            )
+        }
+    }
+
+    /**
+     * Prepare for Play Store release
+     */
+    fun preparePlayStoreRelease(): PlayStoreResult {
+        val releaseResult = prepareSignedReleaseBuild()
+        if (!releaseResult.success) {
+            return PlayStoreResult(
+                success = false,
+                message = "Failed to prepare release build: ${releaseResult.message}",
+                playStoreInfo = null
+            )
+        }
+
+        try {
+            // Validate Play Store requirements
+            val validation = validatePlayStoreRequirements()
+            if (!validation.isValid) {
+                return PlayStoreResult(
+                    success = false,
+                    message = "Play Store validation failed: ${validation.issues.joinToString(", ")}",
+                    playStoreInfo = null
+                )
+            }
+
+            // Generate Play Store metadata
+            val playStoreInfo = generatePlayStoreInfo()
+            
+            // Validate app signing
+            val signingValidation = validateAppSigning()
+            if (!signingValidation.isValid) {
+                return PlayStoreResult(
+                    success = false,
+                    message = "App signing validation failed: ${signingValidation.issues.joinToString(", ")}",
+                    playStoreInfo = null
+                )
+            }
+
+            // Mark as Play Store ready
+            sharedPreferences.setBoolean(PLAY_STORE_READY_KEY, true)
+            
+            return PlayStoreResult(
+                success = true,
+                message = "Play Store release prepared successfully",
+                playStoreInfo = playStoreInfo
+            )
+            
+        } catch (e: Exception) {
+            return PlayStoreResult(
+                success = false,
+                message = "Exception during Play Store preparation: ${e.message}",
+                playStoreInfo = null
+            )
+        }
+    }
+
+    /**
+     * Check if build is Play Store ready
+     */
+    fun isPlayStoreReady(): Boolean {
+        return !BuildConfig.DEBUG && 
+               sharedPreferences.getBoolean(PLAY_STORE_READY_KEY, false) &&
+               validatePlayStoreRequirements().isValid
+    }
+
+    /**
+     * Get build information
+     */
+    fun getBuildInfo(): BuildInfo? {
+        val buildInfoString = sharedPreferences.getString(BUILD_INFO_KEY, "")
+        if (buildInfoString.isEmpty()) return null
+        
+        return try {
+            parseBuildInfo(buildInfoString)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Generate build information
+     */
+    private fun generateBuildInfo(): BuildInfo {
+        val packageManager = context.packageManager
+        val packageInfo = packageManager.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES)
+        
+        return BuildInfo(
+            versionName = BuildConfig.VERSION_NAME,
+            versionCode = BuildConfig.VERSION_CODE,
+            buildType = BuildConfig.BUILD_TYPE,
+            flavor = BuildConfig.FLAVOR,
+            buildTime = BuildConfig.BUILD_TIME,
+            gitCommit = getGitCommit(),
+            gitBranch = getGitBranch(),
+            buildNumber = getBuildNumber(),
+            packageName = context.packageName,
+            minSdkVersion = BuildConfig.MIN_SDK_VERSION,
+            targetSdkVersion = BuildConfig.TARGET_SDK_VERSION,
+            compileSdkVersion = BuildConfig.COMPILE_SDK_VERSION,
+            applicationId = BuildConfig.APPLICATION_ID,
+            debuggable = BuildConfig.DEBUG,
+            signingConfig = getSigningConfig(),
+            proguardEnabled = isProguardEnabled(),
+            shrinkResources = isShrinkResourcesEnabled()
+        )
+    }
+
+    /**
+     * Verify build signature
+     */
+    private fun verifyBuildSignature(): SignatureVerificationResult {
+        try {
+            val packageManager = context.packageManager
+            val packageInfo = packageManager.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES)
+            
+            if (packageInfo.signatures == null || packageInfo.signatures.isEmpty()) {
+                return SignatureVerificationResult(
+                    isValid = false,
+                    message = "No signature found"
+                )
+            }
+            
+            val signature = packageInfo.signatures[0]
+            val signatureHash = generateSignatureHash(signature.toByteArray())
+            
+            // Save signature hash
+            sharedPreferences.setString(SIGNATURE_KEY, signatureHash)
+            
+            return SignatureVerificationResult(
+                isValid = true,
+                message = "Signature verified successfully",
+                signatureHash = signatureHash
+            )
+            
+        } catch (e: Exception) {
+            return SignatureVerificationResult(
+                isValid = false,
+                message = "Signature verification failed: ${e.message}"
+            )
+        }
+    }
+
+    /**
+     * Validate release configuration
+     */
+    private fun validateReleaseConfiguration(): ValidationResult {
+        val issues = mutableListOf<String>()
+        
+        // Check build type
+        if (BuildConfig.DEBUG) {
+            issues.add("Build is still in debug mode")
+        }
+        
+        // Check version code
+        if (BuildConfig.VERSION_CODE <= 0) {
+            issues.add("Invalid version code")
+        }
+        
+        // Check version name
+        if (BuildConfig.VERSION_NAME.isEmpty()) {
+            issues.add("Version name is empty")
+        }
+        
+        // Check application ID
+        if (BuildConfig.APPLICATION_ID.isEmpty()) {
+            issues.add("Application ID is empty")
+        }
+        
+        // Check signing configuration
+        if (getSigningConfig().isEmpty()) {
+            issues.add("No signing configuration found")
+        }
+        
+        // Check ProGuard
+        if (!isProguardEnabled()) {
+            issues.add("ProGuard is not enabled")
+        }
+        
+        return ValidationResult(
+            isValid = issues.isEmpty(),
+            issues = issues
+        )
+    }
+
+    /**
+     * Validate Play Store requirements
+     */
+    private fun validatePlayStoreRequirements(): ValidationResult {
+        val issues = mutableListOf<String>()
+        
+        // Check target SDK version
+        if (BuildConfig.TARGET_SDK_VERSION < 33) { // Android 13
+            issues.add("Target SDK version should be 33 or higher")
+        }
+        
+        // Check app signing
+        val signingValidation = validateAppSigning()
+        if (!signingValidation.isValid) {
+            issues.addAll(signingValidation.issues)
+        }
+        
+        // Check permissions
+        val permissionIssues = validatePermissions()
+        issues.addAll(permissionIssues)
+        
+        // Check app icon
+        if (!hasValidAppIcon()) {
+            issues.add("App icon is missing or invalid")
+        }
+        
+        // Check app name
+        if (!hasValidAppName()) {
+            issues.add("App name is missing or invalid")
+        }
+        
+        // Check content rating
+        if (!hasValidContentRating()) {
+            issues.add("Content rating is not set")
+        }
+        
+        return ValidationResult(
+            isValid = issues.isEmpty(),
+            issues = issues
+        )
+    }
+
+    /**
+     * Validate app signing
+     */
+    private fun validateAppSigning(): ValidationResult {
+        val issues = mutableListOf<String>()
+        
+        try {
+            val packageManager = context.packageManager
+            val packageInfo = packageManager.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES)
+            
+            if (packageInfo.signatures == null || packageInfo.signatures.isEmpty()) {
+                issues.add("App is not signed")
+            }
+            
+            // Check for debug signature
+            if (isDebugSignature(packageInfo.signatures[0].toByteArray())) {
+                issues.add("App is signed with debug key")
+            }
+            
+        } catch (e: Exception) {
+            issues.add("Failed to validate app signing: ${e.message}")
+        }
+        
+        return ValidationResult(
+            isValid = issues.isEmpty(),
+            issues = issues
+        )
+    }
+
+    /**
+     * Generate Play Store information
+     */
+    private fun generatePlayStoreInfo(): PlayStoreInfo {
+        return PlayStoreInfo(
+            appName = getAppName(),
+            appDescription = getAppDescription(),
+            packageName = BuildConfig.APPLICATION_ID,
+            versionName = BuildConfig.VERSION_NAME,
+            versionCode = BuildConfig.VERSION_CODE,
+            minSdkVersion = BuildConfig.MIN_SDK_VERSION,
+            targetSdkVersion = BuildConfig.TARGET_SDK_VERSION,
+            contentRating = getContentRating(),
+            category = getAppCategory(),
+            screenshots = getAppScreenshots(),
+            iconUrl = getAppIconUrl(),
+            features = getAppFeatures(),
+            permissions = getAppPermissions(),
+            privacyPolicyUrl = getPrivacyPolicyUrl(),
+            supportEmail = getSupportEmail(),
+            supportWebsite = getSupportWebsite(),
+            releaseNotes = getReleaseNotes()
+        )
+    }
+
+    // Helper methods
+    private fun generateBuildHash(): String {
+        val input = "${BuildConfig.VERSION_NAME}${BuildConfig.VERSION_CODE}${BuildConfig.BUILD_TIME}"
+        val digest = MessageDigest.getInstance("SHA-256")
+        val hashBytes = digest.digest(input.toByteArray())
+        return hashBytes.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun generateSignatureHash(signature: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val hashBytes = digest.digest(signature)
+        return hashBytes.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun saveBuildInfo(buildInfo: BuildInfo, buildHash: String) {
+        val buildInfoString = formatBuildInfo(buildInfo)
+        sharedPreferences.setString(BUILD_INFO_KEY, buildInfoString)
+        sharedPreferences.setString("build_hash", buildHash)
+    }
+
+    private fun formatBuildInfo(buildInfo: BuildInfo): String {
+        return """
+            versionName=${buildInfo.versionName}
+            versionCode=${buildInfo.versionCode}
+            buildType=${buildInfo.buildType}
+            flavor=${buildInfo.flavor}
+            buildTime=${buildInfo.buildTime}
+            gitCommit=${buildInfo.gitCommit}
+            gitBranch=${buildInfo.gitBranch}
+            buildNumber=${buildInfo.buildNumber}
+            packageName=${buildInfo.packageName}
+            minSdkVersion=${buildInfo.minSdkVersion}
+            targetSdkVersion=${buildInfo.targetSdkVersion}
+            compileSdkVersion=${buildInfo.compileSdkVersion}
+            applicationId=${buildInfo.applicationId}
+            debuggable=${buildInfo.debuggable}
+            signingConfig=${buildInfo.signingConfig}
+            proguardEnabled=${buildInfo.proguardEnabled}
+            shrinkResources=${buildInfo.shrinkResources}
+        """.trimIndent()
+    }
+
+    private fun parseBuildInfo(buildInfoString: String): BuildInfo {
+        val properties = Properties()
+        properties.load(buildInfoString.byteInputStream())
+        
+        return BuildInfo(
+            versionName = properties.getProperty("versionName", ""),
+            versionCode = properties.getProperty("versionCode", "0").toInt(),
+            buildType = properties.getProperty("buildType", ""),
+            flavor = properties.getProperty("flavor", ""),
+            buildTime = properties.getProperty("buildTime", "0").toLong(),
+            gitCommit = properties.getProperty("gitCommit", ""),
+            gitBranch = properties.getProperty("gitBranch", ""),
+            buildNumber = properties.getProperty("buildNumber", ""),
+            packageName = properties.getProperty("packageName", ""),
+            minSdkVersion = properties.getProperty("minSdkVersion", "0").toInt(),
+            targetSdkVersion = properties.getProperty("targetSdkVersion", "0").toInt(),
+            compileSdkVersion = properties.getProperty("compileSdkVersion", "0").toInt(),
+            applicationId = properties.getProperty("applicationId", ""),
+            debuggable = properties.getProperty("debuggable", "false").toBoolean(),
+            signingConfig = properties.getProperty("signingConfig", ""),
+            proguardEnabled = properties.getProperty("proguardEnabled", "false").toBoolean(),
+            shrinkResources = properties.getProperty("shrinkResources", "false").toBoolean()
+        )
+    }
+
+    private fun getGitCommit(): String {
+        // This would be injected during build process
+        return BuildConfig.GIT_COMMIT ?: ""
+    }
+
+    private fun getGitBranch(): String {
+        // This would be injected during build process
+        return BuildConfig.GIT_BRANCH ?: ""
+    }
+
+    private fun getBuildNumber(): String {
+        // This would be injected during build process
+        return BuildConfig.BUILD_NUMBER ?: ""
+    }
+
+    private fun getSigningConfig(): String {
+        return if (BuildConfig.DEBUG) "debug" else "release"
+    }
+
+    private fun isProguardEnabled(): Boolean {
+        return !BuildConfig.DEBUG
+    }
+
+    private fun isShrinkResourcesEnabled(): Boolean {
+        return !BuildConfig.DEBUG
+    }
+
+    private fun isDebugSignature(signature: ByteArray): Boolean {
+        // Check if signature matches debug key hash
+        val debugKeyHash = "debug_key_hash_placeholder" // This would be the actual debug key hash
+        val currentHash = generateSignatureHash(signature)
+        return currentHash == debugKeyHash
+    }
+
+    private fun validatePermissions(): List<String> {
+        val issues = mutableListOf<String>()
+        
+        // Check for dangerous permissions
+        val dangerousPermissions = listOf(
+            "android.permission.READ_CONTACTS",
+            "android.permission.WRITE_CONTACTS",
+            "android.permission.READ_CALENDAR",
+            "android.permission.WRITE_CALENDAR"
+        )
+        
+        dangerousPermissions.forEach { permission ->
+            if (hasPermission(permission)) {
+                issues.add("Dangerous permission used: $permission")
+            }
+        }
+        
+        return issues
+    }
+
+    private fun hasPermission(permission: String): Boolean {
+        return try {
+            context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
+                .requestedPermissions?.contains(permission) ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun hasValidAppIcon(): Boolean {
+        return try {
+            context.packageManager.getApplicationIcon(context.packageName) != null
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun hasValidAppName(): Boolean {
+        return try {
+            val appInfo = context.packageManager.getApplicationInfo(context.packageName, 0)
+            val appName = context.packageManager.getApplicationLabel(appInfo)
+            appName.isNotEmpty()
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun hasValidContentRating(): Boolean {
+        // This would check if content rating is properly configured
+        return true
+    }
+
+    private fun getAppName(): String {
+        return try {
+            val appInfo = context.packageManager.getApplicationInfo(context.packageName, 0)
+            context.packageManager.getApplicationLabel(appInfo).toString()
+        } catch (e: Exception) {
+            "Edham Logistics"
+        }
+    }
+
+    private fun getAppDescription(): String {
+        return "Professional logistics management solution for efficient shipment tracking and delivery."
+    }
+
+    private fun getAppCategory(): String {
+        return "Business"
+    }
+
+    private fun getAppScreenshots(): List<String> {
+        return emptyList() // Would be populated with actual screenshot URLs
+    }
+
+    private fun getAppIconUrl(): String {
+        return "" // Would be populated with actual icon URL
+    }
+
+    private fun getAppFeatures(): List<String> {
+        return listOf(
+            "Real-time shipment tracking",
+            "Driver management",
+            "Route optimization",
+            "Temperature monitoring",
+            "Analytics dashboard",
+            "Payment processing"
+        )
+    }
+
+    private fun getAppPermissions(): List<String> {
+        return emptyList() // Would be populated with actual permissions
+    }
+
+    private fun getContentRating(): String {
+        return "Everyone"
+    }
+
+    private fun getPrivacyPolicyUrl(): String {
+        return "https://edhamlogistics.com/privacy"
+    }
+
+    private fun getSupportEmail(): String {
+        return "support@edhamlogistics.com"
+    }
+
+    private fun getSupportWebsite(): String {
+        return "https://edhamlogistics.com/support"
+    }
+
+    private fun getReleaseNotes(): String {
+        return """
+            Version ${BuildConfig.VERSION_NAME}
+            - Enhanced performance optimizations
+            - Improved stability and reliability
+            - Updated user interface
+            - Bug fixes and improvements
+        """.trimIndent()
+    }
+
+    // Data classes
+    data class BuildInfo(
+        val versionName: String,
+        val versionCode: Int,
+        val buildType: String,
+        val flavor: String,
+        val buildTime: Long,
+        val gitCommit: String,
+        val gitBranch: String,
+        val buildNumber: String,
+        val packageName: String,
+        val minSdkVersion: Int,
+        val targetSdkVersion: Int,
+        val compileSdkVersion: Int,
+        val applicationId: String,
+        val debuggable: Boolean,
+        val signingConfig: String,
+        val proguardEnabled: Boolean,
+        val shrinkResources: Boolean
+    )
+
+    data class PlayStoreInfo(
+        val appName: String,
+        val appDescription: String,
+        val packageName: String,
+        val versionName: String,
+        val versionCode: Int,
+        val minSdkVersion: Int,
+        val targetSdkVersion: Int,
+        val contentRating: String,
+        val category: String,
+        val screenshots: List<String>,
+        val iconUrl: String,
+        val features: List<String>,
+        val permissions: List<String>,
+        val privacyPolicyUrl: String,
+        val supportEmail: String,
+        val supportWebsite: String,
+        val releaseNotes: String
+    )
+
+    data class ReleaseBuildResult(
+        val success: Boolean,
+        val message: String,
+        val buildInfo: BuildInfo?
+    )
+
+    data class PlayStoreResult(
+        val success: Boolean,
+        val message: String,
+        val playStoreInfo: PlayStoreInfo?
+    )
+
+    data class ValidationResult(
+        val isValid: Boolean,
+        val issues: List<String>
+    )
+
+    data class SignatureVerificationResult(
+        val isValid: Boolean,
+        val message: String,
+        val signatureHash: String? = null
+    )
+
+    /**
+     * Production build manager
+     */
+    class ProductionBuildManager(private val context: Context) {
+        private val buildManager = ProductionBuildManager(context)
+        
+        fun prepareRelease(): ReleaseBuildResult {
+            return buildManager.prepareSignedReleaseBuild()
+        }
+        
+        fun preparePlayStore(): PlayStoreResult {
+            return buildManager.preparePlayStoreRelease()
+        }
+        
+        fun isReadyForPlayStore(): Boolean {
+            return buildManager.isPlayStoreReady()
+        }
+        
+        fun getBuildInformation(): BuildInfo? {
+            return buildManager.getBuildInfo()
+        }
+        
+        fun validateBuild(): ValidationResult {
+            return buildManager.validateReleaseConfiguration()
+        }
+        
+        fun validatePlayStoreReadiness(): ValidationResult {
+            return buildManager.validatePlayStoreRequirements()
+        }
+    }
+}

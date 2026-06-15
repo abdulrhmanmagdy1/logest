@@ -1,0 +1,1082 @@
+package com.edham.logistics.feature.fuel
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+/**
+ * Comprehensive Mileage Tracking System
+ * 
+ * Provides advanced mileage tracking capabilities including:
+ * - Automatic and manual mileage recording
+ * - Trip-based mileage tracking
+ * - Vehicle mileage history and trends
+ * - Maintenance scheduling based on mileage
+ * - Mileage validation and anomaly detection
+ */
+class MileageTracking {
+    
+    companion object {
+        private const val TAG = "MileageTracking"
+        private const val MILEAGE_VALIDATION_THRESHOLD = 500.0 // km per day max
+        private const val ANOMALY_DETECTION_THRESHOLD = 3.0 // Standard deviations
+    }
+    
+    private val vehicleMileageRecords = mutableMapOf<String, MutableList<MileageRecord>>()
+    private val tripMileageData = mutableMapOf<String, TripMileageData>()
+    private val maintenanceSchedules = mutableMapOf<String, MaintenanceSchedule>()
+    private val mileageAnomalies = mutableMapOf<String, MutableList<MileageAnomaly>>()
+    
+    /**
+     * Records mileage data for a vehicle
+     */
+    suspend fun recordMileage(
+        vehicleId: String,
+        currentMileage: Double,
+        tripId: String? = null,
+        location: String? = null,
+        recordingType: MileageRecordingType = MileageRecordingType.MANUAL,
+        notes: String? = null,
+        timestamp: LocalDateTime = LocalDateTime.now()
+    ): Result<MileageRecord> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Recording mileage for vehicle: $vehicleId, mileage: $currentMileage")
+            
+            // Validate mileage data
+            val validationResult = validateMileageData(vehicleId, currentMileage, timestamp)
+            
+            if (!validationResult.isValid) {
+                Log.e(TAG, "Invalid mileage data: ${validationResult.errors}")
+                return@withContext Result.failure(
+                    IllegalArgumentException("Invalid mileage data: ${validationResult.errors.joinToString(", ")}")
+                )
+            }
+            
+            // Get previous mileage record
+            val previousRecord = getLatestMileageRecord(vehicleId)
+            val mileageDifference = if (previousRecord != null) {
+                currentMileage - previousRecord.currentMileage
+            } else {
+                0.0
+            }
+            
+            // Detect anomalies
+            val anomalyCheck = detectMileageAnomaly(vehicleId, currentMileage, timestamp)
+            if (anomalyCheck.isAnomaly) {
+                Log.w(TAG, "Mileage anomaly detected: ${anomalyCheck.reason}")
+                recordAnomaly(vehicleId, anomalyCheck)
+            }
+            
+            // Create mileage record
+            val record = MileageRecord(
+                id = generateMileageRecordId(),
+                vehicleId = vehicleId,
+                currentMileage = currentMileage,
+                previousMileage = previousRecord?.currentMileage,
+                mileageDifference = mileageDifference,
+                tripId = tripId,
+                location = location,
+                recordingType = recordingType,
+                notes = notes,
+                timestamp = timestamp,
+                isAnomalous = anomalyCheck.isAnomaly,
+                anomalyReason = if (anomalyCheck.isAnomaly) anomalyCheck.reason else null
+            )
+            
+            // Store mileage record
+            val vehicleRecords = vehicleMileageRecords.getOrPut(vehicleId) { mutableListOf() }
+            vehicleRecords.add(record)
+            
+            // Update trip mileage data if applicable
+            tripId?.let { updateTripMileageData(it, record) }
+            
+            // Update maintenance schedule
+            updateMaintenanceSchedule(vehicleId, currentMileage)
+            
+            Log.d(TAG, "Mileage recorded successfully: ${record.id}")
+            Result.success(record)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error recording mileage", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Starts automatic mileage tracking for a trip
+     */
+    suspend fun startTripMileageTracking(
+        tripId: String,
+        vehicleId: String,
+        startMileage: Double,
+        startLocation: String,
+        estimatedDistance: Double? = null
+    ): Result<TripMileageData> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Starting trip mileage tracking: $tripId")
+            
+            // Validate start mileage
+            val validationResult = validateMileageData(vehicleId, startMileage, LocalDateTime.now())
+            if (!validationResult.isValid) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("Invalid start mileage: ${validationResult.errors.joinToString(", ")}")
+                )
+            }
+            
+            // Create trip mileage data
+            val tripData = TripMileageData(
+                tripId = tripId,
+                vehicleId = vehicleId,
+                startMileage = startMileage,
+                startLocation = startLocation,
+                estimatedDistance = estimatedDistance,
+                currentMileage = startMileage,
+                startTime = LocalDateTime.now(),
+                endTime = null,
+                endLocation = null,
+                actualDistance = 0.0,
+                checkpoints = mutableListOf(),
+                isCompleted = false,
+                isPaused = false
+            )
+            
+            // Store trip data
+            tripMileageData[tripId] = tripData
+            
+            // Record initial mileage
+            recordMileage(
+                vehicleId = vehicleId,
+                currentMileage = startMileage,
+                tripId = tripId,
+                location = startLocation,
+                recordingType = MileageRecordingType.TRIP_START,
+                notes = "Trip start: $tripId"
+            )
+            
+            Log.d(TAG, "Trip mileage tracking started: $tripId")
+            Result.success(tripData)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting trip mileage tracking", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Updates mileage during a trip
+     */
+    suspend fun updateTripMileage(
+        tripId: String,
+        currentMileage: Double,
+        location: String,
+        isCheckpoint: Boolean = false,
+        checkpointNotes: String? = null
+    ): Result<TripMileageData> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Updating trip mileage: $tripId, mileage: $currentMileage")
+            
+            val tripData = tripMileageData[tripId]
+                ?: return@withContext Result.failure(
+                    IllegalArgumentException("Trip not found: $tripId")
+                )
+            
+            if (tripData.isCompleted) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("Trip is already completed: $tripId")
+                )
+            }
+            
+            // Record mileage update
+            recordMileage(
+                vehicleId = tripData.vehicleId,
+                currentMileage = currentMileage,
+                tripId = tripId,
+                location = location,
+                recordingType = if (isCheckpoint) MileageRecordingType.CHECKPOINT else MileageRecordingType.TRIP_UPDATE,
+                notes = if (isCheckpoint) checkpointNotes else "Trip update"
+            )
+            
+            // Update trip data
+            val updatedTripData = tripData.copy(
+                currentMileage = currentMileage,
+                actualDistance = currentMileage - tripData.startMileage
+            )
+            
+            // Add checkpoint if specified
+            if (isCheckpoint) {
+                val checkpoint = MileageCheckpoint(
+                    id = generateCheckpointId(),
+                    tripId = tripId,
+                    mileage = currentMileage,
+                    location = location,
+                    timestamp = LocalDateTime.now(),
+                    notes = checkpointNotes
+                )
+                updatedTripData.checkpoints.add(checkpoint)
+            }
+            
+            tripMileageData[tripId] = updatedTripData
+            
+            Log.d(TAG, "Trip mileage updated: $tripId")
+            Result.success(updatedTripData)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating trip mileage", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Completes trip mileage tracking
+     */
+    suspend fun completeTripMileageTracking(
+        tripId: String,
+        endMileage: Double,
+        endLocation: String,
+        completionNotes: String? = null
+    ): Result<TripMileageData> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Completing trip mileage tracking: $tripId")
+            
+            val tripData = tripMileageData[tripId]
+                ?: return@withContext Result.failure(
+                    IllegalArgumentException("Trip not found: $tripId")
+                )
+            
+            if (tripData.isCompleted) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("Trip is already completed: $tripId")
+                )
+            }
+            
+            // Record final mileage
+            recordMileage(
+                vehicleId = tripData.vehicleId,
+                currentMileage = endMileage,
+                tripId = tripId,
+                location = endLocation,
+                recordingType = MileageRecordingType.TRIP_END,
+                notes = "Trip end: $completionNotes"
+            )
+            
+            // Update trip data
+            val completedTripData = tripData.copy(
+                currentMileage = endMileage,
+                endTime = LocalDateTime.now(),
+                endLocation = endLocation,
+                actualDistance = endMileage - tripData.startMileage,
+                isCompleted = true
+            )
+            
+            tripMileageData[tripId] = completedTripData
+            
+            // Generate trip summary
+            val tripSummary = generateTripSummary(completedTripData)
+            Log.d(TAG, "Trip mileage completed: $tripId, Summary: $tripSummary")
+            
+            Result.success(completedTripData)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error completing trip mileage tracking", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets comprehensive mileage analytics for a vehicle
+     */
+    suspend fun getVehicleMileageAnalytics(
+        vehicleId: String,
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS
+    ): Result<VehicleMileageAnalytics> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting mileage analytics for vehicle: $vehicleId")
+            
+            val mileageRecords = getVehicleMileageInTimeWindow(vehicleId, timeWindow)
+            
+            if (mileageRecords.isEmpty()) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("No mileage data found for vehicle: $vehicleId")
+                )
+            }
+            
+            // Calculate basic metrics
+            val totalDistance = mileageRecords.mapNotNull { it.mileageDifference }.sum()
+            val averageDailyDistance = calculateAverageDailyDistance(mileageRecords)
+            val maximumDailyDistance = calculateMaximumDailyDistance(mileageRecords)
+            val currentMileage = mileageRecords.maxByOrNull { it.timestamp }?.currentMileage ?: 0.0
+            
+            // Trends and patterns
+            val mileageTrend = calculateMileageTrend(mileageRecords)
+            val weeklyPattern = analyzeWeeklyMileagePattern(mileageRecords)
+            val monthlyPattern = analyzeMonthlyMileagePattern(mileageRecords)
+            
+            // Trip analysis
+            val tripAnalytics = analyzeTripMileageData(vehicleId, timeWindow)
+            
+            // Maintenance analysis
+            val maintenanceAnalysis = analyzeMaintenanceRequirements(vehicleId, currentMileage)
+            
+            // Anomaly analysis
+            val anomalyAnalysis = analyzeMileageAnomalies(vehicleId, timeWindow)
+            
+            // Predictions
+            val nextMaintenancePrediction = predictNextMaintenance(vehicleId, currentMileage)
+            val mileageProjection = projectMileageGrowth(vehicleId, mileageRecords)
+            
+            val analytics = VehicleMileageAnalytics(
+                vehicleId = vehicleId,
+                timeWindow = timeWindow,
+                totalDistance = totalDistance,
+                averageDailyDistance = averageDailyDistance,
+                maximumDailyDistance = maximumDailyDistance,
+                currentMileage = currentMileage,
+                mileageTrend = mileageTrend,
+                weeklyPattern = weeklyPattern,
+                monthlyPattern = monthlyPattern,
+                tripAnalytics = tripAnalytics,
+                maintenanceAnalysis = maintenanceAnalysis,
+                anomalyAnalysis = anomalyAnalysis,
+                nextMaintenancePrediction = nextMaintenancePrediction,
+                mileageProjection = mileageProjection,
+                recommendations = generateMileageRecommendations(mileageRecords),
+                lastUpdated = LocalDateTime.now()
+            )
+            
+            Result.success(analytics)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting vehicle mileage analytics", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets fleet-wide mileage analytics
+     */
+    suspend fun getFleetMileageAnalytics(
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS
+    ): Result<FleetMileageAnalytics> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting fleet mileage analytics")
+            
+            // Aggregate data from all vehicles
+            val allMileageRecords = mutableListOf<MileageRecord>()
+            vehicleMileageRecords.values.forEach { records ->
+                allMileageRecords.addAll(
+                    records.filter { it.timestamp >= LocalDateTime.now().minus(timeWindow.duration) }
+                )
+            }
+            
+            if (allMileageRecords.isEmpty()) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("No fleet mileage data available")
+                )
+            }
+            
+            // Fleet-level metrics
+            val totalFleetDistance = allMileageRecords.mapNotNull { it.mileageDifference }.sum()
+            val averageVehicleDistance = calculateAverageVehicleDistance(allMileageRecords)
+            val fleetUtilizationRate = calculateFleetUtilizationRate(allMileageRecords)
+            
+            // Vehicle performance distribution
+            val performanceDistribution = calculateMileagePerformanceDistribution(allMileageRecords)
+            val topPerformers = identifyTopMileagePerformers(allMileageRecords)
+            val underPerformers = identifyUnderPerformers(allMileageRecords)
+            
+            // Maintenance analysis
+            val fleetMaintenanceAnalysis = analyzeFleetMaintenanceRequirements()
+            
+            // Trends and projections
+            val fleetMileageTrend = calculateFleetMileageTrend(allMileageRecords)
+            val fleetProjection = projectFleetMileageGrowth(allMileageRecords)
+            
+            // Cost analysis
+            val costAnalysis = analyzeFleetMileageCosts(allMileageRecords)
+            
+            val analytics = FleetMileageAnalytics(
+                timeWindow = timeWindow,
+                totalFleetDistance = totalFleetDistance,
+                averageVehicleDistance = averageVehicleDistance,
+                fleetUtilizationRate = fleetUtilizationRate,
+                performanceDistribution = performanceDistribution,
+                topPerformers = topPerformers,
+                underPerformers = underPerformers,
+                fleetMaintenanceAnalysis = fleetMaintenanceAnalysis,
+                fleetMileageTrend = fleetMileageTrend,
+                fleetProjection = fleetProjection,
+                costAnalysis = costAnalysis,
+                recommendations = generateFleetMileageRecommendations(allMileageRecords),
+                lastUpdated = LocalDateTime.now()
+            )
+            
+            Result.success(analytics)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting fleet mileage analytics", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets maintenance schedule based on mileage
+     */
+    suspend fun getMaintenanceSchedule(vehicleId: String): Result<MaintenanceSchedule> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting maintenance schedule for vehicle: $vehicleId")
+            
+            val schedule = maintenanceSchedules[vehicleId]
+                ?: return@withContext Result.failure(
+                    IllegalArgumentException("No maintenance schedule found for vehicle: $vehicleId")
+                )
+            
+            // Update current mileage
+            val latestRecord = getLatestMileageRecord(vehicleId)
+            if (latestRecord != null) {
+                val updatedSchedule = updateMaintenanceSchedule(vehicleId, latestRecord.currentMileage)
+                Result.success(updatedSchedule)
+            } else {
+                Result.success(schedule)
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting maintenance schedule", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Validates mileage data for consistency and accuracy
+     */
+    suspend fun validateMileageData(
+        vehicleId: String,
+        currentMileage: Double,
+        timestamp: LocalDateTime
+    ): Result<ValidationResult> = withContext(Dispatchers.IO) {
+        try {
+            val errors = mutableListOf<String>()
+            
+            // Basic validation
+            if (currentMileage < 0) {
+                errors.add("Mileage cannot be negative")
+            }
+            
+            if (currentMileage > 1000000) { // 1 million km max
+                errors.add("Mileage exceeds maximum reasonable value")
+            }
+            
+            // Check against previous records
+            val previousRecord = getLatestMileageRecord(vehicleId)
+            if (previousRecord != null) {
+                val timeDifference = java.time.Duration.between(previousRecord.timestamp, timestamp).toHours()
+                val mileageDifference = currentMileage - previousRecord.currentMileage
+                
+                if (mileageDifference < 0) {
+                    errors.add("Mileage cannot decrease from previous record")
+                }
+                
+                if (timeDifference > 0) {
+                    val hourlyRate = mileageDifference / timeDifference
+                    if (hourlyRate > MILEAGE_VALIDATION_THRESHOLD / 24) {
+                        errors.add("Mileage increase rate exceeds reasonable limits")
+                    }
+                }
+            }
+            
+            val validationResult = ValidationResult(
+                isValid = errors.isEmpty(),
+                errors = errors
+            )
+            
+            Result.success(validationResult)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error validating mileage data", e)
+            Result.failure(e)
+        }
+    }
+    
+    // Private helper methods
+    
+    private fun getLatestMileageRecord(vehicleId: String): MileageRecord? {
+        return vehicleMileageRecords[vehicleId]?.maxByOrNull { it.timestamp }
+    }
+    
+    private fun getVehicleMileageInTimeWindow(
+        vehicleId: String,
+        timeWindow: TimeWindow
+    ): List<MileageRecord> {
+        val cutoffDate = LocalDateTime.now().minus(timeWindow.duration)
+        return vehicleMileageRecords[vehicleId]?.filter { it.timestamp >= cutoffDate } ?: emptyList()
+    }
+    
+    private fun detectMileageAnomaly(
+        vehicleId: String,
+        currentMileage: Double,
+        timestamp: LocalDateTime
+    ): AnomalyDetectionResult {
+        val recentRecords = getVehicleMileageInTimeWindow(vehicleId, TimeWindow.LAST_30_DAYS)
+        
+        if (recentRecords.size < 3) {
+            return AnomalyDetectionResult(isAnomaly = false, reason = null)
+        }
+        
+        val mileageDifferences = recentRecords.mapNotNull { it.mileageDifference }
+        val average = mileageDifferences.average()
+        val standardDeviation = calculateStandardDeviation(mileageDifferences)
+        
+        val previousRecord = getLatestMileageRecord(vehicleId)
+        if (previousRecord != null) {
+            val currentDifference = currentMileage - previousRecord.currentMileage
+            val zScore = if (standardDeviation > 0) {
+                (currentDifference - average) / standardDeviation
+            } else {
+                0.0
+            }
+            
+            if (kotlin.math.abs(zScore) > ANOMALY_DETECTION_THRESHOLD) {
+                return AnomalyDetectionResult(
+                    isAnomaly = true,
+                    reason = "Mileage increase of ${currentDifference}km is ${kotlin.math.abs(zScore).format(2)} standard deviations from normal"
+                )
+            }
+        }
+        
+        return AnomalyDetectionResult(isAnomaly = false, reason = null)
+    }
+    
+    private fun recordAnomaly(vehicleId: String, anomaly: AnomalyDetectionResult) {
+        val vehicleAnomalies = mileageAnomalies.getOrPut(vehicleId) { mutableListOf() }
+        val anomalyRecord = MileageAnomaly(
+            id = generateAnomalyId(),
+            vehicleId = vehicleId,
+            timestamp = LocalDateTime.now(),
+            reason = anomaly.reason!!,
+            severity = AnomalySeverity.MEDIUM,
+            isResolved = false
+        )
+        vehicleAnomalies.add(anomalyRecord)
+    }
+    
+    private fun updateTripMileageData(tripId: String, record: MileageRecord) {
+        tripMileageData[tripId]?.let { tripData ->
+            val updatedTripData = tripData.copy(
+                currentMileage = record.currentMileage,
+                actualDistance = record.currentMileage - tripData.startMileage
+            )
+            tripMileageData[tripId] = updatedTripData
+        }
+    }
+    
+    private fun updateMaintenanceSchedule(vehicleId: String, currentMileage: Double): MaintenanceSchedule {
+        val schedule = maintenanceSchedules.getOrPut(vehicleId) {
+            MaintenanceSchedule(
+                vehicleId = vehicleId,
+                currentMileage = currentMileage,
+                nextServiceMileage = currentMileage + 10000, // Default 10,000 km
+                nextServiceType = ServiceType.REGULAR,
+                upcomingServices = mutableListOf(),
+                lastServiceMileage = 0.0,
+                lastServiceDate = null,
+                serviceHistory = mutableListOf()
+            )
+        }
+        
+        // Update current mileage
+        val updatedSchedule = schedule.copy(currentMileage = currentMileage)
+        
+        // Check if service is due
+        if (currentMileage >= updatedSchedule.nextServiceMileage) {
+            val serviceRecord = ServiceRecord(
+                id = generateServiceRecordId(),
+                vehicleId = vehicleId,
+                serviceType = updatedSchedule.nextServiceType,
+                mileageAtService = currentMileage,
+                serviceDate = LocalDateTime.now(),
+                isCompleted = false
+            )
+            updatedSchedule.upcomingServices.add(serviceRecord)
+        }
+        
+        maintenanceSchedules[vehicleId] = updatedSchedule
+        return updatedSchedule
+    }
+    
+    // Additional calculation methods
+    private fun calculateAverageDailyDistance(records: List<MileageRecord>): Double {
+        // Group by date and calculate daily distances
+        val dailyDistances = records.groupBy { it.timestamp.toLocalDate() }
+            .mapValues { (_, dayRecords) ->
+                dayRecords.mapNotNull { it.mileageDifference }.sum()
+            }
+        
+        return if (dailyDistances.isNotEmpty()) {
+            dailyDistances.values.average()
+        } else {
+            0.0
+        }
+    }
+    
+    private fun calculateMaximumDailyDistance(records: List<MileageRecord>): Double {
+        val dailyDistances = records.groupBy { it.timestamp.toLocalDate() }
+            .mapValues { (_, dayRecords) ->
+                dayRecords.mapNotNull { it.mileageDifference }.sum()
+            }
+        
+        return dailyDistances.values.maxOrNull() ?: 0.0
+    }
+    
+    private fun calculateMileageTrend(records: List<MileageRecord>): TrendDirection {
+        if (records.size < 2) return TrendDirection.STABLE
+        
+        val sortedRecords = records.sortedBy { it.timestamp }
+        val firstHalf = sortedRecords.take(sortedRecords.size / 2)
+        val secondHalf = sortedRecords.drop(sortedRecords.size / 2)
+        
+        val firstHalfAvg = firstHalf.mapNotNull { it.mileageDifference }.average()
+        val secondHalfAvg = secondHalf.mapNotNull { it.mileageDifference }.average()
+        
+        return when {
+            secondHalfAvg > firstHalfAvg * 1.1 -> TrendDirection.INCREASING
+            secondHalfAvg < firstHalfAvg * 0.9 -> TrendDirection.DECREASING
+            else -> TrendDirection.STABLE
+        }
+    }
+    
+    private fun analyzeWeeklyMileagePattern(records: List<MileageRecord>): WeeklyPattern {
+        val weeklyData = records.groupBy { it.timestamp.dayOfWeek }
+            .mapValues { (_, dayRecords) ->
+                dayRecords.mapNotNull { it.mileageDifference }.sum()
+            }
+        
+        return WeeklyPattern(
+            monday = weeklyData[java.time.DayOfWeek.MONDAY] ?: 0.0,
+            tuesday = weeklyData[java.time.DayOfWeek.TUESDAY] ?: 0.0,
+            wednesday = weeklyData[java.time.DayOfWeek.WEDNESDAY] ?: 0.0,
+            thursday = weeklyData[java.time.DayOfWeek.THURSDAY] ?: 0.0,
+            friday = weeklyData[java.time.DayOfWeek.FRIDAY] ?: 0.0,
+            saturday = weeklyData[java.time.DayOfWeek.SATURDAY] ?: 0.0,
+            sunday = weeklyData[java.time.DayOfWeek.SUNDAY] ?: 0.0
+        )
+    }
+    
+    private fun analyzeMonthlyMileagePattern(records: List<MileageRecord>): MonthlyPattern {
+        val monthlyData = records.groupBy { it.timestamp.month }
+            .mapValues { (_, monthRecords) ->
+                monthRecords.mapNotNull { it.mileageDifference }.sum()
+            }
+        
+        return MonthlyPattern(
+            january = monthlyData[java.time.Month.JANUARY] ?: 0.0,
+            february = monthlyData[java.time.Month.FEBRUARY] ?: 0.0,
+            march = monthlyData[java.time.Month.MARCH] ?: 0.0,
+            april = monthlyData[java.time.Month.APRIL] ?: 0.0,
+            may = monthlyData[java.time.Month.MAY] ?: 0.0,
+            june = monthlyData[java.time.Month.JUNE] ?: 0.0,
+            july = monthlyData[java.time.Month.JULY] ?: 0.0,
+            august = monthlyData[java.time.Month.AUGUST] ?: 0.0,
+            september = monthlyData[java.time.Month.SEPTEMBER] ?: 0.0,
+            october = monthlyData[java.time.Month.OCTOBER] ?: 0.0,
+            november = monthlyData[java.time.Month.NOVEMBER] ?: 0.0,
+            december = monthlyData[java.time.Month.DECEMBER] ?: 0.0
+        )
+    }
+    
+    private fun analyzeTripMileageData(vehicleId: String, timeWindow: TimeWindow): TripMileageAnalytics {
+        val vehicleTrips = tripMileageData.values.filter { 
+            it.vehicleId == vehicleId && 
+            it.startTime >= LocalDateTime.now().minus(timeWindow.duration)
+        }
+        
+        val completedTrips = vehicleTrips.filter { it.isCompleted }
+        val averageTripDistance = if (completedTrips.isNotEmpty()) {
+            completedTrips.map { it.actualDistance }.average()
+        } else {
+            0.0
+        }
+        
+        val totalTrips = vehicleTrips.size
+        val completedTripsCount = completedTrips.size
+        val completionRate = if (totalTrips > 0) {
+            (completedTripsCount.toDouble() / totalTrips) * 100
+        } else {
+            0.0
+        }
+        
+        return TripMileageAnalytics(
+            totalTrips = totalTrips,
+            completedTrips = completedTripsCount,
+            completionRate = completionRate,
+            averageTripDistance = averageTripDistance,
+            longestTrip = completedTrips.maxByOrNull { it.actualDistance }?.actualDistance ?: 0.0,
+            shortestTrip = completedTrips.minByOrNull { it.actualDistance }?.actualDistance ?: 0.0
+        )
+    }
+    
+    private fun analyzeMaintenanceRequirements(vehicleId: String, currentMileage: Double): MaintenanceAnalysis {
+        val schedule = maintenanceSchedules[vehicleId]
+        val nextServiceMileage = schedule?.nextServiceMileage ?: (currentMileage + 10000)
+        val distanceToNextService = nextServiceMileage - currentMileage
+        
+        val urgencyLevel = when {
+            distanceToNextService <= 0 -> MaintenanceUrgency.OVERDUE
+            distanceToNextService <= 500 -> MaintenanceUrgency.URGENT
+            distanceToNextService <= 2000 -> MaintenanceUrgency.SOON
+            else -> MaintenanceUrgency.SCHEDULED
+        }
+        
+        return MaintenanceAnalysis(
+            nextServiceMileage = nextServiceMileage,
+            distanceToNextService = distanceToNextService,
+            urgencyLevel = urgencyLevel,
+            estimatedServiceDate = estimateServiceDate(currentMileage, nextServiceMileage),
+            recommendedServices = getRecommendedServices(currentMileage)
+        )
+    }
+    
+    private fun analyzeMileageAnomalies(vehicleId: String, timeWindow: TimeWindow): AnomalyAnalysis {
+        val cutoffDate = LocalDateTime.now().minus(timeWindow.duration)
+        val anomalies = mileageAnomalies[vehicleId]?.filter { it.timestamp >= cutoffDate } ?: emptyList()
+        
+        val totalAnomalies = anomalies.size
+        val resolvedAnomalies = anomalies.count { it.isResolved }
+        val unresolvedAnomalies = totalAnomalies - resolvedAnomalies
+        
+        val severityDistribution = anomalies.groupBy { it.severity }
+            .mapValues { (_, severityAnomalies) -> severityAnomalies.size }
+        
+        return AnomalyAnalysis(
+            totalAnomalies = totalAnomalies,
+            resolvedAnomalies = resolvedAnomalies,
+            unresolvedAnomalies = unresolvedAnomalies,
+            severityDistribution = severityDistribution,
+            mostCommonReason = anomalies.groupingBy { it.reason }.eachCount().maxByOrNull { it.value }?.key
+        )
+    }
+    
+    private fun predictNextMaintenance(vehicleId: String, currentMileage: Double): MaintenancePrediction {
+        val schedule = maintenanceSchedules[vehicleId]
+        val nextServiceMileage = schedule?.nextServiceMileage ?: (currentMileage + 10000)
+        
+        // Calculate average daily mileage to predict when service will be due
+        val recentRecords = getVehicleMileageInTimeWindow(vehicleId, TimeWindow.LAST_30_DAYS)
+        val averageDailyMileage = calculateAverageDailyDistance(recentRecords)
+        
+        val daysToService = if (averageDailyMileage > 0) {
+            ((nextServiceMileage - currentMileage) / averageDailyMileage).toInt()
+        } else {
+            365 // Default to 1 year if no recent data
+        }
+        
+        val estimatedServiceDate = LocalDateTime.now().plusDays(daysToService.toLong())
+        
+        return MaintenancePrediction(
+            predictedServiceMileage = nextServiceMileage,
+            predictedServiceDate = estimatedServiceDate,
+            daysUntilService = daysToService,
+            confidence = if (averageDailyMileage > 0) 0.85 else 0.5
+        )
+    }
+    
+    private fun projectMileageGrowth(vehicleId: String, records: List<MileageRecord>): MileageProjection {
+        val averageDailyMileage = calculateAverageDailyDistance(records)
+        val currentMileage = records.maxByOrNull { it.timestamp }?.currentMileage ?: 0.0
+        
+        val projections = mutableMapOf<Int, Double>()
+        var projectedMileage = currentMileage
+        
+        for (days in listOf(30, 60, 90, 180, 365)) {
+            projectedMileage = currentMileage + (averageDailyMileage * days)
+            projections[days] = projectedMileage
+        }
+        
+        return MileageProjection(
+            currentMileage = currentMileage,
+            averageDailyGrowth = averageDailyMileage,
+            projections = projections
+        )
+    }
+    
+    private fun generateMileageRecommendations(records: List<MileageRecord>): List<MileageRecommendation> {
+        val recommendations = mutableListOf<MileageRecommendation>()
+        
+        val averageDaily = calculateAverageDailyDistance(records)
+        val trend = calculateMileageTrend(records)
+        
+        // Maintenance recommendations
+        if (trend == TrendDirection.INCREASING && averageDaily > 200) {
+            recommendations.add(
+                MileageRecommendation(
+                    type = RecommendationType.MAINTENANCE,
+                    title = "Increase Maintenance Frequency",
+                    description = "High daily mileage detected. Consider more frequent maintenance checks.",
+                    priority = Priority.MEDIUM
+                )
+            )
+        }
+        
+        // Usage optimization
+        if (averageDaily < 50) {
+            recommendations.add(
+                MileageRecommendation(
+                    type = RecommendationType.OPTIMIZATION,
+                    title = "Optimize Vehicle Utilization",
+                    description = "Low daily mileage detected. Consider route optimization or vehicle reallocation.",
+                    priority = Priority.LOW
+                )
+            )
+        }
+        
+        return recommendations
+    }
+    
+    // Additional fleet analysis methods would be implemented here...
+    
+    // Utility methods
+    private fun calculateStandardDeviation(values: List<Double>): Double {
+        if (values.size < 2) return 0.0
+        
+        val mean = values.average()
+        val squaredDifferences = values.map { (it - mean) * (it - mean) }
+        val variance = squaredDifferences.average()
+        
+        return kotlin.math.sqrt(variance)
+    }
+    
+    private fun Double.format(digits: Int): String {
+        return String.format("%.${digits}f", this)
+    }
+    
+    // ID generation methods
+    private fun generateMileageRecordId(): String = "MILE_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    private fun generateCheckpointId(): String = "CHK_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    private fun generateAnomalyId(): String = "ANOM_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    private fun generateServiceRecordId(): String = "SVC_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    
+    // Data classes and enums
+    
+    data class MileageRecord(
+        val id: String,
+        val vehicleId: String,
+        val currentMileage: Double,
+        val previousMileage: Double?,
+        val mileageDifference: Double?,
+        val tripId: String?,
+        val location: String?,
+        val recordingType: MileageRecordingType,
+        val notes: String?,
+        val timestamp: LocalDateTime,
+        val isAnomalous: Boolean,
+        val anomalyReason: String?
+    )
+    
+    data class TripMileageData(
+        val tripId: String,
+        val vehicleId: String,
+        val startMileage: Double,
+        val startLocation: String,
+        val estimatedDistance: Double?,
+        var currentMileage: Double,
+        val startTime: LocalDateTime,
+        val endTime: LocalDateTime?,
+        val endLocation: String?,
+        var actualDistance: Double,
+        val checkpoints: MutableList<MileageCheckpoint>,
+        var isCompleted: Boolean,
+        var isPaused: Boolean
+    )
+    
+    data class MileageCheckpoint(
+        val id: String,
+        val tripId: String,
+        val mileage: Double,
+        val location: String,
+        val timestamp: LocalDateTime,
+        val notes: String?
+    )
+    
+    data class MaintenanceSchedule(
+        val vehicleId: String,
+        var currentMileage: Double,
+        var nextServiceMileage: Double,
+        var nextServiceType: ServiceType,
+        val upcomingServices: MutableList<ServiceRecord>,
+        val lastServiceMileage: Double,
+        val lastServiceDate: LocalDateTime?,
+        val serviceHistory: MutableList<ServiceRecord>
+    )
+    
+    data class ServiceRecord(
+        val id: String,
+        val vehicleId: String,
+        val serviceType: ServiceType,
+        val mileageAtService: Double,
+        val serviceDate: LocalDateTime,
+        val isCompleted: Boolean
+    )
+    
+    data class MileageAnomaly(
+        val id: String,
+        val vehicleId: String,
+        val timestamp: LocalDateTime,
+        val reason: String,
+        val severity: AnomalySeverity,
+        var isResolved: Boolean
+    )
+    
+    data class VehicleMileageAnalytics(
+        val vehicleId: String,
+        val timeWindow: TimeWindow,
+        val totalDistance: Double,
+        val averageDailyDistance: Double,
+        val maximumDailyDistance: Double,
+        val currentMileage: Double,
+        val mileageTrend: TrendDirection,
+        val weeklyPattern: WeeklyPattern,
+        val monthlyPattern: MonthlyPattern,
+        val tripAnalytics: TripMileageAnalytics,
+        val maintenanceAnalysis: MaintenanceAnalysis,
+        val anomalyAnalysis: AnomalyAnalysis,
+        val nextMaintenancePrediction: MaintenancePrediction,
+        val mileageProjection: MileageProjection,
+        val recommendations: List<MileageRecommendation>,
+        val lastUpdated: LocalDateTime
+    )
+    
+    data class FleetMileageAnalytics(
+        val timeWindow: TimeWindow,
+        val totalFleetDistance: Double,
+        val averageVehicleDistance: Double,
+        val fleetUtilizationRate: Double,
+        val performanceDistribution: Map<String, Int>,
+        val topPerformers: List<VehiclePerformance>,
+        val underPerformers: List<VehiclePerformance>,
+        val fleetMaintenanceAnalysis: FleetMaintenanceAnalysis,
+        val fleetMileageTrend: TrendDirection,
+        val fleetProjection: FleetMileageProjection,
+        val costAnalysis: FleetCostAnalysis,
+        val recommendations: List<FleetMileageRecommendation>,
+        val lastUpdated: LocalDateTime
+    )
+    
+    // Supporting data classes
+    data class ValidationResult(
+        val isValid: Boolean,
+        val errors: List<String>
+    )
+    
+    data class AnomalyDetectionResult(
+        val isAnomaly: Boolean,
+        val reason: String?
+    )
+    
+    data class WeeklyPattern(
+        val monday: Double,
+        val tuesday: Double,
+        val wednesday: Double,
+        val thursday: Double,
+        val friday: Double,
+        val saturday: Double,
+        val sunday: Double
+    )
+    
+    data class MonthlyPattern(
+        val january: Double,
+        val february: Double,
+        val march: Double,
+        val april: Double,
+        val may: Double,
+        val june: Double,
+        val july: Double,
+        val august: Double,
+        val september: Double,
+        val october: Double,
+        val november: Double,
+        val december: Double
+    )
+    
+    data class TripMileageAnalytics(
+        val totalTrips: Int,
+        val completedTrips: Int,
+        val completionRate: Double,
+        val averageTripDistance: Double,
+        val longestTrip: Double,
+        val shortestTrip: Double
+    )
+    
+    data class MaintenanceAnalysis(
+        val nextServiceMileage: Double,
+        val distanceToNextService: Double,
+        val urgencyLevel: MaintenanceUrgency,
+        val estimatedServiceDate: LocalDateTime,
+        val recommendedServices: List<ServiceType>
+    )
+    
+    data class AnomalyAnalysis(
+        val totalAnomalies: Int,
+        val resolvedAnomalies: Int,
+        val unresolvedAnomalies: Int,
+        val severityDistribution: Map<AnomalySeverity, Int>,
+        val mostCommonReason: String?
+    )
+    
+    data class MaintenancePrediction(
+        val predictedServiceMileage: Double,
+        val predictedServiceDate: LocalDateTime,
+        val daysUntilService: Int,
+        val confidence: Double
+    )
+    
+    data class MileageProjection(
+        val currentMileage: Double,
+        val averageDailyGrowth: Double,
+        val projections: Map<Int, Double> // days -> projected mileage
+    )
+    
+    data class MileageRecommendation(
+        val type: RecommendationType,
+        val title: String,
+        val description: String,
+        val priority: Priority
+    )
+    
+    // Enums
+    enum class MileageRecordingType {
+        MANUAL, AUTOMATIC, TRIP_START, TRIP_END, TRIP_UPDATE, CHECKPOINT
+    }
+    
+    enum class ServiceType {
+        REGULAR, OIL_CHANGE, TIRE_ROTATION, BRAKE_SERVICE, MAJOR_SERVICE, INSPECTION
+    }
+    
+    enum class AnomalySeverity {
+        LOW, MEDIUM, HIGH, CRITICAL
+    }
+    
+    enum class TrendDirection {
+        INCREASING, DECREASING, STABLE
+    }
+    
+    enum class TimeWindow(val duration: java.time.Duration) {
+        LAST_7_DAYS(java.time.Duration.ofDays(7)),
+        LAST_30_DAYS(java.time.Duration.ofDays(30)),
+        LAST_90_DAYS(java.time.Duration.ofDays(90)),
+        LAST_YEAR(java.time.Duration.ofDays(365))
+    }
+    
+    enum class RecommendationType {
+        MAINTENANCE, OPTIMIZATION, MONITORING, ALERT
+    }
+    
+    enum class Priority {
+        LOW, MEDIUM, HIGH, CRITICAL
+    }
+    
+    enum class MaintenanceUrgency {
+        SCHEDULED, SOON, URGENT, OVERDUE
+    }
+    
+    // Additional fleet analysis data classes would be defined here...
+}

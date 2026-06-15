@@ -1,0 +1,446 @@
+package com.edham.logistics.offline
+
+import android.content.Context
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
+
+/**
+ * Offline Action Queue Manager
+ * Manages queuing and processing of offline actions
+ */
+class OfflineActionQueue private constructor(context: Context) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: OfflineActionQueue? = null
+        
+        fun getInstance(context: Context): OfflineActionQueue {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: OfflineActionQueue(context).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val cacheManager = LocalCacheManager.getInstance(context)
+    private val gson = Gson()
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    private val _queueState = MutableStateFlow<QueueState>(QueueState.IDLE)
+    val queueState = _queueState.asStateFlow()
+    
+    private val _pendingActionsCount = MutableStateFlow(0)
+    val pendingActionsCount = _pendingActionsCount.asStateFlow()
+    
+    private val memoryQueue = ConcurrentLinkedQueue<PendingAction>()
+    private val maxMemoryQueueSize = 100
+    
+    /**
+     * Queue action for offline processing
+     */
+    suspend fun queueAction(
+        type: ActionType,
+        entityType: String,
+        entityId: String,
+        data: Any,
+        priority: ActionPriority = ActionPriority.NORMAL
+    ): String {
+        val actionId = UUID.randomUUID().toString()
+        val jsonData = gson.toJson(data)
+        
+        val offlineAction = OfflineAction(
+            id = actionId,
+            type = type.name,
+            entityType = entityType,
+            entityId = entityId,
+            data = jsonData,
+            timestamp = System.currentTimeMillis(),
+            synced = false,
+            syncedAt = null,
+            retryCount = 0,
+            errorMessage = null
+        )
+        
+        // Add to database
+        cacheManager.queueOfflineAction(offlineAction)
+        
+        // Add to memory queue if not full
+        if (memoryQueue.size < maxMemoryQueueSize) {
+            memoryQueue.offer(
+                PendingAction(
+                    id = actionId,
+                    type = type,
+                    entityType = entityType,
+                    entityId = entityId,
+                    data = data,
+                    priority = priority,
+                    timestamp = System.currentTimeMillis(),
+                    retryCount = 0
+                )
+            )
+        }
+        
+        updateQueueState()
+        return actionId
+    }
+    
+    /**
+     * Queue shipment creation/update
+     */
+    suspend fun queueShipmentAction(
+        shipment: com.edham.logistics.data.remote.model.Shipment,
+        type: ActionType = ActionType.CREATE_UPDATE
+    ): String {
+        return queueAction(
+            type = type,
+            entityType = "SHIPMENT",
+            entityId = shipment.id,
+            data = shipment,
+            priority = ActionPriority.HIGH
+        )
+    }
+    
+    /**
+     * Queue driver location update
+     */
+    suspend fun queueDriverLocationUpdate(
+        driverId: String,
+        location: Map<String, Double>
+    ): String {
+        return queueAction(
+            type = ActionType.UPDATE_LOCATION,
+            entityType = "DRIVER",
+            entityId = driverId,
+            data = location,
+            priority = ActionPriority.CRITICAL
+        )
+    }
+    
+    /**
+     * Queue shipment status update
+     */
+    suspend fun queueShipmentStatusUpdate(
+        shipmentId: String,
+        status: String,
+        notes: String? = null
+    ): String {
+        val updateData = mapOf(
+            "status" to status,
+            "notes" to notes,
+            "timestamp" to System.currentTimeMillis()
+        )
+        
+        return queueAction(
+            type = ActionType.UPDATE_STATUS,
+            entityType = "SHIPMENT",
+            entityId = shipmentId,
+            data = updateData,
+            priority = ActionPriority.HIGH
+        )
+    }
+    
+    /**
+     * Queue proof of delivery upload
+     */
+    suspend fun queueProofOfDelivery(
+        shipmentId: String,
+        proofData: Map<String, Any>
+    ): String {
+        return queueAction(
+            type = ActionType.UPLOAD_PROOF,
+            entityType = "SHIPMENT",
+            entityId = shipmentId,
+            data = proofData,
+            priority = ActionPriority.HIGH
+        )
+    }
+    
+    /**
+     * Get pending actions
+     */
+    suspend fun getPendingActions(): List<OfflineAction> {
+        return cacheManager.getPendingActions()
+    }
+    
+    /**
+     * Get pending actions by type
+     */
+    suspend fun getPendingActionsByType(type: ActionType): List<OfflineAction> {
+        return getPendingActions().filter { it.type == type.name }
+    }
+    
+    /**
+     * Get pending actions by entity
+     */
+    suspend fun getPendingActionsByEntity(entityType: String, entityId: String): List<OfflineAction> {
+        return getPendingActions().filter { 
+            it.entityType == entityType && it.entityId == entityId 
+        }
+    }
+    
+    /**
+     * Remove action from queue
+     */
+    suspend fun removeAction(actionId: String): Boolean {
+        return try {
+            // Remove from memory queue
+            memoryQueue.removeIf { it.id == actionId }
+            
+            // Mark as synced in database (effectively removing it from pending)
+            cacheManager.markActionSynced(actionId)
+            
+            updateQueueState()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Clear all pending actions
+     */
+    suspend fun clearAllActions() {
+        try {
+            memoryQueue.clear()
+            cacheManager.clearAllCache()
+            updateQueueState()
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    /**
+     * Get action queue statistics
+     */
+    suspend fun getQueueStatistics(): QueueStatistics {
+        val pendingActions = getPendingActions()
+        val actionsByType = pendingActions.groupBy { it.type }
+        
+        return QueueStatistics(
+            totalPending = pendingActions.size,
+            criticalActions = pendingActions.count { isCriticalAction(it) },
+            highPriorityActions = pendingActions.count { isHighPriorityAction(it) },
+            actionsByType = actionsByType.mapValues { it.value.size },
+            oldestActionTimestamp = pendingActions.minOfOrNull { it.timestamp } ?: 0L,
+            averageRetryCount = if (pendingActions.isNotEmpty()) {
+                pendingActions.map { it.retryCount }.average()
+            } else 0.0
+        )
+    }
+    
+    /**
+     * Retry failed actions
+     */
+    suspend fun retryFailedActions(maxRetries: Int = 3): Int {
+        val failedActions = getPendingActions().filter { 
+            it.retryCount < maxRetries && it.errorMessage != null 
+        }
+        
+        var retriedCount = 0
+        failedActions.forEach { action ->
+            // Increment retry count
+            val updatedAction = action.copy(
+                retryCount = action.retryCount + 1,
+                errorMessage = null
+            )
+            
+            // Re-queue the action
+            cacheManager.queueOfflineAction(updatedAction)
+            retriedCount++
+        }
+        
+        updateQueueState()
+        return retriedCount
+    }
+    
+    /**
+     * Get next action to process
+     */
+    suspend fun getNextAction(): PendingAction? {
+        return try {
+            // Get from memory queue first
+            val memoryAction = memoryQueue.poll()
+            if (memoryAction != null) {
+                return memoryAction
+            }
+            
+            // Get from database if memory queue is empty
+            val pendingActions = getPendingActions()
+            if (pendingActions.isNotEmpty()) {
+                val action = pendingActions.first()
+                
+                // Convert to PendingAction
+                val data = when (action.entityType) {
+                    "SHIPMENT" -> {
+                        val type = object : TypeToken<com.edham.logistics.data.remote.model.Shipment>() {}.type
+                        gson.fromJson<com.edham.logistics.data.remote.model.Shipment>(action.data, type)
+                    }
+                    "DRIVER" -> {
+                        val type = object : TypeToken<com.edham.logistics.data.remote.model.Driver>() {}.type
+                        gson.fromJson<com.edham.logistics.data.remote.model.Driver>(action.data, type)
+                    }
+                    "VEHICLE" -> {
+                        val type = object : TypeToken<com.edham.logistics.data.remote.model.Vehicle>() {}.type
+                        gson.fromJson<com.edham.logistics.data.remote.model.Vehicle>(action.data, type)
+                    }
+                    else -> {
+                        val type = object : TypeToken<Map<String, Any>>() {}.type
+                        gson.fromJson<Map<String, Any>>(action.data, type)
+                    }
+                }
+                
+                return PendingAction(
+                    id = action.id,
+                    type = ActionType.valueOf(action.type),
+                    entityType = action.entityType,
+                    entityId = action.entityId,
+                    data = data,
+                    priority = getActionPriority(action),
+                    timestamp = action.timestamp,
+                    retryCount = action.retryCount
+                )
+            }
+            
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    /**
+     * Mark action as completed
+     */
+    suspend fun markActionCompleted(actionId: String, success: Boolean, errorMessage: String? = null) {
+        try {
+            if (success) {
+                cacheManager.markActionSynced(actionId)
+            } else {
+                // Update error message and retry count
+                val pendingActions = getPendingActions()
+                val action = pendingActions.find { it.id == actionId }
+                if (action != null) {
+                    val updatedAction = action.copy(
+                        retryCount = action.retryCount + 1,
+                        errorMessage = errorMessage
+                    )
+                    cacheManager.queueOfflineAction(updatedAction)
+                }
+            }
+            
+            updateQueueState()
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    /**
+     * Update queue state
+     */
+    private suspend fun updateQueueState() {
+        val pendingCount = cacheManager.getPendingActions().count()
+        _pendingActionsCount.value = pendingCount
+        
+        _queueState.value = when {
+            pendingCount == 0 -> QueueState.IDLE
+            pendingCount < 10 -> QueueState.LOW
+            pendingCount < 50 -> QueueState.MEDIUM
+            else -> QueueState.HIGH
+        }
+    }
+    
+    /**
+     * Check if action is critical
+     */
+    private fun isCriticalAction(action: OfflineAction): Boolean {
+        return when (action.type) {
+            ActionType.UPDATE_LOCATION.name -> true
+            ActionType.UPDATE_STATUS.name -> true
+            ActionType.UPLOAD_PROOF.name -> true
+            else -> false
+        }
+    }
+    
+    /**
+     * Check if action is high priority
+     */
+    private fun isHighPriorityAction(action: OfflineAction): Boolean {
+        return when (action.type) {
+            ActionType.CREATE_UPDATE.name -> true
+            ActionType.DELETE.name -> true
+            else -> false
+        }
+    }
+    
+    /**
+     * Get action priority
+     */
+    private fun getActionPriority(action: OfflineAction): ActionPriority {
+        return when {
+            isCriticalAction(action) -> ActionPriority.CRITICAL
+            isHighPriorityAction(action) -> ActionPriority.HIGH
+            else -> ActionPriority.NORMAL
+        }
+    }
+    
+    /**
+     * Cleanup old actions
+     */
+    suspend fun cleanupOldActions(maxAgeMs: Long = 7 * 24 * 60 * 60 * 1000L) {
+        cacheManager.clearOldCache(maxAgeMs)
+        updateQueueState()
+    }
+}
+
+/**
+ * Action types and priorities
+ */
+enum class ActionType {
+    CREATE_UPDATE,
+    DELETE,
+    UPDATE_LOCATION,
+    UPDATE_STATUS,
+    UPLOAD_PROOF,
+    SYNC_DATA
+}
+
+enum class ActionPriority {
+    CRITICAL,
+    HIGH,
+    NORMAL,
+    LOW
+}
+
+enum class QueueState {
+    IDLE,
+    LOW,
+    MEDIUM,
+    HIGH,
+    ERROR
+}
+
+/**
+ * Data classes
+ */
+data class PendingAction(
+    val id: String,
+    val type: ActionType,
+    val entityType: String,
+    val entityId: String,
+    val data: Any,
+    val priority: ActionPriority,
+    val timestamp: Long,
+    val retryCount: Int
+)
+
+data class QueueStatistics(
+    val totalPending: Int,
+    val criticalActions: Int,
+    val highPriorityActions: Int,
+    val actionsByType: Map<String, Int>,
+    val oldestActionTimestamp: Long,
+    val averageRetryCount: Double
+)

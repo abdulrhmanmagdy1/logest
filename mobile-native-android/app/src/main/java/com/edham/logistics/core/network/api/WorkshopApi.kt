@@ -11,6 +11,9 @@ interface WorkshopApi {
     @GET("workshop/inventory")
     suspend fun getInventory(): Response<ApiResponse<List<PartItem>>>
 
+    @GET("workshop/vehicles")
+    suspend fun getVehicles(): Response<ApiResponse<List<VehicleItem>>>
+
     @POST("workshop/request-part")
     suspend fun requestPart(
         @Query("partId") partId: String,

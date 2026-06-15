@@ -1,0 +1,688 @@
+package com.edham.logistics.presentation.notifications
+
+import android.content.Context
+import androidx.arch.core.executor.testing.InstantTaskExecutorRule
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.edham.logistics.core.notifications.*
+import com.edham.logistics.domain.notifications.SmartNotificationUseCases
+import com.edham.logistics.data.notifications.SmartNotificationRepository
+import dagger.hilt.android.testing.HiltAndroidRule
+import dagger.hilt.android.testing.HiltAndroidTest
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.runTest
+import org.junit.Before
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.mockito.Mock
+import org.mockito.Mockito.*
+import org.mockito.MockitoAnnotations
+import javax.inject.Inject
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+
+/**
+ * Comprehensive Test Suite for Smart Notifications System
+ * Tests all components of the smart notification system
+ */
+@ExperimentalCoroutinesApi
+@HiltAndroidTest
+@RunWith(AndroidJUnit4::class)
+class NotificationTestSuite {
+
+    @get:Rule
+    val hiltRule = HiltAndroidRule(this)
+
+    @get:Rule
+    val instantTaskExecutorRule = InstantTaskExecutorRule()
+
+    @Inject
+    lateinit var smartNotificationManager: SmartNotificationManager
+
+    @Inject
+    lateinit var eventTriggerManager: EventTriggerManager
+
+    @Inject
+    lateinit var notificationGroupingManager: NotificationGroupingManager
+
+    @Inject
+    lateinit var userPreferencesManager: UserPreferencesManager
+
+    @Inject
+    lateinit var smartNotificationUseCases: SmartNotificationUseCases
+
+    @Inject
+    lateinit var smartNotificationRepository: SmartNotificationRepository
+
+    @Mock
+    private lateinit var mockContext: Context
+
+    private lateinit var notificationViewModel: NotificationViewModel
+
+    @Before
+    fun setup() {
+        MockitoAnnotations.openMocks(this)
+        hiltRule.inject()
+        
+        mockContext = ApplicationProvider.getApplicationContext()
+        notificationViewModel = NotificationViewModel(
+            smartNotificationUseCases,
+            smartNotificationRepository
+        )
+    }
+
+    /**
+     * Test Smart Notification Manager
+     */
+    @Test
+    fun testSmartNotificationManager() = runTest {
+        // Test delay notification
+        val delayNotification = smartNotificationManager.showDelayNotification(
+            shipmentId = "SHIP123",
+            delayMinutes = 45,
+            estimatedDelivery = System.currentTimeMillis() + 3600000
+        )
+        
+        assertNotNull(delayNotification)
+        assertEquals(NotificationEvent.SHIPMENT_DELAYED, delayNotification.event)
+        assertEquals(NotificationPriority.HIGH, delayNotification.priority)
+        
+        // Test temperature notification
+        val tempNotification = smartNotificationManager.showTemperatureNotification(
+            shipmentId = "SHIP123",
+            currentTemp = -15.0,
+            minTemp = -20.0,
+            maxTemp = -10.0,
+            location = "Riyadh"
+        )
+        
+        assertNotNull(tempNotification)
+        assertEquals(NotificationEvent.TEMPERATURE_ISSUE, tempNotification.event)
+        assertEquals(NotificationPriority.CRITICAL, tempNotification.priority)
+        
+        // Test payment overdue notification
+        val paymentNotification = smartNotificationManager.showPaymentOverdueNotification(
+            invoiceId = "INV456",
+            amount = 1500.0,
+            dueDate = System.currentTimeMillis() - 86400000,
+            daysOverdue = 3
+        )
+        
+        assertNotNull(paymentNotification)
+        assertEquals(NotificationEvent.PAYMENT_OVERDUE, paymentNotification.event)
+        assertEquals(NotificationPriority.HIGH, paymentNotification.priority)
+    }
+
+    /**
+     * Test Event Trigger Manager
+     */
+    @Test
+    fun testEventTriggerManager() = runTest {
+        // Test event processing
+        val eventData = mapOf(
+            "shipmentId" to "SHIP123",
+            "delayMinutes" to 30,
+            "location" to "Riyadh"
+        )
+        
+        val result = eventTriggerManager.processEvent(
+            event = NotificationEvent.SHIPMENT_DELAYED,
+            data = eventData
+        )
+        
+        assertTrue(result)
+        
+        // Test trigger conditions
+        val conditions = mapOf(
+            "minDelayMinutes" to 30,
+            "priorityThreshold" to NotificationPriority.NORMAL
+        )
+        
+        val conditionResult = eventTriggerManager.evaluateConditions(
+            event = NotificationEvent.SHIPMENT_DELAYED,
+            data = eventData,
+            conditions = conditions
+        )
+        
+        assertTrue(conditionResult)
+    }
+
+    /**
+     * Test Notification Grouping Manager
+     */
+    @Test
+    fun testNotificationGroupingManager() = runTest {
+        // Create test notifications
+        val notification1 = SmartNotification(
+            id = "notif1",
+            title = "تأخير في الشحنة",
+            message = "الشحنة #123 متأخرة",
+            event = NotificationEvent.SHIPMENT_DELAYED,
+            priority = NotificationPriority.HIGH,
+            timestamp = System.currentTimeMillis(),
+            data = mapOf("shipmentId" to "123")
+        )
+        
+        val notification2 = SmartNotification(
+            id = "notif2",
+            title = "تأخير في الشحنة",
+            message = "الشحنة #124 متأخرة",
+            event = NotificationEvent.SHIPMENT_DELAYED,
+            priority = NotificationPriority.HIGH,
+            timestamp = System.currentTimeMillis(),
+            data = mapOf("shipmentId" to "124")
+        )
+        
+        // Test grouping
+        val groupResult = notificationGroupingManager.addNotificationToGroup(notification1)
+        assertNotNull(groupResult.groupId)
+        
+        val groupResult2 = notificationGroupingManager.addNotificationToGroup(notification2)
+        assertEquals(groupResult.groupId, groupResult2.groupId)
+        
+        // Test group summary
+        val summary = notificationGroupingManager.generateGroupSummary(groupResult.groupId)
+        assertNotNull(summary)
+        assertTrue(summary.contains("2 إشعارات"))
+    }
+
+    /**
+     * Test User Preferences Manager
+     */
+    @Test
+    fun testUserPreferencesManager() = runTest {
+        // Test getting default preferences
+        val defaultPrefs = userPreferencesManager.getUserPreferences()
+        assertNotNull(defaultPrefs)
+        assertTrue(defaultPrefs.shipmentAlerts)
+        assertTrue(defaultPrefs.paymentAlerts)
+        assertTrue(defaultPrefs.temperatureAlerts)
+        
+        // Test updating preferences
+        val updatedPrefs = defaultPrefs.copy(
+            shipmentAlerts = false,
+            quietHours = true,
+            quietStartHour = 22,
+            quietEndHour = 8
+        )
+        
+        userPreferencesManager.updateUserPreferences(updatedPrefs)
+        
+        // Verify preferences were updated
+        val currentPrefs = userPreferencesManager.getUserPreferences()
+        assertEquals(false, currentPrefs.shipmentAlerts)
+        assertEquals(true, currentPrefs.quietHours)
+        assertEquals(22, currentPrefs.quietStartHour)
+        assertEquals(8, currentPrefs.quietEndHour)
+    }
+
+    /**
+     * Test Smart Notification Use Cases
+     */
+    @Test
+    fun testSmartNotificationUseCases() = runTest {
+        // Test showing delay notification
+        val delayResult = smartNotificationUseCases.showDelayNotification(
+            shipmentId = "SHIP123",
+            delayMinutes = 45,
+            estimatedDelivery = System.currentTimeMillis() + 3600000
+        )
+        
+        assertTrue(delayResult)
+        
+        // Test getting notification history
+        val history = smartNotificationUseCases.getNotificationHistory()
+        assertNotNull(history)
+        assertTrue(history.isNotEmpty())
+        
+        // Test getting notification statistics
+        val stats = smartNotificationUseCases.getNotificationStatistics()
+        assertNotNull(stats)
+        assertTrue(stats.totalNotifications > 0)
+        
+        // Test updating user preferences
+        val preferences = smartNotificationUseCases.getUserPreferences()
+        val updatedPreferences = preferences.copy(
+            shipmentAlerts = false,
+            maxNotificationsPerHour = 5
+        )
+        
+        val updateResult = smartNotificationUseCases.updateUserPreferences(updatedPreferences)
+        assertTrue(updateResult)
+    }
+
+    /**
+     * Test Smart Notification Repository
+     */
+    @Test
+    fun testSmartNotificationRepository() = runTest {
+        // Test getting notifications
+        val notifications = smartNotificationRepository.getNotifications()
+        assertNotNull(notifications)
+        
+        // Test filtering by event type
+        val shipmentNotifications = smartNotificationRepository.getNotificationsByEvent(
+            NotificationEvent.SHIPMENT_DELAYED
+        )
+        assertNotNull(shipmentNotifications)
+        
+        // Test filtering by priority
+        val highPriorityNotifications = smartNotificationRepository.getNotificationsByPriority(
+            NotificationPriority.HIGH
+        )
+        assertNotNull(highPriorityNotifications)
+        
+        // Test searching notifications
+        val searchResults = smartNotificationRepository.searchNotifications("شحنة")
+        assertNotNull(searchResults)
+        
+        // Test marking notification as read
+        val unreadNotifications = smartNotificationRepository.getUnreadNotifications()
+        if (unreadNotifications.isNotEmpty()) {
+            val markReadResult = smartNotificationRepository.markNotificationAsRead(
+                unreadNotifications.first().id
+            )
+            assertTrue(markReadResult)
+        }
+        
+        // Test deleting notification
+        val allNotifications = smartNotificationRepository.getNotifications()
+        if (allNotifications.isNotEmpty()) {
+            val deleteResult = smartNotificationRepository.deleteNotification(
+                allNotifications.first().id
+            )
+            assertTrue(deleteResult)
+        }
+    }
+
+    /**
+     * Test Notification ViewModel
+     */
+    @Test
+    fun testNotificationViewModel() = runTest {
+        // Test initial state
+        val initialNotifications = notificationViewModel.notifications.first()
+        assertNotNull(initialNotifications)
+        
+        // Test showing delay notification
+        notificationViewModel.showDelayNotification(
+            shipmentId = "SHIP123",
+            delayMinutes = 45,
+            estimatedDelivery = System.currentTimeMillis() + 3600000
+        )
+        
+        val updatedNotifications = notificationViewModel.notifications.first()
+        assertTrue(updatedNotifications.isNotEmpty())
+        
+        // Test marking notification as read
+        if (updatedNotifications.isNotEmpty()) {
+            val firstNotification = updatedNotifications.first()
+            notificationViewModel.markNotificationAsRead(firstNotification.id)
+            
+            val notificationsAfterMark = notificationViewModel.notifications.first()
+            val markedNotification = notificationsAfterMark.find { it.id == firstNotification.id }
+            assertNotNull(markedNotification)
+            assertTrue(markedNotification.isRead)
+        }
+        
+        // Test updating user preferences
+        val currentPrefs = notificationViewModel.userPreferences.first()
+        val updatedPrefs = currentPrefs.copy(
+            shipmentAlerts = false,
+            quietHours = true
+        )
+        
+        notificationViewModel.updateUserPreferences(updatedPrefs)
+        
+        val prefsAfterUpdate = notificationViewModel.userPreferences.first()
+        assertEquals(false, prefsAfterUpdate.shipmentAlerts)
+        assertEquals(true, prefsAfterUpdate.quietHours)
+        
+        // Test clearing all notifications
+        notificationViewModel.clearAllNotifications()
+        
+        val notificationsAfterClear = notificationViewModel.notifications.first()
+        assertTrue(notificationsAfterClear.isEmpty())
+    }
+
+    /**
+     * Test Notification Filtering and Search
+     */
+    @Test
+    fun testNotificationFiltering() = runTest {
+        // Create test notifications
+        val notifications = listOf(
+            SmartNotification(
+                id = "notif1",
+                title = "تأخير في الشحنة",
+                message = "الشحنة #123 متأخرة",
+                event = NotificationEvent.SHIPMENT_DELAYED,
+                priority = NotificationPriority.HIGH,
+                timestamp = System.currentTimeMillis(),
+                data = mapOf("shipmentId" to "123")
+            ),
+            SmartNotification(
+                id = "notif2",
+                title = "مشكلة في درجة الحرارة",
+                message = "درجة الحرارة مرتفعة",
+                event = NotificationEvent.TEMPERATURE_ISSUE,
+                priority = NotificationPriority.CRITICAL,
+                timestamp = System.currentTimeMillis(),
+                data = mapOf("shipmentId" to "124", "temperature" to "25.0")
+            ),
+            SmartNotification(
+                id = "notif3",
+                title = "فاتورة متأخرة",
+                message = "الفاتورة #456 متأخرة",
+                event = NotificationEvent.PAYMENT_OVERDUE,
+                priority = NotificationPriority.NORMAL,
+                timestamp = System.currentTimeMillis(),
+                data = mapOf("invoiceId" to "456")
+            )
+        )
+        
+        // Test filtering by event type
+        val shipmentNotifications = notifications.filter { it.event == NotificationEvent.SHIPMENT_DELAYED }
+        assertEquals(1, shipmentNotifications.size)
+        
+        val tempNotifications = notifications.filter { it.event == NotificationEvent.TEMPERATURE_ISSUE }
+        assertEquals(1, tempNotifications.size)
+        
+        // Test filtering by priority
+        val criticalNotifications = notifications.filter { it.priority == NotificationPriority.CRITICAL }
+        assertEquals(1, criticalNotifications.size)
+        
+        val highPriorityNotifications = notifications.filter { it.priority == NotificationPriority.HIGH }
+        assertEquals(1, highPriorityNotifications.size)
+        
+        // Test search functionality
+        val searchResults = notifications.filter { notification ->
+            notification.title.contains("شحنة") || 
+            notification.message.contains("شحنة") ||
+            notification.data.values.any { value -> value.toString().contains("123") }
+        }
+        assertEquals(1, searchResults.size)
+    }
+
+    /**
+     * Test Notification Performance
+     */
+    @Test
+    fun testNotificationPerformance() = runTest {
+        val startTime = System.currentTimeMillis()
+        
+        // Create multiple notifications
+        val notifications = mutableListOf<SmartNotification>()
+        
+        for (i in 1..100) {
+            val notification = SmartNotification(
+                id = "notif$i",
+                title = "إشعار اختبار $i",
+                message = "هذا إشعار اختبار رقم $i",
+                event = NotificationEvent.SHIPMENT_DELAYED,
+                priority = NotificationPriority.NORMAL,
+                timestamp = System.currentTimeMillis(),
+                data = mapOf("index" to i)
+            )
+            notifications.add(notification)
+        }
+        
+        // Test bulk operations
+        val bulkInsertTime = System.currentTimeMillis()
+        notifications.forEach { notification ->
+            smartNotificationRepository.insertNotification(notification)
+        }
+        val bulkInsertDuration = System.currentTimeMillis() - bulkInsertTime
+        
+        // Test bulk read
+        val bulkReadTime = System.currentTimeMillis()
+        val allNotifications = smartNotificationRepository.getNotifications()
+        val bulkReadDuration = System.currentTimeMillis() - bulkReadTime
+        
+        // Test bulk search
+        val bulkSearchTime = System.currentTimeMillis()
+        val searchResults = smartNotificationRepository.searchNotifications("اختبار")
+        val bulkSearchDuration = System.currentTimeMillis() - bulkSearchTime
+        
+        val totalTime = System.currentTimeMillis() - startTime
+        
+        // Performance assertions
+        assertTrue("Bulk insert should complete within 5 seconds", bulkInsertDuration < 5000)
+        assertTrue("Bulk read should complete within 1 second", bulkReadDuration < 1000)
+        assertTrue("Bulk search should complete within 1 second", bulkSearchDuration < 1000)
+        assertTrue("Total test should complete within 10 seconds", totalTime < 10000)
+        
+        // Verify results
+        assertTrue("Should have 100 notifications", allNotifications.size >= 100)
+        assertTrue("Should find search results", searchResults.isNotEmpty())
+    }
+
+    /**
+     * Test Notification Reliability
+     */
+    @Test
+    fun testNotificationReliability() = runTest {
+        // Test notification persistence
+        val testNotification = SmartNotification(
+            id = "reliability_test",
+            title = "اختبار الموثوقية",
+            message = "هذا إشعار اختبار الموثوقية",
+            event = NotificationEvent.SYSTEM_UPDATE,
+            priority = NotificationPriority.NORMAL,
+            timestamp = System.currentTimeMillis(),
+            data = mapOf("test" to "reliability")
+        )
+        
+        // Insert notification
+        val insertResult = smartNotificationRepository.insertNotification(testNotification)
+        assertTrue(insertResult)
+        
+        // Verify notification exists
+        val retrievedNotification = smartNotificationRepository.getNotificationById("reliability_test")
+        assertNotNull(retrievedNotification)
+        assertEquals("اختبار الموثوقية", retrievedNotification.title)
+        
+        // Test notification update
+        val updatedNotification = retrievedNotification.copy(
+            title = "اختبار الموثوقية - محدث",
+            isRead = true
+        )
+        
+        val updateResult = smartNotificationRepository.updateNotification(updatedNotification)
+        assertTrue(updateResult)
+        
+        // Verify update
+        finalNotification = smartNotificationRepository.getNotificationById("reliability_test")
+        assertEquals("اختبار الموثوقية - محدث", finalNotification.title)
+        assertTrue(finalNotification.isRead)
+        
+        // Test notification deletion
+        val deleteResult = smartNotificationRepository.deleteNotification("reliability_test")
+        assertTrue(deleteResult)
+        
+        // Verify deletion
+        val deletedNotification = smartNotificationRepository.getNotificationById("reliability_test")
+        assertEquals(null, deletedNotification)
+    }
+    
+    private lateinit var finalNotification: SmartNotification
+}
+
+/**
+ * Integration Tests for Smart Notifications System
+ */
+@ExperimentalCoroutinesApi
+@HiltAndroidTest
+@RunWith(AndroidJUnit4::class)
+class NotificationIntegrationTests {
+
+    @get:Rule
+    val hiltRule = HiltAndroidRule(this)
+
+    @get:Rule
+    val instantTaskExecutorRule = InstantTaskExecutorRule()
+
+    @Inject
+    lateinit var smartNotificationManager: SmartNotificationManager
+
+    @Inject
+    lateinit var eventTriggerManager: EventTriggerManager
+
+    @Inject
+    lateinit var notificationGroupingManager: NotificationGroupingManager
+
+    @Inject
+    lateinit var userPreferencesManager: UserPreferencesManager
+
+    @Before
+    fun setup() {
+        hiltRule.inject()
+    }
+
+    /**
+     * Test complete notification flow
+     */
+    @Test
+    fun testCompleteNotificationFlow() = runTest {
+        // 1. Set up user preferences
+        val preferences = NotificationPreferences(
+            shipmentAlerts = true,
+            paymentAlerts = true,
+            temperatureAlerts = true,
+            minDelayMinutes = 30,
+            minPaymentOverdueDays = 7,
+            autoReschedule = true,
+            paymentReminders = true,
+            quietHours = false,
+            groupSimilar = true,
+            maxNotificationsPerHour = 10,
+            notificationSound = true,
+            vibration = true,
+            ledIndicator = true,
+            priorityFilter = false,
+            allowedPriorities = setOf(
+                NotificationPriority.CRITICAL,
+                NotificationPriority.HIGH,
+                NotificationPriority.NORMAL
+            )
+        )
+        
+        userPreferencesManager.updateUserPreferences(preferences)
+        
+        // 2. Trigger delay event
+        val eventData = mapOf(
+            "shipmentId" to "SHIP789",
+            "delayMinutes" to 45,
+            "estimatedDelivery" to System.currentTimeMillis() + 3600000,
+            "location" to "Riyadh"
+        )
+        
+        val eventResult = eventTriggerManager.processEvent(
+            event = NotificationEvent.SHIPMENT_DELAYED,
+            data = eventData
+        )
+        assertTrue(eventResult)
+        
+        // 3. Create notification
+        val notification = smartNotificationManager.showDelayNotification(
+            shipmentId = "SHIP789",
+            delayMinutes = 45,
+            estimatedDelivery = System.currentTimeMillis() + 3600000
+        )
+        assertNotNull(notification)
+        
+        // 4. Add to group
+        val groupResult = notificationGroupingManager.addNotificationToGroup(notification)
+        assertNotNull(groupResult.groupId)
+        
+        // 5. Generate group summary
+        val summary = notificationGroupingManager.generateGroupSummary(groupResult.groupId)
+        assertNotNull(summary)
+        
+        // 6. Verify complete flow
+        assertTrue("Event should be processed", eventResult)
+        assertNotNull("Notification should be created", notification)
+        assertNotNull("Group should be created", groupResult.groupId)
+        assertNotNull("Summary should be generated", summary)
+    }
+
+    /**
+     * Test multi-event scenario
+     */
+    @Test
+    fun testMultiEventScenario() = runTest {
+        // Create multiple events
+        val events = listOf(
+            NotificationEvent.SHIPMENT_DELAYED to mapOf(
+                "shipmentId" to "SHIP001",
+                "delayMinutes" to 30
+            ),
+            NotificationEvent.TEMPERATURE_ISSUE to mapOf(
+                "shipmentId" to "SHIP002",
+                "currentTemp" to -15.0,
+                "minTemp" to -20.0,
+                "maxTemp" to -10.0
+            ),
+            NotificationEvent.PAYMENT_OVERDUE to mapOf(
+                "invoiceId" to "INV001",
+                "amount" to 1000.0,
+                "daysOverdue" to 5
+            )
+        )
+        
+        val notifications = mutableListOf<SmartNotification>()
+        
+        // Process all events
+        events.forEach { (event, data) ->
+            val eventResult = eventTriggerManager.processEvent(event, data)
+            assertTrue("Event $event should be processed", eventResult)
+            
+            when (event) {
+                NotificationEvent.SHIPMENT_DELAYED -> {
+                    val notification = smartNotificationManager.showDelayNotification(
+                        shipmentId = data["shipmentId"] as String,
+                        delayMinutes = data["delayMinutes"] as Int,
+                        estimatedDelivery = System.currentTimeMillis() + 3600000
+                    )
+                    notifications.add(notification)
+                }
+                NotificationEvent.TEMPERATURE_ISSUE -> {
+                    val notification = smartNotificationManager.showTemperatureNotification(
+                        shipmentId = data["shipmentId"] as String,
+                        currentTemp = data["currentTemp"] as Double,
+                        minTemp = data["minTemp"] as Double,
+                        maxTemp = data["maxTemp"] as Double,
+                        location = "Riyadh"
+                    )
+                    notifications.add(notification)
+                }
+                NotificationEvent.PAYMENT_OVERDUE -> {
+                    val notification = smartNotificationManager.showPaymentOverdueNotification(
+                        invoiceId = data["invoiceId"] as String,
+                        amount = data["amount"] as Double,
+                        dueDate = System.currentTimeMillis() - 86400000,
+                        daysOverdue = data["daysOverdue"] as Int
+                    )
+                    notifications.add(notification)
+                }
+                else -> {}
+            }
+        }
+        
+        // Verify all notifications were created
+        assertEquals(3, notifications.size)
+        
+        // Test grouping
+        val groupIds = mutableSetOf<String>()
+        notifications.forEach { notification ->
+            val groupResult = notificationGroupingManager.addNotificationToGroup(notification)
+            groupIds.add(groupResult.groupId)
+        }
+        
+        // Should have different groups for different event types
+        assertTrue("Should have multiple groups", groupIds.size >= 2)
+    }
+}

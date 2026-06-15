@@ -1,0 +1,903 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.FleetAssignmentEntity
+import com.edham.logistics.data.local.entity.DriverEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.domain.model.DriverStatus
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Vehicle Assignment Manager - Advanced vehicle assignment and scheduling system
+ * 
+ * Features:
+ * - Intelligent vehicle assignment
+ * - Driver-vehicle mapping
+ * - Assignment scheduling
+ * - Conflict resolution
+ * - Assignment history
+ * - Performance tracking
+ * - Automated assignment optimization
+ */
+@Singleton
+class VehicleAssignmentManager @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _assignmentState = MutableStateFlow<AssignmentState>(AssignmentState.Idle)
+    val assignmentState: StateFlow<AssignmentState> = _assignmentState.asStateFlow()
+    
+    private val _activeAssignments = MutableStateFlow<List<FleetAssignmentEntity>>(emptyList())
+    val activeAssignments: StateFlow<List<FleetAssignmentEntity>> = _activeAssignments.asStateFlow()
+    
+    private val _assignmentHistory = MutableStateFlow<List<FleetAssignmentEntity>>(emptyList())
+    val assignmentHistory: StateFlow<List<FleetAssignmentEntity>> = _assignmentHistory.asStateFlow()
+    
+    private val _driverVehicleMapping = MutableStateFlow<Map<String, Long>>(emptyMap())
+    val driverVehicleMapping: StateFlow<Map<String, Long>> = _driverVehicleMapping.asStateFlow()
+    
+    private val _assignmentAnalytics = MutableStateFlow<AssignmentAnalytics?>(null)
+    val assignmentAnalytics: StateFlow<AssignmentAnalytics?> = _assignmentAnalytics.asStateFlow()
+    
+    private val _assignmentConflicts = MutableStateFlow<List<AssignmentConflict>>(emptyList())
+    val assignmentConflicts: StateFlow<List<AssignmentConflict>> = _assignmentConflicts.asStateFlow()
+    
+    private var isOptimizing = false
+    private val assignmentRules = mutableListOf<AssignmentRule>()
+    
+    companion object {
+        private const val TAG = "VehicleAssignmentManager"
+        private const val MAX_ASSIGNMENT_DURATION = 24 * 60 * 60 * 1000L // 24 hours
+        private const val MIN_ASSIGNMENT_DURATION = 30 * 60 * 1000L // 30 minutes
+        private const val OPTIMIZATION_INTERVAL = 300000L // 5 minutes
+    }
+    
+    init {
+        initializeAssignmentRules()
+    }
+    
+    /**
+     * Initialize assignment rules
+     */
+    private fun initializeAssignmentRules() {
+        assignmentRules.add(AssignmentRule(
+            id = "driver_availability",
+            name = "Driver Availability Check",
+            description = "Ensure driver is available for assignment",
+            priority = RulePriority.HIGH,
+            condition = { driver, vehicle, context ->
+                driver.status == DriverStatus.AVAILABLE
+            },
+            action = { driver, vehicle, context ->
+                AssignmentResult.SUCCESS
+            }
+        ))
+        
+        assignmentRules.add(AssignmentRule(
+            id = "vehicle_compatibility",
+            name = "Vehicle Compatibility Check",
+            description = "Ensure vehicle is compatible with driver's requirements",
+            priority = RulePriority.HIGH,
+            condition = { driver, vehicle, context ->
+                isVehicleCompatible(driver, vehicle)
+            },
+            action = { driver, vehicle, context ->
+                AssignmentResult.SUCCESS
+            }
+        ))
+        
+        assignmentRules.add(AssignmentRule(
+            id = "license_validation",
+            name = "License Validation",
+            description = "Validate driver's license for vehicle type",
+            priority = RulePriority.CRITICAL,
+            condition = { driver, vehicle, context ->
+                hasValidLicense(driver, vehicle)
+            },
+            action = { driver, vehicle, context ->
+                AssignmentResult.SUCCESS
+            }
+        ))
+        
+        assignmentRules.add(AssignmentRule(
+            id = "fuel_level_check",
+            name = "Fuel Level Check",
+            description = "Ensure vehicle has sufficient fuel",
+            priority = RulePriority.MEDIUM,
+            condition = { driver, vehicle, context ->
+                vehicle.fuelLevel >= 20f
+            },
+            action = { driver, vehicle, context ->
+                if (vehicle.fuelLevel < 20f) {
+                    AssignmentResult.WARNING("Low fuel level")
+                } else {
+                    AssignmentResult.SUCCESS
+                }
+            }
+        ))
+        
+        assignmentRules.add(AssignmentRule(
+            id = "maintenance_check",
+            name = "Maintenance Check",
+            description = "Ensure vehicle is not due for maintenance",
+            priority = RulePriority.HIGH,
+            condition = { driver, vehicle, context ->
+                vehicle.nextMaintenance.after(Date())
+            },
+            action = { driver, vehicle, context ->
+                AssignmentResult.SUCCESS
+            }
+        ))
+    }
+    
+    /**
+     * Create vehicle assignment
+     */
+    suspend fun createAssignment(request: CreateAssignmentRequest): Result<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _assignmentState.value = AssignmentState.CreatingAssignment
+                
+                // Validate request
+                validateAssignmentRequest(request)
+                
+                // Get driver and vehicle
+                val driver = database.driverDao().getDriverById(request.driverId)
+                    ?: throw Exception("Driver not found")
+                
+                val vehicle = database.vehicleDao().getVehicleById(request.vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Check availability
+                if (!isDriverAvailable(request.driverId)) {
+                    throw Exception("Driver is not available")
+                }
+                
+                if (!isVehicleAvailable(request.vehicleId)) {
+                    throw Exception("Vehicle is not available")
+                }
+                
+                // Apply assignment rules
+                val ruleResults = applyAssignmentRules(driver, vehicle, request.context)
+                val failedRules = ruleResults.filter { !it.success }
+                
+                if (failedRules.any { it.priority == RulePriority.CRITICAL }) {
+                    throw Exception("Critical assignment rules failed: ${failedRules.joinToString { it.message }}")
+                }
+                
+                // Create assignment
+                val assignment = FleetAssignmentEntity(
+                    id = 0,
+                    vehicleId = request.vehicleId,
+                    driverId = request.driverId,
+                    assignmentType = request.assignmentType,
+                    status = AssignmentStatus.SCHEDULED,
+                    assignedAt = Date(),
+                    startedAt = null,
+                    endedAt = null,
+                    startMileage = vehicle.mileage,
+                    endMileage = null,
+                    startFuelLevel = vehicle.fuelLevel,
+                    endFuelLevel = null,
+                    route = request.route,
+                    notes = request.notes,
+                    assignedBy = request.assignedBy,
+                    createdAt = Date()
+                )
+                
+                // Save assignment
+                val assignmentId = database.fleetAssignmentDao().insertAssignment(assignment)
+                val savedAssignment = assignment.copy(id = assignmentId)
+                
+                // Update driver status
+                val updatedDriver = driver.copy(
+                    status = DriverStatus.ASSIGNED,
+                    currentVehicleId = request.vehicleId,
+                    updatedAt = Date()
+                )
+                database.driverDao().updateDriver(updatedDriver)
+                
+                // Update vehicle status if immediate assignment
+                if (request.immediate) {
+                    startAssignment(savedAssignment.id)
+                }
+                
+                // Update mappings and lists
+                updateDriverVehicleMapping()
+                updateActiveAssignments()
+                updateAssignmentHistory()
+                
+                // Check for conflicts
+                checkAssignmentConflicts()
+                
+                _assignmentState.value = AssignmentState.AssignmentCreated
+                Result.success(savedAssignment)
+                
+            } catch (e: Exception) {
+                _assignmentState.value = AssignmentState.Error("Failed to create assignment: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Start assignment
+     */
+    suspend fun startAssignment(assignmentId: Long): Result<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val assignment = database.fleetAssignmentDao().getAssignmentById(assignmentId)
+                    ?: throw Exception("Assignment not found")
+                
+                val vehicle = database.vehicleDao().getVehicleById(assignment.vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val driver = database.driverDao().getDriverById(assignment.driverId)
+                    ?: throw Exception("Driver not found")
+                
+                // Update assignment status
+                val startedAssignment = assignment.copy(
+                    status = AssignmentStatus.ACTIVE,
+                    startedAt = Date()
+                )
+                
+                database.fleetAssignmentDao().updateAssignment(startedAssignment)
+                
+                // Update vehicle status
+                val updatedVehicle = vehicle.copy(
+                    status = VehicleStatus.IN_USE,
+                    updatedAt = Date()
+                )
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Update driver status
+                val updatedDriver = driver.copy(
+                    status = DriverStatus.ON_DUTY,
+                    updatedAt = Date()
+                )
+                database.driverDao().updateDriver(updatedDriver)
+                
+                // Start tracking
+                liveTrackingManager.startTracking(vehicle.vehicleId)
+                
+                // Update lists
+                updateActiveAssignments()
+                updateAssignmentHistory()
+                
+                Result.success(startedAssignment)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Complete assignment
+     */
+    suspend fun completeAssignment(
+        assignmentId: Long,
+        endMileage: Float,
+        endFuelLevel: Float,
+        notes: String,
+        completedBy: String
+    ): Result<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val assignment = database.fleetAssignmentDao().getAssignmentById(assignmentId)
+                    ?: throw Exception("Assignment not found")
+                
+                val vehicle = database.vehicleDao().getVehicleById(assignment.vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val driver = database.driverDao().getDriverById(assignment.driverId)
+                    ?: throw Exception("Driver not found")
+                
+                // Calculate assignment metrics
+                val assignmentDuration = if (assignment.startedAt != null) {
+                    System.currentTimeMillis() - assignment.startedAt.time
+                } else 0L
+                
+                val mileageUsed = endMileage - assignment.startMileage
+                val fuelUsed = assignment.startFuelLevel - endFuelLevel
+                
+                // Complete assignment
+                val completedAssignment = assignment.copy(
+                    status = AssignmentStatus.COMPLETED,
+                    endedAt = Date(),
+                    endMileage = endMileage,
+                    endFuelLevel = endFuelLevel,
+                    notes = notes
+                )
+                
+                database.fleetAssignmentDao().updateAssignment(completedAssignment)
+                
+                // Update vehicle
+                val updatedVehicle = vehicle.copy(
+                    status = VehicleStatus.AVAILABLE,
+                    mileage = endMileage,
+                    fuelLevel = endFuelLevel,
+                    updatedAt = Date()
+                )
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Update driver
+                val updatedDriver = driver.copy(
+                    status = DriverStatus.AVAILABLE,
+                    currentVehicleId = null,
+                    updatedAt = Date()
+                )
+                database.driverDao().updateDriver(updatedDriver)
+                
+                // Stop tracking
+                liveTrackingManager.stopTracking()
+                
+                // Update lists
+                updateDriverVehicleMapping()
+                updateActiveAssignments()
+                updateAssignmentHistory()
+                
+                Result.success(completedAssignment)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Cancel assignment
+     */
+    suspend fun cancelAssignment(assignmentId: Long, reason: String, cancelledBy: String): Result<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val assignment = database.fleetAssignmentDao().getAssignmentById(assignmentId)
+                    ?: throw Exception("Assignment not found")
+                
+                val vehicle = database.vehicleDao().getVehicleById(assignment.vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val driver = database.driverDao().getDriverById(assignment.driverId)
+                    ?: throw Exception("Driver not found")
+                
+                // Cancel assignment
+                val cancelledAssignment = assignment.copy(
+                    status = AssignmentStatus.CANCELLED,
+                    endedAt = Date(),
+                    notes = reason
+                )
+                
+                database.fleetAssignmentDao().updateAssignment(cancelledAssignment)
+                
+                // Update vehicle status
+                val updatedVehicle = vehicle.copy(
+                    status = VehicleStatus.AVAILABLE,
+                    updatedAt = Date()
+                )
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Update driver status
+                val updatedDriver = driver.copy(
+                    status = DriverStatus.AVAILABLE,
+                    currentVehicleId = null,
+                    updatedAt = Date()
+                )
+                database.driverDao().updateDriver(updatedDriver)
+                
+                // Update lists
+                updateDriverVehicleMapping()
+                updateActiveAssignments()
+                updateAssignmentHistory()
+                
+                Result.success(cancelledAssignment)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get optimal vehicle for driver
+     */
+    suspend fun getOptimalVehicleForDriver(
+        driverId: String,
+        requirements: VehicleRequirements = VehicleRequirements()
+    ): Result<VehicleEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val driver = database.driverDao().getDriverById(driverId)
+                    ?: throw Exception("Driver not found")
+                
+                val availableVehicles = database.vehicleDao().getVehiclesByStatus(VehicleStatus.AVAILABLE)
+                
+                // Filter by requirements
+                val compatibleVehicles = availableVehicles.filter { vehicle ->
+                    isVehicleCompatible(driver, vehicle) &&
+                    meetsRequirements(vehicle, requirements)
+                }
+                
+                if (compatibleVehicles.isEmpty()) {
+                    throw Exception("No compatible vehicles available")
+                }
+                
+                // Score vehicles based on multiple factors
+                val scoredVehicles = compatibleVehicles.map { vehicle ->
+                    val score = calculateVehicleScore(driver, vehicle, requirements)
+                    vehicle to score
+                }
+                
+                // Get best vehicle
+                val bestVehicle = scoredVehicles.maxByOrNull { it.second }?.first
+                    ?: throw Exception("Failed to determine optimal vehicle")
+                
+                Result.success(bestVehicle)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get driver assignment history
+     */
+    suspend fun getDriverAssignmentHistory(driverId: String, limit: Int = 50): List<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            database.fleetAssignmentDao().getAssignmentsByDriver(driverId, limit)
+        }
+    }
+    
+    /**
+     * Get vehicle assignment history
+     */
+    suspend fun getVehicleAssignmentHistory(vehicleId: Long, limit: Int = 50): List<FleetAssignmentEntity> {
+        return withContext(Dispatchers.IO) {
+            database.fleetAssignmentDao().getAssignmentsByVehicle(vehicleId, limit)
+        }
+    }
+    
+    /**
+     * Get assignment analytics
+     */
+    suspend fun getAssignmentAnalytics(): AssignmentAnalytics {
+        return withContext(Dispatchers.IO) {
+            try {
+                val allAssignments = database.fleetAssignmentDao().getAllAssignments()
+                val activeAssignments = database.fleetAssignmentDao().getActiveAssignments()
+                val allDrivers = database.driverDao().getAllDrivers()
+                val allVehicles = database.vehicleDao().getAllVehicles()
+                
+                val totalAssignments = allAssignments.size
+                val completedAssignments = allAssignments.count { it.status == AssignmentStatus.COMPLETED }
+                val cancelledAssignments = allAssignments.count { it.status == AssignmentStatus.CANCELLED }
+                val averageAssignmentDuration = calculateAverageAssignmentDuration(allAssignments)
+                val driverUtilization = calculateDriverUtilization(allAssignments, allDrivers)
+                val vehicleUtilization = calculateVehicleUtilization(allAssignments, allVehicles)
+                val assignmentTypeDistribution = calculateAssignmentTypeDistribution(allAssignments)
+                val peakAssignmentTimes = calculatePeakAssignmentTimes(allAssignments)
+                
+                AssignmentAnalytics(
+                    totalAssignments = totalAssignments,
+                    activeAssignments = activeAssignments.size,
+                    completedAssignments = completedAssignments,
+                    cancelledAssignments = cancelledAssignments,
+                    completionRate = if (totalAssignments > 0) completedAssignments.toFloat() / totalAssignments else 1f,
+                    averageAssignmentDuration = averageAssignmentDuration,
+                    driverUtilization = driverUtilization,
+                    vehicleUtilization = vehicleUtilization,
+                    assignmentTypeDistribution = assignmentTypeDistribution,
+                    peakAssignmentTimes = peakAssignmentTimes
+                )
+                
+            } catch (e: Exception) {
+                AssignmentAnalytics()
+            }
+        }
+    }
+    
+    /**
+     * Optimize assignments
+     */
+    suspend fun optimizeAssignments(): Result<List<AssignmentOptimization>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (isOptimizing) {
+                    throw Exception("Optimization already in progress")
+                }
+                
+                isOptimizing = true
+                
+                val activeAssignments = database.fleetAssignmentDao().getActiveAssignments()
+                val optimizations = mutableListOf<AssignmentOptimization>()
+                
+                activeAssignments.forEach { assignment ->
+                    val optimization = optimizeAssignment(assignment)
+                    optimizations.add(optimization)
+                }
+                
+                isOptimizing = false
+                Result.success(optimizations)
+                
+            } catch (e: Exception) {
+                isOptimizing = false
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private fun validateAssignmentRequest(request: CreateAssignmentRequest) {
+        if (request.driverId.isBlank()) throw Exception("Driver ID is required")
+        if (request.vehicleId <= 0) throw Exception("Valid vehicle ID is required")
+        if (request.assignmentType == null) throw Exception("Assignment type is required")
+        if (request.assignedBy.isBlank()) throw Exception("Assigned by is required")
+    }
+    
+    private suspend fun isDriverAvailable(driverId: String): Boolean {
+        val driver = database.driverDao().getDriverById(driverId)
+        return driver?.status == DriverStatus.AVAILABLE
+    }
+    
+    private suspend fun isVehicleAvailable(vehicleId: Long): Boolean {
+        val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+        return vehicle?.status == VehicleStatus.AVAILABLE
+    }
+    
+    private fun applyAssignmentRules(
+        driver: DriverEntity,
+        vehicle: VehicleEntity,
+        context: AssignmentContext
+    ): List<AssignmentRuleResult> {
+        return assignmentRules.map { rule ->
+            val conditionMet = rule.condition(driver, vehicle, context)
+            val result = if (conditionMet) {
+                rule.action(driver, vehicle, context)
+            } else {
+                AssignmentResult.FAILED("Condition not met: ${rule.description}")
+            }
+            
+            AssignmentRuleResult(
+                ruleId = rule.id,
+                ruleName = rule.name,
+                success = result.success,
+                message = result.message,
+                priority = rule.priority
+            )
+        }
+    }
+    
+    private fun isVehicleCompatible(driver: DriverEntity, vehicle: VehicleEntity): Boolean {
+        return driver.vehicleTypes.contains(vehicle.vehicleType) &&
+                driver.licenseCategories.contains(vehicle.category)
+    }
+    
+    private fun hasValidLicense(driver: DriverEntity, vehicle: VehicleEntity): Boolean {
+        return driver.licenseExpiry.after(Date()) &&
+                driver.licenseCategories.contains(vehicle.category)
+    }
+    
+    private fun meetsRequirements(vehicle: VehicleEntity, requirements: VehicleRequirements): Boolean {
+        return (requirements.minCapacity == null || vehicle.capacity >= requirements.minCapacity) &&
+                (requirements.vehicleType == null || vehicle.vehicleType == requirements.vehicleType) &&
+                (requirements.category == null || vehicle.category == requirements.category) &&
+                (requirements.minFuelLevel == null || vehicle.fuelLevel >= requirements.minFuelLevel)
+    }
+    
+    private fun calculateVehicleScore(
+        driver: DriverEntity,
+        vehicle: VehicleEntity,
+        requirements: VehicleRequirements
+    ): Float {
+        var score = 0f
+        
+        // Fuel level score (30%)
+        score += (vehicle.fuelLevel / 100f) * 30f
+        
+        // Mileage score (20%) - lower mileage is better
+        val mileageScore = maxOf(0f, 100f - (vehicle.mileage / 1000f))
+        score += (mileageScore / 100f) * 20f
+        
+        // Maintenance score (25%) - more time until maintenance is better
+        val daysUntilMaintenance = ((vehicle.nextMaintenance.time - System.currentTimeMillis()) / (24 * 60 * 60 * 1000)).toFloat()
+        val maintenanceScore = minOf(100f, daysUntilMaintenance / 30f * 100f)
+        score += (maintenanceScore / 100f) * 25f
+        
+        // Compatibility score (25%)
+        val compatibilityScore = if (isVehicleCompatible(driver, vehicle)) 100f else 0f
+        score += (compatibilityScore / 100f) * 25f
+        
+        return score
+    }
+    
+    private suspend fun updateDriverVehicleMapping() {
+        val activeAssignments = database.fleetAssignmentDao().getActiveAssignments()
+        val mapping = activeAssignments.associate { it.driverId to it.vehicleId }
+        _driverVehicleMapping.value = mapping
+    }
+    
+    private suspend fun updateActiveAssignments() {
+        val assignments = database.fleetAssignmentDao().getActiveAssignments()
+        _activeAssignments.value = assignments
+    }
+    
+    private suspend fun updateAssignmentHistory() {
+        val history = database.fleetAssignmentDao().getAllAssignments()
+        _assignmentHistory.value = history
+    }
+    
+    private suspend fun checkAssignmentConflicts() {
+        val conflicts = mutableListOf<AssignmentConflict>()
+        val activeAssignments = database.fleetAssignmentDao().getActiveAssignments()
+        
+        // Check for driver conflicts
+        val driverAssignments = activeAssignments.groupBy { it.driverId }
+        driverAssignments.forEach { (driverId, assignments) ->
+            if (assignments.size > 1) {
+                conflicts.add(AssignmentConflict(
+                    id = 0,
+                    type = ConflictType.DRIVER_CONFLICT,
+                    driverId = driverId,
+                    vehicleIds = assignments.map { it.vehicleId },
+                    description = "Driver assigned to multiple vehicles",
+                    severity = ConflictSeverity.HIGH,
+                    createdAt = Date()
+                ))
+            }
+        }
+        
+        // Check for vehicle conflicts
+        val vehicleAssignments = activeAssignments.groupBy { it.vehicleId }
+        vehicleAssignments.forEach { (vehicleId, assignments) ->
+            if (assignments.size > 1) {
+                conflicts.add(AssignmentConflict(
+                    id = 0,
+                    type = ConflictType.VEHICLE_CONFLICT,
+                    driverId = assignments.first().driverId,
+                    vehicleIds = listOf(vehicleId),
+                    description = "Vehicle assigned to multiple drivers",
+                    severity = ConflictSeverity.HIGH,
+                    createdAt = Date()
+                ))
+            }
+        }
+        
+        _assignmentConflicts.value = conflicts
+    }
+    
+    private fun calculateAverageAssignmentDuration(assignments: List<FleetAssignmentEntity>): Double {
+        val completedAssignments = assignments.filter { 
+            it.status == AssignmentStatus.COMPLETED && it.startedAt != null && it.endedAt != null 
+        }
+        
+        if (completedAssignments.isEmpty()) return 0.0
+        
+        val totalDuration = completedAssignments.sumOf { assignment ->
+            assignment.endedAt!!.time - assignment.startedAt!!.time
+        }
+        
+        return totalDuration / completedAssignments.size / (1000 * 60) // Convert to minutes
+    }
+    
+    private fun calculateDriverUtilization(assignments: List<FleetAssignmentEntity>, drivers: List<DriverEntity>): Map<String, Float> {
+        return drivers.associate { driver ->
+            val driverAssignments = assignments.filter { it.driverId == driver.id }
+            val utilizationRate = if (driverAssignments.isNotEmpty()) {
+                val totalAssignmentTime = driverAssignments.filter { 
+                    it.startedAt != null && it.endedAt != null 
+                }.sumOf { assignment ->
+                    assignment.endedAt!!.time - assignment.startedAt!!.time
+                }
+                val timeRange = System.currentTimeMillis() - driver.createdAt.time
+                (totalAssignmentTime.toFloat() / timeRange.toFloat()) * 100f
+            } else 0f
+            
+            driver.id to utilizationRate
+        }
+    }
+    
+    private fun calculateVehicleUtilization(assignments: List<FleetAssignmentEntity>, vehicles: List<VehicleEntity>): Map<Long, Float> {
+        return vehicles.associate { vehicle ->
+            val vehicleAssignments = assignments.filter { it.vehicleId == vehicle.id }
+            val utilizationRate = if (vehicleAssignments.isNotEmpty()) {
+                val totalAssignmentTime = vehicleAssignments.filter { 
+                    it.startedAt != null && it.endedAt != null 
+                }.sumOf { assignment ->
+                    assignment.endedAt!!.time - assignment.startedAt!!.time
+                }
+                val timeRange = System.currentTimeMillis() - vehicle.createdAt.time
+                (totalAssignmentTime.toFloat() / timeRange.toFloat()) * 100f
+            } else 0f
+            
+            vehicle.id to utilizationRate
+        }
+    }
+    
+    private fun calculateAssignmentTypeDistribution(assignments: List<FleetAssignmentEntity>): Map<AssignmentType, Int> {
+        return assignments.groupBy { it.assignmentType }.mapValues { it.value.size }
+    }
+    
+    private fun calculatePeakAssignmentTimes(assignments: List<FleetAssignmentEntity>): Map<String, Int> {
+        return assignments.groupBy { assignment ->
+            val calendar = Calendar.getInstance()
+            calendar.time = assignment.assignedAt
+            "${calendar.get(Calendar.HOUR_OF_DAY)}:00"
+        }.mapValues { it.value.size }
+    }
+    
+    private fun optimizeAssignment(assignment: FleetAssignmentEntity): AssignmentOptimization {
+        // Implementation would analyze assignment and suggest optimizations
+        return AssignmentOptimization(
+            assignmentId = assignment.id,
+            currentEfficiency = 0.75f,
+            suggestedEfficiency = 0.85f,
+            recommendations = listOf("Optimize route", "Adjust fueling schedule"),
+            potentialSavings = 150.0,
+            priority = OptimizationPriority.MEDIUM
+        )
+    }
+    
+    /**
+     * Get optimization status
+     */
+    fun isOptimizing(): Boolean = isOptimizing
+}
+
+/**
+ * Data classes
+ */
+data class CreateAssignmentRequest(
+    val driverId: String,
+    val vehicleId: Long,
+    val assignmentType: AssignmentType,
+    val route: String?,
+    val notes: String?,
+    val immediate: Boolean = false,
+    val context: AssignmentContext = AssignmentContext(),
+    val assignedBy: String
+)
+
+data class AssignmentContext(
+    val shipmentId: Long? = null,
+    val priority: Priority? = null,
+    val estimatedDuration: Long? = null,
+    val specialRequirements: List<String> = emptyList()
+)
+
+data class VehicleRequirements(
+    val minCapacity: Float? = null,
+    val vehicleType: VehicleType? = null,
+    val category: VehicleCategory? = null,
+    val minFuelLevel: Float? = null,
+    val features: List<String> = emptyList()
+)
+
+data class AssignmentRule(
+    val id: String,
+    val name: String,
+    val description: String,
+    val priority: RulePriority,
+    val condition: (DriverEntity, VehicleEntity, AssignmentContext) -> Boolean,
+    val action: (DriverEntity, VehicleEntity, AssignmentContext) -> AssignmentResult
+)
+
+data class AssignmentRuleResult(
+    val ruleId: String,
+    val ruleName: String,
+    val success: Boolean,
+    val message: String,
+    val priority: RulePriority
+)
+
+data class AssignmentResult(
+    val success: Boolean,
+    val message: String
+) {
+    companion object {
+        fun SUCCESS() = AssignmentResult(true, "Success")
+        fun WARNING(message: String) = AssignmentResult(true, message)
+        fun FAILED(message: String) = AssignmentResult(false, message)
+    }
+}
+
+data class AssignmentAnalytics(
+    val totalAssignments: Int = 0,
+    val activeAssignments: Int = 0,
+    val completedAssignments: Int = 0,
+    val cancelledAssignments: Int = 0,
+    val completionRate: Float = 0f,
+    val averageAssignmentDuration: Double = 0.0,
+    val driverUtilization: Map<String, Float> = emptyMap(),
+    val vehicleUtilization: Map<Long, Float> = emptyMap(),
+    val assignmentTypeDistribution: Map<AssignmentType, Int> = emptyMap(),
+    val peakAssignmentTimes: Map<String, Int> = emptyMap()
+)
+
+data class AssignmentConflict(
+    val id: Long,
+    val type: ConflictType,
+    val driverId: String,
+    val vehicleIds: List<Long>,
+    val description: String,
+    val severity: ConflictSeverity,
+    val createdAt: Date
+)
+
+data class AssignmentOptimization(
+    val assignmentId: Long,
+    val currentEfficiency: Float,
+    val suggestedEfficiency: Float,
+    val recommendations: List<String>,
+    val potentialSavings: Double,
+    val priority: OptimizationPriority
+)
+
+/**
+ * Enums
+ */
+enum class AssignmentState {
+    Idle,
+    CreatingAssignment,
+    AssignmentCreated,
+    StartingAssignment,
+    AssignmentStarted,
+    CompletingAssignment,
+    AssignmentCompleted,
+    CancellingAssignment,
+    AssignmentCancelled,
+    Error
+}
+
+// DriverStatus is now imported from domain.model
+
+enum class Priority {
+    LOW,
+    NORMAL,
+    HIGH,
+    CRITICAL
+}
+
+enum class RulePriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class ConflictType {
+    DRIVER_CONFLICT,
+    VEHICLE_CONFLICT,
+    TIME_CONFLICT,
+    RESOURCE_CONFLICT
+}
+
+enum class ConflictSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class OptimizationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

@@ -1,0 +1,172 @@
+package com.edham.logistics.presentation.ui.dashboard
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.domain.model.Shipment
+import com.edham.logistics.domain.model.Driver
+import com.edham.logistics.domain.model.Vehicle
+import com.edham.logistics.domain.usecase.GetShipmentsUseCase
+import com.edham.logistics.domain.usecase.GetDriversUseCase
+import com.edham.logistics.domain.usecase.GetVehiclesUseCase
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class AdminDashboardViewModel @Inject constructor(
+    private val getShipmentsUseCase: GetShipmentsUseCase,
+    private val getDriversUseCase: GetDriversUseCase,
+    private val getVehiclesUseCase: GetVehiclesUseCase
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(AdminDashboardUiState())
+    val uiState: StateFlow<AdminDashboardUiState> = _uiState.asStateFlow()
+
+    init {
+        loadDashboardData()
+        observeDataChanges()
+    }
+
+    private fun loadDashboardData() {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoading = true, error = null)
+            
+            // Load all data in parallel
+            val shipmentsResult = getShipmentsUseCase()
+            val driversResult = getDriversUseCase()
+            val vehiclesResult = getVehiclesUseCase()
+            
+            when {
+                shipmentsResult is Result.Success && 
+                driversResult is Result.Success && 
+                vehiclesResult is Result.Success -> {
+                    
+                    val shipments = shipmentsResult.data
+                    val drivers = driversResult.data
+                    val vehicles = vehiclesResult.data
+                    
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        shipments = shipments,
+                        drivers = drivers,
+                        vehicles = vehicles,
+                        totalShipments = shipments.size,
+                        activeShipments = shipments.count { it.status == "in_transit" },
+                        totalDrivers = drivers.size,
+                        activeDrivers = drivers.count { it.isOnline },
+                        totalVehicles = vehicles.size,
+                        availableVehicles = vehicles.count { it.status == "available" },
+                        totalRevenue = shipments.filter { it.status == "delivered" }.sumOf { it.price }
+                    )
+                }
+                shipmentsResult is Result.Error -> {
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        error = shipmentsResult.exception.message
+                    )
+                }
+                driversResult is Result.Error -> {
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        error = driversResult.exception.message
+                    )
+                }
+                vehiclesResult is Result.Error -> {
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        error = vehiclesResult.exception.message
+                    )
+                }
+            }
+        }
+    }
+
+    private fun observeDataChanges() {
+        viewModelScope.launch {
+            // Observe shipments changes
+            getShipmentsUseCase.observeShipments().collect { shipments ->
+                _uiState.value = _uiState.value.copy(
+                    shipments = shipments,
+                    totalShipments = shipments.size,
+                    activeShipments = shipments.count { it.status == "in_transit" },
+                    totalRevenue = shipments.filter { it.status == "delivered" }.sumOf { it.price }
+                )
+            }
+        }
+        
+        viewModelScope.launch {
+            // Observe drivers changes
+            getDriversUseCase.observeDrivers().collect { drivers ->
+                _uiState.value = _uiState.value.copy(
+                    drivers = drivers,
+                    totalDrivers = drivers.size,
+                    activeDrivers = drivers.count { it.isOnline }
+                )
+            }
+        }
+        
+        viewModelScope.launch {
+            // Observe vehicles changes
+            getVehiclesUseCase.observeVehicles().collect { vehicles ->
+                _uiState.value = _uiState.value.copy(
+                    vehicles = vehicles,
+                    totalVehicles = vehicles.size,
+                    availableVehicles = vehicles.count { it.status == "available" }
+                )
+            }
+        }
+    }
+
+    fun refreshData() {
+        loadDashboardData()
+    }
+
+    fun clearError() {
+        _uiState.value = _uiState.value.copy(error = null)
+    }
+
+    fun filterShipmentsByStatus(status: String) {
+        viewModelScope.launch {
+            when (val result = getShipmentsUseCase()) {
+                is Result.Success -> {
+                    val filteredShipments = if (status == "all") {
+                        result.data
+                    } else {
+                        result.data.filter { it.status == status }
+                    }
+                    _uiState.value = _uiState.value.copy(
+                        filteredShipments = filteredShipments,
+                        selectedStatus = status
+                    )
+                }
+                is Result.Error -> {
+                    _uiState.value = _uiState.value.copy(error = result.exception.message)
+                }
+                is Result.Loading -> {
+                    _uiState.value = _uiState.value.copy(isLoading = true)
+                }
+            }
+        }
+    }
+}
+
+data class AdminDashboardUiState(
+    val shipments: List<Shipment> = emptyList(),
+    val drivers: List<Driver> = emptyList(),
+    val vehicles: List<Vehicle> = emptyList(),
+    val filteredShipments: List<Shipment> = emptyList(),
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    val totalShipments: Int = 0,
+    val activeShipments: Int = 0,
+    val totalDrivers: Int = 0,
+    val activeDrivers: Int = 0,
+    val totalVehicles: Int = 0,
+    val availableVehicles: Int = 0,
+    val totalRevenue: Double = 0.0,
+    val selectedStatus: String = "all"
+)

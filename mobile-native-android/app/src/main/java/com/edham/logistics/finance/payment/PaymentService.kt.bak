@@ -1,0 +1,741 @@
+package com.edham.logistics.finance.payment
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.PaymentGatewayApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Payment Service - Handles all payment processing operations
+ * 
+ * Features:
+ * - Payment processing through multiple gateways
+ * - Driver payment management
+ * - Customer payment processing
+ * - Payment security and validation
+ * - Payment history tracking
+ * - Refund processing
+ * - Payment analytics
+ * - Multi-currency support
+ */
+@Singleton
+class PaymentService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val paymentGatewayApi: PaymentGatewayApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _paymentState = MutableStateFlow<PaymentState>(PaymentState.Idle)
+    val paymentState: StateFlow<PaymentState> = _paymentState.asStateFlow()
+    
+    private val _paymentHistory = MutableStateFlow<List<PaymentTransaction>>(emptyList())
+    val paymentHistory: StateFlow<List<PaymentTransaction>> = _paymentHistory.asStateFlow()
+    
+    private val _paymentStats = MutableStateFlow<PaymentStats>(PaymentStats())
+    val paymentStats: StateFlow<PaymentStats> = _paymentStats.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "PaymentService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val PAYMENT_TIMEOUT_MS = 30000L
+        private const val MAX_RETRY_ATTEMPTS = 3
+    }
+    
+    /**
+     * Initialize payment service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _paymentState.value = PaymentState.Initializing
+                
+                // Load payment configuration
+                loadPaymentConfiguration()
+                
+                // Initialize payment gateways
+                initializePaymentGateways()
+                
+                // Load payment history
+                loadPaymentHistory()
+                
+                isInitialized = true
+                _paymentState.value = PaymentState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _paymentState.value = PaymentState.Error("Failed to initialize payment service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process payment
+     */
+    suspend fun processPayment(
+        paymentRequest: PaymentRequest
+    ): Result<PaymentTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Payment service not initialized")
+                }
+                
+                _paymentState.value = PaymentState.Processing
+                
+                // Validate payment request
+                validatePaymentRequest(paymentRequest)
+                
+                // Create payment transaction
+                val transaction = PaymentTransaction(
+                    id = UUID.randomUUID().toString(),
+                    userId = paymentRequest.userId,
+                    amount = paymentRequest.amount,
+                    currency = paymentRequest.currency,
+                    paymentMethod = paymentRequest.paymentMethod,
+                    status = PaymentStatus.PENDING,
+                    description = paymentRequest.description,
+                    invoiceId = paymentRequest.invoiceId,
+                    expenseCategory = paymentRequest.expenseCategory,
+                    metadata = paymentRequest.metadata,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save transaction to database
+                savePaymentTransaction(transaction)
+                
+                // Process payment through appropriate gateway
+                val gatewayResult = processPaymentThroughGateway(transaction, paymentRequest)
+                
+                if (gatewayResult.isSuccess) {
+                    val gatewayResponse = gatewayResult.getOrThrow()
+                    
+                    // Update transaction with gateway response
+                    val updatedTransaction = transaction.copy(
+                        status = PaymentStatus.COMPLETED,
+                        gatewayTransactionId = gatewayResponse.transactionId,
+                        gatewayResponse = gatewayResponse,
+                        processedAt = Date(),
+                        updatedAt = Date()
+                    )
+                    
+                    // Update in database
+                    updatePaymentTransaction(updatedTransaction)
+                    
+                    // Add to history
+                    addToPaymentHistory(updatedTransaction)
+                    
+                    // Update stats
+                    updatePaymentStats()
+                    
+                    _paymentState.value = PaymentState.Ready
+                    Result.success(updatedTransaction)
+                    
+                } else {
+                    // Mark transaction as failed
+                    val failedTransaction = transaction.copy(
+                        status = PaymentStatus.FAILED,
+                        errorMessage = gatewayResult.exceptionOrNull()?.message,
+                        updatedAt = Date()
+                    )
+                    
+                    updatePaymentTransaction(failedTransaction)
+                    addToPaymentHistory(failedTransaction)
+                    
+                    throw gatewayResult.exceptionOrNull() ?: Exception("Payment processing failed")
+                }
+                
+            } catch (e: Exception) {
+                _paymentState.value = PaymentState.Error("Payment processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process driver payment
+     */
+    suspend fun processDriverPayment(
+        driverId: String,
+        amount: Float,
+        paymentMethod: PaymentMethod,
+        period: PaymentPeriod,
+        description: String? = null
+    ): Result<PaymentTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get driver details
+                val driver = database.driverDao().getDriverById(driverId.toLong())
+                    ?: throw Exception("Driver not found")
+                
+                // Create driver payment request
+                val paymentRequest = PaymentRequest(
+                    userId = driverId,
+                    amount = amount,
+                    currency = DEFAULT_CURRENCY,
+                    paymentMethod = paymentMethod,
+                    description = description ?: "Driver salary payment for $period",
+                    metadata = mapOf(
+                        "paymentType" to "DRIVER_SALARY",
+                        "driverId" to driverId,
+                        "driverName" to driver.name,
+                        "period" to period.name
+                    )
+                )
+                
+                processPayment(paymentRequest)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process customer payment
+     */
+    suspend fun processCustomerPayment(
+        customerId: String,
+        amount: Float,
+        paymentMethod: PaymentMethod,
+        invoiceId: String? = null,
+        description: String? = null
+    ): Result<PaymentTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get customer details
+                val customer = database.customerDao().getCustomerById(customerId.toLong())
+                    ?: throw Exception("Customer not found")
+                
+                // Create customer payment request
+                val paymentRequest = PaymentRequest(
+                    userId = customerId,
+                    amount = amount,
+                    currency = DEFAULT_CURRENCY,
+                    paymentMethod = paymentMethod,
+                    invoiceId = invoiceId,
+                    description = description ?: "Payment from customer ${customer.name}",
+                    metadata = mapOf(
+                        "paymentType" to "CUSTOMER_PAYMENT",
+                        "customerId" to customerId,
+                        "customerName" to customer.name
+                    )
+                )
+                
+                processPayment(paymentRequest)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process refund
+     */
+    suspend fun processRefund(
+        refundRequest: RefundRequest,
+        originalTransaction: PaymentTransaction
+    ): Result<Refund> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Payment service not initialized")
+                }
+                
+                _paymentState.value = PaymentState.Processing
+                
+                // Validate refund request
+                validateRefundRequest(refundRequest, originalTransaction)
+                
+                // Create refund
+                val refund = Refund(
+                    id = UUID.randomUUID().toString(),
+                    originalTransactionId = originalTransaction.id,
+                    amount = refundRequest.amount,
+                    reason = refundRequest.reason,
+                    refundMethod = refundRequest.refundMethod,
+                    status = RefundStatus.PENDING,
+                    metadata = refundRequest.metadata,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Process refund through gateway
+                val gatewayResult = processRefundThroughGateway(refund, originalTransaction)
+                
+                if (gatewayResult.isSuccess) {
+                    val gatewayResponse = gatewayResult.getOrThrow()
+                    
+                    // Update refund with gateway response
+                    val updatedRefund = refund.copy(
+                        status = RefundStatus.COMPLETED,
+                        gatewayTransactionId = gatewayResponse.transactionId,
+                        gatewayResponse = gatewayResponse,
+                        processedAt = Date(),
+                        updatedAt = Date()
+                    )
+                    
+                    // Update original transaction
+                    val updatedTransaction = originalTransaction.copy(
+                        status = PaymentStatus.REFUNDED,
+                        refundId = updatedRefund.id,
+                        updatedAt = Date()
+                    )
+                    
+                    // Save to database
+                    saveRefund(updatedRefund)
+                    updatePaymentTransaction(updatedTransaction)
+                    
+                    _paymentState.value = PaymentState.Ready
+                    Result.success(updatedRefund)
+                    
+                } else {
+                    // Mark refund as failed
+                    val failedRefund = refund.copy(
+                        status = RefundStatus.FAILED,
+                        errorMessage = gatewayResult.exceptionOrNull()?.message,
+                        updatedAt = Date()
+                    )
+                    
+                    saveRefund(failedRefund)
+                    
+                    throw gatewayResult.exceptionOrNull() ?: Exception("Refund processing failed")
+                }
+                
+            } catch (e: Exception) {
+                _paymentState.value = PaymentState.Error("Refund processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get transaction
+     */
+    suspend fun getTransaction(transactionId: String): PaymentTransaction? {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.paymentTransactionDao().getTransactionById(transactionId)?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get payment history
+     */
+    suspend fun getPaymentHistory(
+        userId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        status: PaymentStatus? = null
+    ): Result<List<PaymentTransaction>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = database.paymentTransactionDao().getPaymentHistory(
+                    userId = userId,
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    status = status
+                ).map { it.toDomainModel() }
+                
+                Result.success(transactions)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get driver payments
+     */
+    suspend fun getDriverPayments(
+        dateRange: DateRange = DateRange.currentMonth()
+    ): Float {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.paymentTransactionDao().getDriverPayments(dateRange.startDate, dateRange.endDate)
+            } catch (e: Exception) {
+                0f
+            }
+        }
+    }
+    
+    /**
+     * Get customer payments
+     */
+    suspend fun getCustomerPayments(
+        dateRange: DateRange = DateRange.currentMonth()
+    ): Float {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.paymentTransactionDao().getCustomerPayments(dateRange.startDate, dateRange.endDate)
+            } catch (e: Exception) {
+                0f
+            }
+        }
+    }
+    
+    /**
+     * Get total transactions
+     */
+    suspend fun getTotalTransactions(
+        dateRange: DateRange = DateRange.currentMonth()
+    ): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.paymentTransactionDao().getTotalTransactions(dateRange.startDate, dateRange.endDate)
+            } catch (e: Exception) {
+                0
+            }
+        }
+    }
+    
+    /**
+     * Get payment analytics
+     */
+    suspend fun getPaymentAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<PaymentAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = getPaymentHistory(null, dateRange).getOrThrow()
+                
+                val analytics = PaymentAnalytics(
+                    totalTransactions = transactions.size,
+                    totalAmount = transactions.sumOf { it.amount.toDouble() }.toFloat(),
+                    averageTransactionAmount = if (transactions.isNotEmpty()) transactions.map { it.amount }.average().toFloat() else 0f,
+                    successfulTransactions = transactions.count { it.status == PaymentStatus.COMPLETED },
+                    failedTransactions = transactions.count { it.status == PaymentStatus.FAILED },
+                    refundedTransactions = transactions.count { it.status == PaymentStatus.REFUNDED },
+                    paymentMethodStats = transactions.groupBy { it.paymentMethod }.mapValues { it.value.size },
+                    currencyStats = transactions.groupBy { it.currency }.mapValues { it.value.sumOf { it.amount.toDouble() }.toFloat() },
+                    dailyStats = calculateDailyStats(transactions),
+                    monthlyStats = calculateMonthlyStats(transactions)
+                )
+                
+                Result.success(analytics)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadPaymentConfiguration() {
+        // Load payment configuration from API or local storage
+    }
+    
+    private suspend fun initializePaymentGateways() {
+        // Initialize payment gateway configurations
+    }
+    
+    private suspend fun loadPaymentHistory() {
+        try {
+            val transactions = database.paymentTransactionDao().getRecentTransactions(100)
+                .map { it.toDomainModel() }
+            
+            _paymentHistory.value = transactions
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun validatePaymentRequest(request: PaymentRequest) {
+        if (request.amount <= 0) throw Exception("Payment amount must be positive")
+        if (request.userId.isBlank()) throw Exception("User ID cannot be empty")
+        if (request.paymentMethod == null) throw Exception("Payment method is required")
+    }
+    
+    private fun validateRefundRequest(request: RefundRequest, originalTransaction: PaymentTransaction) {
+        if (request.amount <= 0) throw Exception("Refund amount must be positive")
+        if (request.amount > originalTransaction.amount) throw Exception("Refund amount cannot exceed original transaction amount")
+        if (request.reason.isBlank()) throw Exception("Refund reason is required")
+        if (originalTransaction.status != PaymentStatus.COMPLETED) throw Exception("Can only refund completed transactions")
+    }
+    
+    private suspend fun processPaymentThroughGateway(
+        transaction: PaymentTransaction,
+        paymentRequest: PaymentRequest
+    ): Result<PaymentGatewayResponse> {
+        return try {
+            when (paymentRequest.paymentMethod) {
+                PaymentMethod.CREDIT_CARD -> paymentGatewayApi.processCreditCardPayment(transaction)
+                PaymentMethod.DEBIT_CARD -> paymentGatewayApi.processDebitCardPayment(transaction)
+                PaymentMethod.BANK_TRANSFER -> paymentGatewayApi.processBankTransferPayment(transaction)
+                PaymentMethod.MOBILE_MONEY -> paymentGatewayApi.processMobileMoneyPayment(transaction)
+                PaymentMethod.WALLET -> paymentGatewayApi.processWalletPayment(transaction)
+                PaymentMethod.CASH -> paymentGatewayApi.processCashPayment(transaction)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    private suspend fun processRefundThroughGateway(
+        refund: Refund,
+        originalTransaction: PaymentTransaction
+    ): Result<PaymentGatewayResponse> {
+        return try {
+            when (refund.refundMethod) {
+                PaymentMethod.CREDIT_CARD -> paymentGatewayApi.processCreditCardRefund(refund, originalTransaction)
+                PaymentMethod.DEBIT_CARD -> paymentGatewayApi.processDebitCardRefund(refund, originalTransaction)
+                PaymentMethod.BANK_TRANSFER -> paymentGatewayApi.processBankTransferRefund(refund, originalTransaction)
+                PaymentMethod.MOBILE_MONEY -> paymentGatewayApi.processMobileMoneyRefund(refund, originalTransaction)
+                PaymentMethod.WALLET -> paymentGatewayApi.processWalletRefund(refund, originalTransaction)
+                else -> throw Exception("Refund method not supported")
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    private suspend fun savePaymentTransaction(transaction: PaymentTransaction) {
+        try {
+            database.paymentTransactionDao().insertTransaction(transaction.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun updatePaymentTransaction(transaction: PaymentTransaction) {
+        try {
+            database.paymentTransactionDao().updateTransaction(transaction.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun saveRefund(refund: Refund) {
+        try {
+            database.refundDao().insertRefund(refund.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun addToPaymentHistory(transaction: PaymentTransaction) {
+        val currentHistory = _paymentHistory.value.toMutableList()
+        currentHistory.add(0, transaction) // Add to beginning
+        
+        // Keep only last 100 transactions in cache
+        if (currentHistory.size > 100) {
+            currentHistory.removeAt(currentHistory.size - 1)
+        }
+        
+        _paymentHistory.value = currentHistory
+    }
+    
+    private suspend fun updatePaymentStats() {
+        try {
+            val transactions = _paymentHistory.value
+            val stats = PaymentStats(
+                totalTransactions = transactions.size,
+                successfulTransactions = transactions.count { it.status == PaymentStatus.COMPLETED },
+                failedTransactions = transactions.count { it.status == PaymentStatus.FAILED },
+                refundedTransactions = transactions.count { it.status == PaymentStatus.REFUNDED },
+                totalAmount = transactions.sumOf { it.amount.toDouble() }.toFloat(),
+                averageAmount = if (transactions.isNotEmpty()) transactions.map { it.amount }.average().toFloat() else 0f,
+                paymentMethodStats = transactions.groupBy { it.paymentMethod }.mapValues { it.value.size }
+            )
+            
+            _paymentStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun calculateDailyStats(transactions: List<PaymentTransaction>): Map<String, DailyPaymentStats> {
+        return transactions.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.createdAt
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}-${String.format("%02d", calendar.get(Calendar.DAY_OF_MONTH))}"
+        }.mapValues { (_, dayTransactions) ->
+            DailyPaymentStats(
+                transactionCount = dayTransactions.size,
+                totalAmount = dayTransactions.sumOf { it.amount.toDouble() }.toFloat(),
+                successfulTransactions = dayTransactions.count { it.status == PaymentStatus.COMPLETED }
+            )
+        }
+    }
+    
+    private fun calculateMonthlyStats(transactions: List<PaymentTransaction>): Map<String, MonthlyPaymentStats> {
+        return transactions.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.createdAt
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { (_, monthTransactions) ->
+            MonthlyPaymentStats(
+                transactionCount = monthTransactions.size,
+                totalAmount = monthTransactions.sumOf { it.amount.toDouble() }.toFloat(),
+                successfulTransactions = monthTransactions.count { it.status == PaymentStatus.COMPLETED },
+                averageAmount = if (monthTransactions.isNotEmpty()) monthTransactions.map { it.amount }.average().toFloat() else 0f
+            )
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class PaymentRequest(
+    val userId: String,
+    val amount: Float,
+    val currency: String = "SAR",
+    val paymentMethod: PaymentMethod,
+    val description: String,
+    val invoiceId: String? = null,
+    val expenseCategory: ExpenseCategory? = null,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class PaymentTransaction(
+    val id: String,
+    val userId: String,
+    val amount: Float,
+    val currency: String,
+    val paymentMethod: PaymentMethod,
+    val status: PaymentStatus,
+    val description: String,
+    val invoiceId: String? = null,
+    val expenseCategory: ExpenseCategory? = null,
+    val gatewayTransactionId: String? = null,
+    val gatewayResponse: PaymentGatewayResponse? = null,
+    val refundId: String? = null,
+    val errorMessage: String? = null,
+    val metadata: Map<String, String> = emptyMap(),
+    val createdAt: Date,
+    val updatedAt: Date,
+    val processedAt: Date? = null
+)
+
+data class RefundRequest(
+    val originalTransactionId: String,
+    val amount: Float,
+    val reason: String,
+    val refundMethod: PaymentMethod,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class Refund(
+    val id: String,
+    val originalTransactionId: String,
+    val amount: Float,
+    val reason: String,
+    val refundMethod: PaymentMethod,
+    val status: RefundStatus,
+    val gatewayTransactionId: String? = null,
+    val gatewayResponse: PaymentGatewayResponse? = null,
+    val errorMessage: String? = null,
+    val metadata: Map<String, String> = emptyMap(),
+    val createdAt: Date,
+    val updatedAt: Date,
+    val processedAt: Date? = null
+)
+
+data class PaymentAnalytics(
+    val totalTransactions: Int,
+    val totalAmount: Float,
+    val averageTransactionAmount: Float,
+    val successfulTransactions: Int,
+    val failedTransactions: Int,
+    val refundedTransactions: Int,
+    val paymentMethodStats: Map<PaymentMethod, Int>,
+    val currencyStats: Map<String, Float>,
+    val dailyStats: Map<String, DailyPaymentStats>,
+    val monthlyStats: Map<String, MonthlyPaymentStats>
+)
+
+data class PaymentStats(
+    val totalTransactions: Int = 0,
+    val successfulTransactions: Int = 0,
+    val failedTransactions: Int = 0,
+    val refundedTransactions: Int = 0,
+    val totalAmount: Float = 0f,
+    val averageAmount: Float = 0f,
+    val paymentMethodStats: Map<PaymentMethod, Int> = emptyMap()
+)
+
+data class DailyPaymentStats(
+    val transactionCount: Int,
+    val totalAmount: Float,
+    val successfulTransactions: Int
+)
+
+data class MonthlyPaymentStats(
+    val transactionCount: Int,
+    val totalAmount: Float,
+    val successfulTransactions: Int,
+    val averageAmount: Float
+)
+
+/**
+ * Enums
+ */
+enum class PaymentState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class PaymentStatus {
+    PENDING,
+    PROCESSING,
+    COMPLETED,
+    FAILED,
+    REFUNDED,
+    CANCELLED
+}
+
+enum class PaymentMethod {
+    CREDIT_CARD,
+    DEBIT_CARD,
+    BANK_TRANSFER,
+    MOBILE_MONEY,
+    WALLET,
+    CASH
+}
+
+enum class RefundStatus {
+    PENDING,
+    PROCESSING,
+    COMPLETED,
+    FAILED,
+    CANCELLED
+}
+
+enum class PaymentPeriod {
+    WEEKLY,
+    BI_WEEKLY,
+    MONTHLY,
+    QUARTERLY,
+    YEARLY
+}

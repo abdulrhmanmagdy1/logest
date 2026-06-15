@@ -1,0 +1,780 @@
+package com.edham.logistics.core.performance
+
+import android.app.ActivityManager
+import android.content.Context
+import android.os.Build
+import android.os.Debug
+import android.os.Process
+import com.edham.logistics.core.utils.DeviceInfo
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.lang.management.ManagementFactory
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Performance monitoring system for production optimization
+ */
+@Singleton
+class PerformanceMonitor @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val deviceInfo: DeviceInfo
+) {
+    
+    companion object {
+        private const val MONITORING_INTERVAL = 5000L // 5 seconds
+        private const val MEMORY_WARNING_THRESHOLD = 0.8 // 80%
+        private const val CPU_WARNING_THRESHOLD = 0.8 // 80%
+        private const val BATTERY_WARNING_THRESHOLD = 0.2 // 20%
+        private const val MAX_PERFORMANCE_LOGS = 1000
+    }
+    
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    private val runtime = Runtime.getRuntime()
+    
+    private val _performanceMetrics = MutableStateFlow(PerformanceMetrics())
+    val performanceMetrics: StateFlow<PerformanceMetrics> = _performanceMetrics.asStateFlow()
+    
+    private val _performanceAlerts = MutableStateFlow<List<PerformanceAlert>>(emptyList())
+    val performanceAlerts: StateFlow<List<PerformanceAlert>> = _performanceAlerts.asStateFlow()
+    
+    private val _batteryInfo = MutableStateFlow(BatteryInfo())
+    val batteryInfo: StateFlow<BatteryInfo> = _batteryInfo.asStateFlow()
+    
+    private val performanceLogs = mutableListOf<PerformanceLog>()
+    private val monitoringEnabled = MutableStateFlow(true)
+    
+    init {
+        startPerformanceMonitoring()
+        startBatteryMonitoring()
+    }
+    
+    /**
+     * Start performance monitoring
+     */
+    private fun startPerformanceMonitoring() {
+        scope.launch {
+            while (monitoringEnabled.value) {
+                try {
+                    val metrics = collectPerformanceMetrics()
+                    _performanceMetrics.value = metrics
+                    
+                    // Check for performance issues
+                    checkPerformanceIssues(metrics)
+                    
+                    // Log performance data
+                    logPerformanceData(metrics)
+                    
+                    delay(MONITORING_INTERVAL)
+                } catch (e: Exception) {
+                    // Log error but don't crash monitoring
+                    delay(MONITORING_INTERVAL)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Start battery monitoring
+     */
+    private fun startBatteryMonitoring() {
+        scope.launch {
+            while (monitoringEnabled.value) {
+                try {
+                    val batteryInfo = collectBatteryInfo()
+                    _batteryInfo.value = batteryInfo
+                    
+                    // Check battery level
+                    if (batteryInfo.level < BATTERY_WARNING_THRESHOLD) {
+                        addPerformanceAlert(
+                            PerformanceAlert(
+                                type = AlertType.BATTERY_LOW,
+                                message = "Battery level is low: ${(batteryInfo.level * 100).toInt()}%",
+                                severity = AlertSeverity.WARNING,
+                                timestamp = System.currentTimeMillis()
+                            )
+                        )
+                    }
+                    
+                    delay(30000L) // Check battery every 30 seconds
+                } catch (e: Exception) {
+                    delay(30000L)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Collect performance metrics
+     */
+    private fun collectPerformanceMetrics(): PerformanceMetrics {
+        val memoryInfo = getMemoryInfo()
+        val cpuInfo = getCpuInfo()
+        val networkInfo = getNetworkInfo()
+        val diskInfo = getDiskInfo()
+        
+        return PerformanceMetrics(
+            timestamp = System.currentTimeMillis(),
+            memoryInfo = memoryInfo,
+            cpuInfo = cpuInfo,
+            networkInfo = networkInfo,
+            diskInfo = diskInfo,
+            appStats = getAppStats(),
+            deviceInfo = deviceInfo.getDeviceInfo()
+        )
+    }
+    
+    /**
+     * Get memory information
+     */
+    private fun getMemoryInfo(): MemoryInfo {
+        val runtime = Runtime.getRuntime()
+        val totalMemory = runtime.totalMemory()
+        val freeMemory = runtime.freeMemory()
+        val usedMemory = totalMemory - freeMemory
+        val maxMemory = runtime.maxMemory()
+        
+        // Get native memory info (Android 10+)
+        val nativeHeapSize = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Debug.getNativeHeapSize()
+        } else 0L
+        
+        val nativeHeapAllocated = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Debug.getNativeHeapAllocatedSize()
+        } else 0L
+        
+        // Get system memory info
+        val memInfo = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memInfo)
+        
+        return MemoryInfo(
+            totalMemory = totalMemory,
+            usedMemory = usedMemory,
+            freeMemory = freeMemory,
+            maxMemory = maxMemory,
+            nativeHeapSize = nativeHeapSize,
+            nativeHeapAllocated = nativeHeapAllocated,
+            systemTotalMemory = memInfo.totalMem,
+            systemAvailableMemory = memInfo.availMem,
+            systemThreshold = memInfo.threshold,
+            lowMemory = memInfo.lowMemory
+        )
+    }
+    
+    /**
+     * Get CPU information
+     */
+    private fun getCpuInfo(): CpuInfo {
+        val cpuUsage = calculateCpuUsage()
+        val cpuCores = Runtime.getRuntime().availableProcessors()
+        
+        return CpuInfo(
+            cpuUsage = cpuUsage,
+            cpuCores = cpuCores,
+            cpuFrequency = getCpuFrequency(),
+            cpuTemperature = getCpuTemperature()
+        )
+    }
+    
+    /**
+     * Calculate CPU usage
+     */
+    private fun calculateCpuUsage(): Float {
+        return try {
+            val pid = Process.myPid()
+            val cmd = arrayOf("sh", "-c", "cat /proc/$pid/stat")
+            val process = Runtime.getRuntime().exec(cmd)
+            val reader = process.inputStream.bufferedReader()
+            val line = reader.readLine()
+            reader.close()
+            process.waitFor()
+            
+            if (line != null) {
+                val parts = line.split(" ")
+                if (parts.size >= 15) {
+                    val utime = parts[13].toLong()
+                    val stime = parts[14].toLong()
+                    val totalTime = utime + stime
+                    
+                    // Simple CPU usage calculation
+                    (totalTime % 100).toFloat() / 100f
+                } else 0f
+            } else 0f
+        } catch (e: Exception) {
+            0f
+        }
+    }
+    
+    /**
+     * Get CPU frequency
+     */
+    private fun getCpuFrequency(): Long {
+        return try {
+            val cmd = arrayOf("sh", "-c", "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+            val process = Runtime.getRuntime().exec(cmd)
+            val reader = process.inputStream.bufferedReader()
+            val line = reader.readLine()
+            reader.close()
+            process.waitFor()
+            
+            line?.toLongOrNull() ?: 0L
+        } catch (e: Exception) {
+            0L
+        }
+    }
+    
+    /**
+     * Get CPU temperature
+     */
+    private fun getCpuTemperature(): Float {
+        return try {
+            val cmd = arrayOf("sh", "-c", "cat /sys/class/thermal/thermal_zone0/temp")
+            val process = Runtime.getRuntime().exec(cmd)
+            val reader = process.inputStream.bufferedReader()
+            val line = reader.readLine()
+            reader.close()
+            process.waitFor()
+            
+            line?.toFloatOrNull()?.div(1000f) ?: 0f
+        } catch (e: Exception) {
+            0f
+        }
+    }
+    
+    /**
+     * Get network information
+     */
+    private fun getNetworkInfo(): NetworkInfo {
+        return NetworkInfo(
+            networkType = getNetworkType(),
+            networkSpeed = getNetworkSpeed(),
+            dataUsage = getDataUsage()
+        )
+    }
+    
+    /**
+     * Get network type
+     */
+    private fun getNetworkType(): String {
+        return try {
+            val cmd = arrayOf("sh", "-c", "getprop ro.product.model")
+            val process = Runtime.getRuntime().exec(cmd)
+            val reader = process.inputStream.bufferedReader()
+            val line = reader.readLine()
+            reader.close()
+            process.waitFor()
+            
+            "Unknown"
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    /**
+     * Get network speed
+     */
+    private fun getNetworkSpeed(): Long {
+        return 0L // Implementation depends on network monitoring
+    }
+    
+    /**
+     * Get data usage
+     */
+    private fun getDataUsage(): Long {
+        return 0L // Implementation depends on network monitoring
+    }
+    
+    /**
+     * Get disk information
+     */
+    private fun getDiskInfo(): DiskInfo {
+        val totalSpace = context.dataDir.totalSpace
+        val freeSpace = context.dataDir.freeSpace
+        val usedSpace = totalSpace - freeSpace
+        
+        return DiskInfo(
+            totalSpace = totalSpace,
+            usedSpace = usedSpace,
+            freeSpace = freeSpace,
+            cacheSize = getCacheSize()
+        )
+    }
+    
+    /**
+     * Get cache size
+     */
+    private fun getCacheSize(): Long {
+        return try {
+            var size = 0L
+            context.cacheDir.walkTopDown().forEach { file ->
+                size += if (file.isFile) file.length() else 0L
+            }
+            size
+        } catch (e: Exception) {
+            0L
+        }
+    }
+    
+    /**
+     * Get app statistics
+     */
+    private fun getAppStats(): AppStats {
+        val packageManager = context.packageManager
+        val packageInfo = packageManager.getPackageInfo(context.packageName, 0)
+        
+        return AppStats(
+            packageName = context.packageName,
+            versionName = packageInfo.versionName ?: "Unknown",
+            versionCode = packageInfo.longVersionCode,
+            installTime = packageInfo.firstInstallTime,
+            updateTime = packageInfo.lastUpdateTime,
+            targetSdkVersion = packageInfo.applicationInfo.targetSdkVersion,
+            processId = Process.myPid(),
+            threadCount = Thread.getAllStackTraces().size
+        )
+    }
+    
+    /**
+     * Collect battery information
+     */
+    private fun collectBatteryInfo(): BatteryInfo {
+        return BatteryInfo(
+            level = getBatteryLevel(),
+            temperature = getBatteryTemperature(),
+            voltage = getBatteryVoltage(),
+            health = getBatteryHealth(),
+            technology = getBatteryTechnology(),
+            isCharging = isCharging(),
+            chargingSource = getChargingSource()
+        )
+    }
+    
+    /**
+     * Get battery level
+     */
+    private fun getBatteryLevel(): Float {
+        return try {
+            val batteryStatus = context.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            val level = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
+            
+            if (level != -1 && scale != -1) {
+                level.toFloat() / scale.toFloat()
+            } else 0f
+        } catch (e: Exception) {
+            0f
+        }
+    }
+    
+    /**
+     * Get battery temperature
+     */
+    private fun getBatteryTemperature(): Float {
+        return try {
+            val batteryStatus = context.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            val temperature = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
+            
+            if (temperature != -1) {
+                temperature.toFloat() / 10f // Convert to Celsius
+            } else 0f
+        } catch (e: Exception) {
+            0f
+        }
+    }
+    
+    /**
+     * Get battery voltage
+     */
+    private fun getBatteryVoltage(): Float {
+        return try {
+            val batteryStatus = context.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            val voltage = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_VOLTAGE, -1) ?: -1
+            
+            if (voltage != -1) {
+                voltage.toFloat() / 1000f // Convert to volts
+            } else 0f
+        } catch (e: Exception) {
+            0f
+        }
+    }
+    
+    /**
+     * Get battery health
+     */
+    private fun getBatteryHealth(): String {
+        return try {
+            val batteryStatus = context.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            val health = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_HEALTH, -1) ?: -1
+            
+            when (health) {
+                android.os.BatteryManager.BATTERY_HEALTH_GOOD -> "Good"
+                android.os.BatteryManager.BATTERY_HEALTH_OVERHEAT -> "Overheat"
+                android.os.BatteryManager.BATTERY_HEALTH_DEAD -> "Dead"
+                android.os.BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> "Over Voltage"
+                android.os.BatteryManager.BATTERY_HEALTH_UNSPECIFIED_FAILURE -> "Failure"
+                else -> "Unknown"
+            }
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    /**
+     * Get battery technology
+     */
+    private fun getBatteryTechnology(): String {
+        return try {
+            val batteryStatus = context.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            batteryStatus?.getStringExtra(android.os.BatteryManager.EXTRA_TECHNOLOGY) ?: "Unknown"
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    /**
+     * Check if charging
+     */
+    private fun isCharging(): Boolean {
+        return try {
+            val batteryStatus = context.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            val status = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
+            
+            status == android.os.BatteryManager.BATTERY_STATUS_CHARGING || 
+            status == android.os.BatteryManager.BATTERY_STATUS_FULL
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Get charging source
+     */
+    private fun getChargingSource(): String {
+        return try {
+            val batteryStatus = context.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            val chargePlug = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+            
+            when (chargePlug) {
+                android.os.BatteryManager.BATTERY_PLUGGED_AC -> "AC"
+                android.os.BatteryManager.BATTERY_PLUGGED_USB -> "USB"
+                android.os.BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Wireless"
+                else -> "None"
+            }
+        } catch (e: Exception) {
+            "None"
+        }
+    }
+    
+    /**
+     * Check for performance issues
+     */
+    private fun checkPerformanceIssues(metrics: PerformanceMetrics) {
+        // Check memory usage
+        val memoryUsage = metrics.memoryInfo.usedMemory.toFloat() / metrics.memoryInfo.maxMemory.toFloat()
+        if (memoryUsage > MEMORY_WARNING_THRESHOLD) {
+            addPerformanceAlert(
+                PerformanceAlert(
+                    type = AlertType.MEMORY_HIGH,
+                    message = "Memory usage is high: ${(memoryUsage * 100).toInt()}%",
+                    severity = AlertSeverity.WARNING,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+        
+        // Check CPU usage
+        if (metrics.cpuInfo.cpuUsage > CPU_WARNING_THRESHOLD) {
+            addPerformanceAlert(
+                PerformanceAlert(
+                    type = AlertType.CPU_HIGH,
+                    message = "CPU usage is high: ${(metrics.cpuInfo.cpuUsage * 100).toInt()}%",
+                    severity = AlertSeverity.WARNING,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+        
+        // Check disk space
+        val diskUsage = metrics.diskInfo.usedSpace.toFloat() / metrics.diskInfo.totalSpace.toFloat()
+        if (diskUsage > 0.9f) {
+            addPerformanceAlert(
+                PerformanceAlert(
+                    type = AlertType.DISK_FULL,
+                    message = "Disk space is almost full: ${(diskUsage * 100).toInt()}%",
+                    severity = AlertSeverity.ERROR,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+        
+        // Check low memory
+        if (metrics.memoryInfo.lowMemory) {
+            addPerformanceAlert(
+                PerformanceAlert(
+                    type = AlertType.LOW_MEMORY,
+                    message = "System is low on memory",
+                    severity = AlertSeverity.ERROR,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+    
+    /**
+     * Add performance alert
+     */
+    private fun addPerformanceAlert(alert: PerformanceAlert) {
+        val currentAlerts = _performanceAlerts.value.toMutableList()
+        currentAlerts.add(alert)
+        
+        // Keep only recent alerts
+        if (currentAlerts.size > 100) {
+            currentAlerts.removeAt(0)
+        }
+        
+        _performanceAlerts.value = currentAlerts
+    }
+    
+    /**
+     * Log performance data
+     */
+    private fun logPerformanceData(metrics: PerformanceMetrics) {
+        val log = PerformanceLog(
+            timestamp = metrics.timestamp,
+            memoryUsage = metrics.memoryInfo.usedMemory,
+            cpuUsage = metrics.cpuInfo.cpuUsage,
+            diskUsage = metrics.diskInfo.usedSpace,
+            batteryLevel = _batteryInfo.value.level
+        )
+        
+        synchronized(performanceLogs) {
+            performanceLogs.add(log)
+            
+            // Keep only recent logs
+            if (performanceLogs.size > MAX_PERFORMANCE_LOGS) {
+                performanceLogs.removeAt(0)
+            }
+        }
+    }
+    
+    /**
+     * Get performance summary
+     */
+    fun getPerformanceSummary(): PerformanceSummary {
+        val metrics = _performanceMetrics.value
+        val alerts = _performanceAlerts.value
+        
+        val memoryUsage = metrics.memoryInfo.usedMemory.toFloat() / metrics.memoryInfo.maxMemory.toFloat()
+        val diskUsage = metrics.diskInfo.usedSpace.toFloat() / metrics.diskInfo.totalSpace.toFloat()
+        
+        val criticalAlerts = alerts.filter { it.severity == AlertSeverity.ERROR }.size
+        val warningAlerts = alerts.filter { it.severity == AlertSeverity.WARNING }.size
+        
+        return PerformanceSummary(
+            memoryUsage = memoryUsage,
+            cpuUsage = metrics.cpuInfo.cpuUsage,
+            diskUsage = diskUsage,
+            batteryLevel = _batteryInfo.value.level,
+            criticalAlerts = criticalAlerts,
+            warningAlerts = warningAlerts,
+            isHealthy = criticalAlerts == 0 && memoryUsage < 0.8f && cpuUsage < 0.8f
+        )
+    }
+    
+    /**
+     * Get performance logs
+     */
+    fun getPerformanceLogs(limit: Int = 100): List<PerformanceLog> {
+        return synchronized(performanceLogs) {
+            performanceLogs.takeLast(limit)
+        }
+    }
+    
+    /**
+     * Clear performance alerts
+     */
+    fun clearPerformanceAlerts() {
+        _performanceAlerts.value = emptyList()
+    }
+    
+    /**
+     * Enable/disable monitoring
+     */
+    fun setMonitoringEnabled(enabled: Boolean) {
+        monitoringEnabled.value = enabled
+    }
+    
+    /**
+     * Force garbage collection
+     */
+    fun forceGarbageCollection() {
+        runtime.gc()
+    }
+    
+    /**
+     * Get memory usage by category
+     */
+    fun getMemoryUsageByCategory(): Map<String, Long> {
+        val runtime = Runtime.getRuntime()
+        
+        return mapOf(
+            "Java Heap" to runtime.totalMemory(),
+            "Native Heap" to Debug.getNativeHeapSize(),
+            "Code" to Debug.getNativeHeapSize(),
+            "Graphics" to 0L, // Would need additional implementation
+            "Other" to 0L // Would need additional implementation
+        )
+    }
+}
+
+/**
+ * Performance metrics data class
+ */
+data class PerformanceMetrics(
+    val timestamp: Long = 0,
+    val memoryInfo: MemoryInfo = MemoryInfo(),
+    val cpuInfo: CpuInfo = CpuInfo(),
+    val networkInfo: NetworkInfo = NetworkInfo(),
+    val diskInfo: DiskInfo = DiskInfo(),
+    val appStats: AppStats = AppStats(),
+    val deviceInfo: Map<String, Any> = emptyMap()
+)
+
+/**
+ * Memory information
+ */
+data class MemoryInfo(
+    val totalMemory: Long = 0,
+    val usedMemory: Long = 0,
+    val freeMemory: Long = 0,
+    val maxMemory: Long = 0,
+    val nativeHeapSize: Long = 0,
+    val nativeHeapAllocated: Long = 0,
+    val systemTotalMemory: Long = 0,
+    val systemAvailableMemory: Long = 0,
+    val systemThreshold: Long = 0,
+    val lowMemory: Boolean = false
+)
+
+/**
+ * CPU information
+ */
+data class CpuInfo(
+    val cpuUsage: Float = 0f,
+    val cpuCores: Int = 0,
+    val cpuFrequency: Long = 0,
+    val cpuTemperature: Float = 0f
+)
+
+/**
+ * Network information
+ */
+data class NetworkInfo(
+    val networkType: String = "",
+    val networkSpeed: Long = 0,
+    val dataUsage: Long = 0
+)
+
+/**
+ * Disk information
+ */
+data class DiskInfo(
+    val totalSpace: Long = 0,
+    val usedSpace: Long = 0,
+    val freeSpace: Long = 0,
+    val cacheSize: Long = 0
+)
+
+/**
+ * App statistics
+ */
+data class AppStats(
+    val packageName: String = "",
+    val versionName: String = "",
+    val versionCode: Long = 0,
+    val installTime: Long = 0,
+    val updateTime: Long = 0,
+    val targetSdkVersion: Int = 0,
+    val processId: Int = 0,
+    val threadCount: Int = 0
+)
+
+/**
+ * Battery information
+ */
+data class BatteryInfo(
+    val level: Float = 0f,
+    val temperature: Float = 0f,
+    val voltage: Float = 0f,
+    val health: String = "",
+    val technology: String = "",
+    val isCharging: Boolean = false,
+    val chargingSource: String = ""
+)
+
+/**
+ * Performance alert
+ */
+data class PerformanceAlert(
+    val type: AlertType,
+    val message: String,
+    val severity: AlertSeverity,
+    val timestamp: Long
+)
+
+/**
+ * Alert types
+ */
+enum class AlertType {
+    MEMORY_HIGH,
+    CPU_HIGH,
+    DISK_FULL,
+    LOW_MEMORY,
+    BATTERY_LOW,
+    OVERHEATING,
+    NETWORK_ISSUE
+}
+
+/**
+ * Alert severity
+ */
+enum class AlertSeverity {
+    INFO,
+    WARNING,
+    ERROR,
+    CRITICAL
+}
+
+/**
+ * Performance log
+ */
+data class PerformanceLog(
+    val timestamp: Long,
+    val memoryUsage: Long,
+    val cpuUsage: Float,
+    val diskUsage: Long,
+    val batteryLevel: Float
+)
+
+/**
+ * Performance summary
+ */
+data class PerformanceSummary(
+    val memoryUsage: Float,
+    val cpuUsage: Float,
+    val diskUsage: Float,
+    val batteryLevel: Float,
+    val criticalAlerts: Int,
+    val warningAlerts: Int,
+    val isHealthy: Boolean
+)

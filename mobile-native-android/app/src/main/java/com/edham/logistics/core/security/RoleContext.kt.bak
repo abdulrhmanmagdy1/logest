@@ -1,0 +1,326 @@
+package com.edham.logistics.core.security
+
+import com.edham.logistics.core.model.UserRole
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * RoleContext - Centralized role management and permission checking
+ * Prevents direct role checks and provides secure role-based operations
+ */
+@Singleton
+class RoleContext @Inject constructor(
+    private val policyEngine: PolicyEngine
+) {
+    
+    private var currentRole: UserRole? = null
+    private var currentUserId: String? = null
+    private var securityContext: SecurityContext? = null
+    
+    /**
+     * Initialize role context with user information
+     */
+    fun initialize(userRole: UserRole, userId: String) {
+        currentRole = userRole
+        currentUserId = userId
+        securityContext = policyEngine.getSecurityContext(userRole)
+        
+        Timber.d("RoleContext initialized for role: ${userRole.displayName}, user: $userId")
+    }
+    
+    /**
+     * Check if current user has specific permission
+     */
+    fun hasPermission(permission: Permission): Boolean {
+        val role = currentRole ?: return false
+        return policyEngine.hasPermission(role, permission)
+    }
+    
+    /**
+     * Check if current user has any of the specified permissions
+     */
+    fun hasAnyPermission(vararg permissions: Permission): Boolean {
+        val role = currentRole ?: return false
+        return policyEngine.hasAnyPermission(role, *permissions)
+    }
+    
+    /**
+     * Check if current user has all of the specified permissions
+     */
+    fun hasAllPermissions(vararg permissions: Permission): Boolean {
+        val role = currentRole ?: return false
+        return policyEngine.hasAllPermissions(role, *permissions)
+    }
+    
+    /**
+     * Check if current user can access specific resource
+     */
+    fun canAccessResource(resourceType: ResourceType, action: ResourceAction, resourceId: String? = null): Boolean {
+        val role = currentRole ?: return false
+        val resource = SecurityResource(resourceType, action, resourceId)
+        return policyEngine.canAccessResource(role, resource)
+    }
+    
+    /**
+     * Check if current user can access another user's data
+     */
+    fun canAccessUserData(targetUserId: String, targetRole: UserRole): Boolean {
+        // Users can access their own data
+        if (currentUserId == targetUserId) return true
+        
+        val role = currentRole ?: return false
+        return policyEngine.canAccessUserData(role, targetRole)
+    }
+    
+    /**
+     * Check if current user has higher or equal priority than target role
+     */
+    fun hasHigherOrEqualPriority(targetRole: UserRole): Boolean {
+        val role = currentRole ?: return false
+        return UserRole.hasHigherOrEqualPriority(role, targetRole)
+    }
+    
+    /**
+     * Get current user role
+     */
+    fun getCurrentRole(): UserRole? {
+        return currentRole
+    }
+    
+    /**
+     * Get current user ID
+     */
+    fun getCurrentUserId(): String? {
+        return currentUserId
+    }
+    
+    /**
+     * Get security context for current user
+     */
+    fun getSecurityContext(): SecurityContext? {
+        return securityContext
+    }
+    
+    /**
+     * Get all permissions for current user
+     */
+    fun getCurrentPermissions(): Set<Permission> {
+        val role = currentRole ?: return emptySet()
+        return policyEngine.getRolePermissions(role)
+    }
+    
+    /**
+     * Get role capabilities as formatted string
+     */
+    fun getRoleCapabilities(): String {
+        val role = currentRole ?: return "No role assigned"
+        return role.getCapabilities()
+    }
+    
+    /**
+     * Check if current user can perform critical operations
+     */
+    fun canPerformCriticalOperations(): Boolean {
+        return securityContext?.canAccessCriticalOperations ?: false
+    }
+    
+    /**
+     * Check if current user can manage other users
+     */
+    fun canManageUsers(): Boolean {
+        return securityContext?.canManageUsers ?: false
+    }
+    
+    /**
+     * Check if current user can manage system settings
+     */
+    fun canManageSystem(): Boolean {
+        return securityContext?.canManageSystem ?: false
+    }
+    
+    /**
+     * Validate if role transition is allowed
+     */
+    fun canTransitionToRole(targetRole: UserRole): Boolean {
+        val role = currentRole ?: return false
+        return policyEngine.validateRoleHierarchy(role, targetRole)
+    }
+    
+    /**
+     * Get accessible features for current user
+     */
+    fun getAccessibleFeatures(): List<String> {
+        val role = currentRole ?: return emptyList()
+        val features = mutableListOf<String>()
+        
+        // Add dashboard
+        if (hasPermission(Permission.VIEW_DASHBOARD)) {
+            features.add("Dashboard")
+        }
+        
+        // Add shipment features
+        if (hasPermission(Permission.CREATE_SHIPMENT)) {
+            features.add("Create Shipment")
+        }
+        if (hasPermission(Permission.TRACK_SHIPMENT)) {
+            features.add("Track Shipment")
+        }
+        if (hasPermission(Permission.VIEW_OWN_SHIPMENTS)) {
+            features.add("View Shipments")
+        }
+        
+        // Add driver features
+        if (hasPermission(Permission.VIEW_TASKS)) {
+            features.add("View Tasks")
+        }
+        if (hasPermission(Permission.UPDATE_LOCATION)) {
+            features.add("Update Location")
+        }
+        if (hasPermission(Permission.VIEW_EARNINGS)) {
+            features.add("View Earnings")
+        }
+        
+        // Add financial features
+        if (hasPermission(Permission.MANAGE_INVOICES)) {
+            features.add("Manage Invoices")
+        }
+        if (hasPermission(Permission.VIEW_TRANSACTIONS)) {
+            features.add("View Transactions")
+        }
+        if (hasPermission(Permission.MANAGE_PAYMENTS)) {
+            features.add("Manage Payments")
+        }
+        
+        // Add workshop features
+        if (hasPermission(Permission.MANAGE_MAINTENANCE)) {
+            features.add("Manage Maintenance")
+        }
+        if (hasPermission(Permission.VIEW_FLEET_HEALTH)) {
+            features.add("View Fleet Health")
+        }
+        
+        // Add admin features
+        if (hasPermission(Permission.MANAGE_USERS)) {
+            features.add("Manage Users")
+        }
+        if (hasPermission(Permission.MANAGE_SYSTEM)) {
+            features.add("Manage System")
+        }
+        
+        return features
+    }
+    
+    /**
+     * Get UI visibility configuration for current user
+     */
+    fun getUIVisibility(): UIVisibility {
+        val role = currentRole ?: return UIVisibility.empty()
+        
+        return UIVisibility(
+            showDashboard = hasPermission(Permission.VIEW_DASHBOARD),
+            showCreateShipment = hasPermission(Permission.CREATE_SHIPMENT),
+            showShipmentManagement = hasPermission(Permission.MANAGE_SHIPMENTS),
+            showDriverManagement = hasPermission(Permission.ASSIGN_DRIVERS),
+            showFleetManagement = hasPermission(Permission.VIEW_FLEET),
+            showFinancialManagement = hasPermission(Permission.MANAGE_INVOICES),
+            showWorkshopManagement = hasPermission(Permission.MANAGE_MAINTENANCE),
+            showUserManagement = hasPermission(Permission.MANAGE_USERS),
+            showSystemManagement = hasPermission(Permission.MANAGE_SYSTEM),
+            showReports = hasPermission(Permission.VIEW_REPORTS),
+            showAnalytics = hasPermission(Permission.VIEW_ANALYTICS),
+            canEditProfile = hasPermission(Permission.MANAGE_PROFILE),
+            canViewWallet = hasPermission(Permission.VIEW_WALLET),
+            canMakePayments = hasPermission(Permission.MAKE_PAYMENTS)
+        )
+    }
+    
+    /**
+     * Clear role context (useful for logout)
+     */
+    fun clear() {
+        currentRole = null
+        currentUserId = null
+        securityContext = null
+        Timber.d("RoleContext cleared")
+    }
+    
+    /**
+     * Check if role context is initialized
+     */
+    fun isInitialized(): Boolean {
+        return currentRole != null && currentUserId != null
+    }
+    
+    /**
+     * Get role summary for debugging
+     */
+    fun getRoleSummary(): String {
+        val role = currentRole ?: return "No role assigned"
+        return buildString {
+            appendLine("🎯 Current Role: ${role.displayName}")
+            appendLine("👤 User ID: $currentUserId")
+            appendLine("🔐 Permissions Count: ${getCurrentPermissions().size}")
+            appendLine("🚨 Critical Access: ${canPerformCriticalOperations()}")
+            appendLine("👥 User Management: ${canManageUsers()}")
+            appendLine("⚙️ System Management: ${canManageSystem()}")
+            appendLine("📱 Accessible Features: ${getAccessibleFeatures().size}")
+        }
+    }
+}
+
+/**
+ * UI visibility configuration based on user permissions
+ */
+data class UIVisibility(
+    val showDashboard: Boolean,
+    val showCreateShipment: Boolean,
+    val showShipmentManagement: Boolean,
+    val showDriverManagement: Boolean,
+    val showFleetManagement: Boolean,
+    val showFinancialManagement: Boolean,
+    val showWorkshopManagement: Boolean,
+    val showUserManagement: Boolean,
+    val showSystemManagement: Boolean,
+    val showReports: Boolean,
+    val showAnalytics: Boolean,
+    val canEditProfile: Boolean,
+    val canViewWallet: Boolean,
+    val canMakePayments: Boolean
+) {
+    companion object {
+        fun empty(): UIVisibility {
+            return UIVisibility(
+                showDashboard = false,
+                showCreateShipment = false,
+                showShipmentManagement = false,
+                showDriverManagement = false,
+                showFleetManagement = false,
+                showFinancialManagement = false,
+                showWorkshopManagement = false,
+                showUserManagement = false,
+                showSystemManagement = false,
+                showReports = false,
+                showAnalytics = false,
+                canEditProfile = false,
+                canViewWallet = false,
+                canMakePayments = false
+            )
+        }
+    }
+}
+
+/**
+ * Extension functions for common permission checks
+ */
+fun RoleContext.canViewDashboard(): Boolean = hasPermission(Permission.VIEW_DASHBOARD)
+fun RoleContext.canCreateShipment(): Boolean = hasPermission(Permission.CREATE_SHIPMENT)
+fun RoleContext.canManageShipments(): Boolean = hasPermission(Permission.MANAGE_SHIPMENTS)
+fun RoleContext.canAssignDrivers(): Boolean = hasPermission(Permission.ASSIGN_DRIVERS)
+fun RoleContext.canViewFleet(): Boolean = hasPermission(Permission.VIEW_FLEET)
+fun RoleContext.canManageInvoices(): Boolean = hasPermission(Permission.MANAGE_INVOICES)
+fun RoleContext.canManageMaintenance(): Boolean = hasPermission(Permission.MANAGE_MAINTENANCE)
+fun RoleContext.canManageUsers(): Boolean = hasPermission(Permission.MANAGE_USERS)
+fun RoleContext.canManageSystem(): Boolean = hasPermission(Permission.MANAGE_SYSTEM)
+fun RoleContext.canViewReports(): Boolean = hasPermission(Permission.VIEW_REPORTS)
+fun RoleContext.canViewAnalytics(): Boolean = hasPermission(Permission.VIEW_ANALYTICS)

@@ -1,0 +1,400 @@
+package com.edham.logistics.core.notifications
+
+import android.content.Context
+import android.content.SharedPreferences
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * User Preferences Manager - Manages user notification preferences
+ * Provides persistent storage and real-time preference updates
+ */
+@Singleton
+class UserPreferencesManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // SharedPreferences
+    private val sharedPreferences: SharedPreferences = 
+        context.getSharedPreferences("notification_preferences", Context.MODE_PRIVATE)
+    
+    // Preference keys
+    private val KEY_SHIPMENT_ALERTS = "shipment_alerts_enabled"
+    private val KEY_PAYMENT_ALERTS = "payment_alerts_enabled"
+    private val KEY_TEMPERATURE_ALERTS = "temperature_alerts_enabled"
+    private val KEY_MIN_DELAY_MINUTES = "min_delay_minutes"
+    private val KEY_MIN_PAYMENT_OVERDUE_DAYS = "min_payment_overdue_days"
+    private val KEY_AUTO_RESCHEDULE = "auto_reschedule_enabled"
+    private val KEY_PAYMENT_REMINDERS = "payment_reminders_enabled"
+    private val KEY_QUIET_HOURS = "quiet_hours_enabled"
+    private val KEY_QUIET_START_HOUR = "quiet_start_hour"
+    private val KEY_QUIET_END_HOUR = "quiet_end_hour"
+    private val KEY_GROUP_SIMILAR = "group_similar_enabled"
+    private val KEY_MAX_NOTIFICATIONS_PER_HOUR = "max_notifications_per_hour"
+    private val KEY_NOTIFICATION_SOUND = "notification_sound_enabled"
+    private val KEY_VIBRATION = "vibration_enabled"
+    private val KEY_LED_INDICATOR = "led_indicator_enabled"
+    private val KEY_PRIORITY_FILTER = "priority_filter_enabled"
+    private val KEY_ALLOWED_PRIORITIES = "allowed_priorities"
+    private val KEY_CUSTOM_RULES = "custom_rules"
+    
+    // Preference state flows
+    private val _preferences = MutableStateFlow<NotificationPreferences>(getDefaultPreferences())
+    val preferences: StateFlow<NotificationPreferences> = _preferences.asStateFlow()
+
+    /**
+     * Initialize preferences manager
+     */
+    fun initialize() {
+        loadPreferences()
+        startPreferenceMonitoring()
+    }
+
+    /**
+     * Update preferences
+     */
+    suspend fun updatePreferences(preferences: NotificationPreferences) {
+        withContext(Dispatchers.IO) {
+            try {
+                // Save to SharedPreferences
+                savePreferences(preferences)
+                
+                // Update state flow
+                _preferences.value = preferences
+                
+                // Apply changes
+                applyPreferenceChanges(preferences)
+                
+            } catch (e: Exception) {
+                // Handle preference update error
+            }
+        }
+    }
+
+    /**
+     * Update single preference
+     */
+    suspend fun updatePreference(key: String, value: Any) {
+        withContext(Dispatchers.IO) {
+            try {
+                val currentPrefs = _preferences.value
+                val updatedPrefs = when (key) {
+                    KEY_SHIPMENT_ALERTS -> currentPrefs.copy(shipmentAlerts = value as Boolean)
+                    KEY_PAYMENT_ALERTS -> currentPrefs.copy(paymentAlerts = value as Boolean)
+                    KEY_TEMPERATURE_ALERTS -> currentPrefs.copy(temperatureAlerts = value as Boolean)
+                    KEY_MIN_DELAY_MINUTES -> currentPrefs.copy(minDelayMinutes = value as Int)
+                    KEY_MIN_PAYMENT_OVERDUE_DAYS -> currentPrefs.copy(minPaymentOverdueDays = value as Int)
+                    KEY_AUTO_RESCHEDULE -> currentPrefs.copy(autoReschedule = value as Boolean)
+                    KEY_PAYMENT_REMINDERS -> currentPrefs.copy(paymentReminders = value as Boolean)
+                    KEY_QUIET_HOURS -> currentPrefs.copy(quietHours = value as Boolean)
+                    KEY_QUIET_START_HOUR -> currentPrefs.copy(quietStartHour = value as Int)
+                    KEY_QUIET_END_HOUR -> currentPrefs.copy(quietEndHour = value as Int)
+                    KEY_GROUP_SIMILAR -> currentPrefs.copy(groupSimilar = value as Boolean)
+                    KEY_MAX_NOTIFICATIONS_PER_HOUR -> currentPrefs.copy(maxNotificationsPerHour = value as Int)
+                    KEY_NOTIFICATION_SOUND -> currentPrefs.copy(notificationSound = value as Boolean)
+                    KEY_VIBRATION -> currentPrefs.copy(vibration = value as Boolean)
+                    KEY_LED_INDICATOR -> currentPrefs.copy(ledIndicator = value as Boolean)
+                    KEY_PRIORITY_FILTER -> currentPrefs.copy(priorityFilter = value as Boolean)
+                    KEY_ALLOWED_PRIORITIES -> currentPrefs.copy(allowedPriorities = value as Set<NotificationPriority>)
+                    KEY_CUSTOM_RULES -> currentPrefs.copy(customRules = value as List<CustomRule>)
+                    else -> currentPrefs
+                }
+                
+                updatePreferences(updatedPrefs)
+                
+            } catch (e: Exception) {
+                // Handle preference update error
+            }
+        }
+    }
+
+    /**
+     * Get preference value
+     */
+    fun <T> getPreference(key: String, defaultValue: T): T {
+        return when (key) {
+            KEY_SHIPMENT_ALERTS -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_PAYMENT_ALERTS -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_TEMPERATURE_ALERTS -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_MIN_DELAY_MINUTES -> sharedPreferences.getInt(key, defaultValue as Int)
+            KEY_MIN_PAYMENT_OVERDUE_DAYS -> sharedPreferences.getInt(key, defaultValue as Int)
+            KEY_AUTO_RESCHEDULE -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_PAYMENT_REMINDERS -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_QUIET_HOURS -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_QUIET_START_HOUR -> sharedPreferences.getInt(key, defaultValue as Int)
+            KEY_QUIET_END_HOUR -> sharedPreferences.getInt(key, defaultValue as Int)
+            KEY_GROUP_SIMILAR -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_MAX_NOTIFICATIONS_PER_HOUR -> sharedPreferences.getInt(key, defaultValue as Int)
+            KEY_NOTIFICATION_SOUND -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_VIBRATION -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_LED_INDICATOR -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_PRIORITY_FILTER -> sharedPreferences.getBoolean(key, defaultValue as Boolean)
+            KEY_ALLOWED_PRIORITIES -> {
+                val json = sharedPreferences.getString(key, null)
+                if (json != null) {
+                    Json.decodeFromString<Set<NotificationPriority>>(json)
+                } else {
+                    defaultValue as Set<NotificationPriority>
+                }
+            }
+            KEY_CUSTOM_RULES -> {
+                val json = sharedPreferences.getString(key, null)
+                if (json != null) {
+                    Json.decodeFromString<List<CustomRule>>(json)
+                } else {
+                    defaultValue as List<CustomRule>
+                }
+            }
+            else -> defaultValue
+        } as T
+    }
+
+    /**
+     * Check if notification should be shown
+     */
+    suspend fun shouldShowNotification(
+        event: NotificationEvent,
+        priority: NotificationPriority,
+        timestamp: Long = System.currentTimeMillis()
+    ): Boolean {
+        val prefs = _preferences.value
+        
+        // Check quiet hours
+        if (prefs.quietHours && isInQuietHours(timestamp)) {
+            return false
+        }
+        
+        // Check priority filter
+        if (prefs.priorityFilter && priority !in prefs.allowedPriorities) {
+            return false
+        }
+        
+        // Check event-specific preferences
+        return when (event) {
+            NotificationEvent.SHIPMENT_DELAYED -> prefs.shipmentAlerts
+            NotificationEvent.PAYMENT_OVERDUE -> prefs.paymentAlerts
+            NotificationEvent.TEMPERATURE_ISSUE -> prefs.temperatureAlerts
+            else -> true
+        }
+    }
+
+    /**
+     * Check if in quiet hours
+     */
+    private fun isInQuietHours(timestamp: Long): Boolean {
+        val prefs = _preferences.value
+        val calendar = java.util.Calendar.getInstance()
+        calendar.timeInMillis = timestamp
+        val currentHour = calendar.get(java.util.Calendar.HOUR_OF_DAY)
+        
+        return if (prefs.quietStartHour <= prefs.quietEndHour) {
+            currentHour in prefs.quietStartHour..prefs.quietEndHour
+        } else {
+            currentHour >= prefs.quietStartHour || currentHour <= prefs.quietEndHour
+        }
+    }
+
+    /**
+     * Get default preferences
+     */
+    private fun getDefaultPreferences(): NotificationPreferences {
+        return NotificationPreferences(
+            shipmentAlerts = true,
+            paymentAlerts = true,
+            temperatureAlerts = true,
+            minDelayMinutes = 30,
+            minPaymentOverdueDays = 7,
+            autoReschedule = false,
+            paymentReminders = true,
+            quietHours = true,
+            quietStartHour = 22,
+            quietEndHour = 8,
+            groupSimilar = true,
+            maxNotificationsPerHour = 10,
+            notificationSound = true,
+            vibration = true,
+            ledIndicator = true,
+            priorityFilter = false,
+            allowedPriorities = setOf(
+                NotificationPriority.NORMAL,
+                NotificationPriority.HIGH,
+                NotificationPriority.CRITICAL
+            ),
+            customRules = emptyList()
+        )
+    }
+
+    /**
+     * Load preferences from storage
+     */
+    private fun loadPreferences() {
+        val prefs = NotificationPreferences(
+            shipmentAlerts = getPreference(KEY_SHIPMENT_ALERTS, true),
+            paymentAlerts = getPreference(KEY_PAYMENT_ALERTS, true),
+            temperatureAlerts = getPreference(KEY_TEMPERATURE_ALERTS, true),
+            minDelayMinutes = getPreference(KEY_MIN_DELAY_MINUTES, 30),
+            minPaymentOverdueDays = getPreference(KEY_MIN_PAYMENT_OVERDUE_DAYS, 7),
+            autoReschedule = getPreference(KEY_AUTO_RESCHEDULE, false),
+            paymentReminders = getPreference(KEY_PAYMENT_REMINDERS, true),
+            quietHours = getPreference(KEY_QUIET_HOURS, true),
+            quietStartHour = getPreference(KEY_QUIET_START_HOUR, 22),
+            quietEndHour = getPreference(KEY_QUIET_END_HOUR, 8),
+            groupSimilar = getPreference(KEY_GROUP_SIMILAR, true),
+            maxNotificationsPerHour = getPreference(KEY_MAX_NOTIFICATIONS_PER_HOUR, 10),
+            notificationSound = getPreference(KEY_NOTIFICATION_SOUND, true),
+            vibration = getPreference(KEY_VIBRATION, true),
+            ledIndicator = getPreference(KEY_LED_INDICATOR, true),
+            priorityFilter = getPreference(KEY_PRIORITY_FILTER, false),
+            allowedPriorities = getPreference(
+                KEY_ALLOWED_PRIORITIES,
+                setOf(NotificationPriority.NORMAL, NotificationPriority.HIGH, NotificationPriority.CRITICAL)
+            ),
+            customRules = getPreference(KEY_CUSTOM_RULES, emptyList<CustomRule>())
+        )
+        
+        _preferences.value = prefs
+    }
+
+    /**
+     * Save preferences to storage
+     */
+    private fun savePreferences(preferences: NotificationPreferences) {
+        sharedPreferences.edit().apply {
+            putBoolean(KEY_SHIPMENT_ALERTS, preferences.shipmentAlerts)
+            putBoolean(KEY_PAYMENT_ALERTS, preferences.paymentAlerts)
+            putBoolean(KEY_TEMPERATURE_ALERTS, preferences.temperatureAlerts)
+            putInt(KEY_MIN_DELAY_MINUTES, preferences.minDelayMinutes)
+            putInt(KEY_MIN_PAYMENT_OVERDUE_DAYS, preferences.minPaymentOverdueDays)
+            putBoolean(KEY_AUTO_RESCHEDULE, preferences.autoReschedule)
+            putBoolean(KEY_PAYMENT_REMINDERS, preferences.paymentReminders)
+            putBoolean(KEY_QUIET_HOURS, preferences.quietHours)
+            putInt(KEY_QUIET_START_HOUR, preferences.quietStartHour)
+            putInt(KEY_QUIET_END_HOUR, preferences.quietEndHour)
+            putBoolean(KEY_GROUP_SIMILAR, preferences.groupSimilar)
+            putInt(KEY_MAX_NOTIFICATIONS_PER_HOUR, preferences.maxNotificationsPerHour)
+            putBoolean(KEY_NOTIFICATION_SOUND, preferences.notificationSound)
+            putBoolean(KEY_VIBRATION, preferences.vibration)
+            putBoolean(KEY_LED_INDICATOR, preferences.ledIndicator)
+            putBoolean(KEY_PRIORITY_FILTER, preferences.priorityFilter)
+            
+            // Save complex objects as JSON
+            val prioritiesJson = Json.encodeToString(preferences.allowedPriorities)
+            putString(KEY_ALLOWED_PRIORITIES, prioritiesJson)
+            
+            val customRulesJson = Json.encodeToString(preferences.customRules)
+            putString(KEY_CUSTOM_RULES, customRulesJson)
+            
+            apply()
+        }
+    }
+
+    /**
+     * Start preference monitoring
+     */
+    private fun startPreferenceMonitoring() {
+        coroutineScope.launch {
+            while (isActive) {
+                try {
+                    // Monitor for external preference changes
+                    loadPreferences()
+                    delay(5000) // Check every 5 seconds
+                } catch (e: Exception) {
+                    // Handle monitoring error
+                }
+            }
+        }
+    }
+
+    /**
+     * Apply preference changes
+     */
+    private suspend fun applyPreferenceChanges(preferences: NotificationPreferences) {
+        withContext(Dispatchers.IO) {
+            try {
+                // Apply changes to notification system
+                // This would integrate with SmartNotificationManager
+                
+            } catch (e: Exception) {
+                // Handle preference application error
+            }
+        }
+    }
+
+    /**
+     * Reset preferences to defaults
+     */
+    suspend fun resetToDefaults() {
+        val defaultPrefs = getDefaultPreferences()
+        updatePreferences(defaultPrefs)
+    }
+
+    /**
+     * Export preferences
+     */
+    suspend fun exportPreferences(): String {
+        return withContext(Dispatchers.IO) {
+            Json.encodeToString(_preferences.value)
+        }
+    }
+
+    /**
+     * Import preferences
+     */
+    suspend fun importPreferences(preferencesJson: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val importedPrefs = Json.decodeFromString<NotificationPreferences>(preferencesJson)
+                updatePreferences(importedPrefs)
+                true
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Cleanup
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Data classes
+ */
+data class NotificationPreferences(
+    val shipmentAlerts: Boolean,
+    val paymentAlerts: Boolean,
+    val temperatureAlerts: Boolean,
+    val minDelayMinutes: Int,
+    val minPaymentOverdueDays: Int,
+    val autoReschedule: Boolean,
+    val paymentReminders: Boolean,
+    val quietHours: Boolean,
+    val quietStartHour: Int,
+    val quietEndHour: Int,
+    val groupSimilar: Boolean,
+    val maxNotificationsPerHour: Int,
+    val notificationSound: Boolean,
+    val vibration: Boolean,
+    val ledIndicator: Boolean,
+    val priorityFilter: Boolean,
+    val allowedPriorities: Set<NotificationPriority>,
+    val customRules: List<CustomRule>
+)
+
+data class CustomRule(
+    val id: String,
+    val name: String,
+    val event: NotificationEvent,
+    val condition: String,
+    val action: String,
+    val enabled: Boolean
+)

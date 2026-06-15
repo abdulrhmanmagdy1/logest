@@ -1,0 +1,720 @@
+package com.edham.logistics.feature.notifications.data.repository
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.notifications.data.api.NotificationApiService
+import com.edham.logistics.feature.notifications.data.database.NotificationDatabase
+import com.edham.logistics.feature.notifications.data.service.FirebaseNotificationService
+import com.edham.logistics.feature.notifications.data.service.NotificationWebSocketService
+import com.edham.logistics.feature.notifications.domain.model.*
+import com.edham.logistics.feature.notifications.domain.repository.NotificationRepository
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class NotificationRepositoryImpl @Inject constructor(
+    private val notificationApiService: NotificationApiService,
+    private val notificationDatabase: NotificationDatabase,
+    private val notificationWebSocketService: NotificationWebSocketService,
+    private val firebaseNotificationService: FirebaseNotificationService
+) : NotificationRepository {
+
+    override suspend fun sendNotification(request: SendNotificationRequest): Result<String> {
+        return try {
+            val response = notificationApiService.sendNotification(request)
+            if (response.isSuccessful) {
+                response.body()?.let { notificationId ->
+                    // Save to local database
+                    val notification = createNotificationFromRequest(request, notificationId)
+                    notificationDatabase.notificationDao().insertNotification(notification.toEntity())
+                    Result.Success(notificationId)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to send notification: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun sendBulkNotification(request: SendBulkNotificationRequest): Result<List<String>> {
+        return try {
+            val response = notificationApiService.sendBulkNotification(request)
+            if (response.isSuccessful) {
+                response.body()?.let { notificationIds ->
+                    // Save to local database
+                    notificationIds.forEach { notificationId ->
+                        val notification = createNotificationFromRequest(request.notification, notificationId)
+                        notificationDatabase.notificationDao().insertNotification(notification.toEntity())
+                    }
+                    Result.Success(notificationIds)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to send bulk notifications: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun sendPushNotification(payload: PushNotificationPayload): Result<String> {
+        return try {
+            val response = notificationApiService.sendPushNotification(payload)
+            if (response.isSuccessful) {
+                response.body()?.let { messageId ->
+                    Result.Success(messageId)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to send push notification: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun sendEmailNotification(userIds: List<String>, subject: String, body: String): Result<Unit> {
+        return try {
+            val response = notificationApiService.sendEmailNotification(userIds, subject, body)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to send email notification: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun sendSmsNotification(phoneNumbers: List<String>, message: String): Result<Unit> {
+        return try {
+            val response = notificationApiService.sendSmsNotification(phoneNumbers, message)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to send SMS notification: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getNotifications(request: GetNotificationsRequest): Result<List<Notification>> {
+        return try {
+            // Try local database first
+            val localNotifications = notificationDatabase.notificationDao()
+                .getNotifications(request.userId, request.userRole.name, request.limit, request.offset)
+            
+            if (localNotifications.isNotEmpty()) {
+                Result.Success(localNotifications.map { it.toDomainModel() })
+            } else {
+                // Fetch from API if not in local database
+                val response = notificationApiService.getNotifications(request)
+                if (response.isSuccessful) {
+                    response.body()?.let { notifications ->
+                        // Save to local database
+                        notifications.forEach { notification ->
+                            notificationDatabase.notificationDao().insertNotification(notification.toEntity())
+                        }
+                        Result.Success(notifications)
+                    } ?: Result.Success(emptyList())
+                } else {
+                    Result.Error(Exception("Failed to get notifications: ${response.code()}"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeNotifications(userId: String, userRole: UserRole): Flow<Result<List<Notification>>> {
+        return flow {
+            try {
+                // Emit local data first
+                val localNotifications = notificationDatabase.notificationDao()
+                    .getNotifications(userId, userRole.name, 50, 0)
+                emit(Result.Success(localNotifications.map { it.toDomainModel() }))
+
+                // Listen for WebSocket updates
+                notificationWebSocketService.messageFlow.collect { message ->
+                    when (message.type) {
+                        NotificationWebSocketType.NOTIFICATION_SENT,
+                        NotificationWebSocketType.NOTIFICATION_DELIVERED -> {
+                            // Refresh notifications
+                            val response = notificationApiService.getNotifications(
+                                GetNotificationsRequest(
+                                    userId = userId,
+                                    userRole = userRole,
+                                    limit = 50,
+                                    offset = 0
+                                )
+                            )
+                            if (response.isSuccessful) {
+                                response.body()?.let { notifications ->
+                                    emit(Result.Success(notifications))
+                                }
+                            }
+                        }
+                        else -> {}
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getNotificationById(notificationId: String): Result<Notification> {
+        return try {
+            // Try local database first
+            val localNotification = notificationDatabase.notificationDao()
+                .getNotificationById(notificationId)
+            
+            if (localNotification != null) {
+                Result.Success(localNotification.toDomainModel())
+            } else {
+                // Fetch from API if not in local database
+                val response = notificationApiService.getNotificationById(notificationId)
+                if (response.isSuccessful) {
+                    response.body()?.let { notification ->
+                        // Save to local database
+                        notificationDatabase.notificationDao().insertNotification(notification.toEntity())
+                        Result.Success(notification)
+                    } ?: Result.Error(Exception("Empty response"))
+                } else {
+                    Result.Error(Exception("Failed to get notification: ${response.code()}"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getUnreadCount(userId: String, userRole: UserRole): Result<Int> {
+        return try {
+            val count = notificationDatabase.notificationDao()
+                .getUnreadCount(userId, userRole.name)
+            Result.Success(count)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun markNotificationAsRead(notificationId: String, userId: String): Result<Unit> {
+        return try {
+            // Update local database
+            notificationDatabase.notificationDao().markAsRead(notificationId)
+            
+            // Update on server
+            val response = notificationApiService.markNotificationAsRead(
+                MarkNotificationReadRequest(notificationId, userId)
+            )
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to mark notification as read: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun markAllNotificationsAsRead(userId: String, userRole: UserRole): Result<Unit> {
+        return try {
+            // Update local database
+            notificationDatabase.notificationDao().markAllAsRead(userId, userRole.name)
+            
+            // Update on server
+            val response = notificationApiService.markAllNotificationsAsRead(
+                MarkAllNotificationsReadRequest(userId, userRole)
+            )
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to mark all notifications as read: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun deleteNotification(notificationId: String, userId: String): Result<Unit> {
+        return try {
+            // Delete from local database
+            notificationDatabase.notificationDao().deleteNotification(notificationId)
+            
+            // Delete on server
+            val response = notificationApiService.deleteNotification(
+                DeleteNotificationRequest(notificationId, userId)
+            )
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to delete notification: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun deleteAllNotifications(userId: String, userRole: UserRole): Result<Unit> {
+        return try {
+            // Delete from local database
+            notificationDatabase.notificationDao().deleteAllNotifications(userId, userRole.name)
+            
+            // Delete on server
+            val response = notificationApiService.deleteAllNotifications(userId, userRole)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to delete all notifications: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getNotificationSettings(userId: String): Result<NotificationSettings> {
+        return try {
+            // Try local database first
+            val localSettings = notificationDatabase.notificationSettingsDao()
+                .getSettings(userId)
+            
+            if (localSettings != null) {
+                Result.Success(localSettings.toDomainModel())
+            } else {
+                // Fetch from API if not in local database
+                val response = notificationApiService.getNotificationSettings(userId)
+                if (response.isSuccessful) {
+                    response.body()?.let { settings ->
+                        // Save to local database
+                        notificationDatabase.notificationSettingsDao().insertSettings(settings.toEntity())
+                        Result.Success(settings)
+                    } ?: Result.Error(Exception("Empty response"))
+                } else {
+                    Result.Error(Exception("Failed to get notification settings: ${response.code()}"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateNotificationSettings(request: UpdateNotificationSettingsRequest): Result<NotificationSettings> {
+        return try {
+            val response = notificationApiService.updateNotificationSettings(request)
+            if (response.isSuccessful) {
+                response.body()?.let { settings ->
+                    // Update local database
+                    notificationDatabase.notificationSettingsDao().updateSettings(settings.toEntity())
+                    Result.Success(settings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update notification settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getDefaultNotificationSettings(userRole: UserRole): Result<NotificationSettings> {
+        return try {
+            val response = notificationApiService.getDefaultNotificationSettings(userRole)
+            if (response.isSuccessful) {
+                response.body()?.let { settings ->
+                    Result.Success(settings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get default notification settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun resetNotificationSettings(userId: String): Result<NotificationSettings> {
+        return try {
+            val response = notificationApiService.resetNotificationSettings(userId)
+            if (response.isSuccessful) {
+                response.body()?.let { settings ->
+                    // Update local database
+                    notificationDatabase.notificationSettingsDao().updateSettings(settings.toEntity())
+                    Result.Success(settings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to reset notification settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getNotificationTemplate(type: NotificationType): Result<NotificationTemplate> {
+        return try {
+            val response = notificationApiService.getNotificationTemplate(type)
+            if (response.isSuccessful) {
+                response.body()?.let { template ->
+                    Result.Success(template)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get notification template: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getAllNotificationTemplates(): Result<List<NotificationTemplate>> {
+        return try {
+            val response = notificationApiService.getAllNotificationTemplates()
+            if (response.isSuccessful) {
+                response.body()?.let { templates ->
+                    Result.Success(templates)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get notification templates: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateNotificationTemplate(template: NotificationTemplate): Result<NotificationTemplate> {
+        return try {
+            val response = notificationApiService.updateNotificationTemplate(template)
+            if (response.isSuccessful) {
+                response.body()?.let { updatedTemplate ->
+                    Result.Success(updatedTemplate)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update notification template: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getNotificationStats(request: GetNotificationStatsRequest): Result<NotificationStats> {
+        return try {
+            val response = notificationApiService.getNotificationStats(request)
+            if (response.isSuccessful) {
+                response.body()?.let { stats ->
+                    Result.Success(stats)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get notification stats: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getDeliveryStats(notificationId: String): Result<Map<String, Any>> {
+        return try {
+            val response = notificationApiService.getDeliveryStats(notificationId)
+            if (response.isSuccessful) {
+                response.body()?.let { stats ->
+                    Result.Success(stats)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get delivery stats: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getUserStats(userId: String, period: String): Result<Map<String, Any>> {
+        return try {
+            val response = notificationApiService.getUserStats(userId, period)
+            if (response.isSuccessful) {
+                response.body()?.let { stats ->
+                    Result.Success(stats)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get user stats: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun registerDevice(userId: String, fcmToken: String, deviceId: String): Result<Unit> {
+        return try {
+            val response = notificationApiService.registerDevice(userId, fcmToken, deviceId)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to register device: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun unregisterDevice(userId: String, deviceId: String): Result<Unit> {
+        return try {
+            val response = notificationApiService.unregisterDevice(userId, deviceId)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to unregister device: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getUserDevices(userId: String): Result<List<Map<String, Any>>> {
+        return try {
+            val response = notificationApiService.getUserDevices(userId)
+            if (response.isSuccessful) {
+                response.body()?.let { devices ->
+                    Result.Success(devices)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get user devices: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateDeviceToken(userId: String, deviceId: String, fcmToken: String): Result<Unit> {
+        return try {
+            val response = notificationApiService.updateDeviceToken(userId, deviceId, fcmToken)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to update device token: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun connectToNotificationWebSocket(): Result<Unit> {
+        return try {
+            // This would integrate with the WebSocket service
+            notificationWebSocketService.connect("token") // In real app, get token from TokenManager
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun disconnectFromNotificationWebSocket(): Result<Unit> {
+        return try {
+            notificationWebSocketService.disconnect()
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeNotificationMessages(): Flow<Result<NotificationWebSocketMessage>> {
+        return notificationWebSocketService.messageFlow.map { message ->
+            Result.Success(message)
+        }
+    }
+
+    override suspend fun sendNotificationMessage(message: NotificationWebSocketMessage): Result<Unit> {
+        return try {
+            notificationWebSocketService.sendMessage(message)
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun scheduleNotification(request: SendNotificationRequest, scheduledAt: Long): Result<String> {
+        return try {
+            val response = notificationApiService.scheduleNotification(request, scheduledAt)
+            if (response.isSuccessful) {
+                response.body()?.let { notificationId ->
+                    Result.Success(notificationId)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to schedule notification: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun cancelScheduledNotification(notificationId: String): Result<Unit> {
+        return try {
+            val response = notificationApiService.cancelScheduledNotification(notificationId)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to cancel scheduled notification: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getScheduledNotifications(userId: String): Result<List<Notification>> {
+        return try {
+            val response = notificationApiService.getScheduledNotifications(userId)
+            if (response.isSuccessful) {
+                response.body()?.let { notifications ->
+                    Result.Success(notifications)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get scheduled notifications: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun markMultipleAsRead(notificationIds: List<String>, userId: String): Result<Unit> {
+        return try {
+            // Update local database
+            notificationDatabase.notificationDao().markMultipleAsRead(notificationIds)
+            
+            // Update on server
+            val response = notificationApiService.markMultipleAsRead(notificationIds, userId)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to mark multiple notifications as read: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun deleteMultipleNotifications(notificationIds: List<String>, userId: String): Result<Unit> {
+        return try {
+            // Delete from local database
+            notificationDatabase.notificationDao().deleteMultipleNotifications(notificationIds)
+            
+            // Delete on server
+            val response = notificationApiService.deleteMultipleNotifications(notificationIds, userId)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to delete multiple notifications: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun archiveNotifications(notificationIds: List<String>, userId: String): Result<Unit> {
+        return try {
+            val response = notificationApiService.archiveNotifications(notificationIds, userId)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to archive notifications: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun searchNotifications(userId: String, query: String, filters: Map<String, Any>): Result<List<Notification>> {
+        return try {
+            val response = notificationApiService.searchNotifications(userId, query, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { notifications ->
+                    Result.Success(notifications)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to search notifications: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getNotificationsByType(userId: String, type: NotificationType, limit: Int): Result<List<Notification>> {
+        return try {
+            val response = notificationApiService.getNotificationsByType(userId, type, limit)
+            if (response.isSuccessful) {
+                response.body()?.let { notifications ->
+                    Result.Success(notifications)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get notifications by type: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getNotificationsByCategory(userId: String, category: NotificationCategory, limit: Int): Result<List<Notification>> {
+        return try {
+            val response = notificationApiService.getNotificationsByCategory(userId, category, limit)
+            if (response.isSuccessful) {
+                response.body()?.let { notifications ->
+                    Result.Success(notifications)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get notifications by category: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun trackNotificationEvent(notificationId: String, event: String, data: Map<String, Any>): Result<Unit> {
+        return try {
+            val response = notificationApiService.trackNotificationEvent(notificationId, event, data)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to track notification event: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getNotificationAnalytics(period: String, filters: Map<String, Any>): Result<Map<String, Any>> {
+        return try {
+            val response = notificationApiService.getNotificationAnalytics(period, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { analytics ->
+                    Result.Success(analytics)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get notification analytics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    private fun createNotificationFromRequest(request: SendNotificationRequest, notificationId: String): Notification {
+        return Notification(
+            id = notificationId,
+            title = request.title,
+            message = request.message,
+            type = request.type,
+            category = request.category,
+            priority = request.priority,
+            userId = request.userIds.first(), // Simplified for single user
+            userRole = UserRole.CUSTOMER, // Default, should be determined from user data
+            shipmentId = null,
+            driverId = null,
+            customerId = null,
+            data = request.data,
+            imageUrl = request.imageUrl,
+            actionUrl = request.actionUrl,
+            isRead = false,
+            isPush = true,
+            timestamp = System.currentTimeMillis(),
+            expiresAt = null,
+            sound = request.sound ?: "default",
+            vibration = request.vibration,
+            badge = null,
+            deepLink = request.deepLink
+        )
+    }
+}

@@ -7,15 +7,15 @@ import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import com.edham.logistics.R
 
-data class LogEntry(
-    val route: String,
-    val meta: String,
-    val earning: String,
-    val date: String
-)
+import com.edham.logistics.feature.driver.data.models.Trip
 
-class LogBookAdapter(private val logs: List<LogEntry>) :
+class LogBookAdapter(private var logs: List<Trip>) :
     RecyclerView.Adapter<LogBookAdapter.ViewHolder>() {
+
+    fun updateData(newLogs: List<Trip>) {
+        logs = newLogs
+        notifyDataSetChanged()
+    }
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val route: TextView = view.findViewById(R.id.tvTripRoute)
@@ -32,10 +32,10 @@ class LogBookAdapter(private val logs: List<LogEntry>) :
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val log = logs[position]
-        holder.route.text = log.route
-        holder.meta.text = log.meta
-        holder.earning.text = log.earning
-        holder.date.text = log.date
+        holder.route.text = "${log.origin} ← ${log.destination}"
+        holder.meta.text = "${log.distance} كم • ${log.routeSummary}"
+        holder.earning.text = "+${log.earnings} ريال"
+        holder.date.text = log.startTime
     }
 
     override fun getItemCount() = logs.size

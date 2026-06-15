@@ -1,0 +1,334 @@
+package com.edham.logistics.core.security
+
+import android.content.Context
+import com.edham.logistics.core.utils.DeviceInfo
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.runBlocking
+import okhttp3.Interceptor
+import okhttp3.Request
+import okhttp3.Response
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * API security interceptor for protecting API requests
+ */
+@Singleton
+class ApiSecurityInterceptor @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val secureTokenManager: SecureTokenManager,
+    private val sessionManager: SessionManager,
+    private val deviceInfo: DeviceInfo
+) : Interceptor {
+    
+    companion object {
+        private const val AUTHORIZATION_HEADER = "Authorization"
+        private const val BEARER_PREFIX = "Bearer "
+        private const val X_USER_ID = "X-User-ID"
+        private const val X_USER_ROLE = "X-User-Role"
+        private const val X_SESSION_ID = "X-Session-ID"
+        private const val X_DEVICE_ID = "X-Device-ID"
+        private const val X_REQUEST_ID = "X-Request-ID"
+        private const val X_TIMESTAMP = "X-Timestamp"
+        private const val X_SIGNATURE = "X-Signature"
+        private const val X_APP_VERSION = "X-App-Version"
+        private const val X_OS_VERSION = "X-OS-Version"
+        private const val X_DEVICE_INFO = "X-Device-Info"
+        private const val X_SECURITY_TOKEN = "X-Security-Token"
+    }
+    
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val originalRequest = chain.request()
+        
+        try {
+            // Check if request should be secured
+            if (!requiresSecurity(originalRequest)) {
+                return chain.proceed(originalRequest)
+            }
+            
+            // Validate session
+            val sessionValidation = validateSession()
+            if (sessionValidation is Result.Error) {
+                return createUnauthorizedResponse(originalRequest, sessionValidation.exception.message ?: "Session validation failed")
+            }
+            
+            // Add security headers
+            val securedRequest = originalRequest.newBuilder()
+                .apply {
+                    // Add authorization header
+                    runBlocking {
+                        secureTokenManager.getAccessToken()?.let { token ->
+                            addHeader(AUTHORIZATION_HEADER, BEARER_PREFIX + token)
+                        }
+                    }
+                    
+                    // Add user context headers
+                    runBlocking {
+                        secureTokenManager.getUserId()?.let { userId ->
+                            addHeader(X_USER_ID, userId)
+                        }
+                        
+                        secureTokenManager.getUserRole()?.let { userRole ->
+                            addHeader(X_USER_ROLE, userRole)
+                        }
+                    }
+                    
+                    // Add session headers
+                    sessionManager.currentSession.value?.let { session ->
+                        addHeader(X_SESSION_ID, session.sessionId)
+                        addHeader(X_DEVICE_ID, session.deviceId)
+                    }
+                    
+                    // Add security headers
+                    addHeader(X_REQUEST_ID, generateRequestId())
+                    addHeader(X_TIMESTAMP, System.currentTimeMillis().toString())
+                    addHeader(X_APP_VERSION, getAppVersion())
+                    addHeader(X_OS_VERSION, getOsVersion())
+                    addHeader(X_DEVICE_INFO, getDeviceInfo())
+                    addHeader(X_SECURITY_TOKEN, generateSecurityToken())
+                    
+                    // Add signature for sensitive requests
+                    if (isSensitiveRequest(originalRequest)) {
+                        addHeader(X_SIGNATURE, generateSignature(originalRequest))
+                    }
+                }
+                .build()
+            
+            // Update session activity
+            sessionManager.currentSession.value?.let { session ->
+                runBlocking {
+                    sessionManager.updateSessionActivity(session.sessionId)
+                }
+            }
+            
+            // Proceed with secured request
+            val response = chain.proceed(securedRequest)
+            
+            // Handle response
+            return handleResponse(response, originalRequest)
+            
+        } catch (e: Exception) {
+            return createErrorResponse(originalRequest, e)
+        }
+    }
+    
+    /**
+     * Check if request requires security
+     */
+    private fun requiresSecurity(request: Request): Boolean {
+        val path = request.url.encodedPath
+        
+        // Public endpoints that don't require authentication
+        val publicEndpoints = setOf(
+            "/api/auth/login",
+            "/api/auth/register",
+            "/api/auth/forgot-password",
+            "/api/public/",
+            "/api/health",
+            "/api/version"
+        )
+        
+        return !publicEndpoints.any { path.startsWith(it) }
+    }
+    
+    /**
+     * Validate session
+     */
+    private fun validateSession(): Result<Unit> {
+        return try {
+            runBlocking {
+                val session = sessionManager.currentSession.value
+                if (session == null) {
+                    return@runBlocking Result.Error(SecurityException("No active session"))
+                }
+                
+                if (!session.isActive) {
+                    return@runBlocking Result.Error(SecurityException("Session is not active"))
+                }
+                
+                if (runBlocking { sessionManager.validateSession(session.sessionId) } is Result.Error) {
+                    return@runBlocking Result.Error(SecurityException("Session validation failed"))
+                }
+                
+                // Validate token
+                if (!secureTokenManager.isAccessTokenValid()) {
+                    return@runBlocking Result.Error(SecurityException("Access token is not valid"))
+                }
+                
+                Result.Success(Unit)
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    /**
+     * Check if request is sensitive
+     */
+    private fun isSensitiveRequest(request: Request): Boolean {
+        val path = request.url.encodedPath
+        val method = request.method
+        
+        // Sensitive endpoints that require signature
+        val sensitiveEndpoints = setOf(
+            "/api/auth/change-password",
+            "/api/auth/update-profile",
+            "/api/billing/payment",
+            "/api/admin/",
+            "/api/financial/",
+            "/api/user/delete"
+        )
+        
+        // POST, PUT, DELETE requests are sensitive
+        return sensitiveEndpoints.any { path.startsWith(it) } || 
+               method in listOf("POST", "PUT", "DELETE")
+    }
+    
+    /**
+     * Generate request ID
+     */
+    private fun generateRequestId(): String {
+        return "req_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    }
+    
+    /**
+     * Generate security token
+     */
+    private fun generateSecurityToken(): String {
+        return try {
+            val timestamp = System.currentTimeMillis().toString()
+            val deviceId = deviceInfo.getDeviceId()
+            val sessionId = sessionManager.currentSession.value?.sessionId ?: ""
+            
+            // Simple token generation - in production, use proper cryptographic methods
+            "${timestamp}_${deviceId}_${sessionId}"
+        } catch (e: Exception) {
+            "security_token_${System.currentTimeMillis()}"
+        }
+    }
+    
+    /**
+     * Generate signature for request
+     */
+    private fun generateSignature(request: Request): String {
+        return try {
+            val timestamp = System.currentTimeMillis().toString()
+            val method = request.method
+            val path = request.url.encodedPath
+            val bodyHash = request.body?.hashCode().toString() ?: ""
+            
+            // Simple signature generation - in production, use proper HMAC
+            "${timestamp}_${method}_${path}_${bodyHash}"
+        } catch (e: Exception) {
+            "signature_${System.currentTimeMillis()}"
+        }
+    }
+    
+    /**
+     * Handle response
+     */
+    private fun handleResponse(response: Response, originalRequest: Request): Response {
+        return when (response.code) {
+            401 -> {
+                // Unauthorized - clear tokens and session
+                runBlocking {
+                    secureTokenManager.clearTokens()
+                    sessionManager.terminateAllSessions()
+                }
+                response
+            }
+            403 -> {
+                // Forbidden - insufficient permissions
+                runBlocking {
+                    val userRole = secureTokenManager.getUserRole()
+                    val path = originalRequest.url.encodedPath
+                    
+                    // Log security violation
+                    logSecurityViolation("ACCESS_DENIED", mapOf(
+                        "userRole" to userRole,
+                        "path" to path,
+                        "method" to originalRequest.method
+                    ))
+                }
+                response
+            }
+            419 -> {
+                // Authentication timeout
+                runBlocking {
+                    secureTokenManager.clearTokens()
+                    sessionManager.terminateAllSessions()
+                }
+                response
+            }
+            else -> {
+                response
+            }
+        }
+    }
+    
+    /**
+     * Create unauthorized response
+     */
+    private fun createUnauthorizedResponse(request: Request, message: String): Response {
+        return Response.Builder()
+            .request(request)
+            .protocol(okhttp3.Protocol.HTTP_1_1)
+            .code(401)
+            .message("Unauthorized")
+            .body(okhttp3.ResponseBody.create(
+                okhttp3.MediaType.parse("application/json"),
+                """{"error":"$message","code":401}"""
+            ))
+            .build()
+    }
+    
+    /**
+     * Create error response
+     */
+    private fun createErrorResponse(request: Request, error: Exception): Response {
+        return Response.Builder()
+            .request(request)
+            .protocol(okhttp3.Protocol.HTTP_1_1)
+            .code(500)
+            .message("Internal Server Error")
+            .body(okhttp3.ResponseBody.create(
+                okhttp3.MediaType.parse("application/json"),
+                """{"error":"${error.message}","code":500}"""
+            ))
+            .build()
+    }
+    
+    /**
+     * Get app version
+     */
+    private fun getAppVersion(): String {
+        return try {
+            val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            packageInfo.versionName ?: "Unknown"
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    /**
+     * Get OS version
+     */
+    private fun getOsVersion(): String {
+        return "${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})"
+    }
+    
+    /**
+     * Get device info
+     */
+    private fun getDeviceInfo(): String {
+        return "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}"
+    }
+    
+    /**
+     * Log security violation
+     */
+    private fun logSecurityViolation(violationType: String, details: Map<String, Any>) {
+        // Log to security monitoring system
+        // This would integrate with your security infrastructure
+    }
+}

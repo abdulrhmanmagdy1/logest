@@ -1,0 +1,587 @@
+package com.edham.logistics.security
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import android.content.Context
+import android.content.SharedPreferences
+import android.provider.Settings
+import android.telephony.TelephonyManager
+import android.util.Base64
+import java.security.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.crypto.*
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import javax.crypto.spec.PBEKeySpec
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.*
+
+/**
+ * Android Professional Security Service for Application Hardening
+ */
+class ProfessionalSecurityService(private val context: Context) {
+    
+    private val sharedPreferences: SharedPreferences = 
+        context.getSharedPreferences("security_prefs", Context.MODE_PRIVATE)
+    
+    private val securityScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    // In-memory stores for rate limiting and login attempts
+    private val rateLimitStore = ConcurrentHashMap<String, RateLimitInfo>()
+    private val loginAttemptStore = ConcurrentHashMap<String, LoginAttemptInfo>()
+    private val deviceBindingStore = ConcurrentHashMap<String, DeviceBindingInfo>()
+    private val tokenBlacklist = ConcurrentHashMap<String, TokenBlacklist>()
+    
+    // Security configuration
+    private val encryptionKey = "defaultEncryptionKey1234567890123456"
+    private val jwtSecret = "defaultJwtSecretKeyForProfessionalSecurity"
+    private val jwtExpirationMs = 3600000L // 1 hour
+    private val rateLimitRequests = 100
+    private val rateLimitWindowMs = 60000L // 1 minute
+    private val maxLoginAttempts = 5
+    private val lockoutDurationMs = 900000L // 15 minutes
+    
+    // Encryption constants
+    companion object {
+        private const val AES_ALGORITHM = "AES/CBC/PKCS5Padding"
+        private const val AES_KEY_ALGORITHM = "AES"
+        private const val AES_KEY_LENGTH = 256
+        private const val IV_LENGTH = 16
+        private const val HASH_ALGORITHM = "SHA-256"
+        private const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
+        private const val PBKDF2_ITERATIONS = 10000
+        private const val SALT_LENGTH = 32
+    }
+    
+    /**
+     * Encryption/Decryption Result
+     */
+    data class EncryptionResult(
+        val encryptedData: String,
+        val iv: String,
+        val salt: String
+    )
+    
+    /**
+     * Rate Limit Information
+     */
+    data class RateLimitInfo(
+        val identifier: String,
+        var requestCount: Int = 0,
+        var windowStart: Long = System.currentTimeMillis(),
+        var lastReset: Long = System.currentTimeMillis()
+    )
+    
+    /**
+     * Login Attempt Information
+     */
+    data class LoginAttemptInfo(
+        val identifier: String,
+        var attemptCount: Int = 0,
+        var lastAttempt: LocalDateTime = LocalDateTime.now(),
+        var lockoutUntil: LocalDateTime? = null,
+        var isLocked: Boolean = false
+    )
+    
+    /**
+     * Device Binding Information
+     */
+    data class DeviceBindingInfo(
+        val userId: String,
+        val deviceId: String,
+        val deviceFingerprint: String,
+        val boundAt: LocalDateTime = LocalDateTime.now(),
+        var isActive: Boolean = true,
+        var lastUsed: String = LocalDateTime.now().toString()
+    )
+    
+    /**
+     * Token Blacklist Information
+     */
+    data class TokenBlacklist(
+        val tokenId: String,
+        val blacklistedAt: LocalDateTime = LocalDateTime.now(),
+        val expiresAt: LocalDateTime,
+        val reason: String
+    )
+    
+    /**
+     * Security Event
+     */
+    data class SecurityEvent(
+        val eventId: String = UUID.randomUUID().toString(),
+        val eventType: String,
+        val identifier: String,
+        val description: String,
+        val timestamp: LocalDateTime = LocalDateTime.now(),
+        val ipAddress: String? = null,
+        val userAgent: String? = null,
+        val metadata: Map<String, Any> = emptyMap()
+    )
+    
+    /**
+     * Encrypt sensitive data using AES-256
+     */
+    suspend fun encryptSensitiveData(data: String): EncryptionResult = withContext(Dispatchers.IO) {
+        try {
+            // Generate random salt
+            val random = SecureRandom()
+            val salt = ByteArray(SALT_LENGTH)
+            random.nextBytes(salt)
+            
+            // Derive key from password and salt
+            val factory = SecretKeyFactory.getInstance(PBKDF2_ALGORITHM)
+            val spec = PBEKeySpec(encryptionKey.toCharArray(), salt, PBKDF2_ITERATIONS, AES_KEY_LENGTH)
+            val tmp = factory.generateSecret(spec)
+            val secretKey = SecretKeySpec(tmp.encoded, AES_KEY_ALGORITHM)
+            
+            // Generate random IV
+            val iv = ByteArray(IV_LENGTH)
+            random.nextBytes(iv)
+            val ivSpec = IvParameterSpec(iv)
+            
+            // Encrypt data
+            val cipher = Cipher.getInstance(AES_ALGORITHM)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, ivSpec)
+            val encryptedData = cipher.doFinal(data.toByteArray(Charsets.UTF_8))
+            
+            // Return encrypted result
+            EncryptionResult(
+                encryptedData = Base64.encodeToString(encryptedData, Base64.DEFAULT),
+                iv = Base64.encodeToString(iv, Base64.DEFAULT),
+                salt = Base64.encodeToString(salt, Base64.DEFAULT)
+            )
+        } catch (e: Exception) {
+            throw SecurityException("Failed to encrypt sensitive data", e)
+        }
+    }
+    
+    /**
+     * Decrypt sensitive data using AES-256
+     */
+    suspend fun decryptSensitiveData(encryptedData: String, iv: String, salt: String): String = withContext(Dispatchers.IO) {
+        try {
+            // Decode base64 components
+            val encryptedBytes = Base64.decode(encryptedData, Base64.DEFAULT)
+            val ivBytes = Base64.decode(iv, Base64.DEFAULT)
+            val saltBytes = Base64.decode(salt, Base64.DEFAULT)
+            
+            // Derive key from password and salt
+            val factory = SecretKeyFactory.getInstance(PBKDF2_ALGORITHM)
+            val spec = PBEKeySpec(encryptionKey.toCharArray(), saltBytes, PBKDF2_ITERATIONS, AES_KEY_LENGTH)
+            val tmp = factory.generateSecret(spec)
+            val secretKey = SecretKeySpec(tmp.encoded, AES_KEY_ALGORITHM)
+            
+            // Create IV spec
+            val ivSpec = IvParameterSpec(ivBytes)
+            
+            // Decrypt data
+            val cipher = Cipher.getInstance(AES_ALGORITHM)
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, ivSpec)
+            val decryptedData = cipher.doFinal(encryptedBytes)
+            
+            String(decryptedData, Charsets.UTF_8)
+        } catch (e: Exception) {
+            throw SecurityException("Failed to decrypt sensitive data", e)
+        }
+    }
+    
+    /**
+     * Generate secure hash for sensitive data
+     */
+    suspend fun generateSecureHash(data: String, salt: String): String = withContext(Dispatchers.IO) {
+        try {
+            val digest = MessageDigest.getInstance(HASH_ALGORITHM)
+            val saltedData = data + salt
+            val hashBytes = digest.digest(saltedData.toByteArray(Charsets.UTF_8))
+            Base64.encodeToString(hashBytes, Base64.DEFAULT)
+        } catch (e: Exception) {
+            throw SecurityException("Failed to generate secure hash", e)
+        }
+    }
+    
+    /**
+     * Generate random salt
+     */
+    suspend fun generateSalt(): String = withContext(Dispatchers.IO) {
+        val random = SecureRandom()
+        val salt = ByteArray(SALT_LENGTH)
+        random.nextBytes(salt)
+        Base64.encodeToString(salt, Base64.DEFAULT)
+    }
+    
+    /**
+     * Check rate limit for API requests
+     */
+    fun checkRateLimit(identifier: String): Boolean {
+        val currentTime = System.currentTimeMillis()
+        val rateLimitInfo = rateLimitStore.getOrPut(identifier) { RateLimitInfo(identifier) }
+        
+        // Reset window if expired
+        if (currentTime - rateLimitInfo.lastReset >= rateLimitWindowMs) {
+            rateLimitInfo.requestCount = 0
+            rateLimitInfo.windowStart = currentTime
+            rateLimitInfo.lastReset = currentTime
+        }
+        
+        // Check if rate limit exceeded
+        if (rateLimitInfo.requestCount >= rateLimitRequests) {
+            logSecurityEvent("RATE_LIMIT_EXCEEDED", identifier, 
+                "Rate limit exceeded: ${rateLimitInfo.requestCount} requests")
+            return false
+        }
+        
+        // Increment request count
+        rateLimitInfo.requestCount++
+        return true
+    }
+    
+    /**
+     * Handle login attempt
+     */
+    fun handleLoginAttempt(identifier: String, success: Boolean, ipAddress: String? = null, userAgent: String? = null): LoginAttemptInfo {
+        val attemptInfo = loginAttemptStore.getOrPut(identifier) { LoginAttemptInfo(identifier) }
+        
+        attemptInfo.lastAttempt = LocalDateTime.now()
+        
+        if (success) {
+            // Reset on successful login
+            attemptInfo.attemptCount = 0
+            attemptInfo.isLocked = false
+            attemptInfo.lockoutUntil = null
+            
+            logSecurityEvent("LOGIN_SUCCESS", identifier, "Successful login", ipAddress, userAgent)
+        } else {
+            // Increment failed attempts
+            attemptInfo.attemptCount++
+            
+            // Check if should lock account
+            if (attemptInfo.attemptCount >= maxLoginAttempts) {
+                attemptInfo.isLocked = true
+                attemptInfo.lockoutUntil = LocalDateTime.now().plusNanos(lockoutDurationMs * 1_000_000)
+                
+                logSecurityEvent("ACCOUNT_LOCKED", identifier, 
+                    "Account locked due to multiple failed attempts: ${attemptInfo.attemptCount}", 
+                    ipAddress, userAgent, mapOf("lockoutDuration" to lockoutDurationMs))
+            } else {
+                logSecurityEvent("LOGIN_FAILED", identifier, 
+                    "Failed login attempt: ${attemptInfo.attemptCount}/$maxLoginAttempts", 
+                    ipAddress, userAgent)
+            }
+        }
+        
+        return attemptInfo
+    }
+    
+    /**
+     * Check if account is locked
+     */
+    fun isAccountLocked(identifier: String): Boolean {
+        val attemptInfo = loginAttemptStore[identifier] ?: return false
+        
+        // Check if lockout has expired
+        if (attemptInfo.isLocked && attemptInfo.lockoutUntil != null) {
+            if (LocalDateTime.now().isAfter(attemptInfo.lockoutUntil)) {
+                attemptInfo.isLocked = false
+                attemptInfo.lockoutUntil = null
+                attemptInfo.attemptCount = 0
+                return false
+            }
+        }
+        
+        return attemptInfo.isLocked
+    }
+    
+    /**
+     * Bind device to admin account
+     */
+    fun bindDeviceToAccount(userId: String, deviceId: String, deviceFingerprint: String): DeviceBindingInfo {
+        val bindingInfo = DeviceBindingInfo(userId, deviceId, deviceFingerprint)
+        deviceBindingStore["${userId}:$deviceId"] = bindingInfo
+        
+        logSecurityEvent("DEVICE_BOUND", userId, 
+            "Device bound to account: $deviceId", null, null, 
+            mapOf("deviceId" to deviceId, "fingerprint" to deviceFingerprint))
+        
+        return bindingInfo
+    }
+    
+    /**
+     * Verify device binding
+     */
+    fun verifyDeviceBinding(userId: String, deviceId: String, deviceFingerprint: String): Boolean {
+        val key = "${userId}:$deviceId"
+        val bindingInfo = deviceBindingStore[key] ?: return false
+        
+        if (!bindingInfo.isActive) {
+            logSecurityEvent("DEVICE_BINDING_FAILED", userId, 
+                "Device binding verification failed: $deviceId", null, null, 
+                mapOf("deviceId" to deviceId, "fingerprint" to deviceFingerprint))
+            return false
+        }
+        
+        // Verify fingerprint (simplified - in production, use more sophisticated matching)
+        val isValid = deviceFingerprint == bindingInfo.deviceFingerprint
+        
+        if (!isValid) {
+            logSecurityEvent("DEVICE_FINGERPRINT_MISMATCH", userId, 
+                "Device fingerprint mismatch: $deviceId", null, null, 
+                mapOf("deviceId" to deviceId, "expectedFingerprint" to bindingInfo.deviceFingerprint, 
+                       "actualFingerprint" to deviceFingerprint))
+        } else {
+            bindingInfo.lastUsed = LocalDateTime.now().toString()
+        }
+        
+        return isValid
+    }
+    
+    /**
+     * Generate device fingerprint
+     */
+    suspend fun generateDeviceFingerprint(userAgent: String? = null, ipAddress: String? = null): String = withContext(Dispatchers.IO) {
+        try {
+            // Get device information
+            val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+            val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+            val deviceId = try {
+                telephonyManager.deviceId
+            } catch (e: SecurityException) {
+                "unknown"
+            }
+            
+            // Combine various device characteristics
+            val fingerprintData = StringBuilder()
+            fingerprintData.append(androidId ?: "")
+            fingerprintData.append(deviceId ?: "")
+            fingerprintData.append(userAgent ?: "")
+            fingerprintData.append(ipAddress ?: "")
+            
+            // Add additional device info
+            fingerprintData.append(Build.MANUFACTURER)
+            fingerprintData.append(Build.MODEL)
+            fingerprintData.append(Build.VERSION.RELEASE)
+            fingerprintData.append(Build.VERSION.SDK_INT.toString())
+            
+            // Generate hash
+            val digest = MessageDigest.getInstance(HASH_ALGORITHM)
+            val hashBytes = digest.digest(fingerprintData.toString().toByteArray(Charsets.UTF_8))
+            Base64.encodeToString(hashBytes, Base64.DEFAULT)
+        } catch (e: Exception) {
+            throw SecurityException("Failed to generate device fingerprint", e)
+        }
+    }
+    
+    /**
+     * Blacklist token
+     */
+    fun blacklistToken(tokenId: String, expiresAt: LocalDateTime, reason: String) {
+        val blacklistInfo = TokenBlacklist(tokenId, expiresAt, reason)
+        tokenBlacklist[tokenId] = blacklistInfo
+        
+        logSecurityEvent("TOKEN_BLACKLISTED", tokenId, 
+            "Token blacklisted: $reason", null, null, 
+            mapOf("expiresAt" to expiresAt.toString()))
+    }
+    
+    /**
+     * Check if token is blacklisted
+     */
+    fun isTokenBlacklisted(tokenId: String): Boolean {
+        val blacklistInfo = tokenBlacklist[tokenId] ?: return false
+        
+        // Check if blacklist entry has expired
+        if (LocalDateTime.now().isAfter(blacklistInfo.expiresAt)) {
+            tokenBlacklist.remove(tokenId)
+            return false
+        }
+        
+        return true
+    }
+    
+    /**
+     * Handle token expiration
+     */
+    fun handleTokenExpiration(tokenId: String, userId: String) {
+        blacklistToken(tokenId, LocalDateTime.now().plusDays(1), "Token expired naturally")
+        
+        logSecurityEvent("TOKEN_EXPIRED", userId, 
+            "Token expired: $tokenId", null, null, 
+            mapOf("tokenId" to tokenId))
+    }
+    
+    /**
+     * Validate token expiration
+     */
+    fun validateTokenExpiration(tokenId: String, issuedAt: LocalDateTime?): Boolean {
+        if (issuedAt == null) return false
+        
+        val expirationTime = issuedAt.plusNanos(jwtExpirationMs * 1_000_000)
+        return LocalDateTime.now().isBefore(expirationTime)
+    }
+    
+    /**
+     * Generate secure random token
+     */
+    suspend fun generateSecureToken(): String = withContext(Dispatchers.IO) {
+        val random = SecureRandom()
+        val tokenBytes = ByteArray(32)
+        random.nextBytes(tokenBytes)
+        Base64.encodeToString(tokenBytes, Base64.URL_SAFE or Base64.NO_PADDING)
+    }
+    
+    /**
+     * Validate password strength
+     */
+    fun validatePasswordStrength(password: String?): Boolean {
+        if (password == null || password.length < 8) {
+            return false
+        }
+        
+        // Check for at least one uppercase letter
+        if (!password.any { it.isUpperCase() }) {
+            return false
+        }
+        
+        // Check for at least one lowercase letter
+        if (!password.any { it.isLowerCase() }) {
+            return false
+        }
+        
+        // Check for at least one digit
+        if (!password.any { it.isDigit() }) {
+            return false
+        }
+        
+        // Check for at least one special character
+        val specialChars = "!@#$%^&*()_+-=[]{};':\"|,.<>/?"
+        if (!password.any { it in specialChars }) {
+            return false
+        }
+        
+        return true
+    }
+    
+    /**
+     * Sanitize input to prevent injection attacks
+     */
+    fun sanitizeInput(input: String?): String? {
+        if (input == null) return null
+        
+        // Remove potentially dangerous characters
+        return input.replace(Regex("[<>\"'&]"), "")
+    }
+    
+    /**
+     * Log security event
+     */
+    fun logSecurityEvent(eventType: String, identifier: String, description: String, 
+                       ipAddress: String? = null, userAgent: String? = null, 
+                       metadata: Map<String, Any> = emptyMap()) {
+        val event = SecurityEvent(eventType, identifier, description, ipAddress, userAgent, metadata)
+        
+        // In production, this would be sent to a security logging system
+        println("SECURITY_EVENT: ${event.eventType} - ${event.description} at ${event.timestamp}")
+        
+        // Store in SharedPreferences for persistence
+        val eventsJson = sharedPreferences.getString("security_events", "[]")
+        // In production, use proper JSON parsing
+        val updatedEvents = "$eventsJson,\"${event.eventId}\""
+        sharedPreferences.edit().putString("security_events", updatedEvents).apply()
+        
+        // Additional processing for critical events
+        if (eventType == "ACCOUNT_LOCKED" || eventType == "RATE_LIMIT_EXCEEDED") {
+            handleCriticalSecurityEvent(event)
+        }
+    }
+    
+    /**
+     * Handle critical security events
+     */
+    private fun handleCriticalSecurityEvent(event: SecurityEvent) {
+        // In production, this would trigger alerts, notifications, etc.
+        System.err.println("CRITICAL_SECURITY_EVENT: ${event.eventType} - ${event.description} for identifier: ${event.identifier}")
+    }
+    
+    /**
+     * Get security statistics
+     */
+    fun getSecurityStatistics(): Map<String, Any> {
+        return mapOf(
+            "activeRateLimits" to rateLimitStore.size,
+            "rateLimitRequests" to rateLimitRequests,
+            "rateLimitWindowMs" to rateLimitWindowMs,
+            "activeLoginAttempts" to loginAttemptStore.size,
+            "maxLoginAttempts" to maxLoginAttempts,
+            "lockoutDurationMs" to lockoutDurationMs,
+            "activeDeviceBindings" to deviceBindingStore.size,
+            "blacklistedTokens" to tokenBlacklist.size
+        )
+    }
+    
+    /**
+     * Get security configuration
+     */
+    fun getSecurityConfiguration(): Map<String, Any> {
+        return mapOf(
+            "encryptionAlgorithm" to AES_ALGORITHM,
+            "keyLength" to AES_KEY_LENGTH,
+            "hashAlgorithm" to HASH_ALGORITHM,
+            "pbkdf2Iterations" to PBKDF2_ITERATIONS,
+            "jwtExpirationMs" to jwtExpirationMs,
+            "rateLimitRequests" to rateLimitRequests,
+            "rateLimitWindowMs" to rateLimitWindowMs,
+            "maxLoginAttempts" to maxLoginAttempts,
+            "lockoutDurationMs" to lockoutDurationMs
+        )
+    }
+    
+    /**
+     * Test encryption/decryption
+     */
+    suspend fun testEncryption(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val testData = "This is a test for encryption"
+            val encrypted = encryptSensitiveData(testData)
+            val decrypted = decryptSensitiveData(encrypted.encryptedData, encrypted.iv, encrypted.salt)
+            testData == decrypted
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Clear all security data (for testing)
+     */
+    fun clearAllSecurityData() {
+        rateLimitStore.clear()
+        loginAttemptStore.clear()
+        deviceBindingStore.clear()
+        tokenBlacklist.clear()
+        sharedPreferences.edit().clear().apply()
+    }
+    
+    /**
+     * Clean up expired entries
+     */
+    fun cleanupExpiredEntries() {
+        val currentTime = System.currentTimeMillis()
+        
+        // Clean up expired rate limit entries
+        rateLimitStore.entries.removeIf { 
+            currentTime - it.value.lastReset > rateLimitWindowMs * 2 
+        }
+        
+        // Clean up expired login attempts
+        loginAttemptStore.entries.removeIf { entry ->
+            val info = entry.value
+            info.lockoutUntil != null && 
+            LocalDateTime.now().isAfter(info.lockoutUntil!!.plusDays(1))
+        }
+        
+        // Clean up expired token blacklist entries
+        tokenBlacklist.entries.removeIf { 
+            LocalDateTime.now().isAfter(it.value.expiresAt) 
+        }
+    }
+}

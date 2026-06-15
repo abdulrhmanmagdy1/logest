@@ -1,0 +1,495 @@
+package com.edham.logistics.feature.coldchain
+
+import android.graphics.Color
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.Observer
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentColdChainDashboardBinding
+import com.edham.logistics.feature.coldchain.adapters.AlertAdapter
+import com.edham.logistics.feature.coldchain.adapters.SensorStatusAdapter
+import com.edham.logistics.utils.VoiceAlertManager
+import com.github.mikephil.charting.charts.LineChart
+import com.github.mikephil.charting.data.Entry
+import com.github.mikephil.charting.data.LineData
+import com.github.mikephil.charting.data.LineDataSet
+import timber.log.Timber
+import java.text.SimpleDateFormat
+import java.util.*
+
+class ColdChainDashboardFragment : Fragment() {
+    
+    private var _binding: FragmentColdChainDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var coldChainService: ColdChainMonitoringService
+    private lateinit var voiceAlertManager: VoiceAlertManager
+    private lateinit var alertAdapter: AlertAdapter
+    private lateinit var sensorStatusAdapter: SensorStatusAdapter
+    
+    private val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    private var currentShipmentId: String? = null
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentColdChainDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Initialize services
+        coldChainService = ColdChainMonitoringService(
+            requireContext(),
+            // api instance,
+            // database instance
+        )
+        
+        voiceAlertManager = VoiceAlertManager(requireContext())
+        
+        setupUI()
+        setupRecyclerViews()
+        setupCharts()
+        setupClickListeners()
+        setupObservers()
+        
+        // Get shipment ID from arguments
+        currentShipmentId = arguments?.getString("shipment_id")
+        
+        // Start monitoring
+        currentShipmentId?.let { shipmentId ->
+            coldChainService.startMonitoring(shipmentId, ColdChainStandard.FOOD)
+            voiceAlertManager.speak("Cold chain monitoring started")
+        }
+    }
+    
+    private fun setupUI() {
+        // Large touch targets for one-hand usage
+        binding.btnStartMonitoring.minimumHeight = 80.dp
+        binding.btnStartMonitoring.minimumWidth = 160.dp
+        
+        binding.btnStopMonitoring.minimumHeight = 72.dp
+        binding.btnStopMonitoring.minimumWidth = 120.dp
+        
+        binding.btnGenerateReport.minimumHeight = 72.dp
+        binding.btnGenerateReport.minimumWidth = 120.dp
+        
+        // Dark mode optimized colors
+        binding.cardCurrentStatus.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        binding.cardTemperatureChart.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        binding.cardAlerts.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        binding.cardSensorStatus.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        // High visibility status colors
+        updateComplianceStatusUI(ComplianceStatus.COMPLIANT)
+    }
+    
+    private fun setupRecyclerViews() {
+        // Setup alerts RecyclerView
+        alertAdapter = AlertAdapter { alert ->
+            onAlertClicked(alert)
+        }
+        
+        binding.recyclerViewAlerts.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = alertAdapter
+        }
+        
+        // Setup sensor status RecyclerView
+        sensorStatusAdapter = SensorStatusAdapter()
+        
+        binding.recyclerViewSensorStatus.apply {
+            layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+            adapter = sensorStatusAdapter
+        }
+    }
+    
+    private fun setupCharts() {
+        setupTemperatureChart()
+        setupHumidityChart()
+    }
+    
+    private fun setupTemperatureChart() {
+        val chart = binding.temperatureChart
+        
+        // Chart configuration
+        chart.description.isEnabled = false
+        chart.setTouchEnabled(true)
+        chart.isDragEnabled = true
+        chart.setScaleEnabled(true)
+        chart.setPinchZoom(true)
+        chart.setDrawGridBackground(false)
+        
+        // Configure axes
+        chart.xAxis.isEnabled = true
+        chart.axisLeft.isEnabled = true
+        chart.axisRight.isEnabled = false
+        
+        chart.xAxis.textColor = requireContext().getColor(R.color.text_secondary)
+        chart.axisLeft.textColor = requireContext().getColor(R.color.text_secondary)
+        
+        // Configure legend
+        chart.legend.isEnabled = true
+        chart.legend.textColor = requireContext().getColor(R.color.text_primary)
+        
+        // Initialize with empty data
+        val emptyData = LineData()
+        chart.data = emptyData
+        chart.invalidate()
+    }
+    
+    private fun setupHumidityChart() {
+        val chart = binding.humidityChart
+        
+        // Similar configuration as temperature chart
+        chart.description.isEnabled = false
+        chart.setTouchEnabled(true)
+        chart.isDragEnabled = true
+        chart.setScaleEnabled(true)
+        chart.setPinchZoom(true)
+        chart.setDrawGridBackground(false)
+        
+        chart.xAxis.isEnabled = true
+        chart.axisLeft.isEnabled = true
+        chart.axisRight.isEnabled = false
+        
+        chart.xAxis.textColor = requireContext().getColor(R.color.text_secondary)
+        chart.axisLeft.textColor = requireContext().getColor(R.color.text_secondary)
+        
+        chart.legend.isEnabled = true
+        chart.legend.textColor = requireContext().getColor(R.color.text_primary)
+        
+        val emptyData = LineData()
+        chart.data = emptyData
+        chart.invalidate()
+    }
+    
+    private fun setupClickListeners() {
+        binding.btnStartMonitoring.setOnClickListener {
+            startMonitoring()
+        }
+        
+        binding.btnStopMonitoring.setOnClickListener {
+            stopMonitoring()
+        }
+        
+        binding.btnGenerateReport.setOnClickListener {
+            generateComplianceReport()
+        }
+        
+        binding.btnRefreshData.setOnClickListener {
+            refreshData()
+        }
+        
+        binding.switchStandard.setOnCheckedChangeListener { _, isChecked ->
+            val standard = if (isChecked) ColdChainStandard.PHARMA else ColdChainStandard.FOOD
+            changeStandard(standard)
+        }
+    }
+    
+    private fun setupObservers() {
+        // Observe current temperature
+        coldChainService.currentTemperature.observe(viewLifecycleOwner, Observer { temperature ->
+            binding.tvCurrentTemperature.text = String.format("%.1f°C", temperature)
+            updateTemperatureChart(temperature)
+        })
+        
+        // Observe current humidity
+        coldChainService.currentHumidity.observe(viewLifecycleOwner, Observer { humidity ->
+            binding.tvCurrentHumidity.text = String.format("%.1f%%", humidity)
+            updateHumidityChart(humidity)
+        })
+        
+        // Observe sensor status
+        coldChainService.sensorStatus.observe(viewLifecycleOwner, Observer { sensorStatus ->
+            updateSensorStatus(sensorStatus)
+        })
+        
+        // Observe active alerts
+        coldChainService.activeAlerts.observe(viewLifecycleOwner, Observer { alerts ->
+            updateAlerts(alerts)
+        })
+        
+        // Observe compliance status
+        coldChainService.complianceStatus.observe(viewLifecycleOwner, Observer { status ->
+            updateComplianceStatusUI(status)
+        })
+    }
+    
+    private fun startMonitoring() {
+        currentShipmentId?.let { shipmentId ->
+            val standard = if (binding.switchStandard.isChecked) {
+                ColdChainStandard.PHARMA
+            } else {
+                ColdChainStandard.FOOD
+            }
+            
+            coldChainService.startMonitoring(shipmentId, standard)
+            
+            binding.btnStartMonitoring.isEnabled = false
+            binding.btnStopMonitoring.isEnabled = true
+            binding.switchStandard.isEnabled = false
+            
+            voiceAlertManager.speak("Cold chain monitoring started")
+        }
+    }
+    
+    private fun stopMonitoring() {
+        coldChainService.stopMonitoring()
+        
+        binding.btnStartMonitoring.isEnabled = true
+        binding.btnStopMonitoring.isEnabled = false
+        binding.switchStandard.isEnabled = true
+        
+        voiceAlertManager.speak("Cold chain monitoring stopped")
+    }
+    
+    private fun generateComplianceReport() {
+        currentShipmentId?.let { shipmentId ->
+            voiceAlertManager.speak("Generating compliance report")
+            
+            // Generate report for last 24 hours
+            val endTime = System.currentTimeMillis()
+            val startTime = endTime - (24 * 60 * 60 * 1000)
+            
+            // This would generate and show/share the report
+            Toast.makeText(requireContext(), "Compliance report generated", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    private fun refreshData() {
+        voiceAlertManager.speak("Refreshing data")
+        
+        // Refresh all data
+        updateSensorStatus(coldChainService.sensorStatus.value ?: emptyMap())
+        updateAlerts(coldChainService.activeAlerts.value ?: emptyList())
+        
+        Toast.makeText(requireContext(), "Data refreshed", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun changeStandard(standard: ColdChainStandard) {
+        currentShipmentId?.let { shipmentId ->
+            coldChainService.stopMonitoring()
+            coldChainService.startMonitoring(shipmentId, standard)
+            
+            val standardName = standard.name.lowercase()
+            voiceAlertManager.speak("Changed to $standardName standard")
+        }
+    }
+    
+    private fun onAlertClicked(alert: ColdChainAlert) {
+        // Show alert details dialog
+        voiceAlertManager.speak("Alert: ${alert.type.name}")
+        
+        // Acknowledge alert
+        coldChainService.acknowledgeAlert(alert.id)
+    }
+    
+    private fun updateTemperatureChart(temperature: Double) {
+        val chart = binding.temperatureChart
+        val currentTime = dateFormat.format(Date())
+        
+        // Create new entry
+        val entry = Entry(chart.data?.entryCount?.toFloat() ?: 0f, temperature.toFloat())
+        
+        // Get or create dataset
+        var dataSet: LineDataSet? = chart.data?.getDataSetByIndex(0) as? LineDataSet
+        
+        if (dataSet == null) {
+            dataSet = LineDataSet(listOf(entry), "Temperature").apply {
+                color = requireContext().getColor(R.color.temperature_line)
+                setCircleColor(requireContext().getColor(R.color.temperature_circle))
+                lineWidth = 2f
+                circleRadius = 4f
+                setDrawCircleHole(false)
+                valueTextSize = 10f
+                valueTextColor = requireContext().getColor(R.color.text_secondary)
+            }
+            
+            val lineData = LineData(dataSet)
+            chart.data = lineData
+        } else {
+            dataSet.addEntry(entry)
+            
+            // Keep only last 20 entries
+            if (dataSet.entryCount > 20) {
+                dataSet.removeEntryByXValue(0f)
+            }
+        }
+        
+        // Update chart
+        chart.data?.notifyDataChanged()
+        chart.notifyDataSetChanged()
+        chart.invalidate()
+        
+        // Add threshold lines
+        addThresholdLines(chart, "temperature")
+    }
+    
+    private fun updateHumidityChart(humidity: Double) {
+        val chart = binding.humidityChart
+        
+        // Create new entry
+        val entry = Entry(chart.data?.entryCount?.toFloat() ?: 0f, humidity.toFloat())
+        
+        // Get or create dataset
+        var dataSet: LineDataSet? = chart.data?.getDataSetByIndex(0) as? LineDataSet
+        
+        if (dataSet == null) {
+            dataSet = LineDataSet(listOf(entry), "Humidity").apply {
+                color = requireContext().getColor(R.color.humidity_line)
+                setCircleColor(requireContext().getColor(R.color.humidity_circle))
+                lineWidth = 2f
+                circleRadius = 4f
+                setDrawCircleHole(false)
+                valueTextSize = 10f
+                valueTextColor = requireContext().getColor(R.color.text_secondary)
+            }
+            
+            val lineData = LineData(dataSet)
+            chart.data = lineData
+        } else {
+            dataSet.addEntry(entry)
+            
+            // Keep only last 20 entries
+            if (dataSet.entryCount > 20) {
+                dataSet.removeEntryByXValue(0f)
+            }
+        }
+        
+        // Update chart
+        chart.data?.notifyDataChanged()
+        chart.notifyDataSetChanged()
+        chart.invalidate()
+        
+        // Add threshold lines
+        addThresholdLines(chart, "humidity")
+    }
+    
+    private fun addThresholdLines(chart: LineChart, type: String) {
+        // This would add threshold lines to the chart
+        // Implementation depends on the charting library used
+    }
+    
+    private fun updateSensorStatus(sensorStatus: Map<String, SensorStatus>) {
+        sensorStatusAdapter.updateSensors(sensorStatus.values.toList())
+    }
+    
+    private fun updateAlerts(alerts: List<ColdChainAlert>) {
+        alertAdapter.updateAlerts(alerts)
+        
+        // Update alert count
+        binding.tvAlertCount.text = alerts.size.toString()
+        
+        // Update alert badge visibility
+        binding.viewAlertBadge.visibility = if (alerts.isNotEmpty()) View.VISIBLE else View.GONE
+        
+        // Show critical alerts notification
+        val criticalAlerts = alerts.filter { it.severity == AlertSeverity.CRITICAL }
+        if (criticalAlerts.isNotEmpty()) {
+            binding.viewCriticalAlert.visibility = View.VISIBLE
+            binding.tvCriticalAlertCount.text = criticalAlerts.size.toString()
+            
+            // Voice alert for critical alerts
+            voiceAlertManager.speak("Critical alert: ${criticalAlerts.first().type.name}")
+        } else {
+            binding.viewCriticalAlert.visibility = View.GONE
+        }
+    }
+    
+    private fun updateComplianceStatusUI(status: ComplianceStatus) {
+        binding.tvComplianceStatus.text = status.name
+        
+        val (color, icon) = when (status) {
+            ComplianceStatus.COMPLIANT -> {
+                Pair(requireContext().getColor(R.color.status_completed), R.drawable.ic_check_circle)
+            }
+            ComplianceStatus.WARNING -> {
+                Pair(requireContext().getColor(R.color.status_warning), R.drawable.ic_warning)
+            }
+            ComplianceStatus.NON_COMPLIANT -> {
+                Pair(requireContext().getColor(R.color.status_error), R.drawable.ic_error)
+            }
+        }
+        
+        binding.viewComplianceIndicator.setBackgroundColor(color)
+        binding.ivComplianceIcon.setImageResource(icon)
+        
+        // Update status card background
+        when (status) {
+            ComplianceStatus.COMPLIANT -> {
+                binding.cardCurrentStatus.setCardBackgroundColor(
+                    requireContext().getColor(R.color.compliance_compliant)
+                )
+            }
+            ComplianceStatus.WARNING -> {
+                binding.cardCurrentStatus.setCardBackgroundColor(
+                    requireContext().getColor(R.color.compliance_warning)
+                )
+            }
+            ComplianceStatus.NON_COMPLIANT -> {
+                binding.cardCurrentStatus.setCardBackgroundColor(
+                    requireContext().getColor(R.color.compliance_non_compliant)
+                )
+            }
+        }
+    }
+    
+    override fun onResume() {
+        super.onResume()
+        
+        // Resume monitoring if it was active
+        if (binding.btnStopMonitoring.isEnabled) {
+            currentShipmentId?.let { shipmentId ->
+                val standard = if (binding.switchStandard.isChecked) {
+                    ColdChainStandard.PHARMA
+                } else {
+                    ColdChainStandard.FOOD
+                }
+                
+                coldChainService.startMonitoring(shipmentId, standard)
+            }
+        }
+    }
+    
+    override fun onPause() {
+        super.onPause()
+        
+        // Keep monitoring active in background
+        // Don't stop monitoring to ensure continuous data collection
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        
+        // Stop monitoring
+        coldChainService.stopMonitoring()
+        
+        // Cleanup
+        voiceAlertManager.cleanup()
+        _binding = null
+    }
+    
+    // Extension for dp to pixels
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+}

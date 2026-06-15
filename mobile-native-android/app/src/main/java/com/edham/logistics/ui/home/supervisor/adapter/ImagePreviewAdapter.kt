@@ -27,6 +27,12 @@ class ImagePreviewAdapter(private var images: List<String>) :
             .load(url)
             .placeholder(R.drawable.ic_placeholder)
             .into(holder.imageView)
+
+        holder.itemView.setOnClickListener {
+            val intent = android.content.Intent(holder.itemView.context, com.edham.logistics.ui.screens.ImageZoomActivity::class.java)
+            intent.putExtra("IMAGE_URL", url)
+            holder.itemView.context.startActivity(intent)
+        }
     }
 
     override fun getItemCount() = images.size

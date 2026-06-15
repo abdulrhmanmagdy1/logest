@@ -1,0 +1,591 @@
+package com.edham.logistics.shipment
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.ShipmentEntity
+// import com.edham.logistics.data.local.entity.ShipmentEventEntity
+import com.edham.logistics.data.remote.api.ShipmentApi
+import com.edham.logistics.domain.model.ShipmentStatus
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+// import javax.inject.Inject
+// import javax.inject.Singleton
+
+/**
+ * Shipment Timeline Manager - Comprehensive timeline tracking for shipments
+ * 
+ * Features:
+ * - Real-time event tracking
+ * - Timeline visualization
+ * - Event filtering and search
+ * - Historical analysis
+ * - Performance metrics
+ * - Customer notifications
+ */
+// @Singleton
+class ShipmentTimelineManager(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val shipmentApi: ShipmentApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _timelineState = MutableStateFlow<TimelineState>(TimelineState.Idle)
+    val timelineState: StateFlow<TimelineState> = _timelineState.asStateFlow()
+    
+    // private val _timelineEvents = MutableStateFlow<List<ShipmentEventEntity>>(emptyList())
+    // val timelineEvents: StateFlow<List<ShipmentEventEntity>> = _timelineEvents.asStateFlow()
+    
+    private val _currentShipmentTimeline = MutableStateFlow<ShipmentTimeline?>(null)
+    val currentShipmentTimeline: StateFlow<ShipmentTimeline?> = _currentShipmentTimeline.asStateFlow()
+    
+    private val _timelineAnalytics = MutableStateFlow<TimelineAnalytics?>(null)
+    val timelineAnalytics: StateFlow<TimelineAnalytics?> = _timelineAnalytics.asStateFlow()
+    
+    private var currentShipmentId: Long? = null
+    private var isTracking = false
+    private var eventFilters: MutableSet<EventType> = mutableSetOf()
+    private var searchQuery: String = ""
+    
+    companion object {
+        private const val TAG = "ShipmentTimelineManager"
+        private const val MAX_EVENTS_PER_SHIPMENT = 1000
+        private const val EVENT_RETENTION_DAYS = 90
+    }
+    
+    /**
+     * Start timeline tracking for shipment
+     */
+    fun startTracking(shipmentId: Long) {
+        if (isTracking) return
+        
+        try {
+            _timelineState.value = TimelineState.Starting
+            
+            currentShipmentId = shipmentId
+            isTracking = true
+            eventFilters.clear()
+            searchQuery = ""
+            
+            // Load existing timeline
+            loadShipmentTimeline(shipmentId)
+            
+            // Start real-time monitoring
+            startRealTimeMonitoring()
+            
+            _timelineState.value = TimelineState.Tracking
+            
+        } catch (e: Exception) {
+            _timelineState.value = TimelineState.Error("Failed to start tracking: ${e.message}")
+        }
+    }
+    
+    /**
+     * Stop timeline tracking
+     */
+    fun stopTracking() {
+        if (!isTracking) return
+        
+        try {
+            isTracking = false
+            currentShipmentId = null
+            
+            // Stop real-time monitoring
+            stopRealTimeMonitoring()
+            
+            _timelineState.value = TimelineState.Stopped
+            
+        } catch (e: Exception) {
+            _timelineState.value = TimelineState.Error("Failed to stop tracking: ${e.message}")
+        }
+    }
+    
+    /**
+     * Add timeline event
+     */
+    suspend fun addEvent(
+        shipmentId: Long,
+        eventType: EventType,
+        title: String,
+        location: String? = null,
+        metadata: Map<String, Any> = emptyMap(),
+        createdBy: String
+    ): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Create event entity
+                // val event = ShipmentEventEntity(
+                //     id = 0,
+                //     shipmentId = shipmentId,
+                //     eventType = eventType,
+                //     title = title,
+                //     description = description,
+                //     location = location,
+                //     timestamp = Date(),
+                //     metadata = serializeMetadata(metadata),
+                //     createdBy = createdBy,
+                //     createdAt = Date(),
+                //     updatedAt = Date()
+                // )
+                
+                // Save to database
+                val eventId = database.shipmentEventDao().insertEvent(event)
+                val savedEvent = event.copy(id = eventId)
+                
+                // Update timeline if current shipment
+                if (currentShipmentId == shipmentId) {
+                    updateTimelineEvents()
+                }
+                
+                // Send notification if needed
+                if (eventType.isNotificationRequired()) {
+                    sendEventNotification(savedEvent)
+                }
+                
+                Result.success(savedEvent)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get shipment timeline
+     */
+    suspend fun getShipmentTimeline(shipmentId: Long): ShipmentTimeline? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get shipment
+                val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                    ?: return@withContext null
+                
+                // Get events
+                val events = database.shipmentEventDao().getEventsByShipment(shipmentId)
+                
+                // Create timeline
+                val timeline = ShipmentTimeline(
+                    shipment = shipment,
+                    events = events,
+                    currentStatus = shipment.status,
+                    progress = calculateTimelineProgress(shipment, events),
+                    nextExpectedEvent = predictNextEvent(shipment, events),
+                    estimatedCompletion = estimateCompletionTime(shipment, events)
+                )
+                
+                timeline
+                
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Filter timeline events
+     */
+    fun filterEvents(eventTypes: Set<EventType>) {
+        eventFilters.clear()
+        eventFilters.addAll(eventTypes)
+        updateTimelineEvents()
+    }
+    
+    /**
+     * Search timeline events
+     */
+    fun searchEvents(query: String) {
+        searchQuery = query
+        updateTimelineEvents()
+    }
+    
+    /**
+     * Get timeline analytics
+     */
+    suspend fun getTimelineAnalytics(shipmentId: Long): TimelineAnalytics? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val events = database.shipmentEventDao().getEventsByShipment(shipmentId)
+                
+                if (events.isEmpty()) return@withContext null
+                
+                val analytics = TimelineAnalytics(
+                    totalEvents = events.size,
+                    eventsByType = groupEventsByType(events),
+                    averageTimeBetweenEvents = calculateAverageTimeBetweenEvents(events),
+                    longestDelay = calculateLongestDelay(events),
+                    criticalEvents = events.count { it.eventType.isCritical() },
+                    completedMilestones = events.count { it.eventType.isMilestone() },
+                    customerNotifications = events.count { it.eventType.isNotificationRequired() },
+                    timelineEfficiency = calculateTimelineEfficiency(events)
+                )
+                
+                analytics
+                
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Export timeline
+     */
+    suspend fun exportTimeline(shipmentId: Long, format: ExportFormat): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val timeline = getShipmentTimeline(shipmentId)
+                    ?: throw Exception("Timeline not found")
+                
+                val exportedData = when (format) {
+                    ExportFormat.JSON -> exportToJson(timeline)
+                    ExportFormat.CSV -> exportToCsv(timeline)
+                    ExportFormat.PDF -> exportToPdf(timeline)
+                    ExportFormat.EXCEL -> exportToExcel(timeline)
+                }
+                
+                Result.success(exportedData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Load shipment timeline
+     */
+    private suspend fun loadShipmentTimeline(shipmentId: Long) {
+        val timeline = getShipmentTimeline(shipmentId)
+        _currentShipmentTimeline.value = timeline
+        updateTimelineEvents()
+    }
+    
+    /**
+     * Update timeline events based on filters and search
+     */
+    private suspend fun updateTimelineEvents() {
+        val shipmentId = currentShipmentId ?: return
+        
+        withContext(Dispatchers.IO) {
+            var events = database.shipmentEventDao().getEventsByShipment(shipmentId)
+            
+            // Apply event type filters
+            if (eventFilters.isNotEmpty()) {
+                events = events.filter { it.eventType in eventFilters }
+            }
+            
+            // Apply search filter
+            if (searchQuery.isNotBlank()) {
+                val query = searchQuery.lowercase()
+                events = events.filter { event ->
+                    event.title.lowercase().contains(query) ||
+                    event.description.lowercase().contains(query) ||
+                    event.location?.lowercase()?.contains(query) == true
+                }
+            }
+            
+            _timelineEvents.value = events
+        }
+    }
+    
+    /**
+     * Start real-time monitoring
+     */
+    private fun startRealTimeMonitoring() {
+        // Implementation would start listening for real-time updates
+        // This could use WebSocket or other real-time communication
+    }
+    
+    /**
+     * Stop real-time monitoring
+     */
+    private fun stopRealTimeMonitoring() {
+        // Implementation would stop real-time monitoring
+    }
+    
+    /**
+     * Send event notification
+     */
+    private suspend fun sendEventNotification(event: ShipmentEventEntity) {
+        // Implementation would send notification to customer
+        // This could use push notifications, SMS, or email
+    }
+    
+    /**
+     * Calculate timeline progress
+     */
+    private fun calculateTimelineProgress(shipment: ShipmentEntity, events: List<ShipmentEventEntity>): Float {
+        val totalMilestones = EventType.getMilestones().size
+        val completedMilestones = events.count { it.eventType.isMilestone() }
+        
+        return if (totalMilestones > 0) {
+            completedMilestones.toFloat() / totalMilestones
+        } else 0f
+    }
+    
+    /**
+     * Predict next expected event
+     */
+    private fun predictNextEvent(shipment: ShipmentEntity, events: List<ShipmentEventEntity>): EventType? {
+        val currentStatus = shipment.status
+        val completedEvents = events.map { it.eventType }.toSet()
+        
+        return EventType.getNextEvent(currentStatus, completedEvents)
+    }
+    
+    /**
+     * Estimate completion time
+     */
+    private fun estimateCompletionTime(shipment: ShipmentEntity, events: List<ShipmentEventEntity>): Date? {
+        // Use estimated delivery time or calculate based on events
+        return shipment.estimatedDeliveryTime
+    }
+    
+    /**
+     * Group events by type
+     */
+    private fun groupEventsByType(events: List<ShipmentEventEntity>): Map<EventType, Int> {
+        return events.groupBy { it.eventType }.mapValues { it.value.size }
+    }
+    
+    /**
+     * Calculate average time between events
+     */
+    private fun calculateAverageTimeBetweenEvents(events: List<ShipmentEventEntity>): Long {
+        if (events.size < 2) return 0L
+        
+        val sortedEvents = events.sortedBy { it.timestamp }
+        val timeDiffs = mutableListOf<Long>()
+        
+        for (i in 1 until sortedEvents.size) {
+            val diff = sortedEvents[i].timestamp.time - sortedEvents[i-1].timestamp.time
+            timeDiffs.add(diff)
+        }
+        
+        return if (timeDiffs.isNotEmpty()) {
+            timeDiffs.average().toLong()
+        } else 0L
+    }
+    
+    /**
+     * Calculate longest delay
+     */
+    private fun calculateLongestDelay(events: List<ShipmentEventEntity>): Long {
+        // Implementation would calculate longest delay between expected and actual events
+        return 0L // Placeholder
+    }
+    
+    /**
+     * Calculate timeline efficiency
+     */
+    private fun calculateTimelineEfficiency(events: List<ShipmentEventEntity>): Float {
+        // Implementation would calculate efficiency based on on-time events
+        return 0.85f // Placeholder
+    }
+    
+    /**
+     * Serialize metadata
+     */
+    private fun serializeMetadata(metadata: Map<String, Any>): String {
+        // Implementation would serialize metadata to JSON
+        return "{}"
+    }
+    
+    /**
+     * Export to JSON
+     */
+    private suspend fun exportToJson(timeline: ShipmentTimeline): String {
+        // Implementation would export timeline to JSON format
+        return "{}"
+    }
+    
+    /**
+     * Export to CSV
+     */
+    private suspend fun exportToCsv(timeline: ShipmentTimeline): String {
+        // Implementation would export timeline to CSV format
+        return ""
+    }
+    
+    /**
+     * Export to PDF
+     */
+    private suspend fun exportToPdf(timeline: ShipmentTimeline): String {
+        // Implementation would export timeline to PDF format
+        return ""
+    }
+    
+    /**
+     * Export to Excel
+     */
+    private suspend fun exportToExcel(timeline: ShipmentTimeline): String {
+        // Implementation would export timeline to Excel format
+        return ""
+    }
+    
+    /**
+     * Clean up old events
+     */
+    suspend fun cleanupOldEvents() {
+        withContext(Dispatchers.IO) {
+            try {
+                val cutoffDate = Date(System.currentTimeMillis() - (EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000L))
+                database.shipmentEventDao().deleteEventsOlderThan(cutoffDate)
+            } catch (e: Exception) {
+                // Handle error
+            }
+        }
+    }
+    
+    /**
+     * Get tracking status
+     */
+    fun isTracking(): Boolean = isTracking
+}
+
+/**
+ * Data classes
+ */
+data class ShipmentTimeline(
+    val shipment: ShipmentEntity,
+    // val events: List<ShipmentEventEntity>,
+    val currentStatus: ShipmentStatus,
+    val progress: Float,
+    val nextExpectedEvent: EventType?,
+    val estimatedCompletion: Date?
+)
+
+data class TimelineAnalytics(
+    val totalEvents: Int,
+    val eventsByType: Map<EventType, Int>,
+    val averageTimeBetweenEvents: Long,
+    val longestDelay: Long,
+    val criticalEvents: Int,
+    val completedMilestones: Int,
+    val customerNotifications: Int,
+    val timelineEfficiency: Float
+)
+
+/**
+ * Enums
+ */
+enum class TimelineState {
+    Idle,
+    Starting,
+    Tracking,
+    Stopped,
+    Error
+}
+
+enum class ExportFormat {
+    JSON,
+    CSV,
+    PDF,
+    EXCEL
+}
+
+/**
+ * Extension functions for EventType
+ */
+fun EventType.isNotificationRequired(): Boolean {
+    return when (this) {
+        EventType.SHIPMENT_CREATED,
+        EventType.DRIVER_ASSIGNED,
+        EventType.PICKUP_CONFIRMED,
+        EventType.IN_TRANSIT,
+        EventType.OUT_FOR_DELIVERY,
+        EventType.DELIVERED,
+        EventType.DELAYED -> true
+        else -> false
+    }
+}
+
+fun EventType.isCritical(): Boolean {
+    return when (this) {
+        EventType.PICKUP_CONFIRMED,
+        EventType.DELIVERED,
+        EventType.DELAYED,
+        EventType.COLD_CHAIN_VIOLATION,
+        EventType.DAMAGE_REPORTED -> true
+        else -> false
+    }
+}
+
+fun EventType.isMilestone(): Boolean {
+    return when (this) {
+        EventType.SHIPMENT_CREATED,
+        EventType.DRIVER_ASSIGNED,
+        EventType.PICKUP_CONFIRMED,
+        EventType.IN_TRANSIT,
+        EventType.OUT_FOR_DELIVERY,
+        EventType.DELIVERED -> true
+        else -> false
+    }
+}
+
+object EventType {
+    // Milestone events
+    const val SHIPMENT_CREATED = "SHIPMENT_CREATED"
+    const val DRIVER_ASSIGNED = "DRIVER_ASSIGNED"
+    const val PICKUP_CONFIRMED = "PICKUP_CONFIRMED"
+    const val IN_TRANSIT = "IN_TRANSIT"
+    const val OUT_FOR_DELIVERY = "OUT_FOR_DELIVERY"
+    const val DELIVERED = "DELIVERED"
+    
+    // Status events
+    const val DELAYED = "DELAYED"
+    const val CANCELLED = "CANCELLED"
+    const val RETURNED = "RETURNED"
+    
+    // Operational events
+    const val VEHICLE_ASSIGNED = "VEHICLE_ASSIGNED"
+    const val ROUTE_OPTIMIZED = "ROUTE_OPTIMIZED"
+    const val GEOFENCE_ENTERED = "GEOFENCE_ENTERED"
+    const val GEOFENCE_EXITED = "GEOFENCE_EXITED"
+    
+    // Quality events
+    const val COLD_CHAIN_VIOLATION = "COLD_CHAIN_VIOLATION"
+    const val DAMAGE_REPORTED = "DAMAGE_REPORTED"
+    const val INSPECTION_COMPLETED = "INSPECTION_COMPLETED"
+    
+    // Communication events
+    const val CUSTOMER_NOTIFIED = "CUSTOMER_NOTIFIED"
+    const val DRIVER_CONTACTED = "DRIVER_CONTACTED"
+    const val SUPPORT_REQUESTED = "SUPPORT_REQUESTED"
+    
+    fun getMilestones(): List<String> {
+        return listOf(
+            SHIPMENT_CREATED,
+            DRIVER_ASSIGNED,
+            PICKUP_CONFIRMED,
+            IN_TRANSIT,
+            OUT_FOR_DELIVERY,
+            DELIVERED
+        )
+    }
+    
+    fun getNextEvent(currentStatus: ShipmentStatus, completedEvents: Set<String>): String? {
+        return when (currentStatus) {
+            ShipmentStatus.CREATED -> {
+                if (DRIVER_ASSIGNED !in completedEvents) DRIVER_ASSIGNED else null
+            }
+            ShipmentStatus.ASSIGNED -> {
+                if (PICKUP_CONFIRMED !in completedEvents) PICKUP_CONFIRMED else null
+            }
+            ShipmentStatus.SCHEDULED -> {
+                if (PICKUP_CONFIRMED !in completedEvents) PICKUP_CONFIRMED else null
+            }
+            ShipmentStatus.IN_TRANSIT -> {
+                if (OUT_FOR_DELIVERY !in completedEvents) OUT_FOR_DELIVERY else null
+            }
+            else -> null
+        }
+    }
+}

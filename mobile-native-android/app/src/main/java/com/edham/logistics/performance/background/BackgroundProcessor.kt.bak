@@ -1,0 +1,755 @@
+package com.edham.logistics.performance.background
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Background Processor - Advanced background task management and optimization
+ * Implements intelligent task scheduling, priority management, and resource optimization
+ */
+
+@Singleton
+class BackgroundProcessor @Inject constructor() {
+
+    private val backgroundScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val taskQueue = PriorityBlockingQueue<BackgroundTask>(100)
+    private val activeTasks = ConcurrentHashMap<String, Job>()
+    private val taskListeners = mutableListOf<BackgroundTaskListener>()
+    
+    // Performance metrics
+    private val totalTasks = AtomicLong(0)
+    private val completedTasks = AtomicLong(0)
+    private val failedTasks = AtomicLong(0)
+    private val averageExecutionTime = AtomicLong(0)
+    private val totalExecutionTime = AtomicLong(0)
+    
+    // Configuration
+    private val maxConcurrentTasks = 5
+    private val taskTimeout = 300000L // 5 minutes
+    private val cleanupInterval = 60000L // 1 minute
+    
+    // Task management
+    private val _activeTaskCount = MutableStateFlow(0)
+    val activeTaskCount: StateFlow<Int> = _activeTaskCount.asStateFlow()
+    
+    private val _taskStats = MutableStateFlow<BackgroundTaskStats>(BackgroundTaskStats())
+    val taskStats: StateFlow<BackgroundTaskStats> = _taskStats.asStateFlow()
+    
+    init {
+        startTaskProcessor()
+        startTaskMonitor()
+    }
+    
+    /**
+     * Execute task in background
+     */
+    fun <T> executeInBackground(
+        task: suspend () -> T,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        taskId: String? = null,
+        timeout: Long = taskTimeout
+    ): Result<T> {
+        val id = taskId ?: generateTaskId()
+        val backgroundTask = BackgroundTask(
+            id = id,
+            task = { task() },
+            priority = priority,
+            createdAt = System.currentTimeMillis(),
+            timeout = timeout
+        )
+        
+        return try {
+            // Add to queue
+            taskQueue.put(backgroundTask)
+            totalTasks.incrementAndGet()
+            
+            // Wait for completion (simplified for synchronous execution)
+            runBlocking {
+                executeTask(backgroundTask)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error executing background task: $id")
+            failedTasks.incrementAndGet()
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Execute task asynchronously
+     */
+    fun <T> executeAsync(
+        task: suspend () -> T,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        taskId: String? = null,
+        timeout: Long = taskTimeout
+    ): Deferred<Result<T>> {
+        val id = taskId ?: generateTaskId()
+        val backgroundTask = BackgroundTask(
+            id = id,
+            task = { task() },
+            priority = priority,
+            createdAt = System.currentTimeMillis(),
+            timeout = timeout
+        )
+        
+        return backgroundScope.async {
+            try {
+                taskQueue.put(backgroundTask)
+                totalTasks.incrementAndGet()
+                
+                executeTask(backgroundTask)
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error executing async background task: $id")
+                failedTasks.incrementAndGet()
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule background task with delay
+     */
+    fun <T> scheduleBackgroundTask(
+        task: suspend () -> T,
+        delay: Long = 0L,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        taskId: String? = null,
+        timeout: Long = taskTimeout
+    ): Job {
+        val id = taskId ?: generateTaskId()
+        
+        return backgroundScope.launch {
+            delay(delay)
+            
+            val backgroundTask = BackgroundTask(
+                id = id,
+                task = { task() },
+                priority = priority,
+                createdAt = System.currentTimeMillis(),
+                timeout = timeout
+            )
+            
+            try {
+                taskQueue.put(backgroundTask)
+                totalTasks.incrementAndGet()
+                executeTask(backgroundTask)
+            } catch (e: Exception) {
+                Timber.e(e, "Error executing scheduled background task: $id")
+                failedTasks.incrementAndGet()
+            }
+        }
+    }
+    
+    /**
+     * Cancel background task
+     */
+    fun cancelBackgroundTask(taskId: String): Boolean {
+        return try {
+            activeTasks[taskId]?.cancel()
+            activeTasks.remove(taskId)
+            
+            // Also remove from queue if not started
+            taskQueue.removeIf { it.id == taskId }
+            
+            Timber.d("Cancelled background task: $taskId")
+            true
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error cancelling background task: $taskId")
+            false
+        }
+    }
+    
+    /**
+     * Cancel all background tasks
+     */
+    fun cancelAllBackgroundTasks(): Int {
+        return try {
+            val cancelledCount = activeTasks.size
+            
+            activeTasks.values.forEach { it.cancel() }
+            activeTasks.clear()
+            taskQueue.clear()
+            
+            Timber.d("Cancelled $cancelledCount background tasks")
+            cancelledCount
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error cancelling all background tasks")
+            0
+        }
+    }
+    
+    /**
+     * Get background task count
+     */
+    fun getBackgroundTaskCount(): Int {
+        return activeTasks.size + taskQueue.size
+    }
+    
+    /**
+     * Get active tasks
+     */
+    fun getActiveTasks(): List<String> {
+        return activeTasks.keys.toList()
+    }
+    
+    /**
+     * Add background task listener
+     */
+    fun addBackgroundTaskListener(listener: BackgroundTaskListener) {
+        taskListeners.add(listener)
+    }
+    
+    /**
+     * Remove background task listener
+     */
+    fun removeBackgroundTaskListener(listener: BackgroundTaskListener) {
+        taskListeners.remove(listener)
+    }
+    
+    /**
+     * Get background task statistics
+     */
+    fun getBackgroundTaskStats(): BackgroundTaskStats {
+        return BackgroundTaskStats(
+            totalTasks = totalTasks.get(),
+            completedTasks = completedTasks.get(),
+            failedTasks = failedTasks.get(),
+            activeTasks = activeTasks.size,
+            queuedTasks = taskQueue.size,
+            averageExecutionTime = averageExecutionTime.get(),
+            totalExecutionTime = totalExecutionTime.get(),
+            successRate = if (totalTasks.get() > 0) {
+                completedTasks.get().toDouble() / totalTasks.get()
+            } else 0.0
+        )
+    }
+    
+    /**
+     * Optimize background processing
+     */
+    suspend fun optimizeBackgroundProcessing(): BackgroundOptimizationResult {
+        val startTime = System.currentTimeMillis()
+        
+        return try {
+            val beforeStats = getBackgroundTaskStats()
+            
+            // Cancel low priority tasks if too many
+            if (activeTasks.size > maxConcurrentTasks) {
+                cancelLowPriorityTasks()
+            }
+            
+            // Optimize task queue
+            optimizeTaskQueue()
+            
+            // Clean up completed tasks
+            cleanupCompletedTasks()
+            
+            val afterStats = getBackgroundTaskStats()
+            val optimizationTime = System.currentTimeMillis() - startTime
+            
+            val result = BackgroundOptimizationResult(
+                success = true,
+                optimizationTime = optimizationTime,
+                tasksCancelled = beforeStats.activeTasks - afterStats.activeTasks,
+                queueOptimized = true,
+                cleanupPerformed = true
+            )
+            
+            // Notify listeners
+            taskListeners.forEach { listener ->
+                listener.onBackgroundOptimized(result)
+            }
+            
+            Result.success(result)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error optimizing background processing")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Get background processing recommendations
+     */
+    fun getProcessingRecommendations(): List<BackgroundProcessingRecommendation> {
+        val recommendations = mutableListOf<BackgroundProcessingRecommendation>()
+        val stats = getBackgroundTaskStats()
+        
+        when {
+            stats.activeTasks > maxConcurrentTasks -> {
+                recommendations.add(
+                    BackgroundProcessingRecommendation(
+                        priority = RecommendationPriority.HIGH,
+                        action = "REDUCE_CONCURRENT_TASKS",
+                        description = "Too many concurrent tasks. Reduce concurrent task limit.",
+                        estimatedImprovement = "20-30%"
+                    )
+                )
+            }
+            stats.failedTasks > stats.completedTasks -> {
+                recommendations.add(
+                    BackgroundProcessingRecommendation(
+                        priority = RecommendationPriority.MEDIUM,
+                        action = "IMPROVE_ERROR_HANDLING",
+                        description = "High failure rate. Improve error handling and retry logic.",
+                        estimatedImprovement = "15-25%"
+                    )
+                )
+            }
+            stats.averageExecutionTime > 10000 -> {
+                recommendations.add(
+                    BackgroundProcessingRecommendation(
+                        priority = RecommendationPriority.MEDIUM,
+                        action = "OPTIMIZE_TASK_EXECUTION",
+                        description = "Tasks taking too long. Optimize task execution.",
+                        estimatedImprovement = "10-20%"
+                    )
+                )
+            }
+        }
+        
+        return recommendations
+    }
+    
+    // Private methods
+    
+    private fun startTaskProcessor() {
+        backgroundScope.launch {
+            while (isActive) {
+                try {
+                    // Check if we can process more tasks
+                    if (activeTasks.size < maxConcurrentTasks) {
+                        val task = taskQueue.take() // Blocks until task is available
+                        executeTaskAsync(task)
+                    } else {
+                        delay(100) // Wait before checking again
+                    }
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in task processor")
+                    delay(1000) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    private fun startTaskMonitor() {
+        backgroundScope.launch {
+            while (isActive) {
+                try {
+                    // Update task statistics
+                    val stats = getBackgroundTaskStats()
+                    _taskStats.value = stats
+                    _activeTaskCount.value = stats.activeTasks
+                    
+                    // Clean up completed tasks
+                    cleanupCompletedTasks()
+                    
+                    delay(cleanupInterval)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in task monitor")
+                    delay(cleanupInterval * 2) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    private suspend fun <T> executeTask(task: BackgroundTask<T>): Result<T> {
+        val startTime = System.currentTimeMillis()
+        
+        return try {
+            // Add to active tasks
+            val job = backgroundScope.async {
+                withTimeout(task.timeout) {
+                    task.task() as T
+                }
+            }
+            
+            activeTasks[task.id] = job
+            
+            // Notify task started
+            taskListeners.forEach { listener ->
+                listener.onTaskStarted(task.id)
+            }
+            
+            // Wait for completion
+            val result = job.await()
+            val executionTime = System.currentTimeMillis() - startTime
+            
+            // Update metrics
+            completedTasks.incrementAndGet()
+            totalExecutionTime.addAndGet(executionTime)
+            updateAverageExecutionTime(executionTime)
+            
+            // Remove from active tasks
+            activeTasks.remove(task.id)
+            
+            // Notify task completed
+            taskListeners.forEach { listener ->
+                listener.onTaskCompleted(task.id, executionTime)
+            }
+            
+            Result.success(result)
+            
+        } catch (e: TimeoutCancellationException) {
+            Timber.w("Background task timeout: ${task.id}")
+            failedTasks.incrementAndGet()
+            activeTasks.remove(task.id)
+            
+            taskListeners.forEach { listener ->
+                listener.onTaskFailed(task.id, e)
+            }
+            
+            Result.failure(e)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error executing background task: ${task.id}")
+            failedTasks.incrementAndGet()
+            activeTasks.remove(task.id)
+            
+            taskListeners.forEach { listener ->
+                listener.onTaskFailed(task.id, e)
+            }
+            
+            Result.failure(e)
+        }
+    }
+    
+    private fun executeTaskAsync(task: BackgroundTask<*>) {
+        backgroundScope.launch {
+            try {
+                executeTask(task)
+            } catch (e: Exception) {
+                Timber.e(e, "Error in async task execution: ${task.id}")
+            }
+        }
+    }
+    
+    private fun cancelLowPriorityTasks() {
+        try {
+            val lowPriorityTasks = activeTasks.filter { (id, job) ->
+                // This would need to track task priorities
+                // For now, cancel oldest tasks
+                true
+            }
+            
+            lowPriorityTasks.forEach { (id, job) ->
+                job.cancel()
+                activeTasks.remove(id)
+                Timber.d("Cancelled low priority task: $id")
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error cancelling low priority tasks")
+        }
+    }
+    
+    private fun optimizeTaskQueue() {
+        try {
+            // Reorder queue by priority
+            val currentTasks = mutableListOf<BackgroundTask<*>>()
+            taskQueue.drainTo(currentTasks)
+            
+            // Sort by priority (higher priority first)
+            currentTasks.sortByDescending { it.priority.ordinal }
+            
+            // Add back to queue
+            currentTasks.forEach { taskQueue.put(it) }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error optimizing task queue")
+        }
+    }
+    
+    private fun cleanupCompletedTasks() {
+        try {
+            // Remove completed/cancelled tasks from active tasks
+            val iterator = activeTasks.entries.iterator()
+            var cleanedCount = 0
+            
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.value.isCompleted) {
+                    iterator.remove()
+                    cleanedCount++
+                }
+            }
+            
+            if (cleanedCount > 0) {
+                Timber.d("Cleaned up $cleanedCount completed background tasks")
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error cleaning up completed tasks")
+        }
+    }
+    
+    private fun generateTaskId(): String {
+        return "bg_task_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    }
+    
+    private fun updateAverageExecutionTime(executionTime: Long) {
+        val current = averageExecutionTime.get()
+        val newAverage = (current + executionTime) / 2
+        averageExecutionTime.set(newAverage)
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): BackgroundPerformanceMetrics {
+        val stats = getBackgroundTaskStats()
+        
+        return BackgroundPerformanceMetrics(
+            totalTasks = stats.totalTasks,
+            completedTasks = stats.completedTasks,
+            failedTasks = stats.failedTasks,
+            activeTasks = stats.activeTasks,
+            queuedTasks = stats.queuedTasks,
+            averageExecutionTime = stats.averageExecutionTime,
+            totalExecutionTime = stats.totalExecutionTime,
+            successRate = stats.successRate,
+            throughput = if (stats.totalExecutionTime > 0) {
+                stats.totalTasks.toDouble() / (stats.totalExecutionTime / 1000.0) // Tasks per second
+            } else 0.0
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalTasks.set(0)
+        completedTasks.set(0)
+        failedTasks.set(0)
+        averageExecutionTime.set(0)
+        totalExecutionTime.set(0)
+    }
+    
+    /**
+     * Stop background processor
+     */
+    fun stop() {
+        backgroundScope.cancel()
+        cancelAllBackgroundTasks()
+        taskListeners.clear()
+    }
+}
+
+/**
+ * Background Task
+ */
+data class BackgroundTask<T>(
+    val id: String,
+    val task: suspend () -> Any,
+    val priority: TaskPriority,
+    val createdAt: Long,
+    val timeout: Long
+) : Comparable<BackgroundTask<T>> {
+    
+    override fun compareTo(other: BackgroundTask<T>): Int {
+        // Higher priority first
+        return other.priority.ordinal - this.priority.ordinal
+    }
+}
+
+/**
+ * Task Priority
+ */
+enum class TaskPriority {
+    CRITICAL,    // Highest priority
+    HIGH,        // High priority
+    NORMAL,      // Normal priority
+    LOW,         // Low priority
+    BACKGROUND   // Lowest priority
+}
+
+/**
+ * Background Task Statistics
+ */
+data class BackgroundTaskStats(
+    val totalTasks: Long,
+    val completedTasks: Long,
+    val failedTasks: Long,
+    val activeTasks: Int,
+    val queuedTasks: Int,
+    val averageExecutionTime: Long,
+    val totalExecutionTime: Long,
+    val successRate: Double
+)
+
+/**
+ * Background Optimization Result
+ */
+data class BackgroundOptimizationResult(
+    val success: Boolean,
+    val optimizationTime: Long,
+    val tasksCancelled: Int,
+    val queueOptimized: Boolean,
+    val cleanupPerformed: Boolean
+)
+
+/**
+ * Background Processing Recommendation
+ */
+data class BackgroundProcessingRecommendation(
+    val priority: RecommendationPriority,
+    val action: String,
+    val description: String,
+    val estimatedImprovement: String
+)
+
+/**
+ * Background Performance Metrics
+ */
+data class BackgroundPerformanceMetrics(
+    val totalTasks: Long,
+    val completedTasks: Long,
+    val failedTasks: Long,
+    val activeTasks: Int,
+    val queuedTasks: Int,
+    val averageExecutionTime: Long,
+    val totalExecutionTime: Long,
+    val successRate: Double,
+    val throughput: Double
+) {
+    val averageExecutionTimeMs: Double get() = averageExecutionTime.toDouble()
+    val tasksPerSecond: Double get() = throughput
+    val failureRate: Double get() = 1.0 - successRate
+}
+
+/**
+ * Background Task Listener Interface
+ */
+interface BackgroundTaskListener {
+    fun onTaskStarted(taskId: String) {}
+    fun onTaskCompleted(taskId: String, executionTime: Long) {}
+    fun onTaskFailed(taskId: String, error: Throwable) {}
+    fun onBackgroundOptimized(result: BackgroundOptimizationResult) {}
+}
+
+/**
+ * Background Task Manager for specific components
+ */
+class ComponentBackgroundManager @Inject constructor(
+    private val backgroundProcessor: BackgroundProcessor
+) {
+    
+    private val componentTasks = ConcurrentHashMap<String, ComponentTask>()
+    
+    /**
+     * Register component task
+     */
+    fun registerComponentTask(
+        componentName: String,
+        taskName: String,
+        task: suspend () -> Any,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        maxRetries: Int = 3
+    ) {
+        componentTasks[taskName] = ComponentTask(
+            name = taskName,
+            componentName = componentName,
+            task = task,
+            priority = priority,
+            maxRetries = maxRetries,
+            currentRetries = 0,
+            lastExecution = 0L,
+            executionCount = 0
+        )
+    }
+    
+    /**
+     * Execute component task
+     */
+    suspend fun executeComponentTask(taskName: String): Result<Any> {
+        val componentTask = componentTasks[taskName]
+            ?: return Result.failure(Exception("Task not found: $taskName"))
+        
+        return try {
+            componentTask.lastExecution = System.currentTimeMillis()
+            componentTask.executionCount++
+            
+            val result = backgroundProcessor.executeInBackground(
+                task = componentTask.task,
+                priority = componentTask.priority,
+                taskId = "${componentTask.componentName}_${taskName}"
+            )
+            
+            if (result.isSuccess) {
+                componentTask.currentRetries = 0
+            } else {
+                componentTask.currentRetries++
+                
+                // Retry if max retries not reached
+                if (componentTask.currentRetries < componentTask.maxRetries) {
+                    delay(1000 * componentTask.currentRetries) // Exponential backoff
+                    return executeComponentTask(taskName)
+                }
+            }
+            
+            result
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error executing component task: $taskName")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Get component task statistics
+     */
+    fun getComponentTaskStats(): Map<String, ComponentTaskStats> {
+        return componentTasks.mapValues { (name, task) ->
+            ComponentTaskStats(
+                name = name,
+                componentName = task.componentName,
+                priority = task.priority,
+                executionCount = task.executionCount,
+                currentRetries = task.currentRetries,
+                maxRetries = task.maxRetries,
+                lastExecution = task.lastExecution
+            )
+        }
+    }
+}
+
+/**
+ * Component Task
+ */
+data class ComponentTask(
+    val name: String,
+    val componentName: String,
+    val task: suspend () -> Any,
+    val priority: TaskPriority,
+    val maxRetries: Int,
+    var currentRetries: Int,
+    var lastExecution: Long,
+    var executionCount: Int
+)
+
+/**
+ * Component Task Statistics
+ */
+data class ComponentTaskStats(
+    val name: String,
+    val componentName: String,
+    val priority: TaskPriority,
+    val executionCount: Int,
+    val currentRetries: Int,
+    val maxRetries: Int,
+    val lastExecution: Long
+) {
+    val successRate: Double get() = if (executionCount > 0) (executionCount - currentRetries).toDouble() / executionCount else 0.0
+    val lastExecutionFormatted: String get() = java.text.SimpleDateFormat("HH:mm:ss").format(java.util.Date(lastExecution))
+}

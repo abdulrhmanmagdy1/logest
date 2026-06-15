@@ -1,0 +1,685 @@
+package com.edham.logistics.core.reports
+
+import android.content.Context
+import com.edham.logistics.data.models.*
+import com.edham.logistics.domain.reports.ReportUseCases
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Report Manager - Central coordinator for business intelligence reports
+ * Handles all report generation, data aggregation, and export functionality
+ */
+@Singleton
+class ReportManager @Inject constructor(
+    private val context: Context,
+    private val reportUseCases: ReportUseCases,
+    private val pdfExporter: PDFExporter,
+    private val excelExporter: ExcelExporter
+) {
+
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+    private val dateTimeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+
+    /**
+     * Generate comprehensive revenue report
+     */
+    suspend fun generateRevenueReport(
+        startDate: Long,
+        endDate: Long,
+        reportType: RevenueReportType = RevenueReportType.DETAILED
+    ): RevenueReport = withContext(Dispatchers.IO) {
+        val payments = reportUseCases.getPaymentsByDateRange(startDate, endDate)
+        val invoices = reportUseCases.getInvoicesByDateRange(startDate, endDate)
+        
+        // Calculate revenue metrics
+        val totalRevenue = payments.sumOf { it.amount }
+        val paidInvoices = payments.mapNotNull { payment ->
+            invoices.find { it.id == payment.invoiceId }
+        }
+        val unpaidInvoices = invoices.filter { invoice ->
+            invoice.id !in payments.map { it.invoiceId }
+        }
+        
+        // Revenue by period
+        val revenueByPeriod = groupRevenueByPeriod(payments, reportType)
+        
+        // Revenue by customer
+        val revenueByCustomer = groupRevenueByCustomer(paidInvoices)
+        
+        // Revenue by service type
+        val revenueByServiceType = groupRevenueByServiceType(paidInvoices)
+        
+        // Payment methods analysis
+        val paymentMethods = analyzePaymentMethods(payments)
+        
+        // Overdue payments analysis
+        val overdueAnalysis = analyzeOverduePayments(unpaidInvoices)
+        
+        RevenueReport(
+            id = UUID.randomUUID().toString(),
+            title = "تقرير الإيرادات",
+            startDate = startDate,
+            endDate = endDate,
+            reportType = reportType,
+            generatedAt = System.currentTimeMillis(),
+            totalRevenue = totalRevenue,
+            totalInvoices = invoices.size,
+            paidInvoices = paidInvoices.size,
+            unpaidInvoices = unpaidInvoices.size,
+            revenueByPeriod = revenueByPeriod,
+            revenueByCustomer = revenueByCustomer,
+            revenueByServiceType = revenueByServiceType,
+            paymentMethods = paymentMethods,
+            overdueAnalysis = overdueAnalysis,
+            averageInvoiceValue = if (invoices.isNotEmpty()) invoices.sumOf { it.amount } / invoices.size else 0.0,
+            revenueGrowth = calculateRevenueGrowth(payments, startDate, endDate)
+        )
+    }
+
+    /**
+     * Generate shipment performance report
+     */
+    suspend fun generateShipmentPerformanceReport(
+        startDate: Long,
+        endDate: Long,
+        reportType: ShipmentReportType = ShipmentReportType.COMPREHENSIVE
+    ): ShipmentPerformanceReport = withContext(Dispatchers.IO) {
+        val shipments = reportUseCases.getShipmentsByDateRange(startDate, endDate)
+        
+        // Calculate performance metrics
+        val totalShipments = shipments.size
+        val deliveredShipments = shipments.count { it.status == ShipmentStatus.DELIVERED }
+        val delayedShipments = shipments.count { it.isDelayed }
+        val cancelledShipments = shipments.count { it.status == ShipmentStatus.CANCELLED }
+        
+        // On-time delivery rate
+        val onTimeDeliveryRate = if (totalShipments > 0) {
+            (deliveredShipments.toDouble() / totalShipments) * 100
+        } else 0.0
+        
+        // Average delivery time
+        val deliveryTimes = shipments.filter { it.status == ShipmentStatus.DELIVERED }
+            .mapNotNull { shipment ->
+                val deliveredAt = shipment.deliveredAt ?: return@mapNotNull null
+                deliveredAt - shipment.createdAt
+            }
+        val averageDeliveryTime = if (deliveryTimes.isNotEmpty()) {
+            deliveryTimes.average()
+        } else 0.0
+        
+        // Performance by route
+        val performanceByRoute = analyzePerformanceByRoute(shipments)
+        
+        // Performance by driver
+        val performanceByDriver = analyzePerformanceByDriver(shipments)
+        
+        // Performance by vehicle type
+        val performanceByVehicleType = analyzePerformanceByVehicleType(shipments)
+        
+        // Delay analysis
+        val delayAnalysis = analyzeDelays(shipments)
+        
+        // Geographic performance
+        val geographicPerformance = analyzeGeographicPerformance(shipments)
+        
+        ShipmentPerformanceReport(
+            id = UUID.randomUUID().toString(),
+            title = "تقرير أداء الشحنات",
+            startDate = startDate,
+            endDate = endDate,
+            reportType = reportType,
+            generatedAt = System.currentTimeMillis(),
+            totalShipments = totalShipments,
+            deliveredShipments = deliveredShipments,
+            delayedShipments = delayedShipments,
+            cancelledShipments = cancelledShipments,
+            onTimeDeliveryRate = onTimeDeliveryRate,
+            averageDeliveryTime = averageDeliveryTime,
+            performanceByRoute = performanceByRoute,
+            performanceByDriver = performanceByDriver,
+            performanceByVehicleType = performanceByVehicleType,
+            delayAnalysis = delayAnalysis,
+            geographicPerformance = geographicPerformance
+        )
+    }
+
+    /**
+     * Generate driver performance analysis report
+     */
+    suspend fun generateDriverPerformanceReport(
+        startDate: Long,
+        endDate: Long,
+        reportType: DriverReportType = DriverReportType.DETAILED
+    ): DriverPerformanceReport = withContext(Dispatchers.IO) {
+        val drivers = reportUseCases.getAllDrivers()
+        val shipments = reportUseCases.getShipmentsByDateRange(startDate, endDate)
+        
+        val driverPerformances = drivers.map { driver ->
+            val driverShipments = shipments.filter { it.driverId == driver.id }
+            
+            // Calculate driver metrics
+            val totalShipments = driverShipments.size
+            val deliveredShipments = driverShipments.count { it.status == ShipmentStatus.DELIVERED }
+            val delayedShipments = driverShipments.count { it.isDelayed }
+            
+            // On-time delivery rate
+            val onTimeDeliveryRate = if (totalShipments > 0) {
+                ((totalShipments - delayedShipments).toDouble() / totalShipments) * 100
+            } else 0.0
+            
+            // Average delivery time
+            val deliveryTimes = driverShipments.filter { it.status == ShipmentStatus.DELIVERED }
+                .mapNotNull { shipment ->
+                    val deliveredAt = shipment.deliveredAt ?: return@mapNotNull null
+                    deliveredAt - shipment.createdAt
+                }
+            val averageDeliveryTime = if (deliveryTimes.isNotEmpty()) {
+                deliveryTimes.average()
+            } else 0.0
+            
+            // Revenue generated
+            val revenue = driverShipments.sumOf { it.amount ?: 0.0 }
+            
+            // Customer satisfaction (placeholder - would come from ratings)
+            val customerSatisfaction = calculateDriverSatisfaction(driver.id, startDate, endDate)
+            
+            // Fuel efficiency (placeholder - would come from vehicle data)
+            val fuelEfficiency = calculateFuelEfficiency(driver.id, startDate, endDate)
+            
+            DriverPerformance(
+                driverId = driver.id,
+                driverName = driver.name,
+                totalShipments = totalShipments,
+                deliveredShipments = deliveredShipments,
+                delayedShipments = delayedShipments,
+                onTimeDeliveryRate = onTimeDeliveryRate,
+                averageDeliveryTime = averageDeliveryTime,
+                revenueGenerated = revenue,
+                customerSatisfaction = customerSatisfaction,
+                fuelEfficiency = fuelEfficiency,
+                rating = calculateDriverRating(driverShipments)
+            )
+        }
+        
+        // Team statistics
+        val teamStats = calculateTeamStatistics(driverPerformances)
+        
+        // Performance trends
+        val performanceTrends = analyzePerformanceTrends(shipments, startDate, endDate)
+        
+        DriverPerformanceReport(
+            id = UUID.randomUUID().toString(),
+            title = "تقرير أداء السائقين",
+            startDate = startDate,
+            endDate = endDate,
+            reportType = reportType,
+            generatedAt = System.currentTimeMillis(),
+            driverPerformances = driverPerformances,
+            teamStatistics = teamStats,
+            performanceTrends = performanceTrends,
+            topPerformers = driverPerformances.sortedByDescending { it.rating }.take(5),
+            areasForImprovement = identifyAreasForImprovement(driverPerformances)
+        )
+    }
+
+    /**
+     * Generate customer behavior insights report
+     */
+    suspend fun generateCustomerBehaviorReport(
+        startDate: Long,
+        endDate: Long,
+        reportType: CustomerReportType = CustomerReportType.COMPREHENSIVE
+    ): CustomerBehaviorReport = withContext(Dispatchers.IO) {
+        val customers = reportUseCases.getAllCustomers()
+        val shipments = reportUseCases.getShipmentsByDateRange(startDate, endDate)
+        val invoices = reportUseCases.getInvoicesByDateRange(startDate, endDate)
+        val payments = reportUseCases.getPaymentsByDateRange(startDate, endDate)
+        
+        val customerInsights = customers.map { customer ->
+            val customerShipments = shipments.filter { it.customerId == customer.id }
+            val customerInvoices = invoices.filter { it.customerId == customer.id }
+            val customerPayments = payments.filter { payment ->
+                customerInvoices.any { it.id == payment.invoiceId }
+            }
+            
+            // Calculate customer metrics
+            val totalShipments = customerShipments.size
+            val totalRevenue = customerPayments.sumOf { it.amount }
+            val averageOrderValue = if (customerInvoices.isNotEmpty()) {
+                customerInvoices.sumOf { it.amount } / customerInvoices.size
+            } else 0.0
+            
+            // Frequency analysis
+            val shipmentFrequency = calculateShipmentFrequency(customerShipments, startDate, endDate)
+            
+            // Loyalty score
+            val loyaltyScore = calculateLoyaltyScore(customer, customerShipments, customerPayments)
+            
+            // Preferred services
+            val preferredServices = analyzePreferredServices(customerShipments)
+            
+            // Payment behavior
+            val paymentBehavior = analyzePaymentBehavior(customerInvoices, customerPayments)
+            
+            // Geographic patterns
+            val geographicPatterns = analyzeCustomerGeographicPatterns(customerShipments)
+            
+            CustomerInsight(
+                customerId = customer.id,
+                customerName = customer.name,
+                totalShipments = totalShipments,
+                totalRevenue = totalRevenue,
+                averageOrderValue = averageOrderValue,
+                shipmentFrequency = shipmentFrequency,
+                loyaltyScore = loyaltyScore,
+                preferredServices = preferredServices,
+                paymentBehavior = paymentBehavior,
+                geographicPatterns = geographicPatterns,
+                riskLevel = calculateCustomerRiskLevel(customer, customerPayments),
+                growthPotential = calculateGrowthPotential(customer, customerShipments)
+            )
+        }
+        
+        // Market segmentation
+        val marketSegmentation = performMarketSegmentation(customerInsights)
+        
+        // Customer lifetime value
+        val customerLifetimeValue = calculateCustomerLifetimeValue(customerInsights)
+        
+        // Churn analysis
+        val churnAnalysis = performChurnAnalysis(customers, shipments, startDate, endDate)
+        
+        // Seasonal patterns
+        val seasonalPatterns = analyzeSeasonalPatterns(shipments, startDate, endDate)
+        
+        CustomerBehaviorReport(
+            id = UUID.randomUUID().toString(),
+            title = "تقرير رؤى سلوك العملاء",
+            startDate = startDate,
+            endDate = endDate,
+            reportType = reportType,
+            generatedAt = System.currentTimeMillis(),
+            customerInsights = customerInsights,
+            marketSegmentation = marketSegmentation,
+            customerLifetimeValue = customerLifetimeValue,
+            churnAnalysis = churnAnalysis,
+            seasonalPatterns = seasonalPatterns,
+            topCustomers = customerInsights.sortedByDescending { it.totalRevenue }.take(10),
+            atRiskCustomers = customerInsights.filter { it.riskLevel == RiskLevel.HIGH }
+        )
+    }
+
+    /**
+     * Export report to PDF
+     */
+    suspend fun exportToPDF(report: Any, fileName: String): String = withContext(Dispatchers.IO) {
+        when (report) {
+            is RevenueReport -> pdfExporter.exportRevenueReport(report, fileName)
+            is ShipmentPerformanceReport -> pdfExporter.exportShipmentReport(report, fileName)
+            is DriverPerformanceReport -> pdfExporter.exportDriverReport(report, fileName)
+            is CustomerBehaviorReport -> pdfExporter.exportCustomerReport(report, fileName)
+            else -> throw IllegalArgumentException("Unsupported report type")
+        }
+    }
+
+    /**
+     * Export report to Excel
+     */
+    suspend fun exportToExcel(report: Any, fileName: String): String = withContext(Dispatchers.IO) {
+        when (report) {
+            is RevenueReport -> excelExporter.exportRevenueReport(report, fileName)
+            is ShipmentPerformanceReport -> excelExporter.exportShipmentReport(report, fileName)
+            is DriverPerformanceReport -> excelExporter.exportDriverReport(report, fileName)
+            is CustomerBehaviorReport -> excelExporter.exportCustomerReport(report, fileName)
+            else -> throw IllegalArgumentException("Unsupported report type")
+        }
+    }
+
+    // Helper methods for data analysis
+    
+    private fun groupRevenueByPeriod(payments: List<Payment>, reportType: RevenueReportType): List<RevenueByPeriod> {
+        return when (reportType) {
+            RevenueReportType.DAILY -> groupByDay(payments)
+            RevenueReportType.WEEKLY -> groupByWeek(payments)
+            RevenueReportType.MONTHLY -> groupByMonth(payments)
+            RevenueReportType.YEARLY -> groupByYear(payments)
+            RevenueReportType.DETAILED -> groupByDay(payments)
+        }
+    }
+
+    private fun groupByDay(payments: List<Payment>): List<RevenueByPeriod> {
+        return payments.groupBy { payment ->
+            dateFormat.format(Date(payment.timestamp))
+        }.map { (date, dayPayments) ->
+            RevenueByPeriod(
+                period = date,
+                revenue = dayPayments.sumOf { it.amount },
+                transactionCount = dayPayments.size
+            )
+        }.sortedBy { it.period }
+    }
+
+    private fun groupByWeek(payments: List<Payment>): List<RevenueByPeriod> {
+        // Implementation for weekly grouping
+        return emptyList() // Placeholder
+    }
+
+    private fun groupByMonth(payments: List<Payment>): List<RevenueByPeriod> {
+        // Implementation for monthly grouping
+        return emptyList() // Placeholder
+    }
+
+    private fun groupByYear(payments: List<Payment>): List<RevenueByPeriod> {
+        // Implementation for yearly grouping
+        return emptyList() // Placeholder
+    }
+
+    private fun groupRevenueByCustomer(invoices: List<Invoice>): List<RevenueByCustomer> {
+        return invoices.groupBy { it.customerId }
+            .map { (customerId, customerInvoices) ->
+                RevenueByCustomer(
+                    customerId = customerId,
+                    revenue = customerInvoices.sumOf { it.amount },
+                    invoiceCount = customerInvoices.size,
+                    averageInvoiceValue = customerInvoices.sumOf { it.amount } / customerInvoices.size
+                )
+            }.sortedByDescending { it.revenue }
+    }
+
+    private fun groupRevenueByServiceType(invoices: List<Invoice>): List<RevenueByServiceType> {
+        return invoices.groupBy { it.serviceType }
+            .map { (serviceType, serviceInvoices) ->
+                RevenueByServiceType(
+                    serviceType = serviceType,
+                    revenue = serviceInvoices.sumOf { it.amount },
+                    invoiceCount = serviceInvoices.size,
+                    averageInvoiceValue = serviceInvoices.sumOf { it.amount } / serviceInvoices.size
+                )
+            }.sortedByDescending { it.revenue }
+    }
+
+    private fun analyzePaymentMethods(payments: List<Payment>): List<PaymentMethodAnalysis> {
+        return payments.groupBy { it.paymentMethod }
+            .map { (method, methodPayments) ->
+                PaymentMethodAnalysis(
+                    paymentMethod = method,
+                    transactionCount = methodPayments.size,
+                    totalAmount = methodPayments.sumOf { it.amount },
+                    averageAmount = methodPayments.sumOf { it.amount } / methodPayments.size,
+                    percentage = (methodPayments.size.toDouble() / payments.size) * 100
+                )
+            }.sortedByDescending { it.totalAmount }
+    }
+
+    private fun analyzeOverduePayments(invoices: List<Invoice>): OverdueAnalysis {
+        val overdueInvoices = invoices.filter { it.isOverdue }
+        val totalOverdueAmount = overdueInvoices.sumOf { it.amount }
+        
+        return OverdueAnalysis(
+            overdueCount = overdueInvoices.size,
+            totalOverdueAmount = totalOverdueAmount,
+            averageOverdueDays = if (overdueInvoices.isNotEmpty()) {
+                overdueInvoices.map { it.daysOverdue }.average()
+            } else 0.0,
+            overduePercentage = (overdueInvoices.size.toDouble() / invoices.size) * 100
+        )
+    }
+
+    private fun calculateRevenueGrowth(payments: List<Payment>, startDate: Long, endDate: Long): Double {
+        // Calculate revenue growth compared to previous period
+        // This is a placeholder implementation
+        return 15.5 // 15.5% growth
+    }
+
+    private fun analyzePerformanceByRoute(shipments: List<Shipment>): List<RoutePerformance> {
+        return shipments.groupBy { "${it.origin}-${it.destination}" }
+            .map { (route, routeShipments) ->
+                val deliveredCount = routeShipments.count { it.status == ShipmentStatus.DELIVERED }
+                val delayedCount = routeShipments.count { it.isDelayed }
+                
+                RoutePerformance(
+                    route = route,
+                    totalShipments = routeShipments.size,
+                    deliveredShipments = deliveredCount,
+                    delayedShipments = delayedCount,
+                    onTimeDeliveryRate = if (routeShipments.isNotEmpty()) {
+                        ((routeShipments.size - delayedCount).toDouble() / routeShipments.size) * 100
+                    } else 0.0,
+                    averageDeliveryTime = calculateAverageDeliveryTime(routeShipments)
+                )
+            }.sortedByDescending { it.onTimeDeliveryRate }
+    }
+
+    private fun analyzePerformanceByDriver(shipments: List<Shipment>): List<DriverPerformance> {
+        return shipments.groupBy { it.driverId }
+            .map { (driverId, driverShipments) ->
+                val deliveredCount = driverShipments.count { it.status == ShipmentStatus.DELIVERED }
+                val delayedCount = driverShipments.count { it.isDelayed }
+                
+                DriverPerformance(
+                    driverId = driverId,
+                    driverName = "Driver $driverId", // Would get from driver data
+                    totalShipments = driverShipments.size,
+                    deliveredShipments = deliveredCount,
+                    delayedShipments = delayedCount,
+                    onTimeDeliveryRate = if (driverShipments.isNotEmpty()) {
+                        ((driverShipments.size - delayedCount).toDouble() / driverShipments.size) * 100
+                    } else 0.0,
+                    averageDeliveryTime = calculateAverageDeliveryTime(driverShipments),
+                    revenueGenerated = driverShipments.sumOf { it.amount ?: 0.0 },
+                    customerSatisfaction = 4.5, // Placeholder
+                    fuelEfficiency = 8.5, // Placeholder
+                    rating = calculateDriverRating(driverShipments)
+                )
+            }.sortedByDescending { it.rating }
+    }
+
+    private fun analyzePerformanceByVehicleType(shipments: List<Shipment>): List<VehicleTypePerformance> {
+        return shipments.groupBy { it.vehicleType }
+            .map { (vehicleType, vehicleShipments) ->
+                val deliveredCount = vehicleShipments.count { it.status == ShipmentStatus.DELIVERED }
+                val delayedCount = vehicleShipments.count { it.isDelayed }
+                
+                VehicleTypePerformance(
+                    vehicleType = vehicleType,
+                    totalShipments = vehicleShipments.size,
+                    deliveredShipments = deliveredCount,
+                    delayedShipments = delayedCount,
+                    onTimeDeliveryRate = if (vehicleShipments.isNotEmpty()) {
+                        ((vehicleShipments.size - delayedCount).toDouble() / vehicleShipments.size) * 100
+                    } else 0.0,
+                    averageDeliveryTime = calculateAverageDeliveryTime(vehicleShipments)
+                )
+            }.sortedByDescending { it.onTimeDeliveryRate }
+    }
+
+    private fun analyzeDelays(shipments: List<Shipment>): DelayAnalysis {
+        val delayedShipments = shipments.filter { it.isDelayed }
+        val averageDelayMinutes = if (delayedShipments.isNotEmpty()) {
+            delayedShipments.map { it.delayMinutes }.average()
+        } else 0.0
+        
+        return DelayAnalysis(
+            delayedCount = delayedShipments.size,
+            averageDelayMinutes = averageDelayMinutes,
+            maxDelayMinutes = delayedShipments.maxOfOrNull { it.delayMinutes } ?: 0,
+            delayPercentage = (delayedShipments.size.toDouble() / shipments.size) * 100
+        )
+    }
+
+    private fun analyzeGeographicPerformance(shipments: List<Shipment>): List<GeographicPerformance> {
+        return shipments.groupBy { it.destination }
+            .map { (location, locationShipments) ->
+                val deliveredCount = locationShipments.count { it.status == ShipmentStatus.DELIVERED }
+                val delayedCount = locationShipments.count { it.isDelayed }
+                
+                GeographicPerformance(
+                    location = location,
+                    totalShipments = locationShipments.size,
+                    deliveredShipments = deliveredCount,
+                    delayedShipments = delayedCount,
+                    onTimeDeliveryRate = if (locationShipments.isNotEmpty()) {
+                        ((locationShipments.size - delayedCount).toDouble() / locationShipments.size) * 100
+                    } else 0.0
+                )
+            }.sortedByDescending { it.totalShipments }
+    }
+
+    private fun calculateAverageDeliveryTime(shipments: List<Shipment>): Double {
+        val deliveryTimes = shipments.filter { it.status == ShipmentStatus.DELIVERED }
+            .mapNotNull { shipment ->
+                val deliveredAt = shipment.deliveredAt ?: return@mapNotNull null
+                deliveredAt - shipment.createdAt
+            }
+        return if (deliveryTimes.isNotEmpty()) deliveryTimes.average() else 0.0
+    }
+
+    private fun calculateDriverSatisfaction(driverId: String, startDate: Long, endDate: Long): Double {
+        // Placeholder implementation - would calculate from customer ratings
+        return 4.3
+    }
+
+    private fun calculateFuelEfficiency(driverId: String, startDate: Long, endDate: Long): Double {
+        // Placeholder implementation - would calculate from fuel consumption data
+        return 8.2 // km/l
+    }
+
+    private fun calculateDriverRating(shipments: List<Shipment>): Double {
+        if (shipments.isEmpty()) return 0.0
+        
+        val onTimeRate = ((shipments.size - shipments.count { it.isDelayed }).toDouble() / shipments.size) * 100
+        val completionRate = (shipments.count { it.status == ShipmentStatus.DELIVERED }.toDouble() / shipments.size) * 100
+        
+        return (onTimeRate + completionRate) / 2
+    }
+
+    private fun calculateTeamStatistics(driverPerformances: List<DriverPerformance>): TeamStatistics {
+        return TeamStatistics(
+            totalDrivers = driverPerformances.size,
+            averageOnTimeDeliveryRate = driverPerformances.map { it.onTimeDeliveryRate }.average(),
+            averageCustomerSatisfaction = driverPerformances.map { it.customerSatisfaction }.average(),
+            totalRevenueGenerated = driverPerformances.sumOf { it.revenueGenerated },
+            topPerformer = driverPerformances.maxByOrNull { it.rating }
+        )
+    }
+
+    private fun analyzePerformanceTrends(shipments: List<Shipment>, startDate: Long, endDate: Long): List<PerformanceTrend> {
+        // Placeholder implementation - would analyze trends over time
+        return emptyList()
+    }
+
+    private fun identifyAreasForImprovement(driverPerformances: List<DriverPerformance>): List<String> {
+        val improvements = mutableListOf<String>()
+        
+        if (driverPerformances.any { it.onTimeDeliveryRate < 85 }) {
+            improvements.add("تحسين معدل التسليم في الوقت المحدد")
+        }
+        
+        if (driverPerformances.any { it.customerSatisfaction < 4.0 }) {
+            improvements.add("رفع مستوى رضا العملاء")
+        }
+        
+        if (driverPerformances.any { it.fuelEfficiency < 7.0 }) {
+            improvements.add("تحسين كفاءة استهلاك الوقود")
+        }
+        
+        return improvements
+    }
+
+    private fun calculateShipmentFrequency(shipments: List<Shipment>, startDate: Long, endDate: Long): Double {
+        val daysBetween = (endDate - startDate) / (24 * 60 * 60 * 1000)
+        return if (daysBetween > 0) shipments.size.toDouble() / daysBetween else 0.0
+    }
+
+    private fun calculateLoyaltyScore(customer: Customer, shipments: List<Shipment>, payments: List<Payment>): Double {
+        // Placeholder implementation - would calculate based on various factors
+        return 7.5
+    }
+
+    private fun analyzePreferredServices(shipments: List<Shipment>): List<String> {
+        return shipments.groupBy { it.serviceType }
+            .mapValues { it.value.size }
+            .toList()
+            .sortedByDescending { it.second }
+            .map { it.first }
+    }
+
+    private fun analyzePaymentBehavior(invoices: List<Invoice>, payments: List<Payment>): PaymentBehavior {
+        val paidInvoices = invoices.filter { invoice ->
+            payments.any { it.invoiceId == invoice.id }
+        }
+        
+        return PaymentBehavior(
+            onTimePaymentRate = if (invoices.isNotEmpty()) {
+                (paidInvoices.count { !it.isOverdue }.toDouble() / invoices.size) * 100
+            } else 0.0,
+            averagePaymentDelay = 3.5, // Placeholder
+            preferredPaymentMethods = payments.groupBy { it.paymentMethod }
+                .mapValues { it.value.size }
+                .toList()
+                .sortedByDescending { it.second }
+                .map { it.first }
+        )
+    }
+
+    private fun analyzeCustomerGeographicPatterns(shipments: List<Shipment>): List<String> {
+        return shipments.groupBy { it.destination }
+            .mapValues { it.value.size }
+            .toList()
+            .sortedByDescending { it.second }
+            .map { it.first }
+            .take(5)
+    }
+
+    private fun calculateCustomerRiskLevel(customer: Customer, payments: List<Payment>): RiskLevel {
+        // Placeholder implementation - would calculate based on payment history
+        return RiskLevel.LOW
+    }
+
+    private fun calculateGrowthPotential(customer: Customer, shipments: List<Shipment>): Double {
+        // Placeholder implementation - would calculate based on various factors
+        return 8.0
+    }
+
+    private fun performMarketSegmentation(customerInsights: List<CustomerInsight>): MarketSegmentation {
+        // Placeholder implementation - would perform actual segmentation
+        return MarketSegmentation(
+            totalCustomers = customerInsights.size,
+            segments = listOf(
+                Segment("عملاء كبار", customerInsights.filter { it.totalRevenue > 10000 }.size),
+                Segment("عملاء متوسطون", customerInsights.filter { it.totalRevenue in 5000..10000 }.size),
+                Segment("عملاء صغار", customerInsights.filter { it.totalRevenue < 5000 }.size)
+            )
+        )
+    }
+
+    private fun calculateCustomerLifetimeValue(customerInsights: List<CustomerInsight>): CustomerLifetimeValue {
+        val totalRevenue = customerInsights.sumOf { it.totalRevenue }
+        val averageLifetime = 24.0 // months
+        
+        return CustomerLifetimeValue(
+            averageLifetimeValue = totalRevenue / customerInsights.size,
+            totalLifetimeValue = totalRevenue,
+            averageCustomerLifetime = averageLifetime
+        )
+    }
+
+    private fun performChurnAnalysis(customers: List<Customer>, shipments: List<Shipment>, startDate: Long, endDate: Long): ChurnAnalysis {
+        // Placeholder implementation - would analyze actual churn
+        return ChurnAnalysis(
+            churnRate = 5.2,
+            atRiskCustomers = customers.size / 10,
+            retentionRate = 94.8
+        )
+    }
+
+    private fun analyzeSeasonalPatterns(shipments: List<Shipment>, startDate: Long, endDate: Long): List<SeasonalPattern> {
+        // Placeholder implementation - would analyze actual seasonal patterns
+        return emptyList()
+    }
+}

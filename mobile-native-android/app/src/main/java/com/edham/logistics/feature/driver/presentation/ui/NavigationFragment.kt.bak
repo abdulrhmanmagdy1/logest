@@ -1,0 +1,321 @@
+package com.edham.logistics.feature.driver.presentation.ui
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.databinding.FragmentNavigationBinding
+import com.edham.logistics.feature.driver.presentation.ui.NavigationViewModel
+import com.edham.logistics.feature.driver.presentation.adapter.RouteStepsAdapter
+import com.edham.logistics.feature.driver.domain.model.LocationPoint
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class NavigationFragment : Fragment() {
+
+    private var _binding: FragmentNavigationBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: NavigationViewModel by viewModels()
+
+    @Inject
+    lateinit var routeStepsAdapter: RouteStepsAdapter
+
+    private val requestPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        if (isGranted) {
+            startLocationUpdates()
+        } else {
+            showSnackbar("يجب منح إذن الوصول للموقع")
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentNavigationBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerView()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize with trip ID from arguments
+        arguments?.getString("tripId")?.let { tripId ->
+            viewModel.initialize(tripId)
+        }
+    }
+
+    private fun setupRecyclerView() {
+        routeStepsAdapter = RouteStepsAdapter()
+        binding.recyclerViewRouteSteps.apply {
+            adapter = routeStepsAdapter
+            layoutManager = androidx.recyclerview.widget.LinearLayoutManager(requireContext())
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonMarkArrived.setOnClickListener {
+            viewModel.markArrived()
+        }
+        
+        binding.buttonRefreshRoute.setOnClickListener {
+            viewModel.refreshRoute()
+        }
+        
+        binding.buttonCallCustomer.setOnClickListener {
+            callCustomer()
+        }
+        
+        binding.buttonNavigate.setOnClickListener {
+            openGoogleMaps()
+        }
+        
+        binding.textViewPickupLocation.setOnClickListener {
+            navigateToLocation(viewModel.uiState.value.trip?.pickupLocation)
+        }
+        
+        binding.textViewDeliveryLocation.setOnClickListener {
+            navigateToLocation(viewModel.uiState.value.trip?.deliveryLocation)
+        }
+    }
+
+    private fun updateUI(uiState: NavigationViewModel.NavigationUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+        
+        // Show success messages
+        uiState.actionSuccess?.let { message ->
+            showSnackbar(message)
+            viewModel.clearSuccess()
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.scrollView.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.scrollView.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.scrollView.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refreshRoute()
+        }
+    }
+
+    private fun showContent(uiState: NavigationViewModel.NavigationUiState) {
+        binding.progressBar.gone()
+        binding.scrollView.alpha = 1.0f
+        binding.scrollView.visible()
+        binding.layoutError.gone()
+        
+        uiState.trip?.let { trip ->
+            updateTripInfo(trip)
+            updateRouteInfo(trip.route)
+            updateCurrentLocation(trip.currentLocation)
+        }
+    }
+
+    private fun updateTripInfo(trip: com.edham.logistics.feature.driver.domain.model.DriverTrip) {
+        binding.textTrackingNumber.text = trip.trackingNumber
+        binding.textCustomerName.text = trip.customerName
+        binding.textCustomerPhone.text = trip.customerPhone
+        binding.textViewPickupLocation.text = trip.pickupLocation.address
+        binding.textViewDeliveryLocation.text = trip.deliveryLocation.address
+        binding.textCargoType.text = formatCargoType(trip.cargoType)
+        binding.textWeight.text = "${trip.weight} كجم"
+        binding.textEstimatedDistance.text = "${String.format("%.1f", trip.estimatedDistance)} كم"
+        binding.textEstimatedDuration.text = "${trip.estimatedDuration} دقيقة"
+        binding.textStatus.text = formatTripStatus(trip.status)
+        
+        // Set status color
+        binding.textStatus.setTextColor(getTripStatusColor(trip.status))
+        
+        // Update customer call button
+        binding.buttonCallCustomer.setOnClickListener {
+            callCustomer(trip.customerPhone)
+        }
+    }
+
+    private fun updateRouteInfo(route: com.edham.logistics.feature.driver.domain.model.RouteInfo?) {
+        if (route != null) {
+            binding.textTotalDistance.text = "${String.format("%.1f", route.distance)} كم"
+            binding.textTotalDuration.text = "${route.duration} دقيقة"
+            routeStepsAdapter.submitList(route.steps)
+            binding.layoutRouteInfo.visible()
+        } else {
+            binding.layoutRouteInfo.gone()
+        }
+    }
+
+    private fun updateCurrentLocation(currentLocation: LocationPoint?) {
+        if (currentLocation != null) {
+            binding.textCurrentLocation.text = currentLocation.address
+            binding.textCurrentLocationDetail.text = currentLocation.address
+            val updated = formatDateTime(currentLocation.timestamp)
+            binding.textLastUpdate.text = updated
+            binding.textLastUpdateDetail.text = updated
+            binding.layoutCurrentLocation.visible()
+        } else {
+            binding.layoutCurrentLocation.gone()
+        }
+    }
+
+    private fun checkLocationPermission() {
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.ACCESS_FINE_LOCATION)
+            == PackageManager.PERMISSION_GRANTED) {
+            startLocationUpdates()
+        } else {
+            requestPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
+
+    private fun startLocationUpdates() {
+        // In real app, we would start location updates here
+        // For now, we'll use mock location updates
+        showSnackbar("بدء تحديث الموقع")
+        
+        // Mock location update
+        val mockLocation = LocationPoint(
+            latitude = 24.7200,
+            longitude = 46.6800,
+            address = "الرياض، شارع الملك",
+            city = "الرياض",
+            timestamp = java.time.Instant.now().toString()
+        )
+        viewModel.updateCurrentLocation(mockLocation)
+    }
+
+    private fun navigateToLocation(location: LocationPoint?) {
+        location?.let {
+            val gmmIntentUri = android.net.Uri.parse("google.navigation:q=${it.latitude},${it.longitude}")
+            val mapIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, gmmIntentUri)
+            mapIntent.setPackage("com.google.android.apps.maps")
+            startActivity(mapIntent)
+        }
+    }
+
+    private fun openGoogleMaps() {
+        val trip = viewModel.uiState.value.trip
+        if (trip != null) {
+            val gmmIntentUri = android.net.Uri.parse(
+                "google.navigation:q=${trip.deliveryLocation.latitude},${trip.deliveryLocation.longitude}"
+            )
+            val mapIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, gmmIntentUri)
+            mapIntent.setPackage("com.google.android.apps.maps")
+            startActivity(mapIntent)
+        }
+    }
+
+    private fun callCustomer(phoneNumber: String? = null) {
+        val phone = phoneNumber ?: viewModel.uiState.value.trip?.customerPhone
+        phone?.let {
+            val callIntent = android.content.Intent(android.content.Intent.ACTION_DIAL).apply {
+                data = android.net.Uri.parse("tel:$it")
+            }
+            startActivity(callIntent)
+        }
+    }
+
+    private fun formatCargoType(cargoType: String): String {
+        return when (cargoType) {
+            "general" -> "بضائع عامة"
+            "refrigerated" -> "بضائع مبردة"
+            "fragile" -> "بضائع قابلة للكسر"
+            "heavy" -> "بضائع ثقيلة"
+            "urgent" -> "بضائع عاجلة"
+            "documents" -> "مستندات"
+            "electronics" -> "إلكترونيات"
+            "food" -> "مواد غذائية"
+            "medical" -> "معدات طبية"
+            "chemicals" -> "مواد كيميائية"
+            "livestock" -> "مواشي"
+            "vehicles" -> "مركبات"
+            else -> cargoType
+        }
+    }
+
+    private fun formatTripStatus(status: com.edham.logistics.feature.driver.domain.model.TripStatus): String {
+        return when (status) {
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ASSIGNED -> "مخصص"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ACCEPTED -> "مقبول"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.REJECTED -> "مرفوض"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.STARTED -> "بدأت"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.IN_TRANSIT -> "قيد النقل"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ARRIVED -> "وصلت"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.DELIVERED -> "تم التسليم"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.CANCELLED -> "ملغية"
+        }
+    }
+
+    private fun getTripStatusColor(status: com.edham.logistics.feature.driver.domain.model.TripStatus): Int {
+        return when (status) {
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ASSIGNED -> android.graphics.Color.parseColor("#FF9800")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ACCEPTED -> android.graphics.Color.parseColor("#2196F3")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.REJECTED -> android.graphics.Color.parseColor("#F44336")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.STARTED -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.IN_TRANSIT -> android.graphics.Color.parseColor("#2196F3")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ARRIVED -> android.graphics.Color.parseColor("#9C27B0")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.DELIVERED -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.CANCELLED -> android.graphics.Color.parseColor("#F44336")
+        }
+    }
+
+    private fun formatDateTime(timestamp: String?): String {
+        // In real app, we would format the date time properly
+        // For now, we'll return a simple format
+        return timestamp?.let { "آخر تحديث: ${it.substring(0, 19)}" } ?: "غير متوفر"
+    }
+
+    override fun onResume() {
+        super.onResume()
+        checkLocationPermission()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

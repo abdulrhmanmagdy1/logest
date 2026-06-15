@@ -1,0 +1,809 @@
+package com.edham.logistics.core.backup
+
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import kotlinx.coroutines.*
+import java.io.*
+import java.text.SimpleDateFormat
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Database Backup Service - Handles database backup and restoration
+ * Provides secure and efficient database backup operations
+ */
+@Singleton
+class DatabaseBackupService @Inject constructor(
+    private val context: Context
+) {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Create database backup
+     */
+    suspend fun createDatabaseBackup(): DatabaseBackup {
+        return withContext(Dispatchers.IO) {
+            try {
+                val database = getDatabase()
+                val backupFile = createBackupFile()
+                
+                // Create backup using SQLite backup API
+                database.use { db ->
+                    val backupDB = SQLiteDatabase.openOrCreateDatabase(backupFile.absolutePath, null)
+                    
+                    try {
+                        // Use SQLite backup API for efficient backup
+                        db.beginTransaction()
+                        backupDB.beginTransaction()
+                        
+                        // Copy database
+                        val backup = File(db.path)
+                        backup.copyTo(backupFile, overwrite = true)
+                        
+                        db.setTransactionSuccessful()
+                        backupDB.setTransactionSuccessful()
+                        
+                    } finally {
+                        db.endTransaction()
+                        backupDB.endTransaction()
+                        backupDB.close()
+                    }
+                }
+                
+                val backupData = backupFile.readBytes()
+                backupFile.delete() // Clean up temporary file
+                
+                DatabaseBackup(
+                    fileName = "database_${generateTimestamp()}.db",
+                    data = backupData,
+                    size = backupData.size.toLong(),
+                    timestamp = System.currentTimeMillis(),
+                    checksum = calculateChecksum(backupData)
+                )
+                
+            } catch (e: Exception) {
+                throw BackupException("Failed to create database backup", e)
+            }
+        }
+    }
+
+    /**
+     * Restore database backup
+     */
+    suspend fun restoreDatabaseBackup(
+        backupFile: File,
+        backupInfo: BackupInfo
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Verify backup integrity
+                if (!verifyBackupIntegrity(backupFile, backupInfo)) {
+                    throw BackupException("Backup integrity verification failed")
+                }
+                
+                // Create backup of current database before restore
+                createCurrentDatabaseBackup()
+                
+                // Close current database connections
+                closeDatabaseConnections()
+                
+                // Restore database
+                val currentDatabaseFile = getDatabaseFile()
+                backupFile.copyTo(currentDatabaseFile, overwrite = true)
+                
+                // Verify restored database
+                val restored = verifyRestoredDatabase()
+                
+                if (!restored) {
+                    // Restore from backup if restore failed
+                    restoreFromCurrentDatabaseBackup()
+                    throw BackupException("Database restore verification failed")
+                }
+                
+                true
+                
+            } catch (e: Exception) {
+                // Attempt to restore from backup
+                restoreFromCurrentDatabaseBackup()
+                false
+            }
+        }
+    }
+
+    /**
+     * Create incremental backup
+     */
+    suspend fun createIncrementalBackup(
+        lastBackupTime: Long
+    ): IncrementalBackup {
+        return withContext(Dispatchers.IO) {
+            try {
+                val database = getDatabase()
+                val changes = mutableListOf<DatabaseChange>()
+                
+                database.use { db ->
+                    // Get changes since last backup
+                    val cursor = db.query(
+                        "sqlite_master",
+                        null,
+                        "sql LIKE 'CREATE TABLE%'",
+                        null,
+                        null,
+                        null,
+                        null
+                    )
+                    
+                    cursor.use { c ->
+                        while (c.moveToNext()) {
+                            val tableName = c.getString(c.getColumnIndexOrThrow("name"))
+                            val tableChanges = getTableChanges(db, tableName, lastBackupTime)
+                            changes.addAll(tableChanges)
+                        }
+                    }
+                }
+                
+                IncrementalBackup(
+                    fileName = "incremental_${generateTimestamp()}.json",
+                    changes = changes,
+                    baseBackupTime = lastBackupTime,
+                    timestamp = System.currentTimeMillis(),
+                    size = calculateIncrementalSize(changes)
+                )
+                
+            } catch (e: Exception) {
+                throw BackupException("Failed to create incremental backup", e)
+            }
+        }
+    }
+
+    /**
+     * Restore incremental backup
+     */
+    suspend fun restoreIncrementalBackup(
+        incrementalBackup: IncrementalBackup
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val database = getDatabase()
+                
+                database.use { db ->
+                    db.beginTransaction()
+                    
+                    try {
+                        // Apply incremental changes
+                        incrementalBackup.changes.forEach { change ->
+                            applyDatabaseChange(db, change)
+                        }
+                        
+                        db.setTransactionSuccessful()
+                        
+                    } finally {
+                        db.endTransaction()
+                    }
+                }
+                
+                true
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Get database schema
+     */
+    suspend fun getDatabaseSchema(): DatabaseSchema {
+        return withContext(Dispatchers.IO) {
+            val database = getDatabase()
+            val tables = mutableListOf<TableSchema>()
+            
+            database.use { db ->
+                val cursor = db.query(
+                    "sqlite_master",
+                    null,
+                    "type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    null,
+                    null,
+                    null,
+                    "name"
+                )
+                
+                cursor.use { c ->
+                    while (c.moveToNext()) {
+                        val tableName = c.getString(c.getColumnIndexOrThrow("name"))
+                        val createSql = c.getString(c.getColumnIndexOrThrow("sql"))
+                        val columns = getTableColumns(db, tableName)
+                        
+                        tables.add(
+                            TableSchema(
+                                name = tableName,
+                                createSql = createSql,
+                                columns = columns
+                            )
+                        )
+                    }
+                }
+            }
+            
+            DatabaseSchema(
+                version = getDatabaseVersion(),
+                tables = tables,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+    }
+
+    /**
+     * Verify database integrity
+     */
+    suspend fun verifyDatabaseIntegrity(): DatabaseIntegrityResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                val database = getDatabase()
+                var isIntegrity = false
+                var errorMessage: String? = null
+                
+                database.use { db ->
+                    // Run integrity check
+                    val cursor = db.rawQuery("PRAGMA integrity_check", null)
+                    cursor.use { c ->
+                        if (c.moveToFirst()) {
+                            val result = c.getString(0)
+                            isIntegrity = result == "ok"
+                            if (!isIntegrity) {
+                                errorMessage = result
+                            }
+                        }
+                    }
+                }
+                
+                DatabaseIntegrityResult(
+                    isIntegrity = isIntegrity,
+                    errorMessage = errorMessage,
+                    timestamp = System.currentTimeMillis()
+                )
+                
+            } catch (e: Exception) {
+                DatabaseIntegrityResult(
+                    isIntegrity = false,
+                    errorMessage = e.message,
+                    timestamp = System.currentTimeMillis()
+                )
+            }
+        }
+    }
+
+    /**
+     * Optimize database
+     */
+    suspend fun optimizeDatabase(): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val database = getDatabase()
+                
+                database.use { db ->
+                    db.beginTransaction()
+                    
+                    try {
+                        // Analyze tables
+                        db.execSQL("ANALYZE")
+                        
+                        // Vacuum database
+                        db.execSQL("VACUUM")
+                        
+                        // Reindex
+                        db.execSQL("REINDEX")
+                        
+                        db.setTransactionSuccessful()
+                        
+                    } finally {
+                        db.endTransaction()
+                    }
+                }
+                
+                true
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Get database statistics
+     */
+    suspend fun getDatabaseStatistics(): DatabaseStatistics {
+        return withContext(Dispatchers.IO) {
+            val database = getDatabase()
+            val tableStats = mutableListOf<TableStatistics>()
+            var totalSize = 0L
+            var totalRows = 0L
+            
+            database.use { db ->
+                val cursor = db.query(
+                    "sqlite_master",
+                    null,
+                    "type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    null,
+                    null,
+                    null,
+                    null
+                )
+                
+                cursor.use { c ->
+                    while (c.moveToNext()) {
+                        val tableName = c.getString(c.getColumnIndexOrThrow("name"))
+                        val stats = getTableStatistics(db, tableName)
+                        tableStats.add(stats)
+                        totalSize += stats.size
+                        totalRows += stats.rowCount
+                    }
+                }
+            }
+            
+            DatabaseStatistics(
+                version = getDatabaseVersion(),
+                totalSize = totalSize,
+                totalRows = totalRows,
+                tableCount = tableStats.size,
+                tableStatistics = tableStats,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+    }
+
+    /**
+     * Get database
+     */
+    private fun getDatabase(): SQLiteDatabase {
+        return context.openOrCreateDatabase("edham_logistics.db", Context.MODE_PRIVATE, null)
+    }
+
+    /**
+     * Get database file
+     */
+    private fun getDatabaseFile(): File {
+        return File(context.applicationInfo.dataDir + "/databases/edham_logistics.db")
+    }
+
+    /**
+     * Create backup file
+     */
+    private fun createBackupFile(): File {
+        val backupDir = File(context.cacheDir, "database_backup")
+        if (!backupDir.exists()) {
+            backupDir.mkdirs()
+        }
+        return File(backupDir, "backup_${generateTimestamp()}.db")
+    }
+
+    /**
+     * Create current database backup
+     */
+    private fun createCurrentDatabaseBackup() {
+        try {
+            val currentDatabaseFile = getDatabaseFile()
+            val backupFile = File(context.cacheDir, "current_database_backup.db")
+            currentDatabaseFile.copyTo(backupFile, overwrite = true)
+        } catch (e: Exception) {
+            // Handle backup creation error
+        }
+    }
+
+    /**
+     * Restore from current database backup
+     */
+    private fun restoreFromCurrentDatabaseBackup() {
+        try {
+            val backupFile = File(context.cacheDir, "current_database_backup.db")
+            val currentDatabaseFile = getDatabaseFile()
+            if (backupFile.exists()) {
+                backupFile.copyTo(currentDatabaseFile, overwrite = true)
+            }
+        } catch (e: Exception) {
+            // Handle restore error
+        }
+    }
+
+    /**
+     * Close database connections
+     */
+    private fun closeDatabaseConnections() {
+        // Close all database connections
+        // This would depend on how database connections are managed in the app
+    }
+
+    /**
+     * Verify backup integrity
+     */
+    private suspend fun verifyBackupIntegrity(
+        backupFile: File,
+        backupInfo: BackupInfo
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val backupData = backupFile.readBytes()
+                val checksum = calculateChecksum(backupData)
+                
+                // Verify checksum matches
+                checksum == backupInfo.checksum
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Verify restored database
+     */
+    private suspend fun verifyRestoredDatabase(): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val database = getDatabase()
+                var isValid = false
+                
+                database.use { db ->
+                    val cursor = db.rawQuery("PRAGMA integrity_check", null)
+                    cursor.use { c ->
+                        if (c.moveToFirst()) {
+                            val result = c.getString(0)
+                            isValid = result == "ok"
+                        }
+                    }
+                }
+                
+                isValid
+                
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Get table changes since last backup
+     */
+    private suspend fun getTableChanges(
+        database: SQLiteDatabase,
+        tableName: String,
+        lastBackupTime: Long
+    ): List<DatabaseChange> {
+        val changes = mutableListOf<DatabaseChange>()
+        
+        try {
+            // Check if table has timestamp column
+            val hasTimestamp = hasTimestampColumn(database, tableName)
+            
+            if (hasTimestamp) {
+                // Get changes since last backup
+                val cursor = database.query(
+                    tableName,
+                    null,
+                    "updated_at > ?",
+                    arrayOf(lastBackupTime.toString()),
+                    null,
+                    null,
+                    null
+                )
+                
+                cursor.use { c ->
+                    while (c.moveToNext()) {
+                        val change = DatabaseChange(
+                            type = ChangeType.UPDATE,
+                            tableName = tableName,
+                            data = getCurrentRowData(c),
+                            timestamp = System.currentTimeMillis()
+                        )
+                        changes.add(change)
+                    }
+                }
+            }
+            
+        } catch (e: Exception) {
+            // Handle error getting table changes
+        }
+        
+        return changes
+    }
+
+    /**
+     * Apply database change
+     */
+    private suspend fun applyDatabaseChange(
+        database: SQLiteDatabase,
+        change: DatabaseChange
+    ) {
+        withContext(Dispatchers.IO) {
+            try {
+                when (change.type) {
+                    ChangeType.INSERT -> {
+                        database.insert(change.tableName, null, change.data)
+                    }
+                    ChangeType.UPDATE -> {
+                        val id = change.data.getAsString("_id")
+                        database.update(
+                            change.tableName,
+                            change.data,
+                            "_id = ?",
+                            arrayOf(id)
+                        )
+                    }
+                    ChangeType.DELETE -> {
+                        val id = change.data.getAsString("_id")
+                        database.delete(
+                            change.tableName,
+                            "_id = ?",
+                            arrayOf(id)
+                        )
+                    }
+                }
+                
+            } catch (e: Exception) {
+                // Handle error applying change
+            }
+        }
+    }
+
+    /**
+     * Get table columns
+     */
+    private fun getTableColumns(
+        database: SQLiteDatabase,
+        tableName: String
+    ): List<ColumnSchema> {
+        val columns = mutableListOf<ColumnSchema>()
+        
+        val cursor = database.query(
+            "PRAGMA table_info($tableName)",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+        )
+        
+        cursor.use { c ->
+            while (c.moveToNext()) {
+                columns.add(
+                    ColumnSchema(
+                        name = c.getString(c.getColumnIndexOrThrow("name")),
+                        type = c.getString(c.getColumnIndexOrThrow("type")),
+                        notNull = c.getInt(c.getColumnIndexOrThrow("notnull")) == 1,
+                        primaryKey = c.getInt(c.getColumnIndexOrThrow("pk")) > 0
+                    )
+                )
+            }
+        }
+        
+        return columns
+    }
+
+    /**
+     * Get table statistics
+     */
+    private fun getTableStatistics(
+        database: SQLiteDatabase,
+        tableName: String
+    ): TableStatistics {
+        var rowCount = 0L
+        var size = 0L
+        
+        try {
+            // Get row count
+            val countCursor = database.rawQuery("SELECT COUNT(*) FROM $tableName", null)
+            countCursor.use { c ->
+                if (c.moveToFirst()) {
+                    rowCount = c.getLong(0)
+                }
+            }
+            
+            // Get table size (approximate)
+            val sizeCursor = database.rawQuery(
+                "SELECT COUNT(*) * AVG(LENGTH(CAST(* AS BLOB))) FROM $tableName",
+                null
+            )
+            sizeCursor.use { c ->
+                if (c.moveToFirst()) {
+                    size = c.getLong(0)
+                }
+            }
+            
+        } catch (e: Exception) {
+            // Handle error getting statistics
+        }
+        
+        return TableStatistics(
+            name = tableName,
+            rowCount = rowCount,
+            size = size
+        )
+    }
+
+    /**
+     * Check if table has timestamp column
+     */
+    private fun hasTimestampColumn(
+        database: SQLiteDatabase,
+        tableName: String
+    ): Boolean {
+        val cursor = database.query(
+            "PRAGMA table_info($tableName)",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+        )
+        
+        cursor.use { c ->
+            while (c.moveToNext()) {
+                val columnName = c.getString(c.getColumnIndexOrThrow("name"))
+                if (columnName.equals("updated_at", ignoreCase = true) ||
+                    columnName.equals("created_at", ignoreCase = true)) {
+                    return true
+                }
+            }
+        }
+        
+        return false
+    }
+
+    /**
+     * Get current row data
+     */
+    private fun getCurrentRowData(cursor: android.database.Cursor): android.content.ContentValues {
+        val data = android.content.ContentValues()
+        val columnNames = cursor.columnNames
+        
+        for (i in columnNames.indices) {
+            when (cursor.getType(i)) {
+                android.database.Cursor.FIELD_TYPE_INTEGER -> {
+                    data.put(columnNames[i], cursor.getLong(i))
+                }
+                android.database.Cursor.FIELD_TYPE_FLOAT -> {
+                    data.put(columnNames[i], cursor.getDouble(i))
+                }
+                android.database.Cursor.FIELD_TYPE_STRING -> {
+                    data.put(columnNames[i], cursor.getString(i))
+                }
+                android.database.Cursor.FIELD_TYPE_BLOB -> {
+                    data.put(columnNames[i], cursor.getBlob(i))
+                }
+                android.database.Cursor.FIELD_TYPE_NULL -> {
+                    data.putNull(columnNames[i])
+                }
+            }
+        }
+        
+        return data
+    }
+
+    /**
+     * Calculate checksum
+     */
+    private fun calculateChecksum(data: ByteArray): String {
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            val digest = md.digest(data)
+            digest.joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    /**
+     * Calculate incremental size
+     */
+    private fun calculateIncrementalSize(changes: List<DatabaseChange>): Long {
+        return changes.sumOf { change ->
+            change.data.size().toLong()
+        }
+    }
+
+    /**
+     * Generate timestamp
+     */
+    private fun generateTimestamp(): String {
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.getDefault())
+        return dateFormat.format(Date())
+    }
+
+    /**
+     * Get database version
+     */
+    private fun getDatabaseVersion(): Int {
+        return try {
+            val database = getDatabase()
+            database.version
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    /**
+     * Cleanup service
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Data classes and exceptions
+ */
+data class DatabaseBackup(
+    val fileName: String,
+    val data: ByteArray,
+    val size: Long,
+    val timestamp: Long,
+    val checksum: String
+)
+
+data class IncrementalBackup(
+    val fileName: String,
+    val changes: List<DatabaseChange>,
+    val baseBackupTime: Long,
+    val timestamp: Long,
+    val size: Long
+)
+
+data class DatabaseChange(
+    val type: ChangeType,
+    val tableName: String,
+    val data: android.content.ContentValues,
+    val timestamp: Long
+)
+
+data class DatabaseSchema(
+    val version: Int,
+    val tables: List<TableSchema>,
+    val timestamp: Long
+)
+
+data class TableSchema(
+    val name: String,
+    val createSql: String,
+    val columns: List<ColumnSchema>
+)
+
+data class ColumnSchema(
+    val name: String,
+    val type: String,
+    val notNull: Boolean,
+    val primaryKey: Boolean
+)
+
+data class DatabaseIntegrityResult(
+    val isIntegrity: Boolean,
+    val errorMessage: String?,
+    val timestamp: Long
+)
+
+data class DatabaseStatistics(
+    val version: Int,
+    val totalSize: Long,
+    val totalRows: Long,
+    val tableCount: Int,
+    val tableStatistics: List<TableStatistics>,
+    val timestamp: Long
+)
+
+data class TableStatistics(
+    val name: String,
+    val rowCount: Long,
+    val size: Long
+)
+
+enum class ChangeType {
+    INSERT,
+    UPDATE,
+    DELETE
+}
+
+class BackupException(message: String, cause: Throwable? = null) : Exception(message, cause)

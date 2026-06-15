@@ -1,0 +1,391 @@
+package com.edham.logistics.feature.billing.domain.usecase
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.billing.domain.model.*
+import com.edham.logistics.feature.billing.domain.repository.BillingRepository
+import javax.inject.Inject
+
+class ExportInvoiceUseCase @Inject constructor(
+    private val billingRepository: BillingRepository
+) {
+    
+    suspend operator fun invoke(request: ExportInvoiceRequest): Result<String> {
+        return try {
+            // Get invoice details
+            val invoice = billingRepository.getInvoiceById(request.invoiceId)
+            if (invoice is Result.Error) {
+                return Result.Error(Exception("Invoice not found"))
+            }
+            
+            val invoiceData = (invoice as Result.Success).data
+            
+            // Get payment history if requested
+            val paymentHistory = if (request.includePaymentHistory) {
+                val payments = billingRepository.getInvoicePayments(request.invoiceId)
+                if (payments is Result.Success) {
+                    payments.data
+                } else {
+                    emptyList()
+                }
+            } else {
+                emptyList()
+            }
+            
+            // Generate export based on format
+            val exportResult = when (request.format) {
+                ExportFormat.PDF -> generatePDFExport(invoiceData, paymentHistory, request)
+                ExportFormat.EXCEL -> generateExcelExport(invoiceData, paymentHistory, request)
+                ExportFormat.CSV -> generateCSVExport(invoiceData, paymentHistory, request)
+                ExportFormat.JSON -> generateJSONExport(invoiceData, paymentHistory, request)
+            }
+            
+            exportResult
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun generatePDFExport(
+        invoice: Invoice,
+        paymentHistory: List<Payment>,
+        request: ExportInvoiceRequest
+    ): Result<String> {
+        return try {
+            // Generate PDF content
+            val pdfContent = createPDFContent(invoice, paymentHistory, request)
+            
+            // Save PDF to storage or return URL
+            val fileName = "invoice_${invoice.invoiceNumber}.pdf"
+            val filePath = billingRepository.saveExportFile(fileName, pdfContent, "application/pdf")
+            
+            if (filePath is Result.Success) {
+                Result.Success(filePath.data)
+            } else {
+                Result.Error(Exception("Failed to save PDF file"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun generateExcelExport(
+        invoice: Invoice,
+        paymentHistory: List<Payment>,
+        request: ExportInvoiceRequest
+    ): Result<String> {
+        return try {
+            // Generate Excel content
+            val excelContent = createExcelContent(invoice, paymentHistory, request)
+            
+            // Save Excel to storage or return URL
+            val fileName = "invoice_${invoice.invoiceNumber}.xlsx"
+            val filePath = billingRepository.saveExportFile(fileName, excelContent, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            
+            if (filePath is Result.Success) {
+                Result.Success(filePath.data)
+            } else {
+                Result.Error(Exception("Failed to save Excel file"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun generateCSVExport(
+        invoice: Invoice,
+        paymentHistory: List<Payment>,
+        request: ExportInvoiceRequest
+    ): Result<String> {
+        return try {
+            // Generate CSV content
+            val csvContent = createCSVContent(invoice, paymentHistory, request)
+            
+            // Save CSV to storage or return URL
+            val fileName = "invoice_${invoice.invoiceNumber}.csv"
+            val filePath = billingRepository.saveExportFile(fileName, csvContent, "text/csv")
+            
+            if (filePath is Result.Success) {
+                Result.Success(filePath.data)
+            } else {
+                Result.Error(Exception("Failed to save CSV file"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun generateJSONExport(
+        invoice: Invoice,
+        paymentHistory: List<Payment>,
+        request: ExportInvoiceRequest
+    ): Result<String> {
+        return try {
+            // Create JSON export data
+            val exportData = mapOf(
+                "invoice" to invoice,
+                "paymentHistory" to paymentHistory,
+                "exportedAt" to System.currentTimeMillis(),
+                "exportedBy" to "system",
+                "format" to "JSON"
+            )
+            
+            // Convert to JSON string
+            val jsonContent = com.google.gson.Gson().toJson(exportData)
+            
+            // Save JSON to storage or return URL
+            val fileName = "invoice_${invoice.invoiceNumber}.json"
+            val filePath = billingRepository.saveExportFile(fileName, jsonContent, "application/json")
+            
+            if (filePath is Result.Success) {
+                Result.Success(filePath.data)
+            } else {
+                Result.Error(Exception("Failed to save JSON file"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private fun createPDFContent(
+        invoice: Invoice,
+        paymentHistory: List<Payment>,
+        request: ExportInvoiceRequest
+    ): ByteArray {
+        // In a real implementation, this would use a PDF library like iText or PDFBox
+        // For now, we'll create a simple HTML-based PDF content
+        
+        val htmlContent = buildString {
+            appendLine("<!DOCTYPE html>")
+            appendLine("<html dir='rtl' lang='ar'>")
+            appendLine("<head>")
+            appendLine("<meta charset='UTF-8'>")
+            appendLine("<title>فاتورة رقم ${invoice.invoiceNumber}</title>")
+            appendLine("<style>")
+            appendLine("body { font-family: Arial, sans-serif; margin: 20px; }")
+            appendLine(".header { text-align: center; border-bottom: 2px solid #333; padding-bottom: 20px; }")
+            appendLine(".invoice-info { margin: 20px 0; }")
+            appendLine(".customer-info { margin: 20px 0; }")
+            appendLine(".items-table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
+            appendLine(".items-table th, .items-table td { border: 1px solid #ddd; padding: 8px; text-align: right; }")
+            appendLine(".items-table th { background-color: #f2f2f2; }")
+            appendLine(".totals { text-align: left; margin: 20px 0; }")
+            appendLine(".payment-history { margin: 20px 0; }")
+            appendLine("</style>")
+            appendLine("</head>")
+            appendLine("<body>")
+            
+            // Header
+            appendLine("<div class='header'>")
+            appendLine("<h1>فاتورة</h1>")
+            appendLine("<h2>رقم الفاتورة: ${invoice.invoiceNumber}</h2>")
+            appendLine("</div>")
+            
+            // Invoice Info
+            appendLine("<div class='invoice-info'>")
+            appendLine("<p><strong>تاريخ الإصدار:</strong> ${formatDate(invoice.issueDate)}</p>")
+            appendLine("<p><strong>تاريخ الاستحقاق:</strong> ${formatDate(invoice.dueDate)}</p>")
+            appendLine("<p><strong>الحالة:</strong> ${getStatusText(invoice.status)}</p>")
+            appendLine("</div>")
+            
+            // Customer Info
+            appendLine("<div class='customer-info'>")
+            appendLine("<h3>معلومات العميل</h3>")
+            appendLine("<p><strong>الاسم:</strong> ${invoice.customerName}</p>")
+            appendLine("<p><strong>البريد الإلكتروني:</strong> ${invoice.customerEmail}</p>")
+            appendLine("<p><strong>الهاتف:</strong> ${invoice.customerPhone}</p>")
+            appendLine("<p><strong>العنوان:</strong> ${invoice.customerAddress}</p>")
+            appendLine("</div>")
+            
+            // Items Table
+            appendLine("<h3>تفاصيل الفاتورة</h3>")
+            appendLine("<table class='items-table'>")
+            appendLine("<tr><th>الوصف</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th></tr>")
+            
+            invoice.items.forEach { item ->
+                appendLine("<tr>")
+                appendLine("<td>${item.description}</td>")
+                appendLine("<td>${item.quantity}</td>")
+                appendLine("<td>${formatCurrency(item.unitPrice)}</td>")
+                appendLine("<td>${formatCurrency(item.totalPrice)}</td>")
+                appendLine("</tr>")
+            }
+            
+            appendLine("</table>")
+            
+            // Totals
+            appendLine("<div class='totals'>")
+            appendLine("<p><strong>المجموع الفرعي:</strong> ${formatCurrency(invoice.subtotal)}</p>")
+            appendLine("<p><strong>ضريبة:</strong> ${formatCurrency(invoice.taxAmount)}</p>")
+            appendLine("<p><strong>الخصم:</strong> ${formatCurrency(invoice.discountAmount)}</p>")
+            appendLine("<p><strong>الإجمالي:</strong> ${formatCurrency(invoice.totalAmount)}</p>")
+            appendLine("</div>")
+            
+            // Payment History (if included)
+            if (paymentHistory.isNotEmpty()) {
+                appendLine("<div class='payment-history'>")
+                appendLine("<h3>سجل الدفعات</h3>")
+                appendLine("<table class='items-table'>")
+                appendLine("<tr><th>تاريخ الدفع</th><th>المبلغ</th><th>طريقة الدفع</th><th>الحالة</th></tr>")
+                
+                paymentHistory.forEach { payment ->
+                    appendLine("<tr>")
+                    appendLine("<td>${formatDate(payment.paymentDate)}</td>")
+                    appendLine("<td>${formatCurrency(payment.amount)}</td>")
+                    appendLine("<td>${getPaymentMethodText(payment.paymentMethod)}</td>")
+                    appendLine("<td>${getPaymentStatusText(payment.paymentStatus)}</td>")
+                    appendLine("</tr>")
+                }
+                
+                appendLine("</table>")
+                appendLine("</div>")
+            }
+            
+            // Footer
+            if (invoice.notes != null) {
+                appendLine("<div class='notes'>")
+                appendLine("<h3>ملاحظات</h3>")
+                appendLine("<p>${invoice.notes}</p>")
+                appendLine("</div>")
+            }
+            
+            appendLine("</body>")
+            appendLine("</html>")
+        }
+        
+        // Convert HTML to PDF (in real implementation, use proper PDF library)
+        return htmlContent.toByteArray(Charsets.UTF_8)
+    }
+    
+    private fun createExcelContent(
+        invoice: Invoice,
+        paymentHistory: List<Payment>,
+        request: ExportInvoiceRequest
+    ): ByteArray {
+        // In a real implementation, this would use Apache POI or similar Excel library
+        // For now, we'll create a simple CSV-like format that can be opened in Excel
+        
+        val csvContent = buildString {
+            // Invoice Header
+            appendLine("فاتورة رقم,${invoice.invoiceNumber}")
+            appendLine("تاريخ الإصدار,${formatDate(invoice.issueDate)}")
+            appendLine("تاريخ الاستحقاق,${formatDate(invoice.dueDate)}")
+            appendLine("الحالة,${getStatusText(invoice.status)}")
+            appendLine()
+            
+            // Customer Info
+            appendLine("معلومات العميل")
+            appendLine("الاسم,${invoice.customerName}")
+            appendLine("البريد الإلكتروني,${invoice.customerEmail}")
+            appendLine("الهاتف,${invoice.customerPhone}")
+            appendLine("العنوان,${invoice.customerAddress}")
+            appendLine()
+            
+            // Items
+            appendLine("الوصف,الكمية,السعر,الإجمالي")
+            invoice.items.forEach { item ->
+                appendLine("${item.description},${item.quantity},${item.unitPrice},${item.totalPrice}")
+            }
+            appendLine()
+            
+            // Totals
+            appendLine("الإجماليات")
+            appendLine("المجموع الفرعي,${invoice.subtotal}")
+            appendLine("الضريبة,${invoice.taxAmount}")
+            appendLine("الخصم,${invoice.discountAmount}")
+            appendLine("الإجمالي,${invoice.totalAmount}")
+            appendLine()
+            
+            // Payment History (if included)
+            if (paymentHistory.isNotEmpty()) {
+                appendLine("سجل الدفعات")
+                appendLine("تاريخ الدفع,المبلغ,طريقة الدفع,الحالة")
+                paymentHistory.forEach { payment ->
+                    appendLine("${formatDate(payment.paymentDate)},${payment.amount},${getPaymentMethodText(payment.paymentMethod)},${getPaymentStatusText(payment.paymentStatus)}")
+                }
+            }
+        }
+        
+        return csvContent.toByteArray(Charsets.UTF_8)
+    }
+    
+    private fun createCSVContent(
+        invoice: Invoice,
+        paymentHistory: List<Payment>,
+        request: ExportInvoiceRequest
+    ): ByteArray {
+        val csvContent = buildString {
+            // Header
+            appendLine("Invoice Number,Customer Name,Issue Date,Due Date,Status,Subtotal,Tax,Discount,Total")
+            
+            // Invoice Data
+            appendLine("${invoice.invoiceNumber},${invoice.customerName},${formatDate(invoice.issueDate)},${formatDate(invoice.dueDate)},${getStatusText(invoice.status)},${invoice.subtotal},${invoice.taxAmount},${invoice.discountAmount},${invoice.totalAmount}")
+            appendLine()
+            
+            // Items Header
+            appendLine("Description,Quantity,Unit Price,Total Price,Item Type")
+            
+            // Items Data
+            invoice.items.forEach { item ->
+                appendLine("${item.description},${item.quantity},${item.unitPrice},${item.totalPrice},${item.itemType}")
+            }
+            
+            // Payment History (if included)
+            if (paymentHistory.isNotEmpty()) {
+                appendLine()
+                appendLine("Payment Date,Amount,Payment Method,Status,Transaction ID")
+                paymentHistory.forEach { payment ->
+                    appendLine("${formatDate(payment.paymentDate)},${payment.amount},${getPaymentMethodText(payment.paymentMethod)},${getPaymentStatusText(payment.paymentStatus)},${payment.transactionId}")
+                }
+            }
+        }
+        
+        return csvContent.toByteArray(Charsets.UTF_8)
+    }
+    
+    private fun formatDate(timestamp: Long): String {
+        return java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date(timestamp))
+    }
+    
+    private fun formatCurrency(amount: Double): String {
+        return String.format("%.2f ر.س", amount)
+    }
+    
+    private fun getStatusText(status: InvoiceStatus): String {
+        return when (status) {
+            InvoiceStatus.DRAFT -> "مسودة"
+            InvoiceStatus.ISSUED -> "صادرة"
+            InvoiceStatus.SENT -> "مرسلة"
+            InvoiceStatus.PAID -> "مدفوعة"
+            InvoiceStatus.PARTIALLY_PAID -> "مدفوعة جزئياً"
+            InvoiceStatus.OVERDUE -> "متأخرة"
+            InvoiceStatus.CANCELLED -> "ملغاة"
+            InvoiceStatus.REFUNDED -> "مستردة"
+        }
+    }
+    
+    private fun getPaymentMethodText(method: PaymentMethod): String {
+        return when (method) {
+            PaymentMethod.CREDIT_CARD -> "بطاقة ائتمان"
+            PaymentMethod.DEBIT_CARD -> "بطاقة خصم مباشر"
+            PaymentMethod.BANK_TRANSFER -> "تحويل بنكي"
+            PaymentMethod.CASH -> "نقدي"
+            PaymentMethod.CHECK -> "شيك"
+            PaymentMethod.ONLINE_PAYMENT -> "دفع إلكتروني"
+            PaymentMethod.MOBILE_WALLET -> "محفظة جوال"
+            PaymentMethod.CRYPTOCURRENCY -> "عملة مشفرة"
+        }
+    }
+    
+    private fun getPaymentStatusText(status: PaymentStatus): String {
+        return when (status) {
+            PaymentStatus.PENDING -> "قيد الانتظار"
+            PaymentStatus.PROCESSING -> "قيد المعالجة"
+            PaymentStatus.COMPLETED -> "مكتمل"
+            PaymentStatus.FAILED -> "فشل"
+            PaymentStatus.CANCELLED -> "ملغي"
+            PaymentStatus.REFUNDED -> "مسترد"
+            PaymentStatus.PARTIALLY_REFUNDED -> "مسترد جزئياً"
+        }
+    }
+}

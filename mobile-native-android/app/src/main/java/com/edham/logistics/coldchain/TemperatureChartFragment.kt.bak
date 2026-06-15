@@ -1,0 +1,520 @@
+package com.edham.logistics.coldchain
+
+import android.graphics.Color
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as ComposeColor
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import com.github.mikephil.charting.charts.LineChart
+import com.github.mikephil.charting.components.LimitLine
+import com.github.mikephil.charting.components.XAxis
+import com.github.mikephil.charting.components.YAxis
+import com.github.mikephil.charting.data.Entry
+import com.github.mikephil.charting.data.LineData
+import com.github.mikephil.charting.data.LineDataSet
+import kotlinx.coroutines.launch
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+/**
+ * Temperature Chart Fragment - Historical Temperature Visualization
+ */
+class TemperatureChartFragment : Fragment() {
+    
+    private val viewModel: SmartCoolingAlertViewModel by viewModels()
+    private var selectedShipmentId: String? = null
+    private var selectedProductType: String = "REFRIGERATED"
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        return ComposeView(requireContext()).apply {
+            setContent {
+                TemperatureChartScreen(
+                    viewModel = viewModel,
+                    selectedShipmentId = selectedShipmentId,
+                    selectedProductType = selectedProductType,
+                    onShipmentSelected = { shipmentId, productType ->
+                        selectedShipmentId = shipmentId
+                        selectedProductType = productType
+                    }
+                )
+            }
+        }
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Get shipment ID from arguments if available
+        arguments?.getString("shipmentId")?.let { shipmentId ->
+            selectedShipmentId = shipmentId
+        }
+        
+        arguments?.getString("productType")?.let { productType ->
+            selectedProductType = productType
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TemperatureChartScreen(
+    viewModel: SmartCoolingAlertViewModel,
+    selectedShipmentId: String?,
+    selectedProductType: String,
+    onShipmentSelected: (String, String) -> Unit
+) {
+    val temperatureHistory by viewModel.temperatureHistory.collectAsState()
+    val isLoading by viewModel.isLoading.collectAsState()
+    val error by viewModel.error.collectAsState()
+    
+    val scope = rememberCoroutineScope()
+    var selectedTimeRange by remember { mutableStateOf(24) } // hours
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(ComposeColor.Black)
+            .padding(16.dp)
+    ) {
+        // Header
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "📈 مخطط درجة الحرارة التاريخي",
+                color = ComposeColor.White,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold
+            )
+            
+            IconButton(
+                onClick = { scope.launch { viewModel.refreshData() } }
+            ) {
+                Icon(
+                    Icons.Default.Refresh,
+                    contentDescription = "Refresh",
+                    tint = ComposeColor(0xFFF97316)
+                )
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        // Shipment Selection
+        ShipmentSelectionCard(
+            selectedShipmentId = selectedShipmentId,
+            selectedProductType = selectedProductType,
+            onShipmentSelected = onShipmentSelected
+        )
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        // Time Range Selection
+        TimeRangeSelectionCard(
+            selectedTimeRange = selectedTimeRange,
+            onTimeRangeSelected = { selectedTimeRange = it }
+        )
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        // Temperature Chart
+        selectedShipmentId?.let { shipmentId ->
+            TemperatureChartCard(
+                shipmentId = shipmentId,
+                productType = selectedProductType,
+                timeRange = selectedTimeRange,
+                viewModel = viewModel
+            )
+        } ?: run {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = ComposeColor(0xFF1F2937))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        Icons.Default.Info,
+                        contentDescription = "No Shipment Selected",
+                        tint = ComposeColor(0xFF6B7280),
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = "يرجى اختيار شحنة لعرض مخطط درجة الحرارة",
+                        color = ComposeColor.White,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+        
+        // Error message
+        error?.let {
+            Spacer(modifier = Modifier.height(16.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = ComposeColor(0xFFEF4444))
+            ) {
+                Text(
+                    text = it,
+                    color = ComposeColor.White,
+                    modifier = Modifier.padding(16.dp)
+                )
+            }
+        }
+        
+        // Loading indicator
+        if (isLoading) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(color = ComposeColor(0xFFF97316))
+            }
+        }
+    }
+}
+
+@Composable
+fun ShipmentSelectionCard(
+    selectedShipmentId: String?,
+    selectedProductType: String,
+    onShipmentSelected: (String, String) -> Unit
+) {
+    // Mock shipment list - in real app, this would come from repository
+    val shipments = listOf(
+        "SHIP001" to "FROZEN",
+        "SHIP002" to "REFRIGERATED", 
+        "SHIP003" to "AMBIENT",
+        "SHIP004" to "PHARMACEUTICAL",
+        "SHIP005" to "REFRIGERATED"
+    )
+    
+    var expanded by remember { mutableStateOf(false) }
+    
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = ComposeColor(0xFF1F2937))
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "اختيار الشحنة",
+                color = ComposeColor.White,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(8.dp))
+            
+            ExposedDropdownMenuBox(
+                expanded = expanded,
+                onExpandedChange = { expanded = !expanded }
+            ) {
+                OutlinedTextField(
+                    value = selectedShipmentId ?: "اختر شحنة",
+                    onValueChange = { },
+                    readOnly = true,
+                    trailingIcon = {
+                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded)
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = ComposeColor(0xFFF97316),
+                        unfocusedBorderColor = ComposeColor(0xFF4B5563),
+                        textColor = ComposeColor.White
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .menuAnchor()
+                )
+                
+                ExposedDropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false }
+                ) {
+                    shipments.forEach { (shipmentId, productType) ->
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text(
+                                        text = shipmentId,
+                                        color = ComposeColor.Black
+                                    )
+                                    Text(
+                                        text = productType,
+                                        color = ComposeColor.Gray,
+                                        fontSize = 12.sp
+                                    )
+                                }
+                            },
+                            onClick = {
+                                onShipmentSelected(shipmentId, productType)
+                                expanded = false
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TimeRangeSelectionCard(
+    selectedTimeRange: Int,
+    onTimeRangeSelected: (Int) -> Unit
+) {
+    val timeRanges = listOf(
+        1 to "ساعة واحدة",
+        6 to "6 ساعات",
+        12 to "12 ساعة",
+        24 to "24 ساعة",
+        48 to "يومان",
+        168 to "أسبوع"
+    )
+    
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = ComposeColor(0xFF1F2937))
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "نطاق الوقت",
+                color = ComposeColor.White,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(8.dp))
+            
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(timeRanges.size) { index ->
+                    val (hours, label) = timeRanges[index]
+                    FilterChip(
+                        selected = selectedTimeRange == hours,
+                        onClick = { onTimeRangeSelected(hours) },
+                        label = {
+                            Text(
+                                text = label,
+                                color = if (selectedTimeRange == hours) ComposeColor.Black else ComposeColor.White
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = ComposeColor(0xFFF97316),
+                            selectedLabelColor = ComposeColor.Black
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TemperatureChartCard(
+    shipmentId: String,
+    productType: String,
+    timeRange: Int,
+    viewModel: SmartCoolingAlertViewModel
+) {
+    val temperatureHistory = viewModel.getTemperatureHistory(shipmentId, timeRange)
+    val chartData = viewModel.getTemperatureChartData(shipmentId, timeRange)
+    val thresholdLines = viewModel.getThresholdLines(productType)
+    
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(300.dp),
+        colors = CardDefaults.cardColors(containerColor = ComposeColor(0xFF1F2937))
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "مخطط درجة الحرارة",
+                    color = ComposeColor.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                
+                Text(
+                    text = "آخر $timeRange ساعة",
+                    color = ComposeColor(0xFF9CA3AF),
+                    fontSize = 12.sp
+                )
+            }
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            // Chart placeholder - in real implementation, this would be a custom chart view
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(200.dp)
+                    .background(ComposeColor(0xFF111827), RoundedCornerShape(8.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        Icons.Default.ShowChart,
+                        contentDescription = "Temperature Chart",
+                        tint = ComposeColor(0xFFF97316),
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "مخطط تفاعلي لدرجة الحرارة",
+                        color = ComposeColor.White,
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        text = "${temperatureHistory.size} نقطة بيانات",
+                        color = ComposeColor(0xFF9CA3AF),
+                        fontSize = 12.sp
+                    )
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            // Chart statistics
+            if (temperatureHistory.isNotEmpty()) {
+                val temperatures = temperatureHistory.map { it.temperature }
+                val avgTemp = temperatures.average()
+                val minTemp = temperatures.minOrNull() ?: 0.0
+                val maxTemp = temperatures.maxOrNull() ?: 0.0
+                
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    StatItem(
+                        label = "متوسط",
+                        value = String.format("%.1f°C", avgTemp),
+                        color = ComposeColor(0xFFF97316)
+                    )
+                    StatItem(
+                        label = "أدنى",
+                        value = String.format("%.1f°C", minTemp),
+                        color = ComposeColor(0xFF3B82F6)
+                    )
+                    StatItem(
+                        label = "أعلى",
+                        value = String.format("%.1f°C", maxTemp),
+                        color = ComposeColor(0xFFEF4444)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun StatItem(
+    label: String,
+    value: String,
+    color: ComposeColor
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = value,
+            color = ComposeColor.White,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            text = label,
+            color = color,
+            fontSize = 12.sp
+        )
+    }
+}
+
+/**
+ * Custom LineChart View for Android
+ * This would be used in a real implementation with proper chart library
+ */
+class CustomTemperatureChart : LineChart {
+    
+    constructor(context: android.content.Context) : super(context)
+    constructor(context: android.content.Context, attrs: android.util.AttributeSet?) : super(context, attrs)
+    constructor(context: android.content.Context, attrs: android.util.AttributeSet?, defStyle: Int) : super(context, attrs, defStyle)
+    
+    fun setupChart(chartData: LineData, thresholdLines: List<LimitLine>) {
+        // Configure chart appearance
+        description.isEnabled = false
+        legend.isEnabled = true
+        setTouchEnabled(true)
+        isDragEnabled = true
+        setScaleEnabled(true)
+        setDrawGridBackground(false)
+        
+        // Configure axes
+        xAxis.apply {
+            position = XAxis.XAxisPosition.BOTTOM
+            setDrawGridLines(false)
+            granularity = 1f
+            textColor = Color.WHITE
+        }
+        
+        axisLeft.apply {
+            setDrawGridLines(true)
+            gridColor = Color.parseColor("#374151")
+            textColor = Color.WHITE
+            
+            // Add threshold lines
+            thresholdLines.forEach { limitLine ->
+                addLimitLine(limitLine)
+            }
+        }
+        
+        axisRight.isEnabled = false
+        
+        // Set data
+        data = chartData
+        
+        // Refresh
+        invalidate()
+    }
+}

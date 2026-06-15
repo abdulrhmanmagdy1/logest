@@ -1,0 +1,281 @@
+package com.edham.logistics.feature.driver.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.databinding.FragmentDriverDashboardBinding
+import com.edham.logistics.feature.driver.presentation.ui.DriverDashboardViewModel
+import com.edham.logistics.feature.driver.presentation.adapter.AssignedTripsAdapter
+import com.edham.logistics.feature.driver.presentation.adapter.RecentDeliveriesAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class DriverDashboardFragment : Fragment() {
+
+    private var _binding: FragmentDriverDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: DriverDashboardViewModel by viewModels()
+    
+    @Inject
+    lateinit var assignedTripsAdapter: AssignedTripsAdapter
+    
+    @Inject
+    lateinit var recentDeliveriesAdapter: RecentDeliveriesAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentDriverDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupAdapters()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize with driver ID (in real app, get from session)
+        viewModel.initialize("driver_123")
+    }
+
+    private fun setupAdapters() {
+        assignedTripsAdapter = AssignedTripsAdapter { trip, action ->
+            when (action) {
+                "accept" -> viewModel.acceptTrip(trip.id)
+                "reject" -> viewModel.rejectTrip(trip.id)
+                "start" -> viewModel.startTrip(trip.id)
+                "details" -> navigateToTripDetails(trip.id)
+                "navigation" -> navigateToNavigation(trip.id)
+            }
+        }
+        
+        recentDeliveriesAdapter = RecentDeliveriesAdapter { trip ->
+            navigateToTripDetails(trip.id)
+        }
+        
+        binding.recyclerViewAssignedTrips.apply {
+            adapter = assignedTripsAdapter
+            layoutManager = LinearLayoutManager(requireContext())
+        }
+        
+        binding.recyclerViewRecentDeliveries.apply {
+            adapter = recentDeliveriesAdapter
+            layoutManager = LinearLayoutManager(requireContext())
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refresh()
+        }
+        
+        binding.textViewViewAllTrips.setOnClickListener {
+            navigateToAllTrips()
+        }
+        
+        binding.textViewViewAllDeliveries.setOnClickListener {
+            navigateToAllDeliveries()
+        }
+        
+        binding.cardActiveTrip.setOnClickListener {
+            uiState.value.dashboardData?.activeTrip?.let { trip ->
+                navigateToActiveTrip(trip.id)
+            }
+        }
+    }
+
+    private fun updateUI(uiState: DriverDashboardViewModel.DriverDashboardUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+        
+        // Show success messages
+        uiState.actionSuccess?.let { message ->
+            showSnackbar(message)
+            viewModel.clearSuccess()
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.scrollView.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.scrollView.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.scrollView.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refresh()
+        }
+    }
+
+    private fun showContent(uiState: DriverDashboardViewModel.DriverDashboardUiState) {
+        binding.progressBar.gone()
+        binding.scrollView.alpha = 1.0f
+        binding.scrollView.visible()
+        binding.layoutError.gone()
+        
+        uiState.dashboardData?.let { dashboard ->
+            updateDriverInfo(dashboard.driverInfo)
+            updateTodayStats(dashboard.todayStats)
+            updateAssignedTrips(dashboard.assignedTrips)
+            updateActiveTrip(dashboard.activeTrip)
+            updateRecentDeliveries(dashboard.recentDeliveries)
+        }
+    }
+
+    private fun updateDriverInfo(driverInfo: DriverInfo) {
+        binding.textDriverName.text = driverInfo.name
+        binding.textDriverPhone.text = driverInfo.phone
+        binding.textVehicleInfo.text = "${driverInfo.vehicleInfo.type} - ${driverInfo.vehicleInfo.licensePlate}"
+        
+        // Update online status
+        if (driverInfo.isOnline) {
+            binding.textOnlineStatus.text = "متصل"
+            binding.textOnlineStatus.setTextColor(android.graphics.Color.parseColor("#4CAF50"))
+        } else {
+            binding.textOnlineStatus.text = "غير متصل"
+            binding.textOnlineStatus.setTextColor(android.graphics.Color.parseColor("#F44336"))
+        }
+    }
+
+    private fun updateTodayStats(stats: TodayStats) {
+        binding.textCompletedTrips.text = stats.completedTrips.toString()
+        binding.textTotalDistance.text = "${String.format("%.1f", stats.totalDistance)} كم"
+        binding.textTotalEarnings.text = "${String.format("%.2f", stats.totalEarnings)} ريال"
+        binding.textAverageRating.text = String.format("%.1f", stats.averageRating)
+    }
+
+    private fun updateAssignedTrips(trips: List<DriverTrip>) {
+        assignedTripsAdapter.submitList(trips)
+        
+        if (trips.isEmpty()) {
+            binding.layoutEmptyAssignedTrips.visible()
+            binding.recyclerViewAssignedTrips.gone()
+        } else {
+            binding.layoutEmptyAssignedTrips.gone()
+            binding.recyclerViewAssignedTrips.visible()
+        }
+    }
+
+    private fun updateActiveTrip(activeTrip: DriverTrip?) {
+        if (activeTrip != null) {
+            binding.cardActiveTrip.visible()
+            binding.textActiveTripNumber.text = activeTrip.trackingNumber
+            binding.textActiveTripCustomer.text = activeTrip.customerName
+            binding.textActiveTripStatus.text = formatTripStatus(activeTrip.status)
+            binding.textActiveTripStatus.setTextColor(getTripStatusColor(activeTrip.status))
+        } else {
+            binding.cardActiveTrip.gone()
+        }
+    }
+
+    private fun updateRecentDeliveries(deliveries: List<DriverTrip>) {
+        recentDeliveriesAdapter.submitList(deliveries)
+        
+        if (deliveries.isEmpty()) {
+            binding.layoutEmptyRecentDeliveries.visible()
+            binding.recyclerViewRecentDeliveries.gone()
+        } else {
+            binding.layoutEmptyRecentDeliveries.gone()
+            binding.recyclerViewRecentDeliveries.visible()
+        }
+    }
+
+    private fun formatTripStatus(status: TripStatus): String {
+        return when (status) {
+            TripStatus.ASSIGNED -> "مخصص"
+            TripStatus.ACCEPTED -> "مقبول"
+            TripStatus.REJECTED -> "مرفوض"
+            TripStatus.STARTED -> "بدأت"
+            TripStatus.IN_TRANSIT -> "قيد النقل"
+            TripStatus.ARRIVED -> "وصلت"
+            TripStatus.DELIVERED -> "تم التسليم"
+            TripStatus.CANCELLED -> "ملغية"
+        }
+    }
+
+    private fun getTripStatusColor(status: TripStatus): Int {
+        return when (status) {
+            TripStatus.ASSIGNED -> android.graphics.Color.parseColor("#FF9800")
+            TripStatus.ACCEPTED -> android.graphics.Color.parseColor("#2196F3")
+            TripStatus.REJECTED -> android.graphics.Color.parseColor("#F44336")
+            TripStatus.STARTED -> android.graphics.Color.parseColor("#4CAF50")
+            TripStatus.IN_TRANSIT -> android.graphics.Color.parseColor("#2196F3")
+            TripStatus.ARRIVED -> android.graphics.Color.parseColor("#9C27B0")
+            TripStatus.DELIVERED -> android.graphics.Color.parseColor("#4CAF50")
+            TripStatus.CANCELLED -> android.graphics.Color.parseColor("#F44336")
+        }
+    }
+
+    private fun navigateToTripDetails(tripId: String) {
+        val action = DriverDashboardFragmentDirections
+            .actionDriverDashboardFragmentToTripDetailsFragment(tripId)
+        findNavController().navigate(action)
+    }
+
+    private fun navigateToNavigation(tripId: String) {
+        val action = DriverDashboardFragmentDirections
+            .actionDriverDashboardFragmentToNavigationFragment(tripId)
+        findNavController().navigate(action)
+    }
+
+    private fun navigateToActiveTrip(tripId: String) {
+        val action = DriverDashboardFragmentDirections
+            .actionDriverDashboardFragmentToActiveTripFragment(tripId)
+        findNavController().navigate(action)
+    }
+
+    private fun navigateToAllTrips() {
+        val action = DriverDashboardFragmentDirections
+            .actionDriverDashboardFragmentToAllTripsFragment()
+        findNavController().navigate(action)
+    }
+
+    private fun navigateToAllDeliveries() {
+        val action = DriverDashboardFragmentDirections
+            .actionDriverDashboardFragmentToRecentDeliveriesFragment()
+        findNavController().navigate(action)
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

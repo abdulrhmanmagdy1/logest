@@ -1,0 +1,309 @@
+package com.edham.logistics.feature.billing.domain.usecase
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.billing.domain.model.*
+import com.edham.logistics.feature.billing.domain.repository.BillingRepository
+import javax.inject.Inject
+
+class GenerateInvoiceUseCase @Inject constructor(
+    private val billingRepository: BillingRepository
+) {
+    
+    suspend operator fun invoke(request: GenerateInvoiceRequest): Result<Invoice> {
+        return try {
+            // Generate invoice automatically based on shipment data
+            val invoice = when (request.autoCalculate) {
+                true -> generateAutoInvoice(request.shipmentId, request.customItems)
+                false -> generateCustomInvoice(request.shipmentId, request.customItems)
+            }
+            
+            // Save the invoice
+            billingRepository.createInvoice(invoice)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun generateAutoInvoice(shipmentId: String, customItems: List<CreateInvoiceItemRequest>?): Invoice {
+        // Get shipment details
+        val shipment = billingRepository.getShipmentById(shipmentId)
+        if (shipment is Result.Error) {
+            throw Exception("Failed to get shipment details")
+        }
+        
+        val shipmentData = (shipment as Result.Success).data
+        
+        // Get billing settings
+        val settings = billingRepository.getBillingSettings()
+        if (settings is Result.Error) {
+            throw Exception("Failed to get billing settings")
+        }
+        
+        val billingSettings = (settings as Result.Success).data
+        
+        // Calculate base shipping fee
+        val baseShippingFee = calculateShippingFee(shipmentData)
+        
+        // Create invoice items
+        val items = mutableListOf<InvoiceItem>()
+        
+        // Add shipping fee
+        items.add(InvoiceItem(
+            id = "item_shipping",
+            invoiceId = "", // Will be set later
+            description = "رسوم الشحن من ${shipmentData.pickupLocation} إلى ${shipmentData.deliveryLocation}",
+            quantity = 1,
+            unitPrice = baseShippingFee,
+            totalPrice = baseShippingFee,
+            itemType = InvoiceItemType.SHIPPING_FEE,
+            metadata = mapOf(
+                "shipmentId" to shipmentId,
+                "distance" to shipmentData.distance,
+                "weight" to shipmentData.weight
+            )
+        ))
+        
+        // Add insurance if applicable
+        if (shipmentData.insuranceValue > 0) {
+            val insuranceFee = calculateInsuranceFee(shipmentData.insuranceValue)
+            items.add(InvoiceItem(
+                id = "item_insurance",
+                invoiceId = "", // Will be set later
+                description = "تأمين الشحنة (قيمة: ${shipmentData.insuranceValue} ر.س)",
+                quantity = 1,
+                unitPrice = insuranceFee,
+                totalPrice = insuranceFee,
+                itemType = InvoiceItemType.INSURANCE,
+                metadata = mapOf(
+                    "insuranceValue" to shipmentData.insuranceValue,
+                    "insuranceRate" to 0.05 // 5% insurance rate
+                )
+            ))
+        }
+        
+        // Add fuel surcharge
+        val fuelSurcharge = calculateFuelSurcharge(baseShippingFee)
+        if (fuelSurcharge > 0) {
+            items.add(InvoiceItem(
+                id = "item_fuel",
+                invoiceId = "", // Will be set later
+                description = "رسوم الوقود الإضافية",
+                quantity = 1,
+                unitPrice = fuelSurcharge,
+                totalPrice = fuelSurcharge,
+                itemType = InvoiceItemType.FUEL_SURCHARGE,
+                metadata = mapOf(
+                    "baseFee" to baseShippingFee,
+                    "fuelRate" to 0.15 // 15% fuel surcharge
+                )
+            ))
+        }
+        
+        // Add custom items if provided
+        customItems?.forEach { customItem ->
+            items.add(InvoiceItem(
+                id = "item_custom_${items.size}",
+                invoiceId = "", // Will be set later
+                description = customItem.description,
+                quantity = customItem.quantity,
+                unitPrice = customItem.unitPrice,
+                totalPrice = customItem.quantity * customItem.unitPrice,
+                itemType = customItem.itemType,
+                metadata = emptyMap()
+            ))
+        }
+        
+        // Calculate totals
+        val subtotal = items.sumOf { it.totalPrice }
+        val taxAmount = subtotal * billingSettings.taxRate
+        val totalAmount = subtotal + taxAmount
+        
+        // Generate invoice number
+        val invoiceNumber = generateInvoiceNumber(billingSettings.invoicePrefix, billingSettings.invoiceNumberFormat)
+        
+        // Set due date (e.g., 30 days from issue date)
+        val issueDate = System.currentTimeMillis()
+        val dueDate = issueDate + (30L * 24 * 60 * 60 * 1000) // 30 days
+        
+        return Invoice(
+            id = "", // Will be generated by repository
+            invoiceNumber = invoiceNumber,
+            shipmentId = shipmentId,
+            customerId = shipmentData.customerId,
+            customerName = shipmentData.customerName,
+            customerEmail = shipmentData.customerEmail,
+            customerPhone = shipmentData.customerPhone,
+            customerAddress = shipmentData.customerAddress,
+            issueDate = issueDate,
+            dueDate = dueDate,
+            status = InvoiceStatus.DRAFT,
+            subtotal = subtotal,
+            taxAmount = taxAmount,
+            discountAmount = 0.0,
+            totalAmount = totalAmount,
+            currency = billingSettings.defaultCurrency,
+            items = items.map { it.copy(invoiceId = "") }, // Will be set by repository
+            paymentTerms = billingSettings.paymentTerms,
+            notes = null,
+            attachments = emptyList(),
+            createdBy = "system",
+            createdAt = issueDate,
+            updatedAt = issueDate,
+            paidAt = null,
+            paymentMethod = null,
+            transactionId = null,
+            metadata = mapOf(
+                "autoGenerated" to true,
+                "shipmentType" to shipmentData.type,
+                "shipmentPriority" to shipmentData.priority
+            )
+        )
+    }
+    
+    private suspend fun generateCustomInvoice(shipmentId: String, customItems: List<CreateInvoiceItemRequest>?): Invoice {
+        if (customItems == null || customItems.isEmpty()) {
+            throw Exception("Custom items are required for custom invoice generation")
+        }
+        
+        // Get shipment details
+        val shipment = billingRepository.getShipmentById(shipmentId)
+        if (shipment is Result.Error) {
+            throw Exception("Failed to get shipment details")
+        }
+        
+        val shipmentData = (shipment as Result.Success).data
+        
+        // Get billing settings
+        val settings = billingRepository.getBillingSettings()
+        if (settings is Result.Error) {
+            throw Exception("Failed to get billing settings")
+        }
+        
+        val billingSettings = (settings as Result.Success).data
+        
+        // Create invoice items from custom items
+        val items = customItems.mapIndexed { index, customItem ->
+            InvoiceItem(
+                id = "item_custom_$index",
+                invoiceId = "", // Will be set later
+                description = customItem.description,
+                quantity = customItem.quantity,
+                unitPrice = customItem.unitPrice,
+                totalPrice = customItem.quantity * customItem.unitPrice,
+                itemType = customItem.itemType,
+                metadata = emptyMap()
+            )
+        }
+        
+        // Calculate totals
+        val subtotal = items.sumOf { it.totalPrice }
+        val taxAmount = subtotal * billingSettings.taxRate
+        val totalAmount = subtotal + taxAmount
+        
+        // Generate invoice number
+        val invoiceNumber = generateInvoiceNumber(billingSettings.invoicePrefix, billingSettings.invoiceNumberFormat)
+        
+        // Set due date
+        val issueDate = System.currentTimeMillis()
+        val dueDate = issueDate + (30L * 24 * 60 * 60 * 1000) // 30 days
+        
+        return Invoice(
+            id = "", // Will be generated by repository
+            invoiceNumber = invoiceNumber,
+            shipmentId = shipmentId,
+            customerId = shipmentData.customerId,
+            customerName = shipmentData.customerName,
+            customerEmail = shipmentData.customerEmail,
+            customerPhone = shipmentData.customerPhone,
+            customerAddress = shipmentData.customerAddress,
+            issueDate = issueDate,
+            dueDate = dueDate,
+            status = InvoiceStatus.DRAFT,
+            subtotal = subtotal,
+            taxAmount = taxAmount,
+            discountAmount = 0.0,
+            totalAmount = totalAmount,
+            currency = billingSettings.defaultCurrency,
+            items = items.map { it.copy(invoiceId = "") }, // Will be set by repository
+            paymentTerms = billingSettings.paymentTerms,
+            notes = null,
+            attachments = emptyList(),
+            createdBy = "system",
+            createdAt = issueDate,
+            updatedAt = issueDate,
+            paidAt = null,
+            paymentMethod = null,
+            transactionId = null,
+            metadata = mapOf(
+                "autoGenerated" to false,
+                "customInvoice" to true
+            )
+        )
+    }
+    
+    private fun calculateShippingFee(shipment: ShipmentDetails): Double {
+        // Base rate per kilometer
+        val baseRatePerKm = 2.5 // ر.س per km
+        
+        // Weight-based multiplier
+        val weightMultiplier = when {
+            shipment.weight <= 10 -> 1.0
+            shipment.weight <= 50 -> 1.2
+            shipment.weight <= 100 -> 1.5
+            else -> 2.0
+        }
+        
+        // Priority-based multiplier
+        val priorityMultiplier = when (shipment.priority) {
+            "STANDARD" -> 1.0
+            "EXPRESS" -> 1.5
+            "URGENT" -> 2.0
+            else -> 1.0
+        }
+        
+        // Type-based multiplier
+        val typeMultiplier = when (shipment.type) {
+            "REGULAR" -> 1.0
+            "FRAGILE" -> 1.3
+            "PERISHABLE" -> 1.4
+            "HAZARDOUS" -> 2.0
+            else -> 1.0
+        }
+        
+        return shipment.distance * baseRatePerKm * weightMultiplier * priorityMultiplier * typeMultiplier
+    }
+    
+    private fun calculateInsuranceFee(insuranceValue: Double): Double {
+        // Insurance fee is 5% of insured value
+        return insuranceValue * 0.05
+    }
+    
+    private fun calculateFuelSurcharge(baseFee: Double): Double {
+        // Fuel surcharge is 15% of base fee
+        return baseFee * 0.15
+    }
+    
+    private fun generateInvoiceNumber(prefix: String, format: String): String {
+        // Simple implementation - in real app, this would be more sophisticated
+        val timestamp = System.currentTimeMillis()
+        val sequence = timestamp % 10000 // Simple sequence number
+        return "$prefix-${sequence.toString().padStart(4, '0')}"
+    }
+}
+
+// Helper data class for shipment details
+data class ShipmentDetails(
+    val id: String,
+    val customerId: String,
+    val customerName: String,
+    val customerEmail: String,
+    val customerPhone: String,
+    val customerAddress: String,
+    val pickupLocation: String,
+    val deliveryLocation: String,
+    val distance: Double,
+    val weight: Double,
+    val insuranceValue: Double,
+    val type: String,
+    val priority: String
+)

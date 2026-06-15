@@ -1,0 +1,910 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.MaintenanceApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Maintenance Alert Service - Specialized service for maintenance-related alerts
+ * 
+ * Features:
+ * - Maintenance due alerts
+ * - Maintenance overdue alerts
+ * - Emergency maintenance alerts
+ * - Maintenance completion alerts
+ * - Parts availability alerts
+ * - Workshop capacity alerts
+ * - Maintenance cost alerts
+ * - Maintenance scheduling alerts
+ */
+@Singleton
+class MaintenanceAlertService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val maintenanceApi: MaintenanceApi,
+    private val networkUtils: NetworkUtils,
+    private val smartNotificationManager: SmartNotificationManager
+) {
+    
+    private val _maintenanceAlertState = MutableStateFlow<MaintenanceAlertState>(MaintenanceAlertState.Idle)
+    val maintenanceAlertState: StateFlow<MaintenanceAlertState> = _maintenanceAlertState.asStateFlow()
+    
+    private val _activeMaintenanceAlerts = MutableStateFlow<List<MaintenanceAlert>>(emptyList())
+    val activeMaintenanceAlerts: StateFlow<List<MaintenanceAlert>> = _activeMaintenanceAlerts.asStateFlow()
+    
+    private val _maintenanceAnalytics = MutableStateFlow<MaintenanceAnalytics>(MaintenanceAnalytics())
+    val maintenanceAnalytics: StateFlow<MaintenanceAnalytics> = _maintenanceAnalytics.asStateFlow()
+    
+    private var isInitialized = false
+    private val maintenanceAlertListeners = mutableListOf<MaintenanceAlertListener>()
+    
+    companion object {
+        private const val TAG = "MaintenanceAlertService"
+        private const val MAINTENANCE_WARNING_DAYS = 7
+        private const val MAINTENANCE_CRITICAL_DAYS = 3
+        private const val MAINTENANCE_OVERDUE_DAYS = 1
+        private const val MAX_ACTIVE_MAINTENANCE_ALERTS = 50
+    }
+    
+    /**
+     * Initialize maintenance alert service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _maintenanceAlertState.value = MaintenanceAlertState.Initializing
+                
+                // Load maintenance alert configuration
+                loadMaintenanceAlertConfiguration()
+                
+                // Initialize maintenance rules
+                initializeMaintenanceRules()
+                
+                // Load active maintenance alerts
+                loadActiveMaintenanceAlerts()
+                
+                // Start maintenance monitoring
+                startMaintenanceMonitoring()
+                
+                isInitialized = true
+                _maintenanceAlertState.value = MaintenanceAlertState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _maintenanceAlertState.value = MaintenanceAlertState.Error("Failed to initialize maintenance alert service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create maintenance alert
+     */
+    suspend fun createMaintenanceAlert(
+        vehicleId: String,
+        maintenanceData: MaintenanceAlertData
+    ): Result<MaintenanceAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Maintenance alert service not initialized")
+                }
+                
+                // Validate maintenance data
+                validateMaintenanceAlertData(vehicleId, maintenanceData)
+                
+                // Determine alert severity
+                val severity = determineMaintenanceSeverity(maintenanceData)
+                
+                // Check for duplicate alerts
+                if (isDuplicateMaintenanceAlert(vehicleId, maintenanceData.maintenanceType, severity)) {
+                    throw Exception("Duplicate maintenance alert detected")
+                }
+                
+                // Create alert
+                val alert = MaintenanceAlert(
+                    id = UUID.randomUUID().toString(),
+                    vehicleId = vehicleId,
+                    maintenanceType = maintenanceData.maintenanceType,
+                    severity = severity,
+                    title = generateAlertTitle(maintenanceData),
+                    message = generateAlertMessage(maintenanceData),
+                    scheduledDate = maintenanceData.scheduledDate,
+                    estimatedCost = maintenanceData.estimatedCost,
+                    estimatedDuration = maintenanceData.estimatedDuration,
+                    workshopId = maintenanceData.workshopId,
+                    technicianId = maintenanceData.technicianId,
+                    partsRequired = maintenanceData.partsRequired,
+                    recipients = determineMaintenanceRecipients(vehicleId, severity, maintenanceData),
+                    metadata = maintenanceData.toMetadata(),
+                    status = MaintenanceAlertStatus.ACTIVE,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    acknowledgedAt = null,
+                    acknowledgedBy = null,
+                    resolvedAt = null,
+                    resolvedBy = null,
+                    resolution = null
+                )
+                
+                // Save alert to database
+                database.maintenanceAlertDao().insertAlert(alert.toEntity())
+                
+                // Add to active alerts
+                addToActiveMaintenanceAlerts(alert)
+                
+                // Process alert
+                processMaintenanceAlert(alert)
+                
+                // Update analytics
+                updateMaintenanceAnalytics()
+                
+                // Notify listeners
+                notifyMaintenanceAlertCreated(alert)
+                
+                Result.success(alert)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle maintenance due alert
+     */
+    suspend fun handleMaintenanceDue(
+        vehicleId: String,
+        maintenanceType: String,
+        dueDate: Date,
+        lastMaintenanceDate: Date
+    ): Result<MaintenanceAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get vehicle details
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId.toLong())
+                    ?: throw Exception("Vehicle not found")
+                
+                // Calculate days until due
+                val daysUntilDue = ((dueDate.time - Date().time) / (24 * 60 * 60 * 1000)).toInt()
+                
+                // Determine alert type based on days until due
+                val alertType = when {
+                    daysUntilDue <= MAINTENANCE_OVERDUE_DAYS -> MaintenanceAlertType.OVERDUE
+                    daysUntilDue <= MAINTENANCE_CRITICAL_DAYS -> MaintenanceAlertType.CRITICAL
+                    daysUntilDue <= MAINTENANCE_WARNING_DAYS -> MaintenanceAlertType.WARNING
+                    else -> MaintenanceAlertType.SCHEDULED
+                }
+                
+                // Create maintenance alert data
+                val maintenanceData = MaintenanceAlertData(
+                    maintenanceType = maintenanceType,
+                    scheduledDate = dueDate,
+                    lastMaintenanceDate = lastMaintenanceDate,
+                    daysUntilDue = daysUntilDue,
+                    alertType = alertType,
+                    urgency = determineUrgency(daysUntilDue),
+                    estimatedCost = estimateMaintenanceCost(vehicleId, maintenanceType),
+                    estimatedDuration = estimateMaintenanceDuration(maintenanceType),
+                    workshopId = null,
+                    technicianId = null,
+                    partsRequired = emptyList(),
+                    metadata = mapOf(
+                        "vehicleId" to vehicleId,
+                        "vehicleName" to vehicle.vehicleId,
+                        "mileage" to vehicle.mileage.toString(),
+                        "lastMaintenanceMileage" to vehicle.lastMaintenanceMileage.toString()
+                    )
+                )
+                
+                createMaintenanceAlert(vehicleId, maintenanceData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle emergency maintenance
+     */
+    suspend fun handleEmergencyMaintenance(
+        vehicleId: String,
+        issueType: String,
+        description: String,
+        location: String
+    ): Result<MaintenanceAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get vehicle details
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId.toLong())
+                    ?: throw Exception("Vehicle not found")
+                
+                // Create emergency maintenance alert data
+                val maintenanceData = MaintenanceAlertData(
+                    maintenanceType = "EMERGENCY",
+                    scheduledDate = Date(),
+                    lastMaintenanceDate = vehicle.lastMaintenanceDate,
+                    daysUntilDue = 0,
+                    alertType = MaintenanceAlertType.EMERGENCY,
+                    urgency = MaintenanceUrgency.EMERGENCY,
+                    issueType = issueType,
+                    description = description,
+                    location = location,
+                    estimatedCost = null,
+                    estimatedDuration = null,
+                    workshopId = null,
+                    technicianId = null,
+                    partsRequired = emptyList(),
+                    metadata = mapOf(
+                        "vehicleId" to vehicleId,
+                        "vehicleName" to vehicle.vehicleId,
+                        "currentMileage" to vehicle.mileage.toString(),
+                        "issueType" to issueType
+                    )
+                )
+                
+                createMaintenanceAlert(vehicleId, maintenanceData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle maintenance completion
+     */
+    suspend fun handleMaintenanceCompletion(
+        vehicleId: String,
+        maintenanceId: String,
+        maintenanceType: String,
+        actualCost: Float,
+        actualDuration: Int,
+        performedBy: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get active alerts for this vehicle and maintenance type
+                val activeAlerts = _activeMaintenanceAlerts.value.filter { 
+                    it.vehicleId == vehicleId && 
+                    it.maintenanceType == maintenanceType && 
+                    it.status == MaintenanceAlertStatus.ACTIVE 
+                }
+                
+                // Resolve all active alerts
+                activeAlerts.forEach { alert ->
+                    resolveMaintenanceAlert(
+                        alert.id,
+                        "SYSTEM",
+                        "Maintenance completed successfully",
+                        actualCost,
+                        actualDuration,
+                        performedBy
+                    )
+                }
+                
+                // Update vehicle maintenance records
+                updateVehicleMaintenanceRecord(vehicleId, maintenanceType, actualCost, actualDuration)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle parts shortage alert
+     */
+    suspend fun handlePartsShortage(
+        maintenanceId: String,
+        partsRequired: List<MaintenancePart>,
+        availableParts: List<MaintenancePart>
+    ): Result<MaintenanceAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Find missing parts
+                val missingParts = partsRequired.filter { required ->
+                    !availableParts.any { it.partId == required.partId && it.quantity >= required.quantity }
+                }
+                
+                if (missingParts.isEmpty()) {
+                    return@withContext Result.failure(Exception("No parts shortage detected"))
+                }
+                
+                // Get maintenance details
+                val maintenance = database.maintenanceDao().getMaintenanceById(maintenanceId.toLong())
+                    ?: throw Exception("Maintenance not found")
+                
+                // Create parts shortage alert data
+                val maintenanceData = MaintenanceAlertData(
+                    maintenanceType = maintenance.maintenanceType,
+                    scheduledDate = maintenance.scheduledDate,
+                    lastMaintenanceDate = Date(),
+                    daysUntilDue = 0,
+                    alertType = MaintenanceAlertType.PARTS_SHORTAGE,
+                    urgency = MaintenanceUrgency.HIGH,
+                    partsRequired = missingParts,
+                    estimatedCost = missingParts.sumOf { it.unitPrice * (it.quantity - (availableParts.find { vp -> vp.partId == it.partId }?.quantity ?: 0)) },
+                    estimatedDuration = null,
+                    workshopId = maintenance.workshopId,
+                    technicianId = maintenance.technicianId,
+                    metadata = mapOf(
+                        "maintenanceId" to maintenanceId,
+                        "vehicleId" to maintenance.vehicleId.toString(),
+                        "missingParts" to missingParts.joinToString(",") { "${it.partName} (${it.quantity})" }
+                    )
+                )
+                
+                createMaintenanceAlert(maintenance.vehicleId.toString(), maintenanceData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Resolve maintenance alert
+     */
+    suspend fun resolveMaintenanceAlert(
+        alertId: String,
+        resolvedBy: String,
+        resolution: String,
+        actualCost: Float? = null,
+        actualDuration: Int? = null,
+        performedBy: String? = null
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activeMaintenanceAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Maintenance alert not found")
+                
+                // Update alert status
+                val resolvedAlert = alert.copy(
+                    status = MaintenanceAlertStatus.RESOLVED,
+                    resolvedAt = Date(),
+                    resolvedBy = resolvedBy,
+                    resolution = resolution,
+                    actualCost = actualCost,
+                    actualDuration = actualDuration,
+                    performedBy = performedBy,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.maintenanceAlertDao().updateAlert(resolvedAlert.toEntity())
+                
+                // Remove from active alerts
+                removeFromActiveMaintenanceAlerts(alertId)
+                
+                // Update analytics
+                updateMaintenanceAnalytics()
+                
+                // Notify listeners
+                notifyMaintenanceAlertResolved(resolvedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get maintenance alerts by severity
+     */
+    suspend fun getMaintenanceAlertsBySeverity(severity: MaintenanceSeverity): List<MaintenanceAlert> {
+        return _activeMaintenanceAlerts.value.filter { it.severity == severity }
+    }
+    
+    /**
+     * Get maintenance alerts by vehicle
+     */
+    suspend fun getMaintenanceAlertsByVehicle(vehicleId: String): List<MaintenanceAlert> {
+        return _activeMaintenanceAlerts.value.filter { it.vehicleId == vehicleId }
+    }
+    
+    /**
+     * Get active maintenance alerts
+     */
+    suspend fun getActiveMaintenanceAlerts(): List<MaintenanceAlert> {
+        return _activeMaintenanceAlerts.value.filter { it.status == MaintenanceAlertStatus.ACTIVE }
+    }
+    
+    /**
+     * Get maintenance analytics
+     */
+    suspend fun getMaintenanceAnalytics(dateRange: DateRange = DateRange.last30Days()): Result<MaintenanceAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val analytics = database.maintenanceAlertDao().getMaintenanceAnalytics(dateRange.startDate, dateRange.endDate)
+                Result.success(analytics)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add maintenance alert listener
+     */
+    fun addMaintenanceAlertListener(listener: MaintenanceAlertListener) {
+        maintenanceAlertListeners.add(listener)
+    }
+    
+    /**
+     * Remove maintenance alert listener
+     */
+    fun removeMaintenanceAlertListener(listener: MaintenanceAlertListener) {
+        maintenanceAlertListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadMaintenanceAlertConfiguration() {
+        // Load maintenance alert configuration
+    }
+    
+    private suspend fun initializeMaintenanceRules() {
+        // Initialize maintenance rules
+    }
+    
+    private suspend fun loadActiveMaintenanceAlerts() {
+        try {
+            val alerts = database.maintenanceAlertDao().getActiveAlerts()
+                .map { it.toDomainModel() }
+                .sortedByDescending { it.createdAt }
+                .take(MAX_ACTIVE_MAINTENANCE_ALERTS)
+            
+            _activeMaintenanceAlerts.value = alerts
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun startMaintenanceMonitoring() {
+        // Start maintenance monitoring
+    }
+    
+    private fun validateMaintenanceAlertData(vehicleId: String, maintenanceData: MaintenanceAlertData) {
+        if (vehicleId.isBlank()) throw Exception("Vehicle ID cannot be empty")
+        if (maintenanceData.maintenanceType.isBlank()) throw Exception("Maintenance type cannot be empty")
+    }
+    
+    private fun determineMaintenanceSeverity(maintenanceData: MaintenanceAlertData): MaintenanceSeverity {
+        return when (maintenanceData.alertType) {
+            MaintenanceAlertType.EMERGENCY -> MaintenanceSeverity.CRITICAL
+            MaintenanceAlertType.OVERDUE -> MaintenanceSeverity.SEVERE
+            MaintenanceAlertType.CRITICAL -> MaintenanceSeverity.HIGH
+            MaintenanceAlertType.WARNING -> MaintenanceSeverity.MEDIUM
+            MaintenanceAlertType.PARTS_SHORTAGE -> MaintenanceSeverity.HIGH
+            MaintenanceAlertType.SCHEDULED -> MaintenanceSeverity.LOW
+            else -> MaintenanceSeverity.LOW
+        }
+    }
+    
+    private fun isDuplicateMaintenanceAlert(vehicleId: String, maintenanceType: String, severity: MaintenanceSeverity): Boolean {
+        val cutoffTime = Date(System.currentTimeMillis() - 10 * 60 * 1000L) // 10 minutes
+        return _activeMaintenanceAlerts.value.any { alert ->
+            alert.vehicleId == vehicleId &&
+            alert.maintenanceType == maintenanceType &&
+            alert.severity == severity &&
+            alert.createdAt.after(cutoffTime)
+        }
+    }
+    
+    private fun determineUrgency(daysUntilDue: Int): MaintenanceUrgency {
+        return when {
+            daysUntilDue <= 0 -> MaintenanceUrgency.EMERGENCY
+            daysUntilDue <= MAINTENANCE_CRITICAL_DAYS -> MaintenanceUrgency.CRITICAL
+            daysUntilDue <= MAINTENANCE_WARNING_DAYS -> MaintenanceUrgency.HIGH
+            else -> MaintenanceUrgency.NORMAL
+        }
+    }
+    
+    private fun estimateMaintenanceCost(vehicleId: String, maintenanceType: String): Float {
+        // This would use historical data or predefined cost estimates
+        return when (maintenanceType) {
+            "OIL_CHANGE" -> 150f
+            "TIRE_REPLACEMENT" -> 800f
+            "BRAKE_SERVICE" -> 300f
+            "GENERAL_SERVICE" -> 200f
+            else -> 250f
+        }
+    }
+    
+    private fun estimateMaintenanceDuration(maintenanceType: String): Int {
+        // This would use historical data or predefined duration estimates
+        return when (maintenanceType) {
+            "OIL_CHANGE" -> 60
+            "TIRE_REPLACEMENT" -> 120
+            "BRAKE_SERVICE" -> 90
+            "GENERAL_SERVICE" -> 180
+            else -> 120
+        }
+    }
+    
+    private fun determineMaintenanceRecipients(
+        vehicleId: String,
+        severity: MaintenanceSeverity,
+        maintenanceData: MaintenanceAlertData
+    ): List<NotificationRecipient> {
+        val recipients = mutableListOf<NotificationRecipient>()
+        
+        // Get vehicle details
+        val vehicle = database.vehicleDao().getVehicleById(vehicleId.toLong())
+        
+        // Always notify admin for critical alerts
+        if (severity == MaintenanceSeverity.CRITICAL || severity == MaintenanceSeverity.SEVERE) {
+            recipients.add(
+                NotificationRecipient(
+                    id = "maintenance_admin",
+                    type = RecipientType.ADMIN,
+                    address = "maintenance@edham.com",
+                    name = "Maintenance Admin"
+                )
+            )
+        }
+        
+        // Notify driver if vehicle is assigned
+        vehicle?.driverId?.let { driverId ->
+            recipients.add(
+                NotificationRecipient(
+                    id = driverId,
+                    type = RecipientType.DRIVER,
+                    address = "",
+                    name = "Driver"
+                )
+            )
+        }
+        
+        // Notify workshop if assigned
+        maintenanceData.workshopId?.let { workshopId ->
+            val workshop = database.workshopDao().getWorkshopById(workshopId.toLong())
+            workshop?.let {
+                recipients.add(
+                    NotificationRecipient(
+                        id = workshopId,
+                        type = RecipientType.ADMIN,
+                        address = workshop.email,
+                        name = workshop.name
+                    )
+                )
+            }
+        }
+        
+        // Notify technician if assigned
+        maintenanceData.technicianId?.let { technicianId ->
+            val technician = database.technicianDao().getTechnicianById(technicianId)
+            technician?.let {
+                recipients.add(
+                    NotificationRecipient(
+                        id = technicianId,
+                        type = RecipientType.ADMIN,
+                        address = technician.email,
+                        name = technician.name
+                    )
+                )
+            }
+        }
+        
+        return recipients
+    }
+    
+    private suspend fun processMaintenanceAlert(alert: MaintenanceAlert) {
+        try {
+            // Create notification request
+            val notificationRequest = NotificationRequest(
+                title = alert.title,
+                message = alert.message,
+                category = NotificationCategory.MAINTENANCE,
+                priority = mapSeverityToPriority(alert.severity),
+                recipients = alert.recipients,
+                data = alert.metadata + mapOf(
+                    "alertId" to alert.id,
+                    "vehicleId" to alert.vehicleId,
+                    "maintenanceType" to alert.maintenanceType,
+                    "scheduledDate" to alert.scheduledDate.toString(),
+                    "urgency" to alert.metadata["urgency"]
+                ),
+                channels = determineNotificationChannels(alert)
+            )
+            
+            // Send notification
+            smartNotificationManager.sendNotification(notificationRequest)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun generateAlertTitle(maintenanceData: MaintenanceAlertData): String {
+        return when (maintenanceData.alertType) {
+            MaintenanceAlertType.SCHEDULED -> "صيانة مجدولة"
+            MaintenanceAlertType.WARNING -> "تنبيه صيانة"
+            MaintenanceAlertType.CRITICAL -> "صيانة حرجة"
+            MaintenanceAlertType.OVERDUE -> "صيانة متأخرة"
+            MaintenanceAlertType.EMERGENCY -> "طوارئ صيانة"
+            MaintenanceAlertType.PARTS_SHORTAGE -> "نقص في قطع الغيار"
+        }
+    }
+    
+    private fun generateAlertMessage(maintenanceData: MaintenanceAlertData): String {
+        val vehicle = database.vehicleDao().getVehicleById(maintenanceData.metadata["vehicleId"]?.toLong() ?: 0L)
+        
+        return """
+            ${maintenanceData.maintenanceType} مطلوب للمركبة ${vehicle?.vehicleId ?: "غير معروف"}.
+            ${if (maintenanceData.daysUntilDue > 0) "متبقي: ${maintenanceData.daysUntilDue} يوم" else "متأخرة"}
+            ${maintenanceData.scheduledDate?.let { "الموعد: $it" } ?: ""}
+            ${maintenanceData.estimatedCost?.let { "التكلفة التقديرية: $it ريال" } ?: ""}
+            ${maintenanceData.description?.let { "الوصف: $it" } ?: ""}
+        """.trimIndent()
+    }
+    
+    private fun mapSeverityToPriority(severity: MaintenanceSeverity): NotificationPriority {
+        return when (severity) {
+            MaintenanceSeverity.CRITICAL -> NotificationPriority.EMERGENCY
+            MaintenanceSeverity.SEVERE -> NotificationPriority.HIGH
+            MaintenanceSeverity.MEDIUM -> NotificationPriority.HIGH
+            MaintenanceSeverity.LOW -> NotificationPriority.NORMAL
+        }
+    }
+    
+    private fun determineNotificationChannels(alert: MaintenanceAlert): List<NotificationChannel> {
+        return when (alert.severity) {
+            MaintenanceSeverity.CRITICAL -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL,
+                NotificationChannel.IN_APP
+            )
+            MaintenanceSeverity.SEVERE -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL
+            )
+            MaintenanceSeverity.MEDIUM -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.EMAIL
+            )
+            MaintenanceSeverity.LOW -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.IN_APP
+            )
+        }
+    }
+    
+    private fun addToActiveMaintenanceAlerts(alert: MaintenanceAlert) {
+        val currentAlerts = _activeMaintenanceAlerts.value.toMutableList()
+        currentAlerts.add(0, alert)
+        
+        // Keep only max alerts
+        if (currentAlerts.size > MAX_ACTIVE_MAINTENANCE_ALERTS) {
+            currentAlerts.removeAt(currentAlerts.size - 1)
+        }
+        
+        _activeMaintenanceAlerts.value = currentAlerts
+    }
+    
+    private fun removeFromActiveMaintenanceAlerts(alertId: String) {
+        val currentAlerts = _activeMaintenanceAlerts.value.toMutableList()
+        currentAlerts.removeAll { it.id == alertId }
+        _activeMaintenanceAlerts.value = currentAlerts
+    }
+    
+    private suspend fun updateMaintenanceRecord(
+        vehicleId: String,
+        maintenanceType: String,
+        actualCost: Float,
+        actualDuration: Int
+    ) {
+        // Update vehicle maintenance records
+        val vehicle = database.vehicleDao().getVehicleById(vehicleId.toLong())
+        vehicle?.let {
+            val updatedVehicle = it.copy(
+                lastMaintenanceDate = Date(),
+                lastMaintenanceMileage = it.mileage,
+                updatedAt = Date()
+            )
+            database.vehicleDao().updateVehicle(updatedVehicle)
+        }
+    }
+    
+    private suspend fun updateVehicleMaintenanceRecord(
+        vehicleId: String,
+        maintenanceType: String,
+        actualCost: Float,
+        actualDuration: Int
+    ) {
+        // Update vehicle maintenance record
+        updateMaintenanceRecord(vehicleId, maintenanceType, actualCost, actualDuration)
+    }
+    
+    private suspend fun updateMaintenanceAnalytics() {
+        try {
+            val alerts = _activeMaintenanceAlerts.value
+            val analytics = MaintenanceAnalytics(
+                totalActive = alerts.size,
+                criticalAlerts = alerts.count { it.severity == MaintenanceSeverity.CRITICAL },
+                severeAlerts = alerts.count { it.severity == MaintenanceSeverity.SEVERE },
+                mediumAlerts = alerts.count { it.severity == MaintenanceSeverity.MEDIUM },
+                lowAlerts = alerts.count { it.severity == MaintenanceSeverity.LOW },
+                typeStats = alerts.groupBy { it.maintenanceType }
+                    .mapValues { it.value.size },
+                urgencyStats = alerts.groupBy { it.metadata["urgency"] }
+                    .mapValues { it.value.size }
+            )
+            
+            _maintenanceAnalytics.value = analytics
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun notifyMaintenanceAlertCreated(alert: MaintenanceAlert) {
+        maintenanceAlertListeners.forEach { listener ->
+            listener.onMaintenanceAlertCreated(alert)
+        }
+    }
+    
+    private fun notifyMaintenanceAlertResolved(alert: MaintenanceAlert) {
+        maintenanceAlertListeners.forEach { listener ->
+            listener.onMaintenanceAlertResolved(alert)
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class MaintenanceAlertData(
+    val maintenanceType: String,
+    val scheduledDate: Date? = null,
+    val lastMaintenanceDate: Date? = null,
+    val daysUntilDue: Int = 0,
+    val alertType: MaintenanceAlertType = MaintenanceAlertType.SCHEDULED,
+    val urgency: MaintenanceUrgency = MaintenanceUrgency.NORMAL,
+    val issueType: String? = null,
+    val description: String? = null,
+    val location: String? = null,
+    val estimatedCost: Float? = null,
+    val estimatedDuration: Int? = null,
+    val workshopId: String? = null,
+    val technicianId: String? = null,
+    val partsRequired: List<MaintenancePart> = emptyList(),
+    val metadata: Map<String, String> = emptyMap()
+) {
+    fun toMetadata(): Map<String, String> {
+        return metadata + mapOf(
+            "maintenanceType" to maintenanceType,
+            "scheduledDate" to (scheduledDate?.toString() ?: ""),
+            "lastMaintenanceDate" to (lastMaintenanceDate?.toString() ?: ""),
+            "daysUntilDue" to daysUntilDue.toString(),
+            "alertType" to alertType.name,
+            "urgency" to urgency.name,
+            "issueType" to (issueType ?: ""),
+            "description" to (description ?: ""),
+            "location" to (location ?: ""),
+            "estimatedCost" to (estimatedCost?.toString() ?: ""),
+            "estimatedDuration" to (estimatedDuration?.toString() ?: ""),
+            "workshopId" to (workshopId ?: ""),
+            "technicianId" to (technicianId ?: ""),
+            "partsRequired" to partsRequired.joinToString(",") { "${it.partName}(${it.quantity})" }
+        )
+    }
+}
+
+data class MaintenanceAlert(
+    val id: String,
+    val vehicleId: String,
+    val maintenanceType: String,
+    val severity: MaintenanceSeverity,
+    val title: String,
+    val message: String,
+    val scheduledDate: Date?,
+    val estimatedCost: Float?,
+    val estimatedDuration: Int?,
+    val workshopId: String?,
+    val technicianId: String?,
+    val partsRequired: List<MaintenancePart>,
+    val recipients: List<NotificationRecipient>,
+    val metadata: Map<String, String>,
+    val status: MaintenanceAlertStatus,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val acknowledgedAt: Date?,
+    val acknowledgedBy: String?,
+    val resolvedAt: Date?,
+    val resolvedBy: String?,
+    val resolution: String?,
+    val actualCost: Float?,
+    val actualDuration: Int?,
+    val performedBy: String?
+)
+
+data class MaintenanceAnalytics(
+    val totalActive: Int = 0,
+    val criticalAlerts: Int = 0,
+    val severeAlerts: Int = 0,
+    val mediumAlerts: Int = 0,
+    val lowAlerts: Int = 0,
+    val typeStats: Map<String, Int> = emptyMap(),
+    val urgencyStats: Map<String, Int> = emptyMap()
+)
+
+data class MaintenancePart(
+    val partId: String,
+    val partName: String,
+    val quantity: Int,
+    val unitPrice: Float
+)
+
+/**
+ * Interfaces
+ */
+interface MaintenanceAlertListener {
+    fun onMaintenanceAlertCreated(alert: MaintenanceAlert)
+    fun onMaintenanceAlertResolved(alert: MaintenanceAlert)
+}
+
+/**
+ * Enums
+ */
+enum class MaintenanceAlertState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class MaintenanceSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    SEVERE,
+    CRITICAL
+}
+
+enum class MaintenanceAlertStatus {
+    ACTIVE,
+    ACKNOWLEDGED,
+    RESOLVED
+}
+
+enum class MaintenanceAlertType {
+    SCHEDULED,
+    WARNING,
+    CRITICAL,
+    OVERDUE,
+    EMERGENCY,
+    PARTS_SHORTAGE
+}
+
+enum class MaintenanceUrgency {
+    NORMAL,
+    HIGH,
+    CRITICAL,
+    EMERGENCY
+}

@@ -1,0 +1,294 @@
+package com.edham.logistics.feature.driver
+
+import android.content.Context
+import androidx.room.Room
+import com.edham.logistics.data.local.database.OfflineDatabase
+import com.edham.logistics.data.local.entity.OfflineTripEntity
+import com.edham.logistics.data.local.entity.OfflineLocationEntity
+import com.edham.logistics.data.local.entity.OfflineDeliveryEntity
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import java.util.*
+
+class OfflineMode(private val context: Context) {
+    
+    private val database: OfflineDatabase = Room.databaseBuilder(
+        context,
+        OfflineDatabase::class.java,
+        "offline_database"
+    ).build()
+    
+    private val offlineDao = database.offlineDao()
+    
+    /**
+     * Cache trip data for offline use
+     */
+    suspend fun cacheTripData(tripData: DriverTrip) = withContext(Dispatchers.IO) {
+        try {
+            val offlineTrip = OfflineTripEntity(
+                id = tripData.id,
+                destinationAddress = tripData.destinationAddress,
+                status = tripData.status,
+                startTime = tripData.startTime,
+                estimatedDuration = tripData.estimatedDuration,
+                priority = tripData.priority,
+                customerName = tripData.customerName,
+                phoneNumber = tripData.phoneNumber,
+                isSynced = false,
+                createdAt = System.currentTimeMillis()
+            )
+            
+            offlineDao.insertTrip(offlineTrip)
+            Timber.d("Trip data cached offline: ${tripData.id}")
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching trip data")
+        }
+    }
+    
+    /**
+     * Cache location updates for offline sync
+     */
+    suspend fun cacheLocationUpdate(
+        tripId: String,
+        latitude: Double,
+        longitude: Double,
+        timestamp: Long
+    ) = withContext(Dispatchers.IO) {
+        try {
+            val location = OfflineLocationEntity(
+                id = UUID.randomUUID().toString(),
+                tripId = tripId,
+                latitude = latitude,
+                longitude = longitude,
+                timestamp = timestamp,
+                isSynced = false
+            )
+            
+            offlineDao.insertLocation(location)
+            Timber.d("Location cached offline for trip: $tripId")
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching location")
+        }
+    }
+    
+    /**
+     * Cache delivery confirmation for offline sync
+     */
+    suspend fun cacheDeliveryConfirmation(
+        shipmentId: String,
+        photos: List<String>,
+        notes: String,
+        timestamp: Long
+    ) = withContext(Dispatchers.IO) {
+        try {
+            val delivery = OfflineDeliveryEntity(
+                id = UUID.randomUUID().toString(),
+                shipmentId = shipmentId,
+                photos = photos,
+                notes = notes,
+                timestamp = timestamp,
+                isSynced = false
+            )
+            
+            offlineDao.insertDelivery(delivery)
+            Timber.d("Delivery confirmation cached offline: $shipmentId")
+        } catch (e: Exception) {
+            Timber.e(e, "Error caching delivery confirmation")
+        }
+    }
+    
+    /**
+     * Get cached trips for offline viewing
+     */
+    suspend fun getCachedTrips(): List<OfflineTripEntity> = withContext(Dispatchers.IO) {
+        try {
+            offlineDao.getAllTrips()
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting cached trips")
+            emptyList()
+        }
+    }
+    
+    /**
+     * Get cached locations for a trip
+     */
+    suspend fun getCachedLocations(tripId: String): List<OfflineLocationEntity> = withContext(Dispatchers.IO) {
+        try {
+            offlineDao.getLocationsForTrip(tripId)
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting cached locations")
+            emptyList()
+        }
+    }
+    
+    /**
+     * Sync all offline data when connection is restored
+     */
+    suspend fun syncOfflineData(): SyncResult = withContext(Dispatchers.IO) {
+        val result = SyncResult()
+        
+        try {
+            // Sync trips
+            val unsyncedTrips = offlineDao.getUnsyncedTrips()
+            for (trip in unsyncedTrips) {
+                // Sync trip to server
+                val syncSuccess = syncTripToServer(trip)
+                if (syncSuccess) {
+                    trip.isSynced = true
+                    offlineDao.updateTrip(trip)
+                    result.tripsSynced++
+                } else {
+                    result.tripsFailed++
+                }
+            }
+            
+            // Sync locations
+            val unsyncedLocations = offlineDao.getUnsyncedLocations()
+            for (location in unsyncedLocations) {
+                // Sync location to server
+                val syncSuccess = syncLocationToServer(location)
+                if (syncSuccess) {
+                    location.isSynced = true
+                    offlineDao.updateLocation(location)
+                    result.locationsSynced++
+                } else {
+                    result.locationsFailed++
+                }
+            }
+            
+            // Sync deliveries
+            val unsyncedDeliveries = offlineDao.getUnsyncedDeliveries()
+            for (delivery in unsyncedDeliveries) {
+                // Sync delivery to server
+                val syncSuccess = syncDeliveryToServer(delivery)
+                if (syncSuccess) {
+                    delivery.isSynced = true
+                    offlineDao.updateDelivery(delivery)
+                    result.deliveriesSynced++
+                } else {
+                    result.deliveriesFailed++
+                }
+            }
+            
+            // Clean up old synced data (older than 7 days)
+            cleanupOldSyncedData()
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error during offline sync")
+            result.error = e.message
+        }
+        
+        result
+    }
+    
+    /**
+     * Check if there's unsynced data
+     */
+    suspend fun hasUnsyncedData(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val unsyncedCount = offlineDao.getUnsyncedCount()
+            unsyncedCount > 0
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking unsynced data")
+            false
+        }
+    }
+    
+    /**
+     * Get offline data statistics
+     */
+    suspend fun getOfflineStats(): OfflineStats = withContext(Dispatchers.IO) {
+        try {
+            val stats = OfflineStats()
+            stats.totalTrips = offlineDao.getTripCount()
+            stats.totalLocations = offlineDao.getLocationCount()
+            stats.totalDeliveries = offlineDao.getDeliveryCount()
+            stats.unsyncedCount = offlineDao.getUnsyncedCount()
+            return@withContext stats
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting offline stats")
+            OfflineStats()
+        }
+    }
+    
+    private suspend fun syncTripToServer(trip: OfflineTripEntity): Boolean {
+        // Implementation would call API to sync trip
+        // For now, simulate success
+        return try {
+            // API call to sync trip
+            Thread.sleep(100) // Simulate network delay
+            true
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing trip to server")
+            false
+        }
+    }
+    
+    private suspend fun syncLocationToServer(location: OfflineLocationEntity): Boolean {
+        // Implementation would call API to sync location
+        return try {
+            // API call to sync location
+            Thread.sleep(50) // Simulate network delay
+            true
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing location to server")
+            false
+        }
+    }
+    
+    private suspend fun syncDeliveryToServer(delivery: OfflineDeliveryEntity): Boolean {
+        // Implementation would call API to sync delivery
+        return try {
+            // API call to sync delivery
+            Thread.sleep(200) // Simulate network delay
+            true
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing delivery to server")
+            false
+        }
+    }
+    
+    private suspend fun cleanupOldSyncedData() {
+        try {
+            val sevenDaysAgo = System.currentTimeMillis() - (7 * 24 * 60 * 60 * 1000L)
+            offlineDao.deleteOldSyncedData(sevenDaysAgo)
+            Timber.d("Cleaned up old synced data")
+        } catch (e: Exception) {
+            Timber.e(e, "Error cleaning up old data")
+        }
+    }
+    
+    /**
+     * Clear all offline data
+     */
+    suspend fun clearAllOfflineData() = withContext(Dispatchers.IO) {
+        try {
+            offlineDao.clearAllData()
+            Timber.d("All offline data cleared")
+        } catch (e: Exception) {
+            Timber.e(e, "Error clearing offline data")
+        }
+    }
+}
+
+data class SyncResult(
+    var tripsSynced: Int = 0,
+    var tripsFailed: Int = 0,
+    var locationsSynced: Int = 0,
+    var locationsFailed: Int = 0,
+    var deliveriesSynced: Int = 0,
+    var deliveriesFailed: Int = 0,
+    var error: String? = null
+) {
+    val totalSynced: Int get() = tripsSynced + locationsSynced + deliveriesSynced
+    val totalFailed: Int get() = tripsFailed + locationsFailed + deliveriesFailed
+    val isSuccess: Boolean get() = totalFailed == 0 && error == null
+}
+
+data class OfflineStats(
+    var totalTrips: Int = 0,
+    var totalLocations: Int = 0,
+    var totalDeliveries: Int = 0,
+    var unsyncedCount: Int = 0
+)

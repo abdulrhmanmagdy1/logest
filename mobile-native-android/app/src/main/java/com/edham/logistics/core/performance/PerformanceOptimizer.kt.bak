@@ -1,0 +1,742 @@
+package com.edham.logistics.core.performance
+
+import android.content.Context
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Advanced performance optimization system
+ * Optimizes API calls, caching, pagination, database queries, and lazy loading
+ * Ensures smooth performance on low-end devices
+ */
+@Singleton
+class PerformanceOptimizer @Inject constructor(
+    private val context: Context,
+    private val apiCallOptimizer: ApiCallOptimizer,
+    private val cacheManager: AdvancedCacheManager,
+    private val paginationManager: PaginationManager,
+    private val databaseOptimizer: DatabaseOptimizer,
+    private val lazyLoadManager: LazyLoadManager,
+    private val lowEndDeviceOptimizer: LowEndDeviceOptimizer,
+    private val performanceMonitor: PerformanceMonitor
+) {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Performance configuration
+    private var performanceConfig: PerformanceConfig = getDefaultPerformanceConfig()
+    
+    // Device capability detection
+    private val deviceCapability = detectDeviceCapability()
+    
+    // Performance metrics
+    private val _performanceMetrics = MutableStateFlow(PerformanceMetrics())
+    val performanceMetrics: StateFlow<PerformanceMetrics> = _performanceMetrics.asStateFlow()
+
+    init {
+        initializePerformanceOptimization()
+    }
+
+    /**
+     * Initialize performance optimization based on device capabilities
+     */
+    private fun initializePerformanceOptimization() {
+        coroutineScope.launch {
+            // Configure based on device capability
+            performanceConfig = when (deviceCapability) {
+                DeviceCapability.HIGH -> getHighPerformanceConfig()
+                DeviceCapability.MEDIUM -> getMediumPerformanceConfig()
+                DeviceCapability.LOW -> getLowPerformanceConfig()
+                DeviceCapability.VERY_LOW -> getVeryLowPerformanceConfig()
+            }
+
+            // Initialize all optimizers
+            apiCallOptimizer.configure(performanceConfig.apiConfig)
+            cacheManager.configure(performanceConfig.cacheConfig)
+            paginationManager.configure(performanceConfig.paginationConfig)
+            databaseOptimizer.configure(performanceConfig.databaseConfig)
+            lazyLoadManager.configure(performanceConfig.lazyLoadConfig)
+            lowEndDeviceOptimizer.configure(performanceConfig.lowEndConfig)
+
+            // Start performance monitoring
+            startPerformanceMonitoring()
+        }
+    }
+
+    /**
+     * Optimize API calls with intelligent batching and caching
+     */
+    suspend fun <T> optimizeApiCall(
+        call: suspend () -> T,
+        cacheKey: String? = null,
+        cachePolicy: CachePolicy = CachePolicy.DEFAULT,
+        priority: CallPriority = CallPriority.NORMAL
+    ): Result<T> {
+        return try {
+            // Check cache first if cache key provided
+            if (cacheKey != null && cachePolicy != CachePolicy.NO_CACHE) {
+                val cachedResult = cacheManager.get<T>(cacheKey)
+                if (cachedResult != null) {
+                    updateMetrics("api_call_cache_hit")
+                    return Result.success(cachedResult)
+                }
+            }
+
+            // Optimize API call based on device capability
+            val result = when (deviceCapability) {
+                DeviceCapability.VERY_LOW, DeviceCapability.LOW -> {
+                    // Batch calls and add delays for low-end devices
+                    apiCallOptimizer.executeWithOptimization(call, priority)
+                }
+                else -> {
+                    // Direct execution for capable devices
+                    call()
+                }
+            }
+
+            // Cache result if applicable
+            if (cacheKey != null && cachePolicy != CachePolicy.NO_CACHE) {
+                cacheManager.put(cacheKey, result, cachePolicy)
+            }
+
+            updateMetrics("api_call_success")
+            Result.success(result)
+        } catch (e: Exception) {
+            updateMetrics("api_call_error")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Optimized pagination for large lists
+     */
+    suspend fun <T> paginateList(
+        dataSource: suspend (page: Int, pageSize: Int) -> List<T>,
+        pageSize: Int? = null,
+        preloadPages: Int = 1
+    ): PaginatedResult<T> {
+        val optimizedPageSize = pageSize ?: performanceConfig.paginationConfig.defaultPageSize
+        val optimizedPreload = calculateOptimalPreloadPages(preloadPages)
+
+        return paginationManager.paginate(
+            dataSource = dataSource,
+            pageSize = optimizedPageSize,
+            preloadPages = optimizedPreload
+        )
+    }
+
+    /**
+     * Optimized database query execution
+     */
+    suspend fun <T> optimizeDatabaseQuery(
+        query: suspend () -> T,
+        queryType: QueryType = QueryType.SELECT,
+        optimizationLevel: OptimizationLevel = OptimizationLevel.NORMAL
+    ): Result<T> {
+        return try {
+            val result = when (deviceCapability) {
+                DeviceCapability.VERY_LOW, DeviceCapability.LOW -> {
+                    databaseOptimizer.executeWithOptimization(query, queryType, optimizationLevel)
+                }
+                else -> {
+                    query()
+                }
+            }
+
+            updateMetrics("database_query_success")
+            Result.success(result)
+        } catch (e: Exception) {
+            updateMetrics("database_query_error")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Lazy loading for heavy screens
+     */
+    fun <T> lazyLoad(
+        loader: suspend () -> T,
+        placeholder: (() -> T)? = null,
+        priority: LoadPriority = LoadPriority.NORMAL
+    ): LazyLoadResult<T> {
+        return lazyLoadManager.createLazyLoad(
+            loader = loader,
+            placeholder = placeholder,
+            priority = priority,
+            deviceCapability = deviceCapability
+        )
+    }
+
+    /**
+     * Optimize UI rendering for low-end devices
+     */
+    fun optimizeUIRendering(
+        viewOptimizer: () -> Unit,
+        complexity: UIComplexity = UIComplexity.MEDIUM
+    ) {
+        when (deviceCapability) {
+            DeviceCapability.VERY_LOW, DeviceCapability.LOW -> {
+                lowEndDeviceOptimizer.optimizeRendering(viewOptimizer, complexity)
+            }
+            else -> {
+                viewOptimizer()
+            }
+        }
+    }
+
+    /**
+     * Batch multiple operations for efficiency
+     */
+    suspend fun <T> batchOperations(
+        operations: List<suspend () -> T>,
+        batchSize: Int? = null,
+        delayBetweenBatches: Long = 100
+    ): List<Result<T>> {
+        val optimizedBatchSize = batchSize ?: calculateOptimalBatchSize(operations.size)
+        
+        return apiCallOptimizer.batchExecute(
+            operations = operations,
+            batchSize = optimizedBatchSize,
+            delayBetweenBatches = delayBetweenBatches
+        )
+    }
+
+    /**
+     * Preload critical data for better user experience
+     */
+    suspend fun preloadCriticalData(
+        preloadTasks: List<PreloadTask>
+    ) {
+        val prioritizedTasks = prioritizePreloadTasks(preloadTasks)
+        
+        coroutineScope.launch {
+            prioritizedTasks.forEach { task ->
+                try {
+                    when (deviceCapability) {
+                        DeviceCapability.VERY_LOW -> {
+                            // Only preload critical tasks on very low-end devices
+                            if (task.priority == PreloadPriority.CRITICAL) {
+                                task.execute()
+                                delay(100) // Add delay to prevent overwhelming the device
+                            }
+                        }
+                        DeviceCapability.LOW -> {
+                            // Preload critical and high priority tasks
+                            if (task.priority <= PreloadPriority.HIGH) {
+                                task.execute()
+                                delay(50)
+                            }
+                        }
+                        else -> {
+                            // Preload all tasks on capable devices
+                            task.execute()
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Log error but continue with other tasks
+                    updateMetrics("preload_error")
+                }
+            }
+        }
+    }
+
+    /**
+     * Detect device capability based on hardware specs
+     */
+    private fun detectDeviceCapability(): DeviceCapability {
+        val memoryInfo = getMemoryInfo()
+        val cpuInfo = getCPUInfo()
+        val storageInfo = getStorageInfo()
+
+        return when {
+            memoryInfo.totalMemory > 8_000_000_000L && cpuInfo.cores >= 8 -> DeviceCapability.HIGH
+            memoryInfo.totalMemory > 4_000_000_000L && cpuInfo.cores >= 6 -> DeviceCapability.MEDIUM
+            memoryInfo.totalMemory > 2_000_000_000L && cpuInfo.cores >= 4 -> DeviceCapability.LOW
+            else -> DeviceCapability.VERY_LOW
+        }
+    }
+
+    /**
+     * Calculate optimal batch size based on device capability
+     */
+    private fun calculateOptimalBatchSize(totalOperations: Int): Int {
+        return when (deviceCapability) {
+            DeviceCapability.HIGH -> minOf(totalOperations, 50)
+            DeviceCapability.MEDIUM -> minOf(totalOperations, 25)
+            DeviceCapability.LOW -> minOf(totalOperations, 10)
+            DeviceCapability.VERY_LOW -> minOf(totalOperations, 5)
+        }
+    }
+
+    /**
+     * Calculate optimal preload pages based on device capability
+     */
+    private fun calculateOptimalPreloadPages(requestedPages: Int): Int {
+        return when (deviceCapability) {
+            DeviceCapability.HIGH -> requestedPages
+            DeviceCapability.MEDIUM -> minOf(requestedPages, 2)
+            DeviceCapability.LOW -> minOf(requestedPages, 1)
+            DeviceCapability.VERY_LOW -> 0 // No preloading on very low-end devices
+        }
+    }
+
+    /**
+     * Prioritize preload tasks based on device capability and task priority
+     */
+    private fun prioritizePreloadTasks(tasks: List<PreloadTask>): List<PreloadTask> {
+        return tasks.sortedWith { a, b ->
+            when {
+                a.priority != b.priority -> a.priority.ordinal.compareTo(b.priority.ordinal)
+                deviceCapability == DeviceCapability.VERY_LOW -> {
+                    // On very low-end devices, prioritize smaller tasks
+                    a.size.compareTo(b.size)
+                }
+                else -> 0
+            }
+        }
+    }
+
+    /**
+     * Start performance monitoring
+     */
+    private fun startPerformanceMonitoring() {
+        coroutineScope.launch {
+            performanceMonitor.metrics.collect { metrics ->
+                _performanceMetrics.value = metrics
+                
+                // Auto-adjust performance based on metrics
+                if (metrics.averageResponseTime > 3000) { // 3 seconds
+                    reducePerformanceLevel()
+                } else if (metrics.averageResponseTime < 1000) { // 1 second
+                    increasePerformanceLevel()
+                }
+            }
+        }
+    }
+
+    /**
+     * Reduce performance level for struggling devices
+     */
+    private fun reducePerformanceLevel() {
+        coroutineScope.launch {
+            when (performanceConfig.performanceLevel) {
+                PerformanceLevel.HIGH -> {
+                    performanceConfig = performanceConfig.copy(performanceLevel = PerformanceLevel.MEDIUM)
+                    applyPerformanceConfiguration()
+                }
+                PerformanceLevel.MEDIUM -> {
+                    performanceConfig = performanceConfig.copy(performanceLevel = PerformanceLevel.LOW)
+                    applyPerformanceConfiguration()
+                }
+                PerformanceLevel.LOW -> {
+                    performanceConfig = performanceConfig.copy(performanceLevel = PerformanceLevel.VERY_LOW)
+                    applyPerformanceConfiguration()
+                }
+                PerformanceLevel.VERY_LOW -> {
+                    // Already at lowest level
+                }
+            }
+        }
+    }
+
+    /**
+     * Increase performance level for capable devices
+     */
+    private fun increasePerformanceLevel() {
+        coroutineScope.launch {
+            when (performanceConfig.performanceLevel) {
+                PerformanceLevel.VERY_LOW -> {
+                    performanceConfig = performanceConfig.copy(performanceLevel = PerformanceLevel.LOW)
+                    applyPerformanceConfiguration()
+                }
+                PerformanceLevel.LOW -> {
+                    performanceConfig = performanceConfig.copy(performanceLevel = PerformanceLevel.MEDIUM)
+                    applyPerformanceConfiguration()
+                }
+                PerformanceLevel.MEDIUM -> {
+                    performanceConfig = performanceConfig.copy(performanceLevel = PerformanceLevel.HIGH)
+                    applyPerformanceConfiguration()
+                }
+                PerformanceLevel.HIGH -> {
+                    // Already at highest level
+                }
+            }
+        }
+    }
+
+    /**
+     * Apply performance configuration to all optimizers
+     */
+    private suspend fun applyPerformanceConfiguration() {
+        apiCallOptimizer.configure(performanceConfig.apiConfig)
+        cacheManager.configure(performanceConfig.cacheConfig)
+        paginationManager.configure(performanceConfig.paginationConfig)
+        databaseOptimizer.configure(performanceConfig.databaseConfig)
+        lazyLoadManager.configure(performanceConfig.lazyLoadConfig)
+        lowEndDeviceOptimizer.configure(performanceConfig.lowEndConfig)
+    }
+
+    /**
+     * Update performance metrics
+     */
+    private fun updateMetrics(metric: String) {
+        coroutineScope.launch {
+            performanceMonitor.recordMetric(metric)
+        }
+    }
+
+    /**
+     * Get device memory information
+     */
+    private fun getMemoryInfo(): MemoryInfo {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val memoryInfo = android.app.ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memoryInfo)
+        
+        return MemoryInfo(
+            totalMemory = memoryInfo.totalMem,
+            availableMemory = memoryInfo.availMem,
+            threshold = memoryInfo.threshold
+        )
+    }
+
+    /**
+     * Get CPU information
+     */
+    private fun getCPUInfo(): CPUInfo {
+        val cores = Runtime.getRuntime().availableProcessors()
+        return CPUInfo(
+            cores = cores,
+            architecture = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
+        )
+    }
+
+    /**
+     * Get storage information
+     */
+    private fun getStorageInfo(): StorageInfo {
+        val stat = android.os.StatFs(context.filesDir.path)
+        val total = stat.totalBytes
+        val free = stat.availableBytes
+        
+        return StorageInfo(
+            totalStorage = total,
+            availableStorage = free,
+            usedStorage = total - free
+        )
+    }
+
+    /**
+     * Get default performance configuration
+     */
+    private fun getDefaultPerformanceConfig(): PerformanceConfig {
+        return PerformanceConfig(
+            performanceLevel = PerformanceLevel.MEDIUM,
+            apiConfig = ApiConfig(
+                batchSize = 20,
+                timeoutMs = 30000,
+                retryAttempts = 3,
+                enableBatching = true,
+                enableCaching = true
+            ),
+            cacheConfig = CacheConfig(
+                maxSize = 50 * 1024 * 1024, // 50MB
+                ttlMs = 300_000, // 5 minutes
+                enableCompression = true,
+                enableEncryption = false
+            ),
+            paginationConfig = PaginationConfig(
+                defaultPageSize = 20,
+                maxPageSize = 100,
+                preloadPages = 1,
+                enablePreloading = true
+            ),
+            databaseConfig = DatabaseConfig(
+                enableQueryOptimization = true,
+                enableIndexing = true,
+                batchSize = 50,
+                enableTransactions = true
+            ),
+            lazyLoadConfig = LazyLoadConfig(
+                enableLazyLoading = true,
+                preloadDistance = 3,
+                enablePlaceholders = true,
+                loadDelayMs = 100
+            ),
+            lowEndConfig = LowEndConfig(
+                enableUIOptimization = true,
+                reduceAnimations = true,
+                lowerImageQuality = true,
+                enableBackgroundThrottling = true
+            )
+        )
+    }
+
+    /**
+     * Get high performance configuration
+     */
+    private fun getHighPerformanceConfig(): PerformanceConfig {
+        return getDefaultPerformanceConfig().copy(
+            performanceLevel = PerformanceLevel.HIGH,
+            apiConfig = ApiConfig(
+                batchSize = 50,
+                timeoutMs = 15000,
+                retryAttempts = 5,
+                enableBatching = true,
+                enableCaching = true
+            ),
+            cacheConfig = CacheConfig(
+                maxSize = 100 * 1024 * 1024, // 100MB
+                ttlMs = 600_000, // 10 minutes
+                enableCompression = true,
+                enableEncryption = false
+            ),
+            paginationConfig = PaginationConfig(
+                defaultPageSize = 50,
+                maxPageSize = 200,
+                preloadPages = 3,
+                enablePreloading = true
+            )
+        )
+    }
+
+    /**
+     * Get medium performance configuration
+     */
+    private fun getMediumPerformanceConfig(): PerformanceConfig {
+        return getDefaultPerformanceConfig()
+    }
+
+    /**
+     * Get low performance configuration
+     */
+    private fun getLowPerformanceConfig(): PerformanceConfig {
+        return getDefaultPerformanceConfig().copy(
+            performanceLevel = PerformanceLevel.LOW,
+            apiConfig = ApiConfig(
+                batchSize = 10,
+                timeoutMs = 45000,
+                retryAttempts = 2,
+                enableBatching = true,
+                enableCaching = true
+            ),
+            cacheConfig = CacheConfig(
+                maxSize = 25 * 1024 * 1024, // 25MB
+                ttlMs = 180_000, // 3 minutes
+                enableCompression = true,
+                enableEncryption = false
+            ),
+            paginationConfig = PaginationConfig(
+                defaultPageSize = 10,
+                maxPageSize = 50,
+                preloadPages = 1,
+                enablePreloading = true
+            ),
+            lowEndConfig = LowEndConfig(
+                enableUIOptimization = true,
+                reduceAnimations = true,
+                lowerImageQuality = true,
+                enableBackgroundThrottling = true
+            )
+        )
+    }
+
+    /**
+     * Get very low performance configuration
+     */
+    private fun getVeryLowPerformanceConfig(): PerformanceConfig {
+        return getDefaultPerformanceConfig().copy(
+            performanceLevel = PerformanceLevel.VERY_LOW,
+            apiConfig = ApiConfig(
+                batchSize = 5,
+                timeoutMs = 60000,
+                retryAttempts = 1,
+                enableBatching = true,
+                enableCaching = true
+            ),
+            cacheConfig = CacheConfig(
+                maxSize = 10 * 1024 * 1024, // 10MB
+                ttlMs = 120_000, // 2 minutes
+                enableCompression = true,
+                enableEncryption = false
+            ),
+            paginationConfig = PaginationConfig(
+                defaultPageSize = 5,
+                maxPageSize = 20,
+                preloadPages = 0,
+                enablePreloading = false
+            ),
+            lazyLoadConfig = LazyLoadConfig(
+                enableLazyLoading = true,
+                preloadDistance = 1,
+                enablePlaceholders = true,
+                loadDelayMs = 200
+            ),
+            lowEndConfig = LowEndConfig(
+                enableUIOptimization = true,
+                reduceAnimations = true,
+                lowerImageQuality = true,
+                enableBackgroundThrottling = true,
+                disableComplexUI = true,
+                reduceConcurrentOperations = true
+            )
+        )
+    }
+
+    /**
+     * Clean up resources
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+        cacheManager.cleanup()
+        performanceMonitor.cleanup()
+    }
+}
+
+// Data classes and enums
+
+data class PerformanceConfig(
+    val performanceLevel: PerformanceLevel,
+    val apiConfig: ApiConfig,
+    val cacheConfig: CacheConfig,
+    val paginationConfig: PaginationConfig,
+    val databaseConfig: DatabaseConfig,
+    val lazyLoadConfig: LazyLoadConfig,
+    val lowEndConfig: LowEndConfig
+)
+
+enum class PerformanceLevel {
+    VERY_LOW, LOW, MEDIUM, HIGH
+}
+
+data class ApiConfig(
+    val batchSize: Int,
+    val timeoutMs: Long,
+    val retryAttempts: Int,
+    val enableBatching: Boolean,
+    val enableCaching: Boolean
+)
+
+data class CacheConfig(
+    val maxSize: Long,
+    val ttlMs: Long,
+    val enableCompression: Boolean,
+    val enableEncryption: Boolean
+)
+
+data class PaginationConfig(
+    val defaultPageSize: Int,
+    val maxPageSize: Int,
+    val preloadPages: Int,
+    val enablePreloading: Boolean
+)
+
+data class DatabaseConfig(
+    val enableQueryOptimization: Boolean,
+    val enableIndexing: Boolean,
+    val batchSize: Int,
+    val enableTransactions: Boolean
+)
+
+data class LazyLoadConfig(
+    val enableLazyLoading: Boolean,
+    val preloadDistance: Int,
+    val enablePlaceholders: Boolean,
+    val loadDelayMs: Long
+)
+
+data class LowEndConfig(
+    val enableUIOptimization: Boolean,
+    val reduceAnimations: Boolean,
+    val lowerImageQuality: Boolean,
+    val enableBackgroundThrottling: Boolean,
+    val disableComplexUI: Boolean = false,
+    val reduceConcurrentOperations: Boolean = false
+)
+
+enum class DeviceCapability {
+    VERY_LOW, LOW, MEDIUM, HIGH
+}
+
+data class MemoryInfo(
+    val totalMemory: Long,
+    val availableMemory: Long,
+    val threshold: Long
+)
+
+data class CPUInfo(
+    val cores: Int,
+    val architecture: String
+)
+
+data class StorageInfo(
+    val totalStorage: Long,
+    val availableStorage: Long,
+    val usedStorage: Long
+)
+
+enum class CachePolicy {
+    NO_CACHE, DEFAULT, AGGRESSIVE, CONSERVATIVE
+}
+
+enum class CallPriority {
+    LOW, NORMAL, HIGH, CRITICAL
+}
+
+enum class QueryType {
+    SELECT, INSERT, UPDATE, DELETE, COMPLEX
+}
+
+enum class OptimizationLevel {
+    MINIMAL, NORMAL, AGGRESSIVE
+}
+
+enum class LoadPriority {
+    LOW, NORMAL, HIGH, CRITICAL
+}
+
+enum class UIComplexity {
+    LOW, MEDIUM, HIGH, VERY_HIGH
+}
+
+enum class PreloadPriority {
+    LOW, NORMAL, HIGH, CRITICAL
+}
+
+data class PreloadTask(
+    val priority: PreloadPriority,
+    val size: Int, // Estimated size in KB
+    val execute: suspend () -> Unit
+)
+
+data class PaginatedResult<T>(
+    val items: List<T>,
+    val currentPage: Int,
+    val pageSize: Int,
+    val totalCount: Int,
+    val hasNextPage: Boolean,
+    val hasPreviousPage: Boolean
+)
+
+data class LazyLoadResult<T>(
+    val data: T?,
+    val isLoading: Boolean,
+    val isLoaded: Boolean,
+    val load: suspend () -> T
+)
+
+data class PerformanceMetrics(
+    val averageResponseTime: Long = 0,
+    val cacheHitRate: Float = 0f,
+    val memoryUsage: Long = 0,
+    val cpuUsage: Float = 0f,
+    val networkLatency: Long = 0,
+    val uiFrameRate: Float = 60f
+)

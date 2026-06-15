@@ -36,9 +36,23 @@ class DriverSettlementFragment : Fragment() {
         swipeRefresh.setOnRefreshListener { viewModel.loadSettlements() }
 
         setupRecyclerView(view)
+        setupSearch(view)
         observeViewModel()
 
         viewModel.loadSettlements()
+    }
+
+    private fun setupSearch(view: View) {
+        view.findViewById<android.widget.EditText>(R.id.etSearchDriver)?.addTextChangedListener(object : android.text.TextWatcher {
+            override fun afterTextChanged(s: android.text.Editable?) {
+                val query = s.toString().lowercase()
+                val fullList = viewModel.settlements.value ?: emptyList()
+                val filtered = fullList.filter { it.driverName.lowercase().contains(query) }
+                adapter.updateData(filtered)
+            }
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+        })
     }
 
     private fun setupRecyclerView(view: View) {
@@ -49,16 +63,42 @@ class DriverSettlementFragment : Fragment() {
                 viewModel.approveExpense(expense.id)
             },
             onExpenseReject = { expense ->
-                // show reject dialog
-                Toast.makeText(context, "رفض المصروف: ${expense.description}", Toast.LENGTH_SHORT).show()
+                showRejectionDialog(expense)
+            },
+            onImageClick = { url ->
+                val intent = android.content.Intent(requireContext(), com.edham.logistics.ui.screens.ImageZoomActivity::class.java)
+                intent.putExtra("IMAGE_URL", url)
+                startActivity(intent)
             }
         )
         rv.adapter = adapter
     }
 
+    private fun showRejectionDialog(expense: com.edham.logistics.core.network.api.DriverExpense) {
+        val etReason = android.widget.EditText(requireContext())
+        etReason.hint = "ادخل سبب الرفض"
+        
+        androidx.appcompat.app.AlertDialog.Builder(requireContext())
+            .setTitle("رفض المصروف")
+            .setMessage("يرجى توضيح سبب رفض مصروف: ${expense.description}")
+            .setView(etReason)
+            .setPositiveButton("تأكيد الرفض") { _, _ ->
+                val reason = etReason.text.toString()
+                if (reason.isNotEmpty()) {
+                    viewModel.rejectExpense(expense.id, reason)
+                } else {
+                    Toast.makeText(context, "يجب إدخال السبب", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
     private fun observeViewModel() {
         viewModel.settlements.observe(viewLifecycleOwner) { settlements ->
             adapter.updateData(settlements)
+            view?.findViewById<View>(R.id.emptyState)?.visibility = 
+                if (settlements.isEmpty()) View.VISIBLE else View.GONE
         }
 
         viewModel.isLoading.observe(viewLifecycleOwner) { loading ->

@@ -1,0 +1,1011 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.ShipmentApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Shipment Alert Service - Specialized service for shipment-related alerts
+ * 
+ * Features:
+ * - Shipment status change alerts
+ * - Route deviation alerts
+ * - Delay prediction alerts
+ * - Delivery confirmation alerts
+ * - Geofence breach alerts
+ * - ETA updates
+ * - Customer notifications
+ * - Driver notifications
+ * - Shipment analytics alerts
+ */
+@Singleton
+class ShipmentAlertService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val shipmentApi: ShipmentApi,
+    private val networkUtils: NetworkUtils,
+    private val smartNotificationManager: SmartNotificationManager
+) {
+    
+    private val _shipmentAlertState = MutableStateFlow<ShipmentAlertState>(ShipmentAlertState.Idle)
+    val shipmentAlertState: StateFlow<ShipmentAlertState> = _shipmentAlertState.asStateFlow()
+    
+    private val _activeShipmentAlerts = MutableStateFlow<List<ShipmentAlert>>(emptyList())
+    val activeShipmentAlerts: StateFlow<List<ShipmentAlert>> = _activeShipmentAlerts.asStateFlow()
+    
+    private val _shipmentAlertStats = MutableStateFlow<ShipmentAlertStats>(ShipmentAlertStats())
+    val shipmentAlertStats: StateFlow<ShipmentAlertStats> = _shipmentAlertStats.asStateFlow()
+    
+    private var isInitialized = false
+    private val shipmentAlertListeners = mutableListOf<ShipmentAlertListener>()
+    
+    companion object {
+        private const val TAG = "ShipmentAlertService"
+        private const val DELAY_THRESHOLD_MINUTES = 15
+        private const val ROUTE_DEVIATION_THRESHOLD_KM = 5
+        private const val ETA_UPDATE_THRESHOLD_MINUTES = 30
+        private const val MAX_ACTIVE_ALERTS_PER_SHIPMENT = 10
+    }
+    
+    /**
+     * Initialize shipment alert service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _shipmentAlertState.value = ShipmentAlertState.Initializing
+                
+                // Load shipment alert configuration
+                loadShipmentAlertConfiguration()
+                
+                // Initialize alert rules
+                initializeShipmentAlertRules()
+                
+                // Load active shipment alerts
+                loadActiveShipmentAlerts()
+                
+                // Start shipment monitoring
+                startShipmentMonitoring()
+                
+                isInitialized = true
+                _shipmentAlertState.value = ShipmentAlertState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _shipmentAlertState.value = ShipmentAlertState.Error("Failed to initialize shipment alert service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create shipment alert
+     */
+    suspend fun createShipmentAlert(
+        shipmentId: String,
+        alertType: ShipmentAlertType,
+        alertData: ShipmentAlertData
+    ): Result<ShipmentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Shipment alert service not initialized")
+                }
+                
+                // Validate alert data
+                validateShipmentAlertData(shipmentId, alertType, alertData)
+                
+                // Check for duplicate alerts
+                if (isDuplicateShipmentAlert(shipmentId, alertType)) {
+                    throw Exception("Duplicate shipment alert detected")
+                }
+                
+                // Create alert
+                val alert = ShipmentAlert(
+                    id = UUID.randomUUID().toString(),
+                    shipmentId = shipmentId,
+                    alertType = alertType,
+                    severity = determineAlertSeverity(alertType, alertData),
+                    title = generateAlertTitle(alertType, alertData),
+                    message = generateAlertMessage(alertType, alertData),
+                    recipientType = determineRecipientType(alertType),
+                    recipients = determineRecipients(shipmentId, alertType, alertData),
+                    metadata = alertData.toMetadata(),
+                    status = ShipmentAlertStatus.ACTIVE,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    acknowledgedAt = null,
+                    acknowledgedBy = null,
+                    resolvedAt = null,
+                    resolvedBy = null
+                )
+                
+                // Save alert to database
+                database.shipmentAlertDao().insertAlert(alert.toEntity())
+                
+                // Add to active alerts
+                addToActiveShipmentAlerts(alert)
+                
+                // Process alert
+                processShipmentAlert(alert)
+                
+                // Update statistics
+                updateShipmentAlertStats()
+                
+                // Notify listeners
+                notifyShipmentAlertCreated(alert)
+                
+                Result.success(alert)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle shipment status change
+     */
+    suspend fun handleShipmentStatusChange(
+        shipmentId: String,
+        oldStatus: String,
+        newStatus: String,
+        timestamp: Date,
+        metadata: Map<String, String> = emptyMap()
+    ): Result<List<ShipmentAlert>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val alerts = mutableListOf<ShipmentAlert>()
+                
+                // Get shipment details
+                val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                    ?: throw Exception("Shipment not found")
+                
+                // Determine alert type based on status change
+                val alertType = mapStatusToAlertType(newStatus)
+                
+                if (alertType != null) {
+                    val alertData = ShipmentAlertData(
+                        shipmentId = shipmentId,
+                        oldStatus = oldStatus,
+                        newStatus = newStatus,
+                        timestamp = timestamp,
+                        location = shipment.currentLocation,
+                        estimatedDelivery = shipment.estimatedDelivery,
+                        customerName = shipment.customerName,
+                        driverName = shipment.driverName,
+                        pickupLocation = shipment.pickupLocation,
+                        deliveryLocation = shipment.deliveryLocation,
+                        metadata = metadata
+                    )
+                    
+                    val alertResult = createShipmentAlert(shipmentId, alertType, alertData)
+                    if (alertResult.isSuccess) {
+                        alerts.add(alertResult.getOrThrow())
+                    }
+                }
+                
+                // Create additional alerts based on status
+                when (newStatus) {
+                    "OUT_FOR_DELIVERY" -> {
+                        // Create out for delivery alert
+                        val outForDeliveryAlert = createShipmentAlert(
+                            shipmentId,
+                            ShipmentAlertType.OUT_FOR_DELIVERY,
+                            alertData.copy(
+                                message = "الشحنة $shipmentId خرجت للتسليم إلى ${shipment.deliveryLocation}"
+                            )
+                        )
+                        if (outForDeliveryAlert.isSuccess) {
+                            alerts.add(outForDeliveryAlert.getOrThrow())
+                        }
+                    }
+                    "DELAYED" -> {
+                        // Create delay alert
+                        val delayAlert = createShipmentAlert(
+                            shipmentId,
+                            ShipmentAlertType.DELAYED,
+                            alertData.copy(
+                                message = "الشحنة $shipmentId متأخرة. التوصيل الجديد: ${shipment.estimatedDelivery}"
+                            )
+                        )
+                        if (delayAlert.isSuccess) {
+                            alerts.add(delayAlert.getOrThrow())
+                        }
+                    }
+                    "DELIVERED" -> {
+                        // Create delivery confirmation alert
+                        val deliveryAlert = createShipmentAlert(
+                            shipmentId,
+                            ShipmentAlertType.DELIVERED,
+                            alertData.copy(
+                                message = "تم تسليم الشحنة $shipmentId بنجاح"
+                            )
+                        )
+                        if (deliveryAlert.isSuccess) {
+                            alerts.add(deliveryAlert.getOrThrow())
+                        }
+                    }
+                }
+                
+                Result.success(alerts)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle route deviation
+     */
+    suspend fun handleRouteDeviation(
+        shipmentId: String,
+        currentLocation: String,
+        plannedRoute: String,
+        deviationDistance: Float
+    ): Result<ShipmentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (deviationDistance < ROUTE_DEVIATION_THRESHOLD_KM) {
+                    return@withContext Result.failure(Exception("Deviation distance below threshold"))
+                }
+                
+                val alertData = ShipmentAlertData(
+                    shipmentId = shipmentId,
+                    currentLocation = currentLocation,
+                    plannedRoute = plannedRoute,
+                    deviationDistance = deviationDistance,
+                    timestamp = Date(),
+                    metadata = mapOf(
+                        "deviationKm" to deviationDistance.toString(),
+                        "thresholdKm" to ROUTE_DEVIATION_THRESHOLD_KM.toString()
+                    )
+                )
+                
+                createShipmentAlert(
+                    shipmentId,
+                    ShipmentAlertType.ROUTE_DEVIATION,
+                    alertData
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle delay prediction
+     */
+    suspend fun handleDelayPrediction(
+        shipmentId: String,
+        predictedDelay: Int,
+        confidence: Float,
+        reasons: List<String>
+    ): Result<ShipmentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (predictedDelay < DELAY_THRESHOLD_MINUTES) {
+                    return@withContext Result.failure(Exception("Predicted delay below threshold"))
+                }
+                
+                val alertData = ShipmentAlertData(
+                    shipmentId = shipmentId,
+                    predictedDelay = predictedDelay,
+                    confidence = confidence,
+                    delayReasons = reasons,
+                    timestamp = Date(),
+                    metadata = mapOf(
+                        "predictedDelayMinutes" to predictedDelay.toString(),
+                        "confidence" to confidence.toString(),
+                        "reasons" to reasons.joinToString(",")
+                    )
+                )
+                
+                createShipmentAlert(
+                    shipmentId,
+                    ShipmentAlertType.DELAY_PREDICTION,
+                    alertData
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle ETA update
+     */
+    suspend fun handleETAUpdate(
+        shipmentId: String,
+        oldETA: Date,
+        newETA: Date,
+        reason: String
+    ): Result<ShipmentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val etaDifference = ((newETA.time - oldETA.time) / (1000 * 60)).toInt()
+                
+                if (abs(etaDifference) < ETA_UPDATE_THRESHOLD_MINUTES) {
+                    return@withContext Result.failure(Exception("ETA change below threshold"))
+                }
+                
+                val alertData = ShipmentAlertData(
+                    shipmentId = shipmentId,
+                    oldETA = oldETA,
+                    newETA = newETA,
+                    etaDifference = etaDifference,
+                    etaUpdateReason = reason,
+                    timestamp = Date(),
+                    metadata = mapOf(
+                        "oldETA" to oldETA.toString(),
+                        "newETA" to newETA.toString(),
+                        "etaDifferenceMinutes" to etaDifference.toString()
+                    )
+                )
+                
+                createShipmentAlert(
+                    shipmentId,
+                    ShipmentAlertType.ETA_UPDATE,
+                    alertData
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle geofence breach
+     */
+    suspend fun handleGeofenceBreach(
+        shipmentId: String,
+        geofenceId: String,
+        geofenceName: String,
+        breachType: GeofenceBreachType,
+        location: String
+    ): Result<ShipmentAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val alertData = ShipmentAlertData(
+                    shipmentId = shipmentId,
+                    geofenceId = geofenceId,
+                    geofenceName = geofenceName,
+                    breachType = breachType,
+                    location = location,
+                    timestamp = Date(),
+                    metadata = mapOf(
+                        "geofenceId" to geofenceId,
+                        "breachType" to breachType.name
+                    )
+                )
+                
+                createShipmentAlert(
+                    shipmentId,
+                    ShipmentAlertType.GEOFENCE_BREACH,
+                    alertData
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Acknowledge shipment alert
+     */
+    suspend fun acknowledgeShipmentAlert(
+        alertId: String,
+        acknowledgedBy: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activeShipmentAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Alert not found")
+                
+                // Update alert status
+                val updatedAlert = alert.copy(
+                    status = ShipmentAlertStatus.ACKNOWLEDGED,
+                    acknowledgedAt = Date(),
+                    acknowledgedBy = acknowledgedBy,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.shipmentAlertDao().updateAlert(updatedAlert.toEntity())
+                
+                // Update active alerts
+                updateActiveShipmentAlert(updatedAlert)
+                
+                // Notify listeners
+                notifyShipmentAlertAcknowledged(updatedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Resolve shipment alert
+     */
+    suspend fun resolveShipmentAlert(
+        alertId: String,
+        resolvedBy: String,
+        resolution: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activeShipmentAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Alert not found")
+                
+                // Update alert status
+                val updatedAlert = alert.copy(
+                    status = ShipmentAlertStatus.RESOLVED,
+                    resolvedAt = Date(),
+                    resolvedBy = resolvedBy,
+                    resolution = resolution,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.shipmentAlertDao().updateAlert(updatedAlert.toEntity())
+                
+                // Remove from active alerts
+                removeFromActiveShipmentAlerts(alertId)
+                
+                // Notify listeners
+                notifyShipmentAlertResolved(updatedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get alerts by shipment
+     */
+    suspend fun getAlertsByShipment(shipmentId: String): List<ShipmentAlert> {
+        return _activeShipmentAlerts.value.filter { it.shipmentId == shipmentId }
+    }
+    
+    /**
+     * Get alerts by type
+     */
+    suspend fun getAlertsByType(alertType: ShipmentAlertType): List<ShipmentAlert> {
+        return _activeShipmentAlerts.value.filter { it.alertType == alertType }
+    }
+    
+    /**
+     * Get unacknowledged alerts
+     */
+    suspend fun getUnacknowledgedAlerts(): List<ShipmentAlert> {
+        return _activeShipmentAlerts.value.filter { it.status == ShipmentAlertStatus.ACTIVE }
+    }
+    
+    /**
+     * Add shipment alert listener
+     */
+    fun addShipmentAlertListener(listener: ShipmentAlertListener) {
+        shipmentAlertListeners.add(listener)
+    }
+    
+    /**
+     * Remove shipment alert listener
+     */
+    fun removeShipmentAlertListener(listener: ShipmentAlertListener) {
+        shipmentAlertListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadShipmentAlertConfiguration() {
+        // Load shipment alert configuration
+    }
+    
+    private suspend fun initializeShipmentAlertRules() {
+        // Initialize shipment alert rules
+    }
+    
+    private suspend fun loadActiveShipmentAlerts() {
+        try {
+            val alerts = database.shipmentAlertDao().getActiveAlerts()
+                .map { it.toDomainModel() }
+                .sortedByDescending { it.createdAt }
+            
+            _activeShipmentAlerts.value = alerts
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun startShipmentMonitoring() {
+        // Start shipment monitoring
+    }
+    
+    private fun validateShipmentAlertData(shipmentId: String, alertType: ShipmentAlertType, alertData: ShipmentAlertData) {
+        if (shipmentId.isBlank()) throw Exception("Shipment ID cannot be empty")
+        if (alertData.timestamp == null) throw Exception("Timestamp cannot be null")
+    }
+    
+    private fun isDuplicateShipmentAlert(shipmentId: String, alertType: ShipmentAlertType): Boolean {
+        val cutoffTime = Date(System.currentTimeMillis() - 5 * 60 * 1000L) // 5 minutes
+        return _activeShipmentAlerts.value.any { alert ->
+            alert.shipmentId == shipmentId &&
+            alert.alertType == alertType &&
+            alert.createdAt.after(cutoffTime)
+        }
+    }
+    
+    private fun determineAlertSeverity(alertType: ShipmentAlertType, alertData: ShipmentAlertData): ShipmentAlertSeverity {
+        return when (alertType) {
+            ShipmentAlertType.CREATED -> ShipmentAlertSeverity.LOW
+            ShipmentAlertType.PICKED_UP -> ShipmentAlertSeverity.LOW
+            ShipmentAlertType.IN_TRANSIT -> ShipmentAlertSeverity.LOW
+            ShipmentAlertType.OUT_FOR_DELIVERY -> ShipmentAlertSeverity.MEDIUM
+            ShipmentAlertType.DELIVERED -> ShipmentAlertSeverity.LOW
+            ShipmentAlertType.DELAYED -> ShipmentAlertSeverity.HIGH
+            ShipmentAlertType.DELAY_PREDICTION -> ShipmentAlertSeverity.MEDIUM
+            ShipmentAlertType.ROUTE_DEVIATION -> ShipmentAlertSeverity.MEDIUM
+            ShipmentAlertType.GEOFENCE_BREACH -> ShipmentAlertSeverity.HIGH
+            ShipmentAlertType.ETA_UPDATE -> ShipmentAlertSeverity.LOW
+            ShipmentAlertType.CANCELLED -> ShipmentAlertSeverity.HIGH
+            ShipmentAlertType.RETURNED -> ShipmentAlertSeverity.HIGH
+            ShipmentAlertType.LOST -> ShipmentAlertSeverity.CRITICAL
+            ShipmentAlertType.DAMAGED -> ShipmentAlertSeverity.CRITICAL
+        }
+    }
+    
+    private fun generateAlertTitle(alertType: ShipmentAlertType, alertData: ShipmentAlertData): String {
+        return when (alertType) {
+            ShipmentAlertType.CREATED -> "شحنة جديدة"
+            ShipmentAlertType.PICKED_UP -> "تم استلام الشحنة"
+            ShipmentAlertType.IN_TRANSIT -> "الشحنة في الطريق"
+            ShipmentAlertType.OUT_FOR_DELIVERY -> "الشحنة خرجت للتسليم"
+            ShipmentAlertType.DELIVERED -> "تم تسليم الشحنة"
+            ShipmentAlertType.DELAYED -> "تأخير الشحنة"
+            ShipmentAlertType.DELAY_PREDICTION -> "توقع تأخير الشحنة"
+            ShipmentAlertType.ROUTE_DEVIATION -> "انحراف عن المسار"
+            ShipmentAlertType.GEOFENCE_BREACH -> "انتهاك المنطقة الجغرافية"
+            ShipmentAlertType.ETA_UPDATE -> "تحديث وقت الوصول"
+            ShipmentAlertType.CANCELLED -> "إلغاء الشحنة"
+            ShipmentAlertType.RETURNED -> "إرجاع الشحنة"
+            ShipmentAlertType.LOST -> "فقدان الشحنة"
+            ShipmentAlertType.DAMAGED -> "تلف الشحنة"
+        }
+    }
+    
+    private fun generateAlertMessage(alertType: ShipmentAlertType, alertData: ShipmentAlertData): String {
+        return when (alertType) {
+            ShipmentAlertType.CREATED -> "تم إنشاء شحنة جديدة: ${alertData.shipmentId}"
+            ShipmentAlertType.PICKED_UP -> "تم استلام الشحنة ${alertData.shipmentId} من ${alertData.pickupLocation}"
+            ShipmentAlertType.IN_TRANSIT -> "الشحنة ${alertData.shipmentId} حالياً في الطريق إلى ${alertData.deliveryLocation}"
+            ShipmentAlertType.OUT_FOR_DELIVERY -> "الشحنة ${alertData.shipmentId} خرجت للتسليم إلى ${alertData.deliveryLocation}"
+            ShipmentAlertType.DELIVERED -> "تم تسليم الشحنة ${alertData.shipmentId} بنجاح"
+            ShipmentAlertType.DELAYED -> "الشحنة ${alertData.shipmentId} متأخرة. التوصيل المتوقع: ${alertData.estimatedDelivery}"
+            ShipmentAlertType.DELAY_PREDICTION -> "من المتوقع تأخير الشحنة ${alertData.shipmentId} بمقدار ${alertData.predictedDelay} دقيقة"
+            ShipmentAlertType.ROUTE_DEVIATION -> "الشحنة ${alertData.shipmentId} انحرفت عن المسار المحدد بمقدار ${alertData.deviationDistance} كم"
+            ShipmentAlertType.GEOFENCE_BREACH -> "الشحنة ${alertData.shipmentId} خرقت منطقة ${alertData.geofenceName}"
+            ShipmentAlertType.ETA_UPDATE -> "تم تحديث وقت وصول الشحنة ${alertData.shipmentId} إلى ${alertData.newETA}"
+            ShipmentAlertType.CANCELLED -> "تم إلغاء الشحنة ${alertData.shipmentId}. السبب: ${alertData.metadata["reason"]}"
+            ShipmentAlertType.RETURNED -> "تم إرجاع الشحنة ${alertData.shipmentId}. السبب: ${alertData.metadata["reason"]}"
+            ShipmentAlertType.LOST -> "فُقدت الشحنة ${alertData.shipmentId}. يرجى التواصل مع الدعم"
+            ShipmentAlertType.DAMAGED -> "تعرضت الشحنة ${alertData.shipmentId} للتلف. يرجى التواصل مع الدعم"
+        }
+    }
+    
+    private fun determineRecipientType(alertType: ShipmentAlertType): ShipmentAlertRecipientType {
+        return when (alertType) {
+            ShipmentAlertType.CREATED,
+            ShipmentAlertType.PICKED_UP,
+            ShipmentAlertType.IN_TRANSIT,
+            ShipmentAlertType.OUT_FOR_DELIVERY,
+            ShipmentAlertType.DELIVERED -> ShipmentAlertRecipientType.CUSTOMER_AND_DRIVER
+            ShipmentAlertType.DELAYED,
+            ShipmentAlertType.DELAY_PREDICTION,
+            ShipmentAlertType.ROUTE_DEVIATION,
+            ShipmentAlertType.GEOFENCE_BREACH,
+            ShipmentAlertType.ETA_UPDATE -> ShipmentAlertRecipientType.DRIVER_AND_ADMIN
+            ShipmentAlertType.CANCELLED,
+            ShipmentAlertType.RETURNED,
+            ShipmentAlertType.LOST,
+            ShipmentAlertType.DAMAGED -> ShipmentAlertRecipientType.ADMIN_AND_CUSTOMER
+        }
+    }
+    
+    private fun determineRecipients(shipmentId: String, alertType: ShipmentAlertType, alertData: ShipmentAlertData): List<NotificationRecipient> {
+        val recipients = mutableListOf<NotificationRecipient>()
+        
+        when (determineRecipientType(alertType)) {
+            ShipmentAlertRecipientType.CUSTOMER_ONLY -> {
+                alertData.customerEmail?.let { email ->
+                    recipients.add(
+                        NotificationRecipient(
+                            id = alertData.customerId ?: "customer",
+                            type = RecipientType.CUSTOMER,
+                            address = email,
+                            name = alertData.customerName
+                        )
+                    )
+                }
+                alertData.customerPhone?.let { phone ->
+                    recipients.add(
+                        NotificationRecipient(
+                            id = alertData.customerId ?: "customer_sms",
+                            type = RecipientType.CUSTOMER,
+                            address = phone,
+                            name = alertData.customerName
+                        )
+                    )
+                }
+            }
+            ShipmentAlertRecipientType.DRIVER_ONLY -> {
+                alertData.driverId?.let { driverId ->
+                    recipients.add(
+                        NotificationRecipient(
+                            id = driverId,
+                            type = RecipientType.DRIVER,
+                            address = alertData.driverPhone ?: "",
+                            name = alertData.driverName
+                        )
+                    )
+                }
+            }
+            ShipmentAlertRecipientType.ADMIN_ONLY -> {
+                recipients.add(
+                    NotificationRecipient(
+                        id = "shipment_admin",
+                        type = RecipientType.ADMIN,
+                        address = "admin@edham.com",
+                        name = "Shipment Admin"
+                    )
+                )
+            }
+            ShipmentAlertRecipientType.CUSTOMER_AND_DRIVER -> {
+                recipients.addAll(determineRecipients(shipmentId, alertType, alertData.copy(recipientType = ShipmentAlertRecipientType.CUSTOMER_ONLY)))
+                recipients.addAll(determineRecipients(shipmentId, alertType, alertData.copy(recipientType = ShipmentAlertRecipientType.DRIVER_ONLY)))
+            }
+            ShipmentAlertRecipientType.DRIVER_AND_ADMIN -> {
+                recipients.addAll(determineRecipients(shipmentId, alertType, alertData.copy(recipientType = ShipmentAlertRecipientType.DRIVER_ONLY)))
+                recipients.addAll(determineRecipients(shipmentId, alertType, alertData.copy(recipientType = ShipmentAlertRecipientType.ADMIN_ONLY)))
+            }
+            ShipmentAlertRecipientType.ADMIN_AND_CUSTOMER -> {
+                recipients.addAll(determineRecipients(shipmentId, alertType, alertData.copy(recipientType = ShipmentAlertRecipientType.ADMIN_ONLY)))
+                recipients.addAll(determineRecipients(shipmentId, alertType, alertData.copy(recipientType = ShipmentAlertRecipientType.CUSTOMER_ONLY)))
+            }
+            ShipmentAlertRecipientType.ALL -> {
+                recipients.addAll(determineRecipients(shipmentId, alertType, alertData.copy(recipientType = ShipmentAlertRecipientType.CUSTOMER_AND_DRIVER)))
+                recipients.addAll(determineRecipients(shipmentId, alertType, alertData.copy(recipientType = ShipmentAlertRecipientType.ADMIN_ONLY)))
+            }
+        }
+        
+        return recipients
+    }
+    
+    private fun mapStatusToAlertType(status: String): ShipmentAlertType? {
+        return when (status) {
+            "CREATED" -> ShipmentAlertType.CREATED
+            "PICKED_UP" -> ShipmentAlertType.PICKED_UP
+            "IN_TRANSIT" -> ShipmentAlertType.IN_TRANSIT
+            "OUT_FOR_DELIVERY" -> ShipmentAlertType.OUT_FOR_DELIVERY
+            "DELIVERED" -> ShipmentAlertType.DELIVERED
+            "DELAYED" -> ShipmentAlertType.DELAYED
+            "CANCELLED" -> ShipmentAlertType.CANCELLED
+            "RETURNED" -> ShipmentAlertType.RETURNED
+            else -> null
+        }
+    }
+    
+    private suspend fun processShipmentAlert(alert: ShipmentAlert) {
+        try {
+            // Create notification request
+            val notificationRequest = NotificationRequest(
+                title = alert.title,
+                message = alert.message,
+                category = NotificationCategory.SHIPMENT,
+                priority = mapSeverityToPriority(alert.severity),
+                recipients = alert.recipients,
+                data = alert.metadata,
+                channels = determineNotificationChannels(alert)
+            )
+            
+            // Send notification
+            smartNotificationManager.sendNotification(notificationRequest)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun mapSeverityToPriority(severity: ShipmentAlertSeverity): NotificationPriority {
+        return when (severity) {
+            ShipmentAlertSeverity.LOW -> NotificationPriority.NORMAL
+            ShipmentAlertSeverity.MEDIUM -> NotificationPriority.NORMAL
+            ShipmentAlertSeverity.HIGH -> NotificationPriority.HIGH
+            ShipmentAlertSeverity.CRITICAL -> NotificationPriority.EMERGENCY
+        }
+    }
+    
+    private fun determineNotificationChannels(alert: ShipmentAlert): List<NotificationChannel> {
+        return when (alert.severity) {
+            ShipmentAlertSeverity.CRITICAL -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL,
+                NotificationChannel.IN_APP
+            )
+            ShipmentAlertSeverity.HIGH -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL
+            )
+            ShipmentAlertSeverity.MEDIUM -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.EMAIL
+            )
+            ShipmentAlertSeverity.LOW -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.IN_APP
+            )
+        }
+    }
+    
+    private fun addToActiveShipmentAlerts(alert: ShipmentAlert) {
+        val currentAlerts = _activeShipmentAlerts.value.toMutableList()
+        
+        // Check per-shipment limit
+        val shipmentAlerts = currentAlerts.count { it.shipmentId == alert.shipmentId }
+        if (shipmentAlerts >= MAX_ACTIVE_ALERTS_PER_SHIPMENT) {
+            // Remove oldest alert for this shipment
+            val oldestAlert = currentAlerts.filter { it.shipmentId == alert.shipmentId }.minByOrNull { it.createdAt }
+            oldestAlert?.let { currentAlerts.remove(it) }
+        }
+        
+        currentAlerts.add(0, alert)
+        _activeShipmentAlerts.value = currentAlerts
+    }
+    
+    private fun updateActiveShipmentAlert(alert: ShipmentAlert) {
+        val currentAlerts = _activeShipmentAlerts.value.toMutableList()
+        val index = currentAlerts.indexOfFirst { it.id == alert.id }
+        
+        if (index != -1) {
+            currentAlerts[index] = alert
+            _activeShipmentAlerts.value = currentAlerts
+        }
+    }
+    
+    private fun removeFromActiveShipmentAlerts(alertId: String) {
+        val currentAlerts = _activeShipmentAlerts.value.toMutableList()
+        currentAlerts.removeAll { it.id == alertId }
+        _activeShipmentAlerts.value = currentAlerts
+    }
+    
+    private suspend fun updateShipmentAlertStats() {
+        try {
+            val alerts = _activeShipmentAlerts.value
+            val stats = ShipmentAlertStats(
+                totalActive = alerts.size,
+                criticalAlerts = alerts.count { it.severity == ShipmentAlertSeverity.CRITICAL },
+                highAlerts = alerts.count { it.severity == ShipmentAlertSeverity.HIGH },
+                mediumAlerts = alerts.count { it.severity == ShipmentAlertSeverity.MEDIUM },
+                lowAlerts = alerts.count { it.severity == ShipmentAlertSeverity.LOW },
+                unacknowledgedAlerts = alerts.count { it.status == ShipmentAlertStatus.ACTIVE },
+                typeStats = alerts.groupBy { it.alertType }
+                    .mapValues { it.value.size },
+                shipmentStats = alerts.groupBy { it.shipmentId }
+                    .mapValues { it.value.size }
+            )
+            
+            _shipmentAlertStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun notifyShipmentAlertCreated(alert: ShipmentAlert) {
+        shipmentAlertListeners.forEach { listener ->
+            listener.onShipmentAlertCreated(alert)
+        }
+    }
+    
+    private fun notifyShipmentAlertAcknowledged(alert: ShipmentAlert) {
+        shipmentAlertListeners.forEach { listener ->
+            listener.onShipmentAlertAcknowledged(alert)
+        }
+    }
+    
+    private fun notifyShipmentAlertResolved(alert: ShipmentAlert) {
+        shipmentAlertListeners.forEach { listener ->
+            listener.onShipmentAlertResolved(alert)
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class ShipmentAlertData(
+    val shipmentId: String,
+    val oldStatus: String? = null,
+    val newStatus: String? = null,
+    val timestamp: Date,
+    val location: String? = null,
+    val estimatedDelivery: Date? = null,
+    val customerName: String? = null,
+    val customerEmail: String? = null,
+    val customerPhone: String? = null,
+    val customerId: String? = null,
+    val driverName: String? = null,
+    val driverPhone: String? = null,
+    val driverId: String? = null,
+    val pickupLocation: String? = null,
+    val deliveryLocation: String? = null,
+    val currentLocation: String? = null,
+    val plannedRoute: String? = null,
+    val deviationDistance: Float? = null,
+    val predictedDelay: Int? = null,
+    val confidence: Float? = null,
+    val delayReasons: List<String>? = null,
+    val oldETA: Date? = null,
+    val newETA: Date? = null,
+    val etaDifference: Int? = null,
+    val etaUpdateReason: String? = null,
+    val geofenceId: String? = null,
+    val geofenceName: String? = null,
+    val breachType: GeofenceBreachType? = null,
+    val recipientType: ShipmentAlertRecipientType? = null,
+    val metadata: Map<String, String> = emptyMap()
+) {
+    fun toMetadata(): Map<String, String> {
+        return metadata + mapOf(
+            "shipmentId" to shipmentId,
+            "oldStatus" to (oldStatus ?: ""),
+            "newStatus" to (newStatus ?: ""),
+            "timestamp" to timestamp.toString(),
+            "location" to (location ?: ""),
+            "estimatedDelivery" to (estimatedDelivery?.toString() ?: ""),
+            "customerName" to (customerName ?: ""),
+            "driverName" to (driverName ?: ""),
+            "pickupLocation" to (pickupLocation ?: ""),
+            "deliveryLocation" to (deliveryLocation ?: ""),
+            "currentLocation" to (currentLocation ?: ""),
+            "plannedRoute" to (plannedRoute ?: ""),
+            "deviationDistance" to (deviationDistance?.toString() ?: ""),
+            "predictedDelay" to (predictedDelay?.toString() ?: ""),
+            "confidence" to (confidence?.toString() ?: ""),
+            "delayReasons" to (delayReasons?.joinToString(",") ?: ""),
+            "oldETA" to (oldETA?.toString() ?: ""),
+            "newETA" to (newETA?.toString() ?: ""),
+            "etaDifference" to (etaDifference?.toString() ?: ""),
+            "etaUpdateReason" to (etaUpdateReason ?: ""),
+            "geofenceId" to (geofenceId ?: ""),
+            "geofenceName" to (geofenceName ?: ""),
+            "breachType" to (breachType?.name ?: "")
+        )
+    }
+}
+
+data class ShipmentAlert(
+    val id: String,
+    val shipmentId: String,
+    val alertType: ShipmentAlertType,
+    val severity: ShipmentAlertSeverity,
+    val title: String,
+    val message: String,
+    val recipientType: ShipmentAlertRecipientType,
+    val recipients: List<NotificationRecipient>,
+    val metadata: Map<String, String>,
+    val status: ShipmentAlertStatus,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val acknowledgedAt: Date?,
+    val acknowledgedBy: String?,
+    val resolvedAt: Date?,
+    val resolvedBy: String?,
+    val resolution: String? = null
+)
+
+data class ShipmentAlertStats(
+    val totalActive: Int = 0,
+    val criticalAlerts: Int = 0,
+    val highAlerts: Int = 0,
+    val mediumAlerts: Int = 0,
+    val lowAlerts: Int = 0,
+    val unacknowledgedAlerts: Int = 0,
+    val typeStats: Map<ShipmentAlertType, Int> = emptyMap(),
+    val shipmentStats: Map<String, Int> = emptyMap()
+)
+
+/**
+ * Interfaces
+ */
+interface ShipmentAlertListener {
+    fun onShipmentAlertCreated(alert: ShipmentAlert)
+    fun onShipmentAlertAcknowledged(alert: ShipmentAlert)
+    fun onShipmentAlertResolved(alert: ShipmentAlert)
+}
+
+/**
+ * Enums
+ */
+enum class ShipmentAlertState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class ShipmentAlertType {
+    CREATED,
+    PICKED_UP,
+    IN_TRANSIT,
+    OUT_FOR_DELIVERY,
+    DELIVERED,
+    DELAYED,
+    DELAY_PREDICTION,
+    ROUTE_DEVIATION,
+    GEOFENCE_BREACH,
+    ETA_UPDATE,
+    CANCELLED,
+    RETURNED,
+    LOST,
+    DAMAGED
+}
+
+enum class ShipmentAlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class ShipmentAlertStatus {
+    ACTIVE,
+    ACKNOWLEDGED,
+    RESOLVED
+}
+
+enum class ShipmentAlertRecipientType {
+    CUSTOMER_ONLY,
+    DRIVER_ONLY,
+    ADMIN_ONLY,
+    CUSTOMER_AND_DRIVER,
+    DRIVER_AND_ADMIN,
+    ADMIN_AND_CUSTOMER,
+    ALL
+}
+
+enum class GeofenceBreachType {
+    ENTRY,
+    EXIT,
+    DWELL_TIME_EXCEEDED
+}

@@ -1,0 +1,769 @@
+package com.edham.logistics.reports
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import com.edham.logistics.reports.AdvancedReportingService.*
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Android Advanced Reporting Service - Comprehensive Analytics and Reporting
+ */
+class AdvancedReportingService {
+    
+    private val _reports = MutableStateFlow<List<Report>>(emptyList())
+    val reports: StateFlow<List<Report>> = _reports.asStateFlow()
+    
+    private val _reportStatistics = MutableStateFlow<ReportStatistics>(ReportStatistics())
+    val reportStatistics: StateFlow<ReportStatistics> = _reportStatistics.asStateFlow()
+    
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val reportsMap = ConcurrentHashMap<String, Report>()
+    
+    /**
+     * Report Type Enum
+     */
+    enum class ReportType(val arabicName: String) {
+        PROFIT_LOSS("تقرير الأرباح والخسائر"),
+        DRIVER_PERFORMANCE("تقرير أداء السائقين"),
+        SHIPMENT_EFFICIENCY("تقرير كفاءة الشحنات"),
+        FUEL_CONSUMPTION("تقرير استهلاك الوقود")
+    }
+    
+    /**
+     * Export Format Enum
+     */
+    enum class ExportFormat(val name: String, val mimeType: String, val extension: String) {
+        PDF("PDF", "application/pdf", ".pdf"),
+        EXCEL("Excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"),
+        CSV("CSV", "text/csv", ".csv")
+    }
+    
+    /**
+     * Report data class
+     */
+    data class Report(
+        val reportId: String,
+        val type: ReportType,
+        val title: String,
+        val description: String,
+        val generatedAt: LocalDateTime,
+        val startDate: LocalDateTime,
+        val endDate: LocalDateTime,
+        val data: Map<String, Any>,
+        val metadata: Map<String, Any> = emptyMap()
+    )
+    
+    /**
+     * Report Statistics data class
+     */
+    data class ReportStatistics(
+        val totalReports: Int = 0,
+        val reportsByType: Map<ReportType, Int> = emptyMap(),
+        val lastGenerated: LocalDateTime? = null,
+        val averageGenerationTime: Double = 0.0,
+        val exportCount: Int = 0
+    )
+    
+    /**
+     * Profit/Loss Report Data
+     */
+    data class ProfitLossData(
+        val totalRevenue: Double,
+        val totalExpenses: Double,
+        val grossProfit: Double,
+        val netProfit: Double,
+        val profitMargin: Double,
+        val revenueBreakdown: List<RevenueItem>,
+        val expenseBreakdown: List<ExpenseItem>,
+        val monthlyTrends: List<MonthlyTrend>
+    )
+    
+    data class RevenueItem(
+        val category: String,
+        val amount: Double,
+        val percentage: Double,
+        val growth: Double
+    )
+    
+    data class ExpenseItem(
+        val category: String,
+        val amount: Double,
+        val percentage: Double,
+        val growth: Double
+    )
+    
+    data class MonthlyTrend(
+        val month: String,
+        val revenue: Double,
+        val expenses: Double,
+        val profit: Double,
+        val profitMargin: Double
+    )
+    
+    /**
+     * Driver Performance Report Data
+     */
+    data class DriverPerformanceData(
+        val totalDrivers: Int,
+        val averageCompletionRate: Double,
+        val averageOnTimeDelivery: Double,
+        val averageCustomerRating: Double,
+        val totalRevenue: Double,
+        val topPerformers: List<DriverMetrics>,
+        val underPerformers: List<DriverMetrics>,
+        val driverDetails: List<DriverDetail>
+    )
+    
+    data class DriverMetrics(
+        val driverId: String,
+        val driverName: String,
+        val score: Double,
+        val rank: String
+    )
+    
+    data class DriverDetail(
+        val driverId: String,
+        val driverName: String,
+        val totalShipments: Int,
+        val completedShipments: Int,
+        val completionRate: Double,
+        val averageDeliveryTime: Double,
+        val onTimeDeliveryRate: Double,
+        val customerRating: Double,
+        val totalDistance: Double,
+        val fuelEfficiency: Double,
+        val revenueGenerated: Double,
+        val violations: Int
+    )
+    
+    /**
+     * Shipment Efficiency Report Data
+     */
+    data class ShipmentEfficiencyData(
+        val totalShipments: Int,
+        val completedShipments: Int,
+        val completionRate: Double,
+        val averageDeliveryTime: Double,
+        val onTimeDeliveryRate: Double,
+        val averageDistance: Double,
+        val totalRevenue: Double,
+        val routeEfficiencies: List<RouteEfficiency>,
+        val delayAnalysis: List<DelayAnalysis>,
+        val timeAnalysis: List<TimeAnalysis>
+    )
+    
+    data class RouteEfficiency(
+        val routeId: String,
+        val routeName: String,
+        val totalShipments: Int,
+        val averageTime: Double,
+        val averageDistance: Double,
+        val efficiency: Double,
+        val totalRevenue: Double
+    )
+    
+    data class DelayAnalysis(
+        val reason: String,
+        val count: Int,
+        val averageDelay: Double,
+        val totalDelay: Double,
+        val percentage: Double
+    )
+    
+    data class TimeAnalysis(
+        val period: String,
+        val averageTime: Double,
+        val minTime: Double,
+        val maxTime: Double,
+        val shipments: Int
+    )
+    
+    /**
+     * Fuel Consumption Report Data
+     */
+    data class FuelConsumptionData(
+        val totalFuel: Double,
+        val totalCost: Double,
+        val averageFuelPerKm: Double,
+        val totalDistance: Double,
+        val costPerKm: Double,
+        val vehicleConsumptions: List<VehicleFuelData>,
+        val driverEfficiencies: List<DriverFuelData>,
+        val fuelTrends: List<FuelTrend>
+    )
+    
+    data class VehicleFuelData(
+        val vehicleId: String,
+        val vehicleName: String,
+        val totalFuel: Double,
+        val totalDistance: Double,
+        val fuelPerKm: Double,
+        val totalCost: Double,
+        val efficiency: Double
+    )
+    
+    data class DriverFuelData(
+        val driverId: String,
+        val driverName: String,
+        val totalFuel: Double,
+        val totalDistance: Double,
+        val fuelPerKm: Double,
+        val efficiency: Double,
+        val costSavings: Double
+    )
+    
+    data class FuelTrend(
+        val period: String,
+        val fuelConsumption: Double,
+        val cost: Double,
+        val efficiency: Double
+    )
+    
+    /**
+     * Generate Profit/Loss Report
+     */
+    fun generateProfitLossReport(startDate: LocalDateTime, endDate: LocalDateTime): Report {
+        return serviceScope.async {
+            val reportData = generateMockProfitLossData(startDate, endDate)
+            
+            val report = Report(
+                reportId = java.util.UUID.randomUUID().toString(),
+                type = ReportType.PROFIT_LOSS,
+                title = "تقرير الأرباح والخسائر",
+                description = "تحليل شامل للأرباح والخسائر للفترة المحددة",
+                generatedAt = LocalDateTime.now(),
+                startDate = startDate,
+                endDate = endDate,
+                data = mapOf(
+                    "profitLossData" to reportData,
+                    "summary" to mapOf(
+                        "totalRevenue" to reportData.totalRevenue,
+                        "totalExpenses" to reportData.totalExpenses,
+                        "netProfit" to reportData.netProfit,
+                        "profitMargin" to reportData.profitMargin
+                    )
+                )
+            )
+            
+            reportsMap[report.reportId] = report
+            updateStatistics()
+            
+            report
+        }.await()
+    }
+    
+    /**
+     * Generate Driver Performance Report
+     */
+    fun generateDriverPerformanceReport(startDate: LocalDateTime, endDate: LocalDateTime): Report {
+        return serviceScope.async {
+            val reportData = generateMockDriverPerformanceData(startDate, endDate)
+            
+            val report = Report(
+                reportId = java.util.UUID.randomUUID().toString(),
+                type = ReportType.DRIVER_PERFORMANCE,
+                title = "تقرير أداء السائقين",
+                description = "تقييم شامل لأداء السائقين ومقارنات",
+                generatedAt = LocalDateTime.now(),
+                startDate = startDate,
+                endDate = endDate,
+                data = mapOf(
+                    "driverPerformanceData" to reportData,
+                    "summary" to mapOf(
+                        "totalDrivers" to reportData.totalDrivers,
+                        "averageCompletionRate" to reportData.averageCompletionRate,
+                        "averageOnTimeDelivery" to reportData.averageOnTimeDelivery,
+                        "totalRevenue" to reportData.totalRevenue
+                    )
+                )
+            )
+            
+            reportsMap[report.reportId] = report
+            updateStatistics()
+            
+            report
+        }.await()
+    }
+    
+    /**
+     * Generate Shipment Efficiency Report
+     */
+    fun generateShipmentEfficiencyReport(startDate: LocalDateTime, endDate: LocalDateTime): Report {
+        return serviceScope.async {
+            val reportData = generateMockShipmentEfficiencyData(startDate, endDate)
+            
+            val report = Report(
+                reportId = java.util.UUID.randomUUID().toString(),
+                type = ReportType.SHIPMENT_EFFICIENCY,
+                title = "تقرير كفاءة الشحنات",
+                description = "تحليل كفاءة الشحنات والمسارات",
+                generatedAt = LocalDateTime.now(),
+                startDate = startDate,
+                endDate = endDate,
+                data = mapOf(
+                    "shipmentEfficiencyData" to reportData,
+                    "summary" to mapOf(
+                        "totalShipments" to reportData.totalShipments,
+                        "completionRate" to reportData.completionRate,
+                        "onTimeDeliveryRate" to reportData.onTimeDeliveryRate,
+                        "totalRevenue" to reportData.totalRevenue
+                    )
+                )
+            )
+            
+            reportsMap[report.reportId] = report
+            updateStatistics()
+            
+            report
+        }.await()
+    }
+    
+    /**
+     * Generate Fuel Consumption Report
+     */
+    fun generateFuelConsumptionReport(startDate: LocalDateTime, endDate: LocalDateTime): Report {
+        return serviceScope.async {
+            val reportData = generateMockFuelConsumptionData(startDate, endDate)
+            
+            val report = Report(
+                reportId = java.util.UUID.randomUUID().toString(),
+                type = ReportType.FUEL_CONSUMPTION,
+                title = "تقرير استهلاك الوقود",
+                description = "تحليل استهلاك الوقود وكفاءة المركبات",
+                generatedAt = LocalDateTime.now(),
+                startDate = startDate,
+                endDate = endDate,
+                data = mapOf(
+                    "fuelConsumptionData" to reportData,
+                    "summary" to mapOf(
+                        "totalFuel" to reportData.totalFuel,
+                        "totalCost" to reportData.totalCost,
+                        "averageFuelPerKm" to reportData.averageFuelPerKm,
+                        "totalDistance" to reportData.totalDistance
+                    )
+                )
+            )
+            
+            reportsMap[report.reportId] = report
+            updateStatistics()
+            
+            report
+        }.await()
+    }
+    
+    /**
+     * Export report to specified format
+     */
+    fun exportReport(reportId: String, format: ExportFormat): ByteArray {
+        val report = reportsMap[reportId] 
+            ?: throw IllegalArgumentException("Report not found: $reportId")
+        
+        return when (format) {
+            ExportFormat.PDF -> exportToPDF(report)
+            ExportFormat.EXCEL -> exportToExcel(report)
+            ExportFormat.CSV -> exportToCSV(report)
+        }
+    }
+    
+    /**
+     * Get report by ID
+     */
+    fun getReport(reportId: String): Report? {
+        return reportsMap[reportId]
+    }
+    
+    /**
+     * Get all reports
+     */
+    fun getAllReports(): List<Report> {
+        return reportsMap.values.sortedByDescending { it.generatedAt }
+    }
+    
+    /**
+     * Get reports by type
+     */
+    fun getReportsByType(type: ReportType): List<Report> {
+        return reportsMap.values.filter { it.type == type }
+            .sortedByDescending { it.generatedAt }
+    }
+    
+    /**
+     * Delete report
+     */
+    fun deleteReport(reportId: String) {
+        reportsMap.remove(reportId)
+        updateStatistics()
+    }
+    
+    /**
+     * Get report statistics
+     */
+    fun getReportStatistics(): ReportStatistics {
+        return _reportStatistics.value
+    }
+    
+    /**
+     * Mock data generation methods (in real app, these would query actual data sources)
+     */
+    private fun generateMockProfitLossData(startDate: LocalDateTime, endDate: LocalDateTime): ProfitLossData {
+        val revenue = 150000.0 + (Math.random() * 50000.0)
+        val expenses = 100000.0 + (Math.random() * 30000.0)
+        val grossProfit = revenue
+        val netProfit = revenue - expenses
+        val profitMargin = if (revenue > 0) (netProfit / revenue) * 100 else 0.0
+        
+        val revenueBreakdown = listOf(
+            RevenueItem("الشحنات العادية", revenue * 0.6, 60.0, 15.0),
+            RevenueItem("الشحنات السريعة", revenue * 0.25, 25.0, 25.0),
+            RevenueItem("خدمات إضافية", revenue * 0.15, 15.0, 10.0)
+        )
+        
+        val expenseBreakdown = listOf(
+            ExpenseItem("الوقود", expenses * 0.35, 35.0, 5.0),
+            ExpenseItem("الرواتب", expenses * 0.30, 30.0, 8.0),
+            ExpenseItem("الصيانة", expenses * 0.20, 20.0, -5.0),
+            ExpenseItem("أخرى", expenses * 0.15, 15.0, 12.0)
+        )
+        
+        val monthlyTrends = (1..6).map { month ->
+            val monthRevenue = revenue / 6 + (Math.random() - 0.5) * 10000
+            val monthExpenses = expenses / 6 + (Math.random() - 0.5) * 5000
+            MonthlyTrend(
+                month = LocalDateTime.now().minusMonths(6 - month.toLong()).format(DateTimeFormatter.ofPattern("MMM yyyy")),
+                revenue = monthRevenue,
+                expenses = monthExpenses,
+                profit = monthRevenue - monthExpenses,
+                profitMargin = if (monthRevenue > 0) ((monthRevenue - monthExpenses) / monthRevenue) * 100 else 0.0
+            )
+        }
+        
+        return ProfitLossData(
+            totalRevenue = revenue,
+            totalExpenses = expenses,
+            grossProfit = grossProfit,
+            netProfit = netProfit,
+            profitMargin = profitMargin,
+            revenueBreakdown = revenueBreakdown,
+            expenseBreakdown = expenseBreakdown,
+            monthlyTrends = monthlyTrends
+        )
+    }
+    
+    private fun generateMockDriverPerformanceData(startDate: LocalDateTime, endDate: LocalDateTime): DriverPerformanceData {
+        val drivers = (1..15).map { driverId ->
+            val completionRate = 85.0 + (Math.random() * 15.0)
+            val onTimeRate = 80.0 + (Math.random() * 20.0)
+            val rating = 3.5 + (Math.random() * 1.5)
+            val revenue = 5000.0 + (Math.random() * 10000.0)
+            
+            DriverDetail(
+                driverId = "DRV_$driverId",
+                driverName = "السائق $driverId",
+                totalShipments = 20 + (Math.random() * 30).toInt(),
+                completedShipments = (20 + (Math.random() * 30).toInt() * (completionRate / 100)).toInt(),
+                completionRate = completionRate,
+                averageDeliveryTime = 2.0 + (Math.random() * 3.0),
+                onTimeDeliveryRate = onTimeRate,
+                customerRating = rating,
+                totalDistance = 1000.0 + (Math.random() * 2000.0),
+                fuelEfficiency = 8.0 + (Math.random() * 4.0),
+                revenueGenerated = revenue,
+                violations = (Math.random() * 5).toInt()
+            )
+        }
+        
+        val topPerformers = drivers
+            .sortedByDescending { 
+                it.completionRate * 0.3 + it.onTimeDeliveryRate * 0.3 + it.customerRating * 20 * 0.2 + it.fuelEfficiency * 10 * 0.2 
+            }
+            .take(5)
+            .mapIndexed { index, driver ->
+                DriverMetrics(
+                    driverId = driver.driverId,
+                    driverName = driver.driverName,
+                    score = 100.0 - (index * 15.0),
+                    rank = "TOP ${index + 1}"
+                )
+            }
+        
+        val underPerformers = drivers
+            .sortedBy { 
+                it.completionRate * 0.3 + it.onTimeDeliveryRate * 0.3 + it.customerRating * 20 * 0.2 + it.fuelEfficiency * 10 * 0.2 
+            }
+            .take(5)
+            .mapIndexed { index, driver ->
+                DriverMetrics(
+                    driverId = driver.driverId,
+                    driverName = driver.driverName,
+                    score = 40.0 + (index * 10.0),
+                    rank = "LOW ${index + 1}"
+                )
+            }
+        
+        return DriverPerformanceData(
+            totalDrivers = drivers.size,
+            averageCompletionRate = drivers.map { it.completionRate }.average(),
+            averageOnTimeDelivery = drivers.map { it.onTimeDeliveryRate }.average(),
+            averageCustomerRating = drivers.map { it.customerRating }.average(),
+            totalRevenue = drivers.sumOf { it.revenueGenerated },
+            topPerformers = topPerformers,
+            underPerformers = underPerformers,
+            driverDetails = drivers
+        )
+    }
+    
+    private fun generateMockShipmentEfficiencyData(startDate: LocalDateTime, endDate: LocalDateTime): ShipmentEfficiencyData {
+        val shipments = (1..50).map { shipmentId ->
+            val efficiency = 70.0 + (Math.random() * 30.0)
+            val actualTime = 1.0 + (Math.random() * 4.0)
+            val estimatedTime = actualTime * (efficiency / 100.0)
+            
+            ShipmentEfficiencyData(
+                totalShipments = 0, // Will be calculated
+                completedShipments = 0, // Will be calculated
+                completionRate = 0.0, // Will be calculated
+                averageDeliveryTime = 0.0, // Will be calculated
+                onTimeDeliveryRate = 0.0, // Will be calculated
+                averageDistance = 0.0, // Will be calculated
+                totalRevenue = 0.0, // Will be calculated
+                routeEfficiencies = emptyList(),
+                delayAnalysis = emptyList(),
+                timeAnalysis = emptyList()
+            )
+        }
+        
+        // Generate route efficiencies
+        val routeEfficiencies = (1..10).map { routeId ->
+            RouteEfficiency(
+                routeId = "ROUTE_$routeId",
+                routeName = "المسار $routeId",
+                totalShipments = 5 + (Math.random() * 10).toInt(),
+                averageTime = 2.0 + (Math.random() * 2.0),
+                averageDistance = 50.0 + (Math.random() * 100.0),
+                efficiency = 75.0 + (Math.random() * 25.0),
+                totalRevenue = 1000.0 + (Math.random() * 5000.0)
+            )
+        }
+        
+        // Generate delay analysis
+        val delayAnalysis = listOf(
+            DelayAnalysis("ازدحام المرور", 15, 45.0, 675.0, 30.0),
+            DelayAnalysis("ظروف جوية سيئة", 8, 30.0, 240.0, 16.0),
+            DelayAnalysis("مشاكل في المركبة", 5, 60.0, 300.0, 10.0),
+            DelayAnalysis("أخرى", 12, 20.0, 240.0, 24.0)
+        )
+        
+        // Generate time analysis
+        val timeAnalysis = listOf(
+            TimeAnalysis("صباح", 2.5, 1.0, 4.0, 25),
+            TimeAnalysis("مساء", 3.2, 1.5, 5.0, 30),
+            TimeAnalysis("ليل", 2.8, 1.2, 4.5, 20)
+        )
+        
+        val totalShipments = shipments.size
+        val completedShipments = (totalShipments * 0.9).toInt()
+        val completionRate = (completedShipments.toDouble() / totalShipments) * 100
+        val onTimeDeliveryRate = 85.0 + (Math.random() * 15.0)
+        
+        return ShipmentEfficiencyData(
+            totalShipments = totalShipments,
+            completedShipments = completedShipments,
+            completionRate = completionRate,
+            averageDeliveryTime = 2.5 + (Math.random() * 1.5),
+            onTimeDeliveryRate = onTimeDeliveryRate,
+            averageDistance = 75.0 + (Math.random() * 50.0),
+            totalRevenue = 50000.0 + (Math.random() * 30000.0),
+            routeEfficiencies = routeEfficiencies,
+            delayAnalysis = delayAnalysis,
+            timeAnalysis = timeAnalysis
+        )
+    }
+    
+    private fun generateMockFuelConsumptionData(startDate: LocalDateTime, endDate: LocalDateTime): FuelConsumptionData {
+        val totalFuel = 5000.0 + (Math.random() * 2000.0)
+        val totalCost = totalFuel * 1.5 + (Math.random() * 500.0)
+        val totalDistance = 50000.0 + (Math.random() * 20000.0)
+        val averageFuelPerKm = totalFuel / totalDistance
+        
+        val vehicleConsumptions = (1..8).map { vehicleId ->
+            val vehicleFuel = totalFuel / 8 + (Math.random() * 500.0)
+            val vehicleDistance = totalDistance / 8 + (Math.random() * 2000.0)
+            
+            VehicleFuelData(
+                vehicleId = "VEH_$vehicleId",
+                vehicleName = "مركبة $vehicleId",
+                totalFuel = vehicleFuel,
+                totalDistance = vehicleDistance,
+                fuelPerKm = vehicleFuel / vehicleDistance,
+                totalCost = vehicleFuel * 1.5,
+                efficiency = 100.0 / (vehicleFuel / vehicleDistance * 100)
+            )
+        }
+        
+        val driverEfficiencies = (1..12).map { driverId ->
+            val driverFuel = totalFuel / 12 + (Math.random() * 200.0)
+            val driverDistance = totalDistance / 12 + (Math.random() * 1500.0)
+            
+            DriverFuelData(
+                driverId = "DRV_$driverId",
+                driverName = "السائق $driverId",
+                totalFuel = driverFuel,
+                totalDistance = driverDistance,
+                fuelPerKm = driverFuel / driverDistance,
+                efficiency = 100.0 / (driverFuel / driverDistance * 100),
+                costSavings = (Math.random() - 0.5) * 200.0
+            )
+        }
+        
+        val fuelTrends = (1..6).map { month ->
+            val monthFuel = totalFuel / 6 + (Math.random() - 0.5) * 500.0
+            val monthCost = monthFuel * 1.5
+            val monthDistance = totalDistance / 6 + (Math.random() - 0.5) * 3000.0
+            
+            FuelTrend(
+                period = LocalDateTime.now().minusMonths(6 - month.toLong()).format(DateTimeFormatter.ofPattern("MMM yyyy")),
+                fuelConsumption = monthFuel,
+                cost = monthCost,
+                efficiency = monthDistance / monthFuel
+            )
+        }
+        
+        return FuelConsumptionData(
+            totalFuel = totalFuel,
+            totalCost = totalCost,
+            averageFuelPerKm = averageFuelPerKm,
+            totalDistance = totalDistance,
+            costPerKm = totalCost / totalDistance,
+            vehicleConsumptions = vehicleConsumptions,
+            driverEfficiencies = driverEfficiencies,
+            fuelTrends = fuelTrends
+        )
+    }
+    
+    /**
+     * Export methods (simplified - would use actual libraries)
+     */
+    private fun exportToPDF(report: Report): ByteArray {
+        // Implementation would use PDF library like iText or PDFBox
+        val content = buildString {
+            appendLine("تقرير: ${report.title}")
+            appendLine("النوع: ${report.type.arabicName}")
+            appendLine("الفترة: ${report.startDate} إلى ${report.endDate}")
+            appendLine("تم الإنشاء: ${report.generatedAt}")
+            appendLine("\n")
+            appendLine("البيانات:")
+            appendLine(report.data.toString())
+        }
+        return content.toByteArray(Charsets.UTF_8)
+    }
+    
+    private fun exportToExcel(report: Report): ByteArray {
+        // Implementation would use Apache POI or similar
+        val content = buildString {
+            appendLine("تقرير: ${report.title}")
+            appendLine("النوع: ${report.type.arabicName}")
+            appendLine("الفترة: ${report.startDate} إلى ${report.endDate}")
+            appendLine("\n")
+            appendLine("البيانات:")
+            appendLine(report.data.toString())
+        }
+        return content.toByteArray(Charsets.UTF_8)
+    }
+    
+    private fun exportToCSV(report: Report): ByteArray {
+        // Implementation would generate proper CSV format
+        val content = buildString {
+            appendLine("تقرير,النوع,الفترة,تم الإنشاء")
+            appendLine("${report.title},${report.type.arabicName},${report.startDate} إلى ${report.endDate},${report.generatedAt}")
+            appendLine("\n")
+            appendLine("البيانات:")
+            appendLine(report.data.toString())
+        }
+        return content.toByteArray(Charsets.UTF_8)
+    }
+    
+    /**
+     * Update statistics
+     */
+    private fun updateStatistics() {
+        val allReports = reportsMap.values.toList()
+        
+        val reportsByType = allReports.groupBy { it.type }
+            .mapValues { it.value.size }
+        
+        val statistics = ReportStatistics(
+            totalReports = allReports.size,
+            reportsByType = reportsByType,
+            lastGenerated = allReports.maxOfOrNull { it.generatedAt },
+            averageGenerationTime = 2.5, // Mock value
+            exportCount = 0 // Mock value
+        )
+        
+        _reports.value = allReports
+        _reportStatistics.value = statistics
+    }
+    
+    /**
+     * Get report type information
+     */
+    fun getReportTypeInfo(): Map<String, Map<String, Any>> {
+        return mapOf(
+            "PROFIT_LOSS" to mapOf(
+                "name" to "تقرير الأرباح والخسائر",
+                "description" to "تحليل شامل للأرباح والخسائر مع تفصيل حسب الفئات",
+                "features" to listOf("Revenue breakdown", "Expense breakdown", "Monthly trends", "Profit margins")
+            ),
+            "DRIVER_PERFORMANCE" to mapOf(
+                "name" to "تقرير أداء السائقين",
+                "description" to "تقييم شامل لأداء السائقين ومقارنات",
+                "features" to listOf("Completion rates", "On-time delivery", "Customer ratings", "Performance ranking")
+            ),
+            "SHIPMENT_EFFICIENCY" to mapOf(
+                "name" to "تقرير كفاءة الشحنات",
+                "description" to "تحليل كفاءة الشحنات والمسارات",
+                "features" to listOf("Delivery times", "Route efficiency", "Delay analysis", "Time patterns")
+            ),
+            "FUEL_CONSUMPTION" to mapOf(
+                "name" to "تقرير استهلاك الوقود",
+                "description" to "تحليل استهلاك الوقود وكفاءة المركبات",
+                "features" to listOf("Vehicle efficiency", "Driver efficiency", "Cost analysis", "Trends")
+            )
+        )
+    }
+    
+    /**
+     * Get export format information
+     */
+    fun getExportFormatInfo(): Map<String, Map<String, String>> {
+        return mapOf(
+            "PDF" to mapOf(
+                "name" to "PDF",
+                "description" to "تنسيق PDF مع رسوم بيانية وتنسيق احترافي",
+                "mimeType" to "application/pdf",
+                "extension" to ".pdf"
+            ),
+            "EXCEL" to mapOf(
+                "name" to "Excel",
+                "description" to "تنسيق Excel مع جداول قابلة للتعديل",
+                "mimeType" to "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "extension" to ".xlsx"
+            ),
+            "CSV" to mapOf(
+                "name" to "CSV",
+                "description" to "تنسيق CSV للتحليل في برامج أخرى",
+                "mimeType" to "text/csv",
+                "extension" to ".csv"
+            )
+        )
+    }
+    
+    /**
+     * Clear all data (for testing)
+     */
+    fun clearAllData() {
+        reportsMap.clear()
+        updateStatistics()
+    }
+}

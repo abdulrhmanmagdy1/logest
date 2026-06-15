@@ -1,0 +1,257 @@
+package com.edham.logistics.feature.analytics.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.databinding.FragmentAdminDashboardBinding
+import com.edham.logistics.feature.analytics.presentation.adapter.ActivityLogAdapter
+import com.edham.logistics.feature.analytics.presentation.adapter.DriverPerformanceAdapter
+import com.edham.logistics.feature.analytics.presentation.adapter.CustomerAnalyticsAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class AdminDashboardFragment : Fragment() {
+
+    private var _binding: FragmentAdminDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: AdminDashboardViewModel by viewModels()
+    
+    @Inject
+    lateinit var activityLogAdapter: ActivityLogAdapter
+    
+    @Inject
+    lateinit var driverPerformanceAdapter: DriverPerformanceAdapter
+    
+    @Inject
+    lateinit var customerAnalyticsAdapter: CustomerAnalyticsAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentAdminDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerViews()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize with user data (in real app, this would come from user session)
+        viewModel.initialize("admin_123")
+    }
+
+    private fun setupRecyclerViews() {
+        activityLogAdapter = ActivityLogAdapter()
+        driverPerformanceAdapter = DriverPerformanceAdapter()
+        customerAnalyticsAdapter = CustomerAnalyticsAdapter()
+        
+        binding.recyclerViewActivityLog.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = activityLogAdapter
+        }
+        
+        binding.recyclerViewDriverPerformance.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = driverPerformanceAdapter
+        }
+        
+        binding.recyclerViewTopCustomers.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = customerAnalyticsAdapter
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refresh()
+        }
+        
+        binding.cardTotalShipments.setOnClickListener {
+            navigateToShipmentsList()
+        }
+        
+        binding.cardActiveDrivers.setOnClickListener {
+            navigateToDriversList()
+        }
+        
+        binding.cardTotalRevenue.setOnClickListener {
+            navigateToRevenueAnalytics()
+        }
+        
+        binding.cardDelayedShipments.setOnClickListener {
+            navigateToDelayedShipments()
+        }
+    }
+
+    private fun updateUI(uiState: AdminDashboardViewModel.AdminDashboardUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.contentLayout.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refresh()
+        }
+    }
+
+    private fun showContent(uiState: AdminDashboardViewModel.AdminDashboardUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        
+        uiState.dashboardData?.let { data ->
+            updateMetricCards(data)
+            updateCharts(data)
+            updateLists(data)
+        }
+    }
+
+    private fun updateMetricCards(data: AdminDashboardData) {
+        binding.apply {
+            // Total Shipments
+            textTotalShipments.text = data.totalShipments.toString()
+            textTotalShipmentsTrend.text = formatTrend(data.totalShipments.toDouble(), 0.0)
+            
+            // Active Drivers
+            textActiveDrivers.text = data.activeDrivers.toString()
+            textActiveDriversTrend.text = formatTrend(data.activeDrivers.toDouble(), 0.0)
+            
+            // Total Revenue
+            textTotalRevenue.text = formatCurrency(data.totalRevenue)
+            textTotalRevenueTrend.text = formatTrend(data.monthlyRevenue, 0.0)
+            
+            // Delayed Shipments
+            textDelayedShipments.text = data.delayedShipments.toString()
+            textDelayedShipmentsTrend.text = formatTrend(data.delayedShipments.toDouble(), 0.0)
+            
+            // Additional Metrics
+            textAverageDeliveryTime.text = "${data.averageDeliveryTime.toInt()} دقيقة"
+            textCustomerSatisfaction.text = "${(data.customerSatisfaction * 100).toInt()}%"
+            textFleetUtilization.text = "${(data.fleetUtilization * 100).toInt()}%"
+            textSystemHealth.text = "${(data.systemHealth * 100).toInt()}%"
+        }
+    }
+
+    private fun updateCharts(data: AdminDashboardData) {
+        // Revenue Chart
+        updateRevenueChart(data.revenueByMonth)
+        
+        // Shipment Status Chart
+        updateShipmentStatusChart(data.shipmentsByStatus)
+    }
+
+    private fun updateRevenueChart(revenueByMonth: List<MonthlyRevenue>) {
+        // In a real implementation, you would use a charting library like MPAndroidChart
+        // For now, we'll just display the data in a simple format
+        val labels = revenueByMonth.map { it.month }
+        val values = revenueByMonth.map { it.revenue }
+        
+        binding.textRevenueChartSummary.text = "الإيرادات الشهرية: ${labels.size} شهر"
+    }
+
+    private fun updateShipmentStatusChart(shipmentsByStatus: Map<String, Long>) {
+        // In a real implementation, you would use a charting library
+        val total = shipmentsByStatus.values.sum()
+        val statusText = shipmentsByStatus.entries.joinToString("\n") { (status, count) ->
+            "$status: $count (${(count * 100 / total)}%)"
+        }
+        binding.textShipmentStatusSummary.text = statusText
+    }
+
+    private fun updateLists(data: AdminDashboardData) {
+        // Activity Log
+        activityLogAdapter.submitList(data.recentActivities)
+        
+        // Driver Performance
+        driverPerformanceAdapter.submitList(data.driverPerformance)
+        
+        // Top Customers
+        customerAnalyticsAdapter.submitList(data.topCustomers)
+    }
+
+    private fun formatTrend(current: Double, previous: Double): String {
+        val change = current - previous
+        val percentage = if (previous != 0.0) (change / previous) * 100 else 0.0
+        
+        return when {
+            change > 0 -> "↑ ${percentage.toInt()}%"
+            change < 0 -> "↓ ${Math.abs(percentage).toInt()}%"
+            else -> "→ 0%"
+        }
+    }
+
+    private fun formatCurrency(amount: Double): String {
+        return String.format("%,.0f ر.س", amount)
+    }
+
+    private fun navigateToShipmentsList() {
+        // Navigate to shipments list
+        showSnackbar("فتح قائمة الشحنات")
+    }
+
+    private fun navigateToDriversList() {
+        // Navigate to drivers list
+        showSnackbar("فتح قائمة السائقين")
+    }
+
+    private fun navigateToRevenueAnalytics() {
+        // Navigate to revenue analytics
+        showSnackbar("فتح تحليلات الإيرادات")
+    }
+
+    private fun navigateToDelayedShipments() {
+        // Navigate to delayed shipments
+        showSnackbar("فتح الشحنات المتأخرة")
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

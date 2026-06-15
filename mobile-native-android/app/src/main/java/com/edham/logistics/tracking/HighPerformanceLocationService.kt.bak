@@ -1,0 +1,636 @@
+package com.edham.logistics.tracking
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.os.*
+import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.edham.logistics.R
+import com.edham.logistics.core.network.RetrofitClient
+import com.edham.logistics.data.remote.api.TrackingApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.BatteryUtils
+import kotlinx.coroutines.*
+import org.json.JSONObject
+import java.util.concurrent.ConcurrentLinkedQueue
+
+/**
+ * High-performance location service for smooth vehicle tracking
+ * Optimized for battery life, network usage, and weak internet conditions
+ */
+class HighPerformanceLocationService : Service(), LocationListener {
+
+    companion object {
+        private const val TAG = "HighPerformanceLocationService"
+        private const val NOTIFICATION_ID = 1001
+        private const val LOCATION_UPDATE_INTERVAL = 3000L // 3 seconds
+        private const val LOCATION_UPDATE_FASTEST_INTERVAL = 1000L // 1 second
+        private const val MIN_ACCURACY = 50.0f // 50 meters
+        private const val MAX_SPEED_THRESHOLD = 200.0f // 200 km/h
+        private const val BATCH_SIZE = 10 // Batch location updates
+        private const val OFFLINE_QUEUE_MAX_SIZE = 100
+        
+        // Optimization levels
+        private const val BATTERY_HIGH_THRESHOLD = 80
+        private const val BATTERY_MEDIUM_THRESHOLD = 50
+        private const val BATTERY_LOW_THRESHOLD = 20
+        
+        // Network quality thresholds
+        private const val NETWORK_EXCELLENT_THRESHOLD = 90
+        private const val NETWORK_GOOD_THRESHOLD = 70
+        private const val NETWORK_FAIR_THRESHOLD = 40
+    }
+
+    private lateinit var locationManager: LocationManager
+    private lateinit var trackingApi: TrackingApi
+    private lateinit var notificationManager: NotificationManager
+    
+    // Service components
+    private var serviceJob: Job? = null
+    private var locationUpdateJob: Job? = null
+    private var networkMonitorJob: Job? = null
+    private var batteryMonitorJob: Job? = null
+    
+    // Location data
+    private var lastLocation: Location? = null
+    private var currentOptimizationLevel = OptimizationLevel.HIGH_PERFORMANCE
+    private var locationQueue = ConcurrentLinkedQueue<LocationData>()
+    private var offlineLocationQueue = ConcurrentLinkedQueue<LocationData>()
+    
+    // Performance tracking
+    private var totalLocationUpdates = 0
+    private var successfulUploads = 0
+    private var failedUploads = 0
+    private var lastUploadTime = 0L
+    private var sessionStartTime = 0L
+    
+    // Connection management
+    private var isNetworkAvailable = false
+    private var lastConnectionCheck = 0L
+    private var connectionRetryCount = 0
+    private var maxRetryAttempts = 5
+    
+    // Battery management
+    private var currentBatteryLevel = 100
+    private var isCharging = false
+    
+    enum class OptimizationLevel {
+        HIGH_PERFORMANCE,    // 3 seconds, high accuracy
+        BALANCED,           // 5 seconds, medium accuracy
+        POWER_SAVING,       // 10 seconds, low accuracy
+        CRITICAL_POWER_SAVING // 30 seconds, minimal accuracy
+    }
+    
+    data class LocationData(
+        val latitude: Double,
+        val longitude: Double,
+        val altitude: Double?,
+        val speed: Float,
+        val heading: Float,
+        val accuracy: Float,
+        val timestamp: Long,
+        val batteryLevel: Int,
+        val signalStrength: Int,
+        val connectionQuality: String
+    )
+
+    override fun onCreate() {
+        super.onCreate()
+        Log.d(TAG, "High-performance location service starting")
+        
+        initializeComponents()
+        startForegroundService()
+        startLocationTracking()
+        startPerformanceMonitoring()
+        
+        sessionStartTime = System.currentTimeMillis()
+        Log.i(TAG, "Location service initialized successfully")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            "START_TRACKING" -> {
+                val vehicleId = intent.getLongExtra("vehicle_id", -1L)
+                val driverId = intent.getLongExtra("driver_id", -1L)
+                startTracking(vehicleId, driverId)
+            }
+            "STOP_TRACKING" -> {
+                stopTracking()
+            }
+            "UPDATE_OPTIMIZATION" -> {
+                val level = intent.getStringExtra("optimization_level")
+                updateOptimizationLevel(level)
+            }
+        }
+        
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Log.d(TAG, "Location service stopping")
+        
+        stopLocationTracking()
+        stopPerformanceMonitoring()
+        
+        // Upload remaining offline data
+        if (offlineLocationQueue.isNotEmpty()) {
+            uploadOfflineData()
+        }
+        
+        Log.i(TAG, "Location service stopped. Stats: Updates: $totalLocationUpdates, Success: $successfulUploads, Failed: $failedUploads")
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onLocationChanged(location: Location) {
+        if (isValidLocation(location)) {
+            processLocationUpdate(location)
+        }
+    }
+
+    override fun onProviderDisabled(provider: String) {
+        Log.w(TAG, "Location provider disabled: $provider")
+        
+        if (provider == LocationManager.GPS_PROVIDER) {
+            // Try to switch to network provider
+            try {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    LOCATION_UPDATE_INTERVAL,
+                    LOCATION_UPDATE_FASTEST_INTERVAL,
+                    this
+                )
+                Log.i(TAG, "Switched to network provider")
+            } catch (e: SecurityException) {
+                Log.e(TAG, "Failed to switch to network provider", e)
+            }
+        }
+    }
+
+    override fun onProviderEnabled(provider: String) {
+        Log.i(TAG, "Location provider enabled: $provider")
+    }
+
+    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
+        when (status) {
+            LocationProvider.AVAILABLE -> Log.d(TAG, "Location provider available: $provider")
+            LocationProvider.OUT_OF_SERVICE -> Log.w(TAG, "Location provider out of service: $provider")
+            LocationProvider.TEMPORARILY_UNAVAILABLE -> Log.w(TAG, "Location provider temporarily unavailable: $provider")
+            LocationProvider.TEMPORARILY_UNAVAILABLE -> Log.d(TAG, "Location provider temporarily unavailable: $provider")
+        }
+    }
+
+    private fun initializeComponents() {
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        trackingApi = RetrofitClient.getInstance().create(TrackingApi::class.java)
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        
+        // Check permissions
+        if (!hasLocationPermissions()) {
+            Log.e(TAG, "Location permissions not granted")
+            return
+        }
+    }
+
+    private fun startForegroundService() {
+        val notification = createNotification()
+        startForeground(NOTIFICATION_ID, notification)
+        Log.d(TAG, "Foreground service started")
+    }
+
+    private fun createNotification(): Notification {
+        val channelId = "location_tracking_channel"
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Location Tracking",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Tracks vehicle location for logistics"
+                setShowBadge(false)
+                enableVibration(false)
+                setSound(null, null)
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+        
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Edham Logistics Tracking")
+            .setContentText("Vehicle location tracking active")
+            .setSmallIcon(R.drawable.ic_location)
+            .setOngoing(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startLocationTracking() {
+        if (!hasLocationPermissions()) {
+            Log.e(TAG, "Cannot start tracking without permissions")
+            return
+        }
+        
+        try {
+            // Try GPS first for high accuracy
+            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    getUpdateInterval(),
+                    getFastestUpdateInterval(),
+                    this
+                )
+                Log.i(TAG, "GPS provider enabled for tracking")
+            } else if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    getUpdateInterval(),
+                    getFastestUpdateInterval(),
+                    this
+                )
+                Log.i(TAG, "Network provider enabled for tracking")
+            } else {
+                Log.e(TAG, "No location provider available")
+                return
+            }
+            
+            // Get last known location
+            val lastKnownLocation = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            
+            lastKnownLocation?.let {
+                processLocationUpdate(it)
+            }
+            
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Failed to start location tracking", e)
+        }
+    }
+
+    private fun stopLocationTracking() {
+        try {
+            locationManager.removeUpdates(this)
+            Log.d(TAG, "Location tracking stopped")
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Failed to stop location tracking", e)
+        }
+    }
+
+    private fun startPerformanceMonitoring() {
+        serviceJob = Job().also { job ->
+            // Network monitoring
+            networkMonitorJob = CoroutineScope(Dispatchers.IO + job).launch {
+                while (isActive) {
+                    checkNetworkStatus()
+                    delay(10000) // Check every 10 seconds
+                }
+            }
+            
+            // Battery monitoring
+            batteryMonitorJob = CoroutineScope(Dispatchers.IO + job).launch {
+                while (isActive) {
+                    monitorBatteryLevel()
+                    delay(30000) // Check every 30 seconds
+                }
+            }
+            
+            // Location upload job
+            locationUpdateJob = CoroutineScope(Dispatchers.IO + job).launch {
+                while (isActive) {
+                    processLocationQueue()
+                    delay(2000) // Process every 2 seconds
+                }
+            }
+        }
+    }
+
+    private fun stopPerformanceMonitoring() {
+        serviceJob?.cancel()
+        networkMonitorJob?.cancel()
+        batteryMonitorJob?.cancel()
+        locationUpdateJob?.cancel()
+    }
+
+    private fun isValidLocation(location: Location): Boolean {
+        // Check accuracy
+        if (location.accuracy > MIN_ACCURACY) {
+            Log.w(TAG, "Location accuracy too low: ${location.accuracy}m")
+            return false
+        }
+        
+        // Check speed (prevent unrealistic speeds)
+        if (location.speed > MAX_SPEED_THRESHOLD) {
+            Log.w(TAG, "Unrealistic speed detected: ${location.speed}km/h")
+            return false
+        }
+        
+        // Check timestamp
+        val timeDiff = System.currentTimeMillis() - location.time
+        if (timeDiff > 60000) { // More than 1 minute old
+            Log.w(TAG, "Location timestamp too old: ${timeDiff}ms")
+            return false
+        }
+        
+        return true
+    }
+
+    private fun processLocationUpdate(location: Location) {
+        totalLocationUpdates++
+        
+        // Apply smoothing for smooth movement
+        val smoothedLocation = applyLocationSmoothing(location)
+        
+        // Create location data
+        val locationData = LocationData(
+            latitude = smoothedLocation.latitude,
+            longitude = smoothedLocation.longitude,
+            altitude = smoothedLocation.altitude,
+            speed = smoothedLocation.speed,
+            heading = smoothedLocation.bearing,
+            accuracy = smoothedLocation.accuracy,
+            timestamp = System.currentTimeMillis(),
+            batteryLevel = currentBatteryLevel,
+            signalStrength = getSignalStrength(),
+            connectionQuality = getConnectionQuality()
+        )
+        
+        lastLocation = smoothedLocation
+        
+        // Add to queue for processing
+        locationQueue.offer(locationData)
+        
+        // Store offline if no network
+        if (!isNetworkAvailable) {
+            offlineLocationQueue.offer(locationData)
+            if (offlineLocationQueue.size > OFFLINE_QUEUE_MAX_SIZE) {
+                offlineLocationQueue.poll() // Remove oldest
+            }
+            Log.d(TAG, "Stored location offline. Queue size: ${offlineLocationQueue.size}")
+        }
+        
+        Log.d(TAG, "Location processed: ${locationData.latitude}, ${locationData.longitude}, Accuracy: ${locationData.accuracy}m")
+    }
+
+    private fun applyLocationSmoothing(location: Location): Location {
+        val smoothedLocation = Location(location)
+        
+        lastLocation?.let { last ->
+            val timeDiff = (location.time - last.time) / 1000.0
+            
+            if (timeDiff > 0 && timeDiff < 60) { // Only smooth for recent locations
+                val smoothingFactor = 0.7 // Adjust for desired smoothness
+                
+                smoothedLocation.latitude = last.latitude * smoothingFactor + location.latitude * (1 - smoothingFactor)
+                smoothedLocation.longitude = last.longitude * smoothingFactor + location.longitude * (1 - smoothingFactor)
+                smoothedLocation.speed = last.speed * smoothingFactor + location.speed * (1 - smoothingFactor)
+                smoothedLocation.bearing = last.bearing * smoothingFactor + location.bearing * (1 - smoothingFactor)
+            }
+        }
+        
+        return smoothedLocation
+    }
+
+    private suspend fun processLocationQueue() {
+        if (locationQueue.isEmpty()) return
+        
+        val batch = mutableListOf<LocationData>()
+        
+        // Collect batch
+        repeat(BATCH_SIZE) {
+            locationQueue.poll()?.let { batch.add(it) }
+        }
+        
+        if (batch.isNotEmpty()) {
+            uploadLocationBatch(batch)
+        }
+    }
+
+    private suspend fun uploadLocationBatch(locations: List<LocationData>) {
+        if (!isNetworkAvailable) {
+            // Store offline
+            offlineLocationQueue.addAll(locations)
+            return
+        }
+        
+        try {
+            // Upload to server
+            val response = trackingApi.updateLocationBatch(
+                locations.map { location ->
+                    mapOf(
+                        "latitude" to location.latitude,
+                        "longitude" to location.longitude,
+                        "altitude" to location.altitude,
+                        "speed" to location.speed,
+                        "heading" to location.heading,
+                        "accuracy" to location.accuracy,
+                        "timestamp" to location.timestamp,
+                        "batteryLevel" to location.batteryLevel,
+                        "signalStrength" to location.signalStrength,
+                        "connectionQuality" to location.connectionQuality
+                    )
+                }
+            )
+            
+            if (response.isSuccessful) {
+                successfulUploads += locations.size
+                lastUploadTime = System.currentTimeMillis()
+                connectionRetryCount = 0 // Reset retry count on success
+                
+                // Process offline queue if successful
+                if (offlineLocationQueue.isNotEmpty()) {
+                    uploadOfflineData()
+                }
+            } else {
+                failedUploads += locations.size
+                handleUploadFailure()
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to upload location batch", e)
+            failedUploads += locations.size
+            handleUploadFailure()
+        }
+    }
+
+    private suspend fun uploadOfflineData() {
+        if (!isNetworkAvailable || offlineLocationQueue.isEmpty()) return
+        
+        try {
+            val offlineData = offlineLocationQueue.toList()
+            offlineLocationQueue.clear()
+            
+            val response = trackingApi.uploadOfflineData(
+                offlineData.map { location ->
+                    mapOf(
+                        "latitude" to location.latitude,
+                        "longitude" to location.longitude,
+                        "altitude" to location.altitude,
+                        "speed" to location.speed,
+                        "heading" to location.heading,
+                        "accuracy" to location.accuracy,
+                        "timestamp" to location.timestamp,
+                        "batteryLevel" to location.batteryLevel,
+                        "signalStrength" to location.signalStrength,
+                        "connectionQuality" to location.connectionQuality
+                    )
+                }
+            )
+            
+            if (response.isSuccessful) {
+                successfulUploads += offlineData.size
+                Log.i(TAG, "Uploaded ${offlineData.size} offline locations")
+            } else {
+                // Re-add to queue if failed
+                offlineLocationQueue.addAll(offlineData)
+                failedUploads += offlineData.size
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to upload offline data", e)
+        }
+    }
+
+    private fun handleUploadFailure() {
+        connectionRetryCount++
+        
+        if (connectionRetryCount >= maxRetryAttempts) {
+            // Reduce optimization level to save battery
+            when (currentOptimizationLevel) {
+                OptimizationLevel.HIGH_PERFORMANCE -> updateOptimizationLevel("BALANCED")
+                OptimizationLevel.BALANCED -> updateOptimizationLevel("POWER_SAVING")
+                else -> { /* Already at low level */ }
+            }
+            connectionRetryCount = 0
+        }
+        
+        // Exponential backoff for retry
+        val backoffTime = (1000L * (2.0.pow(connectionRetryCount.toDouble()))).toLong()
+        delay(backoffTime)
+    }
+
+    private fun checkNetworkStatus() {
+        val currentTime = System.currentTimeMillis()
+        
+        // Don't check too frequently
+        if (currentTime - lastConnectionCheck < 5000) return
+        
+        lastConnectionCheck = currentTime
+        isNetworkAvailable = NetworkUtils.isNetworkAvailable(this)
+        
+        if (isNetworkAvailable && !NetworkUtils.isInternetAvailable()) {
+            isNetworkAvailable = false
+        }
+        
+        Log.d(TAG, "Network status: $isNetworkAvailable")
+    }
+
+    private fun monitorBatteryLevel() {
+        currentBatteryLevel = BatteryUtils.getBatteryLevel(this)
+        isCharging = BatteryUtils.isCharging(this)
+        
+        // Adjust optimization based on battery level
+        val newLevel = when {
+            currentBatteryLevel > BATTERY_HIGH_THRESHOLD && !isCharging -> OptimizationLevel.HIGH_PERFORMANCE
+            currentBatteryLevel > BATTERY_MEDIUM_THRESHOLD -> OptimizationLevel.BALANCED
+            currentBatteryLevel > BATTERY_LOW_THRESHOLD -> OptimizationLevel.POWER_SAVING
+            else -> OptimizationLevel.CRITICAL_POWER_SAVING
+        }
+        
+        if (newLevel != currentOptimizationLevel) {
+            updateOptimizationLevel(newLevel.name)
+        }
+    }
+
+    private fun updateOptimizationLevel(level: String) {
+        try {
+            val newLevel = OptimizationLevel.valueOf(level)
+            if (newLevel != currentOptimizationLevel) {
+                currentOptimizationLevel = newLevel
+                
+                // Restart location tracking with new interval
+                stopLocationTracking()
+                startLocationTracking()
+                
+                Log.i(TAG, "Optimization level updated to: $newLevel")
+            }
+        } catch (e: IllegalArgumentException) {
+            Log.e(TAG, "Invalid optimization level: $level")
+        }
+    }
+
+    private fun getUpdateInterval(): Long {
+        return when (currentOptimizationLevel) {
+            OptimizationLevel.HIGH_PERFORMANCE -> LOCATION_UPDATE_INTERVAL
+            OptimizationLevel.BALANCED -> 5000L
+            OptimizationLevel.POWER_SAVING -> 10000L
+            OptimizationLevel.CRITICAL_POWER_SAVING -> 30000L
+        }
+    }
+
+    private fun getFastestUpdateInterval(): Long {
+        return when (currentOptimizationLevel) {
+            OptimizationLevel.HIGH_PERFORMANCE -> LOCATION_UPDATE_FASTEST_INTERVAL
+            OptimizationLevel.BALANCED -> 2000L
+            OptimizationLevel.POWER_SAVING -> 5000L
+            OptimizationLevel.CRITICAL_POWER_SAVING -> 15000L
+        }
+    }
+
+    private fun getSignalStrength(): Int {
+        return when {
+            isNetworkAvailable -> {
+                when (getConnectionQuality()) {
+                    "EXCELLENT" -> 95
+                    "GOOD" -> 80
+                    "FAIR" -> 60
+                    else -> 40
+                }
+            }
+            else -> 0
+        }
+    }
+
+    private fun getConnectionQuality(): String {
+        return when {
+            !isNetworkAvailable -> "POOR"
+            NetworkUtils.getNetworkType(this) == "WIFI" -> "EXCELLENT"
+            NetworkUtils.getSignalStrength(this) > NETWORK_EXCELLENT_THRESHOLD -> "EXCELLENT"
+            NetworkUtils.getSignalStrength(this) > NETWORK_GOOD_THRESHOLD -> "GOOD"
+            NetworkUtils.getSignalStrength(this) > NETWORK_FAIR_THRESHOLD -> "FAIR"
+            else -> "POOR"
+        }
+    }
+
+    private fun hasLocationPermissions(): Boolean {
+        return ActivityCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED &&
+                ActivityCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun startTracking(vehicleId: Long, driverId: Long) {
+        // Implementation for starting specific vehicle tracking
+        Log.i(TAG, "Starting tracking for vehicle: $vehicleId, driver: $driverId")
+    }
+
+    private fun stopTracking() {
+        // Implementation for stopping tracking
+        Log.i(TAG, "Stopping tracking")
+    }
+}

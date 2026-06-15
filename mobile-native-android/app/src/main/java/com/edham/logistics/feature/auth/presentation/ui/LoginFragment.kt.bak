@@ -1,0 +1,228 @@
+package com.edham.logistics.feature.auth.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.databinding.FragmentLoginBinding
+import com.edham.logistics.feature.auth.presentation.ui.LoginViewModel
+import com.edham.logistics.core.auth.AuthStateManager
+import com.edham.logistics.core.auth.AuthUiState
+import com.edham.logistics.core.auth.NavigationState
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class LoginFragment : Fragment() {
+
+    private var _binding: FragmentLoginBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: LoginViewModel by viewModels()
+    
+    @Inject
+    lateinit var authStateManager: AuthStateManager
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentLoginBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupViews()
+        observeViewModel()
+        setupClickListeners()
+    }
+
+    private fun setupViews() {
+        // Set up text watchers for real-time validation
+        binding.editTextEmail.addTextChangedListener {
+            viewModel.updateEmail(it.toString())
+        }
+        
+        binding.editTextPassword.addTextChangedListener {
+            viewModel.updatePassword(it.toString())
+        }
+        
+        binding.checkBoxRememberMe.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updateRememberMe(isChecked)
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe ViewModel state
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+            
+            // Observe AuthStateManager state
+            authStateManager.authState.collect { authState ->
+                when (authState) {
+                    is AuthUiState.Authenticated -> {
+                        // AuthStateManager will handle navigation
+                        showContent(viewModel.uiState.value)
+                    }
+                    is AuthUiState.Unauthenticated -> {
+                        // Stay on login screen
+                        showContent(viewModel.uiState.value)
+                    }
+                    is AuthUiState.Loading -> {
+                        showLoading()
+                    }
+                    is AuthUiState.Error -> {
+                        showError(authState.message)
+                    }
+                    is AuthUiState.SessionExpired -> {
+                        showError("Session expired. Please login again.")
+                    }
+                    else -> {
+                        // Initial state
+                        showContent(viewModel.uiState.value)
+                    }
+                }
+            }
+            
+            // Observe navigation state
+            authStateManager.navigationState.collect { navState ->
+                when (navState) {
+                    is NavigationState.NavigateToDashboard -> {
+                        // Navigate to appropriate dashboard
+                        navigateToDashboard(navState.destination)
+                        authStateManager.clearNavigationState()
+                    }
+                    is NavigationState.NavigateToLogin -> {
+                        // Stay on login screen
+                        // Already on login screen
+                    }
+                    else -> {
+                        // No navigation needed
+                    }
+                }
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonLogin.setOnClickListener {
+            val email = binding.editTextEmail.text.toString().trim()
+            val password = binding.editTextPassword.text.toString()
+            val rememberMe = binding.checkBoxRememberMe.isChecked
+            
+            viewModel.login(email, password, rememberMe)
+        }
+        
+        binding.textViewForgotPassword.setOnClickListener {
+            // Navigate to forgot password
+            findNavController().navigate(R.id.action_loginFragment_to_forgotPasswordFragment)
+        }
+        
+        binding.textViewRegister.setOnClickListener {
+            // Navigate to register
+            findNavController().navigate(R.id.action_loginFragment_to_registerFragment)
+        }
+    }
+
+    private fun updateUI(uiState: LoginViewModel.LoginUiState) {
+        // Handle automatic role-based navigation
+        uiState.routingDestination?.let { destination ->
+            navigateToDashboard(destination)
+            viewModel.onNavigationHandled()
+        }
+        
+        // Update loading state
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.buttonLogin.isEnabled = false
+        binding.editTextEmail.isEnabled = false
+        binding.editTextPassword.isEnabled = false
+    }
+
+    private fun hideLoading() {
+        binding.progressBar.gone()
+        binding.buttonLogin.isEnabled = true
+        binding.editTextEmail.isEnabled = true
+        binding.editTextPassword.isEnabled = true
+    }
+
+    private fun showError(error: String) {
+        binding.textInputLayoutEmail.error = null
+        binding.textInputLayoutPassword.error = null
+        
+        when {
+            error.contains("email", ignoreCase = true) -> {
+                binding.textInputLayoutEmail.error = error
+            }
+            error.contains("password", ignoreCase = true) -> {
+                binding.textInputLayoutPassword.error = error
+            }
+            else -> {
+                showSnackbar(error)
+            }
+        }
+    }
+
+    private fun updateFormValidation(uiState: LoginViewModel.LoginUiState) {
+        // Clear previous errors when user starts typing
+        if (uiState.email.isNotEmpty()) {
+            binding.textInputLayoutEmail.error = null
+        }
+        if (uiState.password.isNotEmpty()) {
+            binding.textInputLayoutPassword.error = null
+        }
+        
+        // Enable/disable login button based on form validity
+        val isFormValid = uiState.email.isNotBlank() && uiState.password.isNotBlank()
+        binding.buttonLogin.isEnabled = isFormValid && !uiState.isLoading
+    }
+
+    private fun navigateToDashboard(destination: com.edham.logistics.core.auth.NavigationDestination) {
+        try {
+            findNavController().navigate(destination.fragmentId)
+        } catch (e: Exception) {
+            // Handle navigation errors
+            showSnackbar("Navigation error: ${e.message}")
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
+    private fun android.widget.TextView.addTextChangedListener(listener: (CharSequence?) -> Unit) {
+        addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                listener(s)
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+    }
+}

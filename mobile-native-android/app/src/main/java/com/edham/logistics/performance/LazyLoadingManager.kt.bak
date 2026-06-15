@@ -1,0 +1,363 @@
+package com.edham.logistics.performance
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import androidx.paging.*
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Lazy Loading Manager for Efficient Large Dataset Handling
+ */
+class LazyLoadingManager {
+    
+    private val loadingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val preloadCache = ConcurrentHashMap<String, Any>()
+    private val loadingTasks = ConcurrentHashMap<String, Job>()
+    private val dataSources = ConcurrentHashMap<String, suspend () -> Any>()
+    
+    /**
+     * Create lazy loading flow for large datasets
+     */
+    fun <T> createLazyFlow(
+        dataSource: suspend (Int, Int) -> List<T>,
+        pageSize: Int = 20,
+        prefetchDistance: Int = 3
+    ): Flow<PagingData<T>> {
+        return Pager(
+            config = PagingConfig(
+                pageSize = pageSize,
+                prefetchDistance = prefetchDistance,
+                enablePlaceholders = false,
+                initialLoadSize = pageSize * 2
+            ),
+            pagingSourceFactory = {
+                LazyPagingSource(dataSource, pageSize)
+            }
+        ).flow
+    }
+    
+    /**
+     * Create optimized lazy list with preloading
+     */
+    fun <T> createLazyList(
+        key: String,
+        dataSource: suspend () -> List<T>,
+        preloadThreshold: Int = 100
+    ): LazyList<T> {
+        return LazyList(key, dataSource, preloadThreshold, this)
+    }
+    
+    /**
+     * Preload data for faster access
+     */
+    fun preloadData(key: String, dataLoader: suspend () -> Any) {
+        if (preloadCache.containsKey(key) || loadingTasks.containsKey(key)) {
+            return
+        }
+        
+        val job = loadingScope.launch {
+            try {
+                val data = dataLoader()
+                preloadCache[key] = data
+            } catch (e: Exception) {
+                // Handle preloading error
+            } finally {
+                loadingTasks.remove(key)
+            }
+        }
+        
+        loadingTasks[key] = job
+    }
+    
+    /**
+     * Get preloaded data
+     */
+    @Suppress("UNCHECKED_CAST")
+    fun <T> getPreloadedData(key: String): T? {
+        return preloadCache[key] as? T
+    }
+    
+    /**
+     * Register data source for lazy loading
+     */
+    fun registerDataSource(key: String, dataLoader: suspend () -> Any) {
+        dataSources[key] = dataLoader
+    }
+    
+    /**
+     * Load data from registered source
+     */
+    suspend fun loadData(key: String): Any? {
+        val dataLoader = dataSources[key] ?: return null
+        
+        // Check cache first
+        getPreloadedData<Any>(key)?.let { return it }
+        
+        // Load data
+        return try {
+            val data = dataLoader()
+            preloadCache[key] = data
+            data
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    /**
+     * Create infinite lazy loading flow
+     */
+    fun <T> createInfiniteFlow(
+        dataSource: suspend (Int) -> List<T>,
+        pageSize: Int = 20
+    ): Flow<List<T>> = flow {
+        var page = 0
+        var hasMore = true
+        
+        while (hasMore) {
+            try {
+                val data = dataSource(page)
+                emit(data)
+                hasMore = data.isNotEmpty()
+                page++
+            } catch (e: Exception) {
+                // Handle error and continue
+                delay(1000) // Wait before retry
+            }
+        }
+    }.flowOn(Dispatchers.IO)
+    
+    /**
+     * Create lazy loading with search functionality
+     */
+    fun <T> createSearchableLazyFlow(
+        searchDataSource: suspend (String, Int, Int) -> List<T>,
+        pageSize: Int = 20
+    ): (String) -> Flow<PagingData<T>> = { query ->
+        Pager(
+            config = PagingConfig(
+                pageSize = pageSize,
+                enablePlaceholders = false
+            ),
+            pagingSourceFactory = {
+                SearchablePagingSource(query, searchDataSource, pageSize)
+            }
+        ).flow
+    }
+    
+    /**
+     * Create lazy loading with filtering
+     */
+    fun <T> createFilterableLazyFlow(
+        filterDataSource: suspend (Map<String, Any>, Int, Int) -> List<T>,
+        pageSize: Int = 20
+    ): (Map<String, Any>) -> Flow<PagingData<T>> = { filters ->
+        Pager(
+            config = PagingConfig(
+                pageSize = pageSize,
+                enablePlaceholders = false
+            ),
+            pagingSourceFactory = {
+                FilterablePagingSource(filters, filterDataSource, pageSize)
+            }
+        ).flow
+    }
+    
+    /**
+     * Clear preloaded data
+     */
+    fun clearPreloadedData(key: String? = null) {
+        if (key != null) {
+            preloadCache.remove(key)
+            loadingTasks[key]?.cancel()
+            loadingTasks.remove(key)
+        } else {
+            preloadCache.clear()
+            loadingTasks.values.forEach { it.cancel() }
+            loadingTasks.clear()
+        }
+    }
+    
+    /**
+     * Get loading statistics
+     */
+    fun getLoadingStatistics(): LoadingStatistics {
+        return LoadingStatistics(
+            cachedItems = preloadCache.size,
+            activeLoadingTasks = loadingTasks.size,
+            registeredDataSources = dataSources.size
+        )
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        loadingScope.cancel()
+        clearPreloadedData()
+        dataSources.clear()
+    }
+    
+    /**
+     * Lazy PagingSource implementation
+     */
+    private class LazyPagingSource<T : Any>(
+        private val dataSource: suspend (Int, Int) -> List<T>,
+        private val pageSize: Int
+    ) : PagingSource<Int, T>() {
+        
+        override suspend fun load(params: LoadParams<Int>): LoadResult<Int, T> {
+            return try {
+                val page = params.key ?: 0
+                val data = dataSource(page, params.loadSize)
+                
+                LoadResult.Page(
+                    data = data,
+                    prevKey = if (page == 0) null else page - 1,
+                    nextKey = if (data.size < params.loadSize) null else page + 1
+                )
+            } catch (e: Exception) {
+                LoadResult.Error(e)
+            }
+        }
+        
+        override fun getRefreshKey(state: PagingState<Int, T>): Int? {
+            return state.anchorPosition
+        }
+    }
+    
+    /**
+     * Searchable PagingSource implementation
+     */
+    private class SearchablePagingSource<T : Any>(
+        private val query: String,
+        private val dataSource: suspend (String, Int, Int) -> List<T>,
+        private val pageSize: Int
+    ) : PagingSource<Int, T>() {
+        
+        override suspend fun load(params: LoadParams<Int>): LoadResult<Int, T> {
+            return try {
+                val page = params.key ?: 0
+                val data = dataSource(query, page, params.loadSize)
+                
+                LoadResult.Page(
+                    data = data,
+                    prevKey = if (page == 0) null else page - 1,
+                    nextKey = if (data.size < params.loadSize) null else page + 1
+                )
+            } catch (e: Exception) {
+                LoadResult.Error(e)
+            }
+        }
+        
+        override fun getRefreshKey(state: PagingState<Int, T>): Int? {
+            return state.anchorPosition
+        }
+    }
+    
+    /**
+     * Filterable PagingSource implementation
+     */
+    private class FilterablePagingSource<T : Any>(
+        private val filters: Map<String, Any>,
+        private val dataSource: suspend (Map<String, Any>, Int, Int) -> List<T>,
+        private val pageSize: Int
+    ) : PagingSource<Int, T>() {
+        
+        override suspend fun load(params: LoadParams<Int>): LoadResult<Int, T> {
+            return try {
+                val page = params.key ?: 0
+                val data = dataSource(filters, page, params.loadSize)
+                
+                LoadResult.Page(
+                    data = data,
+                    prevKey = if (page == 0) null else page - 1,
+                    nextKey = if (data.size < params.loadSize) null else page + 1
+                )
+            } catch (e: Exception) {
+                LoadResult.Error(e)
+            }
+        }
+        
+        override fun getRefreshKey(state: PagingState<Int, T>): Int? {
+            return state.anchorPosition
+        }
+    }
+    
+    /**
+     * Lazy List implementation
+     */
+    class LazyList<T>(
+        private val key: String,
+        private val dataSource: suspend () -> List<T>,
+        private val preloadThreshold: Int,
+        private val manager: LazyLoadingManager
+    ) : AbstractList<T>() {
+        
+        private var data: List<T> = emptyList()
+        private var isLoading = false
+        private var hasLoaded = false
+        
+        override fun get(index: Int): T {
+            ensureLoaded()
+            return data[index]
+        }
+        
+        override val size: Int
+            get() {
+                ensureLoaded()
+                return data.size
+            }
+        
+        private fun ensureLoaded() {
+            if (hasLoaded || isLoading) return
+            
+            isLoading = true
+            
+            GlobalScope.launch {
+                try {
+                    // Check cache first
+                    manager.getPreloadedData<List<T>>(key)?.let { cachedData ->
+                        data = cachedData
+                        hasLoaded = true
+                        isLoading = false
+                        return@launch
+                    }
+                    
+                    // Load data
+                    val loadedData = dataSource()
+                    data = loadedData
+                    hasLoaded = true
+                    
+                    // Preload if threshold is met
+                    if (loadedData.size >= preloadThreshold) {
+                        manager.preloadData("${key}_next") {
+                            // Load next page data (simplified)
+                            emptyList<T>()
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Handle loading error
+                } finally {
+                    isLoading = false
+                }
+            }
+        }
+        
+        fun refresh() {
+            hasLoaded = false
+            isLoading = false
+            data = emptyList()
+            manager.clearPreloadedData(key)
+            ensureLoaded()
+        }
+    }
+    
+    /**
+     * Data classes
+     */
+    data class LoadingStatistics(
+        val cachedItems: Int,
+        val activeLoadingTasks: Int,
+        val registeredDataSources: Int
+    )
+}

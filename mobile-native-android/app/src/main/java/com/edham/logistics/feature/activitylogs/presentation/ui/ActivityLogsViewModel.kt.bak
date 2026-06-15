@@ -1,0 +1,652 @@
+package com.edham.logistics.feature.activitylogs.presentation.ui
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.activitylogs.domain.model.*
+import com.edham.logistics.feature.activitylogs.domain.usecase.*
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * ViewModel for activity logs management
+ */
+@HiltViewModel
+class ActivityLogsViewModel @Inject constructor(
+    private val getActivityLogsUseCase: GetActivityLogsUseCase,
+    private val getActivityLogStatisticsUseCase: GetActivityLogStatisticsUseCase,
+    private val searchActivityLogsUseCase: SearchActivityLogsUseCase,
+    private val exportActivityLogsUseCase: ExportActivityLogsUseCase,
+    private val deleteActivityLogsUseCase: DeleteActivityLogsUseCase,
+    private val archiveActivityLogsUseCase: ArchiveActivityLogsUseCase,
+    private val getActivityLogDashboardUseCase: GetActivityLogDashboardUseCase,
+    private val batchActivityLogOperationUseCase: BatchActivityLogOperationUseCase,
+    private val createActivityLogAlertRuleUseCase: CreateActivityLogAlertRuleUseCase,
+    private val getActivityLogAlertsUseCase: GetActivityLogAlertsUseCase,
+    private val getActivityLogTagsUseCase: GetActivityLogTagsUseCase,
+    private val tagActivityLogUseCase: TagActivityLogUseCase,
+    private val observeActivityLogsUseCase: ObserveActivityLogsUseCase,
+    private val observeActivityLogStatisticsUseCase: ObserveActivityLogStatisticsUseCase,
+    private val logLoginUseCase: LogLoginUseCase,
+    private val logLogoutUseCase: LogLogoutUseCase,
+    private val logShipmentCreationUseCase: LogShipmentCreationUseCase,
+    private val logShipmentStatusUpdateUseCase: LogShipmentStatusUpdateUseCase,
+    private val logPaymentUseCase: LogPaymentUseCase
+) : ViewModel() {
+
+    // UI State
+    private val _uiState = MutableStateFlow<ActivityLogsUiState>(ActivityLogsUiState.Idle)
+    val uiState: StateFlow<ActivityLogsUiState> = _uiState.asStateFlow()
+
+    // Activity Logs
+    private val _activityLogs = MutableStateFlow<List<ActivityLog>>(emptyList())
+    val activityLogs: StateFlow<List<ActivityLog>> = _activityLogs.asStateFlow()
+
+    // Statistics
+    private val _statistics = MutableStateFlow<ActivityLogStatistics?>(null)
+    val statistics: StateFlow<ActivityLogStatistics?> = _statistics.asStateFlow()
+
+    // Dashboard Data
+    private val _dashboardData = MutableStateFlow<ActivityLogDashboardData?>(null)
+    val dashboardData: StateFlow<ActivityLogDashboardData?> = _dashboardData.asStateFlow()
+
+    // Search Filters
+    private val _searchFilters = MutableStateFlow(ActivityLogFilters())
+    val searchFilters: StateFlow<ActivityLogFilters> = _searchFilters.asStateFlow()
+
+    // Search Query
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
+
+    // Pagination
+    private val _pagination = MutableStateFlow(PaginationState())
+    val pagination: StateFlow<PaginationState> = _pagination.asStateState()
+
+    // Selected Logs
+    private val _selectedLogs = MutableStateFlow<Set<String>>(emptySet())
+    val selectedLogs: StateFlow<Set<String>> = _selectedLogs.asStateFlow()
+
+    // Alerts
+    private val _alerts = MutableStateFlow<List<ActivityLogAlert>>(emptyList())
+    val alerts: StateFlow<List<ActivityLogAlert>> = _alerts.asStateFlow()
+
+    // Tags
+    private val _tags = MutableStateFlow<List<ActivityLogTag>>(emptyList())
+    val tags: StateFlow<List<ActivityLogTag>> = _tags.asStateFlow()
+
+    // Export Result
+    private val _exportResult = MutableStateFlow<ActivityLogExportResult?>(null)
+    val exportResult: StateFlow<ActivityLogExportResult?> = _exportResult.asStateFlow()
+
+    // Batch Operation Result
+    private val _batchOperationResult = MutableStateFlow<ActivityLogBatchOperationResult?>(null)
+    val batchOperationResult: StateFlow<ActivityLogBatchOperationResult?> = _batchOperationResult.asStateFlow()
+
+    init {
+        loadActivityLogs()
+        loadStatistics()
+        loadDashboardData()
+        loadAlerts()
+        loadTags()
+        observeRealTimeData()
+    }
+
+    // Load Activity Logs
+    fun loadActivityLogs(refresh: Boolean = false) {
+        viewModelScope.launch {
+            _uiState.value = ActivityLogsUiState.Loading
+            
+            if (refresh) {
+                _pagination.value = _pagination.value.copy(currentPage = 1)
+            }
+            
+            val filters = _searchFilters.value.copy(
+                page = _pagination.value.currentPage,
+                limit = _pagination.value.pageSize
+            )
+            
+            when (val result = getActivityLogsUseCase(filters)) {
+                is Result.Success -> {
+                    _activityLogs.value = result.data
+                    _pagination.value = _pagination.value.copy(
+                        totalCount = result.data.size.toLong(),
+                        totalPages = (result.data.size.toLong() + _pagination.value.pageSize - 1) / _pagination.value.pageSize,
+                        hasNextPage = result.data.size >= _pagination.value.pageSize,
+                        hasPreviousPage = _pagination.value.currentPage > 1
+                    )
+                    _uiState.value = ActivityLogsUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = ActivityLogsUiState.Error(result.exception.message ?: "Failed to load activity logs")
+                }
+            }
+        }
+    }
+
+    // Search Activity Logs
+    fun searchActivityLogs(query: String) {
+        viewModelScope.launch {
+            _uiState.value = ActivityLogsUiState.Loading
+            _searchQuery.value = query
+            
+            val filters = _searchFilters.value.copy(
+                searchQuery = query,
+                page = 1
+            )
+            
+            when (val result = searchActivityLogsUseCase(query, filters)) {
+                is Result.Success -> {
+                    _activityLogs.value = result.data
+                    _pagination.value = _pagination.value.copy(
+                        currentPage = 1,
+                        totalCount = result.data.size.toLong()
+                    )
+                    _uiState.value = ActivityLogsUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = ActivityLogsUiState.Error(result.exception.message ?: "Failed to search activity logs")
+                }
+            }
+        }
+    }
+
+    // Update Search Filters
+    fun updateSearchFilters(filters: ActivityLogFilters) {
+        _searchFilters.value = filters
+        loadActivityLogs(refresh = true)
+    }
+
+    // Filter by Category
+    fun filterByCategory(category: LogCategory?) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(category = category))
+    }
+
+    // Filter by Severity
+    fun filterBySeverity(severity: LogSeverity?) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(severity = severity))
+    }
+
+    // Filter by Action
+    fun filterByAction(action: ActivityAction?) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(action = action))
+    }
+
+    // Filter by User
+    fun filterByUser(userId: String?) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(userId = userId))
+    }
+
+    // Filter by Date Range
+    fun filterByDateRange(startTime: Long?, endTime: Long?) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(startTime = startTime, endTime = endTime))
+    }
+
+    // Sort Logs
+    fun sortLogs(sortBy: ActivityLogSortField, sortOrder: SortOrder) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(sortBy = sortBy, sortOrder = sortOrder))
+    }
+
+    // Load Statistics
+    private fun loadStatistics() {
+        viewModelScope.launch {
+            when (val result = getActivityLogStatisticsUseCase()) {
+                is Result.Success -> {
+                    _statistics.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for statistics
+                }
+            }
+        }
+    }
+
+    // Load Dashboard Data
+    private fun loadDashboardData() {
+        viewModelScope.launch {
+            when (val result = getActivityLogDashboardUseCase()) {
+                is Result.Success -> {
+                    _dashboardData.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for dashboard
+                }
+            }
+        }
+    }
+
+    // Load Alerts
+    private fun loadAlerts() {
+        viewModelScope.launch {
+            when (val result = getActivityLogAlertsUseCase()) {
+                is Result.Success -> {
+                    _alerts.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for alerts
+                }
+            }
+        }
+    }
+
+    // Load Tags
+    private fun loadTags() {
+        viewModelScope.launch {
+            when (val result = getActivityLogTagsUseCase()) {
+                is Result.Success -> {
+                    _tags.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for tags
+                }
+            }
+        }
+    }
+
+    // Export Activity Logs
+    fun exportActivityLogs(format: ExportFormat) {
+        viewModelScope.launch {
+            _uiState.value = ActivityLogsUiState.Loading
+            
+            val exportOptions = ActivityLogExportOptions(
+                format = format,
+                filters = _searchFilters.value,
+                includeMetadata = true,
+                includeDetails = true
+            )
+            
+            when (val result = exportActivityLogsUseCase(exportOptions)) {
+                is Result.Success -> {
+                    _exportResult.value = result.data
+                    _uiState.value = ActivityLogsUiState.ExportCompleted(result.data)
+                }
+                is Result.Error -> {
+                    _uiState.value = ActivityLogsUiState.Error(result.exception.message ?: "Failed to export activity logs")
+                }
+            }
+        }
+    }
+
+    // Delete Selected Logs
+    fun deleteSelectedLogs() {
+        viewModelScope.launch {
+            _uiState.value = ActivityLogsUiState.Loading
+            
+            val selectedLogIds = _selectedLogs.value.toList()
+            val filters = ActivityLogFilters(
+                entityId = selectedLogIds.firstOrNull(),
+                limit = selectedLogIds.size
+            )
+            
+            when (val result = deleteActivityLogsUseCase(filters)) {
+                is Result.Success -> {
+                    _uiState.value = ActivityLogsUiState.LogsDeleted(result.data)
+                    clearSelection()
+                    loadActivityLogs(refresh = true)
+                }
+                is Result.Error -> {
+                    _uiState.value = ActivityLogsUiState.Error(result.exception.message ?: "Failed to delete activity logs")
+                }
+            }
+        }
+    }
+
+    // Archive Selected Logs
+    fun archiveSelectedLogs() {
+        viewModelScope.launch {
+            _uiState.value = ActivityLogsUiState.Loading
+            
+            val selectedLogIds = _selectedLogs.value.toList()
+            val filters = ActivityLogFilters(
+                entityId = selectedLogIds.firstOrNull(),
+                limit = selectedLogIds.size
+            )
+            
+            when (val result = archiveActivityLogsUseCase(filters)) {
+                is Result.Success -> {
+                    _uiState.value = ActivityLogsUiState.LogsArchived(result.data)
+                    clearSelection()
+                    loadActivityLogs(refresh = true)
+                }
+                is Result.Error -> {
+                    _uiState.value = ActivityLogsUiState.Error(result.exception.message ?: "Failed to archive activity logs")
+                }
+            }
+        }
+    }
+
+    // Batch Operation
+    fun performBatchOperation(operation: ActivityLogBatchOperation) {
+        viewModelScope.launch {
+            _uiState.value = ActivityLogsUiState.Loading
+            
+            when (val result = batchActivityLogOperationUseCase(operation)) {
+                is Result.Success -> {
+                    _batchOperationResult.value = result.data
+                    _uiState.value = ActivityLogsUiState.BatchOperationCompleted(result.data)
+                    loadActivityLogs(refresh = true)
+                }
+                is Result.Error -> {
+                    _uiState.value = ActivityLogsUiState.Error(result.exception.message ?: "Batch operation failed")
+                }
+            }
+        }
+    }
+
+    // Tag Selection
+    fun toggleLogSelection(logId: String) {
+        val currentSelection = _selectedLogs.value.toMutableSet()
+        if (currentSelection.contains(logId)) {
+            currentSelection.remove(logId)
+        } else {
+            currentSelection.add(logId)
+        }
+        _selectedLogs.value = currentSelection
+    }
+
+    // Select All Logs
+    fun selectAllLogs() {
+        val allLogIds = _activityLogs.value.map { it.id }.toSet()
+        _selectedLogs.value = allLogIds
+    }
+
+    // Clear Selection
+    fun clearSelection() {
+        _selectedLogs.value = emptySet()
+    }
+
+    // Tag Selected Logs
+    fun tagSelectedLogs(tagIds: List<String>) {
+        viewModelScope.launch {
+            _uiState.value = ActivityLogsUiState.Loading
+            
+            val selectedLogIds = _selectedLogs.value.toList()
+            var successCount = 0
+            var errorCount = 0
+            
+            selectedLogIds.forEach { logId ->
+                when (tagActivityLogUseCase(logId, tagIds)) {
+                    is Result.Success -> successCount++
+                    is Result.Error -> errorCount++
+                }
+            }
+            
+            _uiState.value = ActivityLogsUiState.LogsTagged(successCount, errorCount)
+            clearSelection()
+        }
+    }
+
+    // Create Alert Rule
+    fun createAlertRule(rule: ActivityLogAlertRule) {
+        viewModelScope.launch {
+            _uiState.value = ActivityLogsUiState.Loading
+            
+            when (val result = createActivityLogAlertRuleUseCase(rule)) {
+                is Result.Success -> {
+                    _uiState.value = ActivityLogsUiState.AlertRuleCreated(result.data)
+                    loadAlerts()
+                }
+                is Result.Error -> {
+                    _uiState.value = ActivityLogsUiState.Error(result.exception.message ?: "Failed to create alert rule")
+                }
+            }
+        }
+    }
+
+    // Load Next Page
+    fun loadNextPage() {
+        val currentPagination = _pagination.value
+        if (currentPagination.hasNextPage) {
+            _pagination.value = currentPagination.copy(currentPage = currentPagination.currentPage + 1)
+            loadActivityLogs()
+        }
+    }
+
+    // Load Previous Page
+    fun loadPreviousPage() {
+        val currentPagination = _pagination.value
+        if (currentPagination.hasPreviousPage) {
+            _pagination.value = currentPagination.copy(currentPage = currentPagination.currentPage - 1)
+            loadActivityLogs()
+        }
+    }
+
+    // Refresh Data
+    fun refresh() {
+        loadActivityLogs(refresh = true)
+        loadStatistics()
+        loadDashboardData()
+        loadAlerts()
+        loadTags()
+    }
+
+    // Clear Export Result
+    fun clearExportResult() {
+        _exportResult.value = null
+    }
+
+    // Clear Batch Operation Result
+    fun clearBatchOperationResult() {
+        _batchOperationResult.value = null
+    }
+
+    // Reset UI State
+    fun resetUiState() {
+        _uiState.value = ActivityLogsUiState.Idle
+    }
+
+    // Observe Real-time Data
+    private fun observeRealTimeData() {
+        viewModelScope.launch {
+            observeActivityLogsUseCase().collect { logs ->
+                _activityLogs.value = logs
+            }
+        }
+        
+        viewModelScope.launch {
+            observeActivityLogStatisticsUseCase().collect { stats ->
+                _statistics.value = stats
+            }
+        }
+    }
+
+    // Convenience logging methods
+    fun logLogin(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        success: Boolean,
+        ipAddress: String? = null,
+        userAgent: String? = null,
+        deviceId: String? = null,
+        location: String? = null,
+        sessionId: String? = null,
+        errorMessage: String? = null
+    ) {
+        viewModelScope.launch {
+            logLoginUseCase(
+                userId = userId,
+                userRole = userRole,
+                userName = userName,
+                userEmail = userEmail,
+                success = success,
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                deviceId = deviceId,
+                location = location,
+                sessionId = sessionId,
+                errorMessage = errorMessage
+            )
+        }
+    }
+
+    fun logLogout(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        sessionId: String? = null,
+        ipAddress: String? = null,
+        userAgent: String? = null,
+        deviceId: String? = null,
+        location: String? = null
+    ) {
+        viewModelScope.launch {
+            logLogoutUseCase(
+                userId = userId,
+                userRole = userRole,
+                userName = userName,
+                userEmail = userEmail,
+                sessionId = sessionId,
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                deviceId = deviceId,
+                location = location
+            )
+        }
+    }
+
+    fun logShipmentCreation(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        shipmentId: String,
+        shipmentName: String,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String? = null,
+        userAgent: String? = null,
+        deviceId: String? = null,
+        location: String? = null,
+        sessionId: String? = null
+    ) {
+        viewModelScope.launch {
+            logShipmentCreationUseCase(
+                userId = userId,
+                userRole = userRole,
+                userName = userName,
+                userEmail = userEmail,
+                shipmentId = shipmentId,
+                shipmentName = shipmentName,
+                details = details,
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                deviceId = deviceId,
+                location = location,
+                sessionId = sessionId
+            )
+        }
+    }
+
+    fun logShipmentStatusUpdate(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        shipmentId: String,
+        shipmentName: String,
+        oldStatus: String,
+        newStatus: String,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String? = null,
+        userAgent: String? = null,
+        deviceId: String? = null,
+        location: String? = null,
+        sessionId: String? = null
+    ) {
+        viewModelScope.launch {
+            logShipmentStatusUpdateUseCase(
+                userId = userId,
+                userRole = userRole,
+                userName = userName,
+                userEmail = userEmail,
+                shipmentId = shipmentId,
+                shipmentName = shipmentName,
+                oldStatus = oldStatus,
+                newStatus = newStatus,
+                details = details,
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                deviceId = deviceId,
+                location = location,
+                sessionId = sessionId
+            )
+        }
+    }
+
+    fun logPayment(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        paymentId: String,
+        paymentAmount: Double,
+        paymentMethod: String,
+        success: Boolean,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String? = null,
+        userAgent: String? = null,
+        deviceId: String? = null,
+        location: String? = null,
+        sessionId: String? = null,
+        errorMessage: String? = null
+    ) {
+        viewModelScope.launch {
+            logPaymentUseCase(
+                userId = userId,
+                userRole = userRole,
+                userName = userName,
+                userEmail = userEmail,
+                paymentId = paymentId,
+                paymentAmount = paymentAmount,
+                paymentMethod = paymentMethod,
+                success = success,
+                details = details,
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                deviceId = deviceId,
+                location = location,
+                sessionId = sessionId,
+                errorMessage = errorMessage
+            )
+        }
+    }
+}
+
+/**
+ * UI State for Activity Logs
+ */
+sealed class ActivityLogsUiState {
+    object Idle : ActivityLogsUiState()
+    object Loading : ActivityLogsUiState()
+    object Success : ActivityLogsUiState()
+    data class Error(val message: String) : ActivityLogsUiState()
+    data class LogsDeleted(val count: Long) : ActivityLogsUiState()
+    data class LogsArchived(val count: Long) : ActivityLogsUiState()
+    data class LogsTagged(val successCount: Int, val errorCount: Int) : ActivityLogsUiState()
+    data class ExportCompleted(val result: ActivityLogExportResult) : ActivityLogsUiState()
+    data class BatchOperationCompleted(val result: ActivityLogBatchOperationResult) : ActivityLogsUiState()
+    data class AlertRuleCreated(val rule: ActivityLogAlertRule) : ActivityLogsUiState()
+}
+
+/**
+ * Pagination State
+ */
+data class PaginationState(
+    val currentPage: Int = 1,
+    val pageSize: Int = 50,
+    val totalCount: Long = 0,
+    val totalPages: Long = 0,
+    val hasNextPage: Boolean = false,
+    val hasPreviousPage: Boolean = false
+)

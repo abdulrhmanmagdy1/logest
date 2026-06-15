@@ -1,0 +1,372 @@
+package com.edham.logistics.core.auth
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.auth.AuthenticationManager
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Centralized Session Expired Handler
+ * Provides unified handling for session expiration scenarios
+ * Ensures consistent user experience across the app
+ */
+@Singleton
+class SessionExpiredHandler @Inject constructor(
+    private val authenticationManager: AuthenticationManager,
+    private val sessionManager: SessionManager,
+    private val authStateManager: AuthStateManager,
+    private val navigationController: NavigationController
+) {
+    
+    private val _sessionExpiredState = MutableStateFlow<SessionExpiredState>(SessionExpiredState.None)
+    val sessionExpiredState: StateFlow<SessionExpiredState> = _sessionExpiredState.asStateFlow()
+    
+    private val _userAction = MutableSharedFlow<SessionExpiredAction>()
+    val userAction: SharedFlow<SessionExpiredAction> = _userAction.asSharedFlow()
+    
+    init {
+        Timber.d("SessionExpiredHandler initialized")
+        observeSessionChanges()
+        observeUserActions()
+    }
+    
+    /**
+     * Observe session state changes
+     */
+    private fun observeSessionChanges() {
+        sessionManager.sessionState
+            .onEach { sessionState ->
+                when (sessionState) {
+                    is SessionState.Expired -> {
+                        handleSessionExpired(sessionState.reason)
+                    }
+                    is SessionState.Error -> {
+                        if (sessionState.message.contains("expired", ignoreCase = true)) {
+                            handleSessionExpired(sessionState.message)
+                        }
+                    }
+                    else -> {
+                        // Reset expired state when session becomes valid
+                        _sessionExpiredState.value = SessionExpiredState.None
+                    }
+                }
+            }
+            .catch { e ->
+                Timber.e(e, "Error observing session state")
+                _sessionExpiredState.value = SessionExpiredState.Error("Session monitoring error: ${e.message}")
+            }
+            .launchIn(viewModelScope)
+    }
+    
+    /**
+     * Observe user actions for session expired scenarios
+     */
+    private fun observeUserActions() {
+        _userAction
+            .onEach { action ->
+                when (action) {
+                    is SessionExpiredAction.RetryLogin -> {
+                        handleRetryLogin()
+                    }
+                    is SessionExpiredAction.Logout -> {
+                        handleForceLogout()
+                    }
+                    is SessionExpiredAction.Dismiss -> {
+                        handleDismissExpiredMessage()
+                    }
+                }
+            }
+            .catch { e ->
+                Timber.e(e, "Error handling user action")
+            }
+            .launchIn(viewModelScope)
+    }
+    
+    /**
+     * Handle session expiration
+     */
+    private fun handleSessionExpired(reason: String) {
+        viewModelScope.launch {
+            Timber.d("Session expired: $reason")
+            
+            _sessionExpiredState.value = SessionExpiredState.Expired(
+                reason = reason,
+                canRetry = canRetrySession(reason),
+                message = getExpiredMessage(reason)
+            )
+            
+            // Attempt automatic token refresh if possible
+            if (canRetrySession(reason)) {
+                attemptAutomaticRefresh()
+            }
+        }
+    }
+    
+    /**
+     * Check if session can be retried
+     */
+    private fun canRetrySession(reason: String): Boolean {
+        return when {
+            reason.contains("token", ignoreCase = true) -> true
+            reason.contains("expired", ignoreCase = true) && !reason.contains("inactivity", ignoreCase = true) -> true
+            reason.contains("network", ignoreCase = true) -> true
+            else -> false
+        }
+    }
+    
+    /**
+     * Get user-friendly expired message
+     */
+    private fun getExpiredMessage(reason: String): String {
+        return when {
+            reason.contains("inactivity", ignoreCase = true) -> {
+                "Your session has expired due to inactivity. Please login again."
+            }
+            reason.contains("token", ignoreCase = true) -> {
+                "Your authentication has expired. Please login again."
+            }
+            reason.contains("network", ignoreCase = true) -> {
+                "Connection lost. Please check your internet connection and try again."
+            }
+            else -> {
+                "Your session has expired. Please login again."
+            }
+        }
+    }
+    
+    /**
+     * Attempt automatic token refresh
+     */
+    private fun attemptAutomaticRefresh() {
+        viewModelScope.launch {
+            try {
+                Timber.d("Attempting automatic token refresh")
+                
+                _sessionExpiredState.value = SessionExpiredState.Refreshing(
+                    message = "Refreshing your session..."
+                )
+                
+                val refreshResult = authenticationManager.refreshToken()
+                
+                refreshResult.onSuccess { success ->
+                    if (success) {
+                        _sessionExpiredState.value = SessionExpiredState.None
+                        Timber.d("Automatic token refresh successful")
+                    } else {
+                        _sessionExpiredState.value = SessionExpiredState.Expired(
+                            reason = "Token refresh failed",
+                            canRetry = true,
+                            message = "Failed to refresh your session. Please login again."
+                        )
+                        Timber.w("Automatic token refresh failed")
+                    }
+                }
+                
+                refreshResult.onFailure { error ->
+                    _sessionExpiredState.value = SessionExpiredState.Expired(
+                        reason = "Token refresh error: ${error.message}",
+                        canRetry = true,
+                        message = "Failed to refresh your session. Please login again."
+                    )
+                    Timber.e(error, "Automatic token refresh failed")
+                }
+                
+            } catch (e: Exception) {
+                _sessionExpiredState.value = SessionExpiredState.Expired(
+                    reason = "Refresh exception: ${e.message}",
+                    canRetry = true,
+                    message = "An error occurred while refreshing your session. Please login again."
+                )
+                Timber.e(e, "Exception during automatic token refresh")
+            }
+        }
+    }
+    
+    /**
+     * Handle retry login action
+     */
+    private fun handleRetryLogin() {
+        viewModelScope.launch {
+            try {
+                Timber.d("User requested retry login")
+                
+                _sessionExpiredState.value = SessionExpiredState.Refreshing(
+                    message = "Attempting to restore your session..."
+                )
+                
+                // Force token refresh
+                val refreshResult = authenticationManager.refreshToken()
+                
+                refreshResult.onSuccess { success ->
+                    if (success) {
+                        _sessionExpiredState.value = SessionExpiredState.None
+                        Timber.d("Retry login successful")
+                    } else {
+                        _sessionExpiredState.value = SessionExpiredState.Expired(
+                            reason = "Retry failed",
+                            canRetry = false,
+                            message = "Unable to restore your session. Please login again."
+                        )
+                    }
+                }
+                
+                refreshResult.onFailure { error ->
+                    _sessionExpiredState.value = SessionExpiredState.Expired(
+                        reason = "Retry error: ${error.message}",
+                        canRetry = false,
+                        message = "Unable to restore your session. Please login again."
+                    )
+                }
+                
+            } catch (e: Exception) {
+                _sessionExpiredState.value = SessionExpiredState.Expired(
+                    reason = "Retry exception: ${e.message}",
+                    canRetry = false,
+                    message = "An error occurred while restoring your session. Please login again."
+                )
+                Timber.e(e, "Exception during retry login")
+            }
+        }
+    }
+    
+    /**
+     * Handle force logout
+     */
+    private fun handleForceLogout() {
+        viewModelScope.launch {
+            try {
+                Timber.d("User requested force logout")
+                
+                _sessionExpiredState.value = SessionExpiredState.LoggingOut(
+                    message = "Logging out..."
+                )
+                
+                authenticationManager.logout()
+                _sessionExpiredState.value = SessionExpiredState.None
+                
+                Timber.d("Force logout completed")
+                
+            } catch (e: Exception) {
+                _sessionExpiredState.value = SessionExpiredState.Error(
+                    message = "Logout failed: ${e.message}"
+                )
+                Timber.e(e, "Exception during force logout")
+            }
+        }
+    }
+    
+    /**
+     * Handle dismiss expired message
+     */
+    private fun handleDismissExpiredMessage() {
+        viewModelScope.launch {
+            Timber.d("User dismissed expired message")
+            _sessionExpiredState.value = SessionExpiredState.None
+        }
+    }
+    
+    /**
+     * User actions for session expired scenarios
+     */
+    fun retryLogin() {
+        _userAction.tryEmit(SessionExpiredAction.RetryLogin)
+    }
+    
+    fun logout() {
+        _userAction.tryEmit(SessionExpiredAction.Logout)
+    }
+    
+    fun dismissExpiredMessage() {
+        _userAction.tryEmit(SessionExpiredAction.Dismiss)
+    }
+    
+    /**
+     * Get current session expired state
+     */
+    fun getCurrentState(): SessionExpiredState {
+        return _sessionExpiredState.value
+    }
+    
+    /**
+     * Check if session is expired
+     */
+    fun isSessionExpired(): Boolean {
+        return _sessionExpiredState.value is SessionExpiredState.Expired
+    }
+    
+    /**
+     * Reset session expired handler
+     */
+    fun reset() {
+        viewModelScope.launch {
+            _sessionExpiredState.value = SessionExpiredState.None
+            Timber.d("SessionExpiredHandler reset")
+        }
+    }
+}
+
+/**
+ * Session Expired State
+ */
+sealed class SessionExpiredState {
+    object None : SessionExpiredState()
+    data class Expired(
+        val reason: String,
+        val canRetry: Boolean,
+        val message: String
+    ) : SessionExpiredState()
+    
+    data class Refreshing(val message: String) : SessionExpiredState()
+    data class LoggingOut(val message: String) : SessionExpiredState()
+    data class Error(val message: String) : SessionExpiredState()
+}
+
+/**
+ * Session Expired Actions
+ */
+sealed class SessionExpiredAction {
+    object RetryLogin : SessionExpiredAction()
+    object Logout : SessionExpiredAction()
+    object Dismiss : SessionExpiredAction()
+}
+
+/**
+ * ViewModel for UI components that need session expired handling
+ */
+@HiltViewModel
+class SessionExpiredViewModel @Inject constructor(
+    private val sessionExpiredHandler: SessionExpiredHandler
+) : ViewModel() {
+    
+    val sessionExpiredState = sessionExpiredHandler.sessionExpiredState
+    
+    fun retryLogin() {
+        sessionExpiredHandler.retryLogin()
+    }
+    
+    fun logout() {
+        sessionExpiredHandler.logout()
+    }
+    
+    fun dismissExpiredMessage() {
+        sessionExpiredHandler.dismissExpiredMessage()
+    }
+    
+    fun getCurrentState(): SessionExpiredState {
+        return sessionExpiredHandler.getCurrentState()
+    }
+    
+    fun isSessionExpired(): Boolean {
+        return sessionExpiredHandler.isSessionExpired()
+    }
+    
+    fun reset() {
+        sessionExpiredHandler.reset()
+    }
+}

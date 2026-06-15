@@ -1,0 +1,382 @@
+package com.edham.logistics.auth
+
+import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.ArrayAdapter
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentRegisterBinding
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.ValidationUtils
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Register Fragment - Handles user registration
+ * 
+ * Features:
+ * - User registration with validation
+ * - Role selection
+ * - OTP verification
+ * - Terms and conditions
+ * - Arabic RTL support
+ */
+@AndroidEntryPoint
+class RegisterFragment : Fragment() {
+
+    private var _binding: FragmentRegisterBinding? = null
+    private val binding get() = _binding!!
+
+    @Inject
+    lateinit var authenticationManager: AuthenticationManager
+
+    @Inject
+    lateinit var networkUtils: NetworkUtils
+
+    @Inject
+    lateinit var validationUtils: ValidationUtils
+
+    private val viewModel: RegisterViewModel by viewModels()
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentRegisterBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupUI()
+        setupObservers()
+        setupClickListeners()
+        setupTextWatchers()
+        setupRoleDropdown()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
+    private fun setupUI() {
+        // Configure text direction for RTL support
+        if (isRTL()) {
+            binding.nameEditText.textDirection = View.TEXT_DIRECTION_RTL
+            binding.emailEditText.textDirection = View.TEXT_DIRECTION_RTL
+            binding.phoneEditText.textDirection = View.TEXT_DIRECTION_RTL
+            binding.passwordEditText.textDirection = View.TEXT_DIRECTION_RTL
+            binding.confirmPasswordEditText.textDirection = View.TEXT_DIRECTION_RTL
+        }
+        
+        // Initially disable register button
+        updateRegisterButtonState()
+    }
+
+    private fun setupObservers() {
+        // Observe authentication state
+        viewLifecycleOwner.lifecycleScope.launch {
+            authenticationManager.authState.collect { state ->
+                when (state) {
+                    is AuthState.Loading -> showLoading(true)
+                    is AuthState.Authenticated -> navigateToMain()
+                    is AuthState.Error -> showError(state.message)
+                    is AuthState.Unauthenticated -> showLoading(false)
+                    else -> {}
+                }
+            }
+        }
+
+        // Observe registration result
+        viewModel.registrationResult.observe(viewLifecycleOwner) { result ->
+            result.onSuccess { authResponse ->
+                // Handle successful registration
+                showLoading(false)
+                navigateToOTPVerification()
+            }.onFailure { exception ->
+                showLoading(false)
+                showError(exception.message ?: "Registration failed")
+            }
+        }
+
+        // Observe OTP result
+        viewModel.otpResult.observe(viewLifecycleOwner) { result ->
+            result.onSuccess { otpId ->
+                // OTP sent successfully
+                showLoading(false)
+                navigateToOTPVerification()
+            }.onFailure { exception ->
+                showLoading(false)
+                showError(exception.message ?: "Failed to send OTP")
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.registerButton.setOnClickListener {
+            attemptRegister()
+        }
+
+        binding.verifyOtpButton.setOnClickListener {
+            sendOTP()
+        }
+
+        binding.loginText.setOnClickListener {
+            navigateToLogin()
+        }
+    }
+
+    private fun setupTextWatchers() {
+        val textWatcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                clearAllErrors()
+                updateRegisterButtonState()
+            }
+        }
+
+        binding.nameEditText.addTextChangedListener(textWatcher)
+        binding.emailEditText.addTextChangedListener(textWatcher)
+        binding.phoneEditText.addTextChangedListener(textWatcher)
+        binding.passwordEditText.addTextChangedListener(textWatcher)
+        binding.confirmPasswordEditText.addTextChangedListener(textWatcher)
+
+        // Password confirmation validation
+        binding.confirmPasswordEditText.addTextChangedListener {
+            validatePasswordConfirmation()
+        }
+
+        binding.termsCheckbox.setOnCheckedChangeListener { _, _ ->
+            updateRegisterButtonState()
+        }
+    }
+
+    private fun setupRoleDropdown() {
+        val roles = UserRole.values().map { it.displayName }
+        val adapter = ArrayAdapter(
+            requireContext(),
+            android.R.layout.simple_dropdown_item_1line,
+            roles
+        )
+        
+        binding.roleAutoComplete.setAdapter(adapter)
+        
+        // Set default role
+        binding.roleAutoComplete.setText(UserRole.DISPATCHER.displayName, false)
+        
+        binding.roleAutoComplete.setOnItemClickListener { _, _, position, _ ->
+            clearError(binding.roleInputLayout)
+            updateRegisterButtonState()
+        }
+    }
+
+    private fun attemptRegister() {
+        val name = binding.nameEditText.text.toString().trim()
+        val email = binding.emailEditText.text.toString().trim()
+        val phone = binding.phoneEditText.text.toString().trim()
+        val password = binding.passwordEditText.text.toString()
+        val confirmPassword = binding.confirmPasswordEditText.text.toString()
+        val roleText = binding.roleAutoComplete.text.toString()
+        val termsAccepted = binding.termsCheckbox.isChecked
+
+        // Validate inputs
+        if (!validateInputs(name, email, phone, password, confirmPassword, roleText, termsAccepted)) {
+            return
+        }
+
+        // Get selected role
+        val role = UserRole.values().find { it.displayName == roleText } ?: UserRole.DISPATCHER
+
+        // Attempt registration
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = authenticationManager.register(name, email, password, phone, role)
+            result.onSuccess {
+                // Registration successful - send OTP
+                sendOTP()
+            }.onFailure { exception ->
+                showError(exception.message ?: "Registration failed")
+            }
+        }
+    }
+
+    private fun sendOTP() {
+        val phone = binding.phoneEditText.text.toString().trim()
+        
+        if (!validationUtils.isValidPhone(phone)) {
+            binding.phoneInputLayout.error = getString(R.string.invalid_phone)
+            return
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            showLoading(true)
+            val result = authenticationManager.sendOTP(phone)
+            result.onSuccess { otpId ->
+                showLoading(false)
+                navigateToOTPVerification()
+            }.onFailure { exception ->
+                showLoading(false)
+                showError(exception.message ?: "Failed to send OTP")
+            }
+        }
+    }
+
+    private fun validateInputs(
+        name: String,
+        email: String,
+        phone: String,
+        password: String,
+        confirmPassword: String,
+        roleText: String,
+        termsAccepted: Boolean
+    ): Boolean {
+        var isValid = true
+
+        // Validate name
+        if (!validationUtils.isValidName(name)) {
+            binding.nameInputLayout.error = getString(R.string.invalid_name)
+            isValid = false
+        }
+
+        // Validate email
+        if (!validationUtils.isValidEmail(email)) {
+            binding.emailInputLayout.error = getString(R.string.invalid_email)
+            isValid = false
+        }
+
+        // Validate phone
+        if (!validationUtils.isValidPhone(phone)) {
+            binding.phoneInputLayout.error = getString(R.string.invalid_phone)
+            isValid = false
+        }
+
+        // Validate password
+        if (!validationUtils.isValidPassword(password)) {
+            binding.passwordInputLayout.error = getString(R.string.invalid_password)
+            isValid = false
+        }
+
+        // Validate password confirmation
+        if (password != confirmPassword) {
+            binding.confirmPasswordInputLayout.error = getString(R.string.passwords_do_not_match)
+            isValid = false
+        }
+
+        // Validate role
+        if (roleText.isEmpty() || !UserRole.values().any { it.displayName == roleText }) {
+            binding.roleInputLayout.error = getString(R.string.invalid_role)
+            isValid = false
+        }
+
+        // Validate terms acceptance
+        if (!termsAccepted) {
+            showError(getString(R.string.must_accept_terms))
+            isValid = false
+        }
+
+        return isValid
+    }
+
+    private fun validatePasswordConfirmation() {
+        val password = binding.passwordEditText.text.toString()
+        val confirmPassword = binding.confirmPasswordEditText.text.toString()
+        
+        if (confirmPassword.isNotEmpty() && password != confirmPassword) {
+            binding.confirmPasswordInputLayout.error = getString(R.string.passwords_do_not_match)
+        } else {
+            clearError(binding.confirmPasswordInputLayout)
+        }
+    }
+
+    private fun updateRegisterButtonState() {
+        val name = binding.nameEditText.text.toString().trim()
+        val email = binding.emailEditText.text.toString().trim()
+        val phone = binding.phoneEditText.text.toString().trim()
+        val password = binding.passwordEditText.text.toString()
+        val confirmPassword = binding.confirmPasswordEditText.text.toString()
+        val roleText = binding.roleAutoComplete.text.toString()
+        val termsAccepted = binding.termsCheckbox.isChecked
+        
+        val isValid = validationUtils.isValidName(name) &&
+                      validationUtils.isValidEmail(email) &&
+                      validationUtils.isValidPhone(phone) &&
+                      validationUtils.isValidPassword(password) &&
+                      password == confirmPassword &&
+                      roleText.isNotEmpty() &&
+                      UserRole.values().any { it.displayName == roleText } &&
+                      termsAccepted &&
+                      networkUtils.isNetworkAvailable()
+        
+        binding.registerButton.isEnabled = isValid
+    }
+
+    private fun showLoading(show: Boolean) {
+        binding.progressOverlay.visibility = if (show) View.VISIBLE else View.GONE
+        binding.registerButton.isEnabled = !show
+        binding.verifyOtpButton.isEnabled = !show
+    }
+
+    private fun showError(message: String) {
+        // Show error message
+        binding.nameInputLayout.error = if (message.contains("name", ignoreCase = true)) message else null
+        binding.emailInputLayout.error = if (message.contains("email", ignoreCase = true)) message else null
+        binding.phoneInputLayout.error = if (message.contains("phone", ignoreCase = true)) message else null
+        binding.passwordInputLayout.error = if (message.contains("password", ignoreCase = true)) message else null
+        
+        if (!message.contains("name", ignoreCase = true) && 
+            !message.contains("email", ignoreCase = true) && 
+            !message.contains("phone", ignoreCase = true) && 
+            !message.contains("password", ignoreCase = true)) {
+            // Show general error
+            binding.nameInputLayout.error = message
+        }
+    }
+
+    private fun clearError(inputLayout: com.google.android.material.textfield.TextInputLayout) {
+        inputLayout.error = null
+        inputLayout.isErrorEnabled = false
+    }
+
+    private fun clearAllErrors() {
+        clearError(binding.nameInputLayout)
+        clearError(binding.emailInputLayout)
+        clearError(binding.phoneInputLayout)
+        clearError(binding.passwordInputLayout)
+        clearError(binding.confirmPasswordInputLayout)
+        clearError(binding.roleInputLayout)
+    }
+
+    private fun navigateToMain() {
+        findNavController().navigate(R.id.action_registerFragment_to_mainActivity)
+        requireActivity().finish()
+    }
+
+    private fun navigateToLogin() {
+        findNavController().navigate(R.id.action_registerFragment_to_loginFragment)
+    }
+
+    private fun navigateToOTPVerification() {
+        val phone = binding.phoneEditText.text.toString().trim()
+        val action = RegisterFragmentDirections.actionRegisterFragmentToOtpVerificationFragment(phone)
+        findNavController().navigate(action)
+    }
+
+    private fun isRTL(): Boolean {
+        return resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL
+    }
+
+    companion object {
+        private const val TAG = "RegisterFragment"
+    }
+}

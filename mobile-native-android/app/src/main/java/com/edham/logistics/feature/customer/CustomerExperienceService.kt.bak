@@ -1,0 +1,832 @@
+package com.edham.logistics.feature.customer
+
+import android.content.Context
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import com.edham.logistics.data.local.database.CustomerDatabase
+import com.edham.logistics.data.local.entity.Shipment
+import com.edham.logistics.data.local.entity.Customer
+import com.edham.logistics.data.remote.api.CustomerApi
+import kotlinx.coroutines.*
+import timber.log.Timber
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Customer Experience Service
+ * Complete customer experience management with tracking, notifications, and support
+ */
+class CustomerExperienceService(
+    private val context: Context,
+    private val api: CustomerApi,
+    private val database: CustomerDatabase
+) {
+    
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    // LiveData for real-time customer data
+    private val _activeShipments = MutableLiveData<List<Shipment>>()
+    val activeShipments: LiveData<List<Shipment>> = _activeShipments
+    
+    private val _shipmentHistory = MutableLiveData<List<Shipment>>()
+    val shipmentHistory: LiveData<List<Shipment>> = _shipmentHistory
+    
+    private val _notifications = MutableLiveData<List<CustomerNotification>>()
+    val notifications: LiveData<List<CustomerNotification>> = _notifications
+    
+    private val _invoices = MutableLiveData<List<DigitalInvoice>>()
+    val invoices: LiveData<List<DigitalInvoice>> = _invoices
+    
+    private val _reviews = MutableLiveData<List<CustomerReview>>()
+    val reviews: LiveData<List<CustomerReview>> = _reviews
+    
+    private val _complaints = MutableLiveData<List<CustomerComplaint>>()
+    val complaints: LiveData<List<CustomerComplaint>> = _complaints
+    
+    private val _chatMessages = MutableLiveData<List<ChatMessage>>()
+    val chatMessages: LiveData<List<ChatMessage>> = _chatMessages
+    
+    private val _trackingData = MutableLiveData<Map<String, TrackingData>>()
+    val trackingData: LiveData<Map<String, TrackingData>> = _trackingData
+    
+    // Live tracking cache
+    private val trackingCache = ConcurrentHashMap<String, TrackingData>()
+    private val etaCache = ConcurrentHashMap<String, ETACalculation>()
+    
+    companion object {
+        private const val TRACKING_UPDATE_INTERVAL = 30000L // 30 seconds
+        private const val NOTIFICATION_UPDATE_INTERVAL = 60000L // 1 minute
+        private const val CHAT_UPDATE_INTERVAL = 5000L // 5 seconds
+    }
+    
+    /**
+     * Initialize customer experience service
+     */
+    suspend fun initializeCustomerExperience(customerId: String) {
+        try {
+            // Load customer data
+            loadCustomerData(customerId)
+            
+            // Start real-time tracking
+            startRealTimeTracking()
+            
+            // Start notification monitoring
+            startNotificationMonitoring()
+            
+            // Start chat monitoring
+            startChatMonitoring()
+            
+            Timber.d("Customer experience service initialized for customer: $customerId")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error initializing customer experience service")
+        }
+    }
+    
+    /**
+     * Load customer data
+     */
+    private suspend fun loadCustomerData(customerId: String) {
+        try {
+            // Load active shipments
+            val active = database.shipmentDao().getCustomerActiveShipments(customerId)
+            _activeShipments.postValue(active)
+            
+            // Load shipment history
+            val history = database.shipmentDao().getCustomerShipmentHistory(customerId)
+            _shipmentHistory.postValue(history)
+            
+            // Load notifications
+            val notifications = database.notificationDao().getCustomerNotifications(customerId)
+            _notifications.postValue(notifications)
+            
+            // Load invoices
+            val invoices = database.invoiceDao().getCustomerInvoices(customerId)
+            _invoices.postValue(invoices)
+            
+            // Load reviews
+            val reviews = database.reviewDao().getCustomerReviews(customerId)
+            _reviews.postValue(reviews)
+            
+            // Load complaints
+            val complaints = database.complaintDao().getCustomerComplaints(customerId)
+            _complaints.postValue(complaints)
+            
+            // Load chat messages
+            val messages = database.chatDao().getCustomerChatMessages(customerId)
+            _chatMessages.postValue(messages)
+            
+            Timber.d("Customer data loaded successfully")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error loading customer data")
+        }
+    }
+    
+    /**
+     * Start real-time tracking
+     */
+    private fun startRealTimeTracking() {
+        serviceScope.launch {
+            while (true) {
+                try {
+                    // Update tracking data for active shipments
+                    updateTrackingData()
+                    
+                    // Calculate ETAs
+                    calculateETAs()
+                    
+                    delay(TRACKING_UPDATE_INTERVAL)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in real-time tracking")
+                    delay(10000) // Wait before retrying
+                }
+            }
+        }
+    }
+    
+    /**
+     * Start notification monitoring
+     */
+    private fun startNotificationMonitoring() {
+        serviceScope.launch {
+            while (true) {
+                try {
+                    // Check for new notifications
+                    checkNewNotifications()
+                    
+                    // Send push notifications for important events
+                    sendPushNotifications()
+                    
+                    delay(NOTIFICATION_UPDATE_INTERVAL)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in notification monitoring")
+                    delay(30000) // Wait before retrying
+                }
+            }
+        }
+    }
+    
+    /**
+     * Start chat monitoring
+     */
+    private fun startChatMonitoring() {
+        serviceScope.launch {
+            while (true) {
+                try {
+                    // Check for new chat messages
+                    checkNewChatMessages()
+                    
+                    // Update chat status
+                    updateChatStatus()
+                    
+                    delay(CHAT_UPDATE_INTERVAL)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in chat monitoring")
+                    delay(10000) // Wait before retrying
+                }
+            }
+        }
+    }
+    
+    /**
+     * Update tracking data
+     */
+    private suspend fun updateTrackingData() {
+        try {
+            val activeShipments = _activeShipments.value ?: return
+            
+            activeShipments.forEach { shipment ->
+                // Get latest tracking data from API
+                val trackingResponse = api.getShipmentTracking(shipment.id)
+                
+                if (trackingResponse.isSuccessful) {
+                    val trackingData = trackingResponse.body()
+                    if (trackingData != null) {
+                        // Update cache
+                        trackingCache[shipment.id] = trackingData
+                        
+                        // Update database
+                        database.trackingDao().updateTrackingData(trackingData)
+                    }
+                }
+            }
+            
+            // Update LiveData
+            _trackingData.postValue(trackingCache.toMap())
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating tracking data")
+        }
+    }
+    
+    /**
+     * Calculate ETAs
+     */
+    private suspend fun calculateETAs() {
+        try {
+            val activeShipments = _activeShipments.value ?: return
+            
+            activeShipments.forEach { shipment ->
+                val trackingData = trackingCache[shipment.id]
+                
+                if (trackingData != null) {
+                    // Calculate ETA based on current location and route
+                    val eta = calculateETA(shipment, trackingData)
+                    
+                    // Update cache
+                    etaCache[shipment.id] = eta
+                    
+                    // Update shipment with new ETA
+                    database.shipmentDao().updateShipmentETA(shipment.id, eta.estimatedTime)
+                }
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error calculating ETAs")
+        }
+    }
+    
+    /**
+     * Calculate ETA for shipment
+     */
+    private suspend fun calculateETA(shipment: Shipment, trackingData: TrackingData): ETACalculation {
+        try {
+            // Get remaining distance
+            val remainingDistance = calculateRemainingDistance(trackingData)
+            
+            // Get average speed
+            val averageSpeed = calculateAverageSpeed(trackingData)
+            
+            // Calculate estimated time
+            val estimatedMinutes = (remainingDistance / averageSpeed * 60).toLong()
+            val estimatedTime = System.currentTimeMillis() + (estimatedMinutes * 60 * 1000)
+            
+            // Calculate confidence based on traffic and weather
+            val confidence = calculateETAConfidence(trackingData)
+            
+            return ETACalculation(
+                shipmentId = shipment.id,
+                estimatedTime = estimatedTime,
+                estimatedMinutes = estimatedMinutes,
+                remainingDistance = remainingDistance,
+                confidence = confidence,
+                timestamp = System.currentTimeMillis()
+            )
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error calculating ETA for shipment: ${shipment.id}")
+            return ETACalculation(
+                shipmentId = shipment.id,
+                estimatedTime = shipment.estimatedTime,
+                estimatedMinutes = 0,
+                remainingDistance = 0.0,
+                confidence = 0.0,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+    }
+    
+    /**
+     * Calculate remaining distance
+     */
+    private suspend fun calculateRemainingDistance(trackingData: TrackingData): Double {
+        try {
+            val currentLocation = trackingData.currentLocation
+            val destination = trackingData.destination
+            
+            // Simple distance calculation (in real app, use proper distance calculation)
+            return calculateDistance(
+                currentLocation.latitude, currentLocation.longitude,
+                destination.latitude, destination.longitude
+            )
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error calculating remaining distance")
+            return 0.0
+        }
+    }
+    
+    /**
+     * Calculate average speed
+     */
+    private suspend fun calculateAverageSpeed(trackingData: TrackingData): Double {
+        try {
+            val recentLocations = trackingData.locationHistory.takeLast(10)
+            
+            if (recentLocations.size < 2) return 60.0 // Default 60 km/h
+            
+            var totalSpeed = 0.0
+            var speedCount = 0
+            
+            for (i in 1 until recentLocations.size) {
+                val prevLocation = recentLocations[i - 1]
+                val currentLocation = recentLocations[i]
+                
+                val distance = calculateDistance(
+                    prevLocation.latitude, prevLocation.longitude,
+                    currentLocation.latitude, currentLocation.longitude
+                )
+                
+                val timeDiff = (currentLocation.timestamp - prevLocation.timestamp) / 1000.0 / 3600.0 // hours
+                val speed = if (timeDiff > 0) distance / timeDiff else 0.0
+                
+                if (speed > 0 && speed < 200) { // Filter unrealistic speeds
+                    totalSpeed += speed
+                    speedCount++
+                }
+            }
+            
+            return if (speedCount > 0) totalSpeed / speedCount else 60.0
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error calculating average speed")
+            return 60.0
+        }
+    }
+    
+    /**
+     * Calculate ETA confidence
+     */
+    private suspend fun calculateETAConfidence(trackingData: TrackingData): Double {
+        try {
+            var confidence = 0.8 // Base confidence
+            
+            // Adjust based on traffic conditions
+            val trafficFactor = when (trackingData.trafficConditions) {
+                "light" -> 0.1
+                "moderate" -> -0.1
+                "heavy" -> -0.2
+                "severe" -> -0.3
+                else -> 0.0
+            }
+            
+            // Adjust based on weather conditions
+            val weatherFactor = when (trackingData.weatherConditions) {
+                "clear" -> 0.05
+                "cloudy" -> 0.0
+                "rain" -> -0.1
+                "snow" -> -0.2
+                "storm" -> -0.3
+                else -> 0.0
+            }
+            
+            confidence += trafficFactor + weatherFactor
+            return confidence.coerceIn(0.1, 1.0)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error calculating ETA confidence")
+            return 0.5
+        }
+    }
+    
+    /**
+     * Calculate distance between two points
+     */
+    private fun calculateDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val R = 6371 // Earth's radius in kilometers
+        
+        val latDistance = Math.toRadians(lat2 - lat1)
+        val lonDistance = Math.toRadians(lon2 - lon1)
+        
+        val a = sin(latDistance / 2).pow(2) +
+                cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) *
+                sin(lonDistance / 2).pow(2)
+        
+        val c = 2 * atan2(sqrt(a), sqrt(1 - a))
+        
+        return R * c
+    }
+    
+    /**
+     * Check for new notifications
+     */
+    private suspend fun checkNewNotifications() {
+        try {
+            val customerId = getCurrentCustomerId() ?: return
+            
+            // Get new notifications from API
+            val response = api.getCustomerNotifications(customerId)
+            
+            if (response.isSuccessful) {
+                val newNotifications = response.body() ?: emptyList()
+                
+                // Save to database
+                newNotifications.forEach { notification ->
+                    database.notificationDao().insertNotification(notification)
+                }
+                
+                // Update LiveData
+                val allNotifications = database.notificationDao().getCustomerNotifications(customerId)
+                _notifications.postValue(allNotifications)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking new notifications")
+        }
+    }
+    
+    /**
+     * Send push notifications
+     */
+    private suspend fun sendPushNotifications() {
+        try {
+            val notifications = _notifications.value ?: return
+            
+            // Filter unsent notifications
+            val unsentNotifications = notifications.filter { !it.isSent }
+            
+            unsentNotifications.forEach { notification ->
+                // Send push notification
+                sendPushNotification(notification)
+                
+                // Mark as sent
+                database.notificationDao().markNotificationAsSent(notification.id)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending push notifications")
+        }
+    }
+    
+    /**
+     * Send push notification
+     */
+    private suspend fun sendPushNotification(notification: CustomerNotification) {
+        try {
+            // Implementation would use Firebase Cloud Messaging or similar
+            Timber.d("Sending push notification: ${notification.title}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending push notification")
+        }
+    }
+    
+    /**
+     * Check for new chat messages
+     */
+    private suspend fun checkNewChatMessages() {
+        try {
+            val customerId = getCurrentCustomerId() ?: return
+            
+            // Get new messages from API
+            val response = api.getCustomerChatMessages(customerId)
+            
+            if (response.isSuccessful) {
+                val newMessages = response.body() ?: emptyList()
+                
+                // Save to database
+                newMessages.forEach { message ->
+                    database.chatDao().insertMessage(message)
+                }
+                
+                // Update LiveData
+                val allMessages = database.chatDao().getCustomerChatMessages(customerId)
+                _chatMessages.postValue(allMessages)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking new chat messages")
+        }
+    }
+    
+    /**
+     * Update chat status
+     */
+    private suspend fun updateChatStatus() {
+        try {
+            val customerId = getCurrentCustomerId() ?: return
+            
+            // Update chat status (online/offline)
+            val response = api.updateChatStatus(customerId, "online")
+            
+            if (response.isSuccessful) {
+                Timber.d("Chat status updated to online")
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating chat status")
+        }
+    }
+    
+    /**
+     * Get current customer ID
+     */
+    private suspend fun getCurrentCustomerId(): String? {
+        try {
+            // In real app, get from session or preferences
+            return "customer_123" // Placeholder
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting current customer ID")
+            return null
+        }
+    }
+    
+    /**
+     * Public API methods
+     */
+    suspend fun trackShipment(shipmentId: String): TrackingData? {
+        return trackingCache[shipmentId]
+    }
+    
+    suspend fun getShipmentETA(shipmentId: String): ETACalculation? {
+        return etaCache[shipmentId]
+    }
+    
+    suspend fun sendChatMessage(message: String): Boolean {
+        try {
+            val customerId = getCurrentCustomerId() ?: return false
+            
+            val chatMessage = ChatMessage(
+                id = UUID.randomUUID().toString(),
+                customerId = customerId,
+                message = message,
+                isFromCustomer = true,
+                timestamp = System.currentTimeMillis(),
+                isRead = false
+            )
+            
+            // Send to API
+            val response = api.sendChatMessage(chatMessage)
+            
+            if (response.isSuccessful) {
+                // Save to database
+                database.chatDao().insertMessage(chatMessage)
+                
+                // Update LiveData
+                val allMessages = _chatMessages.value?.toMutableList() ?: mutableListOf()
+                allMessages.add(chatMessage)
+                _chatMessages.postValue(allMessages)
+                
+                return true
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending chat message")
+        }
+        
+        return false
+    }
+    
+    suspend fun submitReview(review: CustomerReview): Boolean {
+        try {
+            // Send to API
+            val response = api.submitReview(review)
+            
+            if (response.isSuccessful) {
+                // Save to database
+                database.reviewDao().insertReview(review)
+                
+                // Update LiveData
+                val allReviews = _reviews.value?.toMutableList() ?: mutableListOf()
+                allReviews.add(review)
+                _reviews.postValue(allReviews)
+                
+                return true
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error submitting review")
+        }
+        
+        return false
+    }
+    
+    suspend fun submitComplaint(complaint: CustomerComplaint): Boolean {
+        try {
+            // Send to API
+            val response = api.submitComplaint(complaint)
+            
+            if (response.isSuccessful) {
+                // Save to database
+                database.complaintDao().insertComplaint(complaint)
+                
+                // Update LiveData
+                val allComplaints = _complaints.value?.toMutableList() ?: mutableListOf()
+                allComplaints.add(complaint)
+                _complaints.postValue(allComplaints)
+                
+                return true
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error submitting complaint")
+        }
+        
+        return false
+    }
+    
+    suspend fun getInvoice(invoiceId: String): DigitalInvoice? {
+        return _invoices.value?.find { it.id == invoiceId }
+    }
+    
+    suspend fun downloadInvoice(invoiceId: String): String? {
+        try {
+            val response = api.downloadInvoice(invoiceId)
+            
+            if (response.isSuccessful) {
+                return response.body()?.downloadUrl
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error downloading invoice")
+        }
+        
+        return null
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        serviceScope.cancel()
+        
+        // Clear caches
+        trackingCache.clear()
+        etaCache.clear()
+        
+        Timber.d("Customer experience service cleaned up")
+    }
+}
+
+// Data classes
+data class TrackingData(
+    val shipmentId: String,
+    val currentLocation: LocationPoint,
+    val destination: LocationPoint,
+    val locationHistory: List<LocationPoint>,
+    val trafficConditions: String,
+    val weatherConditions: String,
+    val estimatedArrival: Long,
+    val status: String,
+    val driverInfo: DriverInfo,
+    val vehicleInfo: VehicleInfo,
+    val timestamp: Long
+)
+
+data class ETACalculation(
+    val shipmentId: String,
+    val estimatedTime: Long,
+    val estimatedMinutes: Long,
+    val remainingDistance: Double,
+    val confidence: Double,
+    val timestamp: Long
+)
+
+data class CustomerNotification(
+    val id: String,
+    val customerId: String,
+    val title: String,
+    val message: String,
+    val type: NotificationType,
+    val shipmentId: String? = null,
+    val isRead: Boolean = false,
+    val isSent: Boolean = false,
+    val timestamp: Long
+)
+
+data class DigitalInvoice(
+    val id: String,
+    val customerId: String,
+    val shipmentId: String,
+    val invoiceNumber: String,
+    val amount: Double,
+    val currency: String,
+    val dueDate: Long,
+    val status: InvoiceStatus,
+    val items: List<InvoiceItem>,
+    val taxes: List<TaxItem>,
+    val pdfUrl: String,
+    val timestamp: Long
+)
+
+data class CustomerReview(
+    val id: String,
+    val customerId: String,
+    val shipmentId: String,
+    val rating: Float,
+    val comment: String,
+    val categories: Map<String, Float>,
+    val isVerified: Boolean = false,
+    val timestamp: Long
+)
+
+data class CustomerComplaint(
+    val id: String,
+    val customerId: String,
+    val shipmentId: String,
+    val category: ComplaintCategory,
+    val subject: String,
+    val description: String,
+    val priority: ComplaintPriority,
+    val status: ComplaintStatus,
+    val attachments: List<String>,
+    val responses: List<ComplaintResponse>,
+    val timestamp: Long
+)
+
+data class ChatMessage(
+    val id: String,
+    val customerId: String,
+    val message: String,
+    val isFromCustomer: Boolean,
+    val timestamp: Long,
+    val isRead: Boolean = false,
+    val attachments: List<String> = emptyList()
+)
+
+data class LocationPoint(
+    val latitude: Double,
+    val longitude: Double,
+    val address: String,
+    val timestamp: Long
+)
+
+data class DriverInfo(
+    val id: String,
+    val name: String,
+    val phone: String,
+    val photo: String,
+    val rating: Float
+)
+
+data class VehicleInfo(
+    val id: String,
+    val type: String,
+    val make: String,
+    val model: String,
+    val licensePlate: String,
+    val color: String
+)
+
+data class InvoiceItem(
+    val description: String,
+    val quantity: Int,
+    val unitPrice: Double,
+    val total: Double
+)
+
+data class TaxItem(
+    val name: String,
+    val rate: Double,
+    val amount: Double
+)
+
+data class ComplaintResponse(
+    val id: String,
+    val responderId: String,
+    val responderName: String,
+    val message: String,
+    val timestamp: Long
+)
+
+// Enums
+enum class NotificationType {
+    SHIPMENT_CREATED,
+    SHIPMENT_PICKED_UP,
+    SHIPMENT_IN_TRANSIT,
+    SHIPMENT_OUT_FOR_DELIVERY,
+    SHIPMENT_DELIVERED,
+    DELAY_ALERT,
+    ETA_UPDATE,
+    PAYMENT_DUE,
+    PAYMENT_RECEIVED,
+    REVIEW_REQUEST,
+    PROMOTION
+}
+
+enum class InvoiceStatus {
+    DRAFT,
+    SENT,
+    PAID,
+    OVERDUE,
+    CANCELLED
+}
+
+enum class ComplaintCategory {
+    DELIVERY_DELAY,
+    DAMAGED_PACKAGE,
+    WRONG_ITEM,
+    MISSING_ITEM,
+    POOR_SERVICE,
+    BILLING_ISSUE,
+    OTHER
+}
+
+enum class ComplaintPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    URGENT
+}
+
+enum class ComplaintStatus {
+    OPEN,
+    IN_PROGRESS,
+    RESOLVED,
+    CLOSED,
+    REJECTED
+}

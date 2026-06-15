@@ -1,0 +1,655 @@
+package com.edham.logistics.notification
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import com.edham.logistics.R
+import com.edham.logistics.MainActivity
+import com.google.firebase.messaging.FirebaseMessaging
+import com.google.firebase.messaging.FirebaseMessagingService
+import com.google.firebase.messaging.RemoteMessage
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import javax.inject.Inject
+
+/**
+ * Push Notification Service - Firebase Cloud Messaging integration
+ * 
+ * Features:
+ * - Firebase FCM integration
+ * - Push notification handling
+ * - In-app notification display
+ * - Emergency alert prioritization
+ * - Notification channel management
+ * - Device token management
+ * - Notification analytics
+ */
+@AndroidEntryPoint
+class PushNotificationService : FirebaseMessagingService() {
+
+    @Inject
+    lateinit var smartNotificationManager: SmartNotificationManager
+
+    @Inject
+    lateinit var notificationRepository: NotificationRepository
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO)
+
+    companion object {
+        private const val TAG = "PushNotificationService"
+        
+        // Notification Channel IDs
+        const val CHANNEL_GENERAL = "general_notifications"
+        const val CHANNEL_SHIPMENT = "shipment_notifications"
+        const val CHANNEL_EMERGENCY = "emergency_notifications"
+        const val CHANNEL_MAINTENANCE = "maintenance_notifications"
+        const val CHANNEL_PAYMENT = "payment_notifications"
+        const val CHANNEL_DRIVER = "driver_notifications"
+        
+        // Notification IDs
+        private const val NOTIFICATION_ID_BASE = 1000
+        private const val EMERGENCY_NOTIFICATION_ID = 9999
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannels()
+        initializeFCM()
+        Timber.d("PushNotificationService created")
+    }
+
+    override fun onNewToken(token: String) {
+        super.onNewToken(token)
+        serviceScope.launch {
+            try {
+                // Save new FCM token
+                notificationRepository.saveFCMToken(token)
+                
+                // Send token to server
+                notificationRepository.syncFCMTokenWithServer(token)
+                
+                Timber.d("FCM token updated: $token")
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to update FCM token")
+            }
+        }
+    }
+
+    override fun onMessageReceived(remoteMessage: RemoteMessage) {
+        super.onMessageReceived(remoteMessage)
+        
+        serviceScope.launch {
+            try {
+                // Handle incoming FCM message
+                handleFCMMessage(remoteMessage)
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to handle FCM message")
+            }
+        }
+    }
+
+    override fun onDeletedMessages() {
+        super.onDeletedMessages()
+        serviceScope.launch {
+            try {
+                // Handle deleted messages
+                notificationRepository.markNotificationsAsDeleted()
+                Timber.d("FCM messages deleted on server")
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to handle deleted messages")
+            }
+        }
+    }
+
+    /**
+     * Initialize Firebase Cloud Messaging
+     */
+    private fun initializeFCM() {
+        FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
+            serviceScope.launch {
+                try {
+                    notificationRepository.saveFCMToken(token)
+                    notificationRepository.syncFCMTokenWithServer(token)
+                    Timber.d("FCM token initialized: $token")
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to initialize FCM token")
+                }
+            }
+        }.addOnFailureListener { exception ->
+            Timber.e(exception, "Failed to get FCM token")
+        }
+    }
+
+    /**
+     * Create notification channels for Android 8.0+
+     */
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            // General notifications channel
+            val generalChannel = NotificationChannel(
+                CHANNEL_GENERAL,
+                "General Notifications",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "General app notifications"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+            }
+
+            // Shipment notifications channel
+            val shipmentChannel = NotificationChannel(
+                CHANNEL_SHIPMENT,
+                "Shipment Notifications",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Shipment status updates and alerts"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = getColor(R.color.primary_blue)
+            }
+
+            // Emergency notifications channel
+            val emergencyChannel = NotificationChannel(
+                CHANNEL_EMERGENCY,
+                "Emergency Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Emergency and critical alerts"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = getColor(R.color.red)
+                setSound(null, null) // Use default emergency sound
+            }
+
+            // Maintenance notifications channel
+            val maintenanceChannel = NotificationChannel(
+                CHANNEL_MAINTENANCE,
+                "Maintenance Notifications",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Maintenance reminders and alerts"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = getColor(R.color.orange)
+            }
+
+            // Payment notifications channel
+            val paymentChannel = NotificationChannel(
+                CHANNEL_PAYMENT,
+                "Payment Notifications",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Payment related notifications"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = getColor(R.color.green)
+            }
+
+            // Driver notifications channel
+            val driverChannel = NotificationChannel(
+                CHANNEL_DRIVER,
+                "Driver Notifications",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Driver alerts and updates"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+                lightColor = getColor(R.color.yellow)
+            }
+
+            // Register channels
+            notificationManager.createNotificationChannels(listOf(
+                generalChannel,
+                shipmentChannel,
+                emergencyChannel,
+                maintenanceChannel,
+                paymentChannel,
+                driverChannel
+            ))
+
+            Timber.d("Notification channels created")
+        }
+    }
+
+    /**
+     * Handle incoming FCM message
+     */
+    private suspend fun handleFCMMessage(remoteMessage: RemoteMessage) {
+        val data = remoteMessage.data
+        val notification = remoteMessage.notification
+
+        // Extract notification data
+        val title = notification?.title ?: data["title"] ?: "إشعار جديد"
+        val message = notification?.body ?: data["message"] ?: ""
+        val category = data["category"]?.let { NotificationCategory.valueOf(it) } ?: NotificationCategory.GENERAL
+        val priority = data["priority"]?.let { NotificationPriority.valueOf(it) } ?: NotificationPriority.NORMAL
+        val isEmergency = data["isEmergency"]?.toBoolean() ?: false
+
+        // Create notification request
+        val notificationRequest = NotificationRequest(
+            title = title,
+            message = message,
+            category = category,
+            priority = priority,
+            recipients = listOf(
+                NotificationRecipient(
+                    id = "current_user",
+                    type = RecipientType.USER,
+                    address = "",
+                    name = "Current User"
+                )
+            ),
+            data = data,
+            channels = listOf(NotificationChannel.PUSH, NotificationChannel.IN_APP)
+        )
+
+        // Send notification through smart notification manager
+        val result = smartNotificationManager.sendNotification(notificationRequest)
+
+        // Display system notification
+        if (result.isSuccess) {
+            displaySystemNotification(title, message, category, priority, isEmergency, data)
+        }
+
+        // Log notification received
+        logNotificationReceived(remoteMessage, result)
+    }
+
+    /**
+     * Display system notification
+     */
+    private fun displaySystemNotification(
+        title: String,
+        message: String,
+        category: NotificationCategory,
+        priority: NotificationPriority,
+        isEmergency: Boolean,
+        data: Map<String, String>
+    ) {
+        val channelId = getChannelId(category, isEmergency)
+        val notificationId = if (isEmergency) EMERGENCY_NOTIFICATION_ID else NOTIFICATION_ID_BASE + category.ordinal
+
+        // Create intent for when notification is tapped
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            putExtra("notification_category", category.name)
+            putExtra("notification_data", data.toMap())
+        }
+
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Build notification
+        val notificationBuilder = NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(getNotificationIcon(category, isEmergency))
+            .setContentTitle(title)
+            .setContentText(message)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(getNotificationPriority(priority))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+
+        // Add emergency styling
+        if (isEmergency) {
+            notificationBuilder
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setFullScreenIntent(pendingIntent, true)
+                .setTimeoutAfter(30000) // Auto-dismiss after 30 seconds
+        }
+
+        // Add action buttons for certain categories
+        addNotificationActions(notificationBuilder, category, data)
+
+        // Show notification
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(notificationId, notificationBuilder.build())
+
+        Timber.d("System notification displayed: $title")
+    }
+
+    /**
+     * Get notification channel ID based on category and emergency status
+     */
+    private fun getChannelId(category: NotificationCategory, isEmergency: Boolean): String {
+        return if (isEmergency) {
+            CHANNEL_EMERGENCY
+        } else {
+            when (category) {
+                NotificationCategory.SHIPMENT -> CHANNEL_SHIPMENT
+                NotificationCategory.MAINTENANCE -> CHANNEL_MAINTENANCE
+                NotificationCategory.PAYMENT -> CHANNEL_PAYMENT
+                NotificationCategory.DRIVER -> CHANNEL_DRIVER
+                else -> CHANNEL_GENERAL
+            }
+        }
+    }
+
+    /**
+     * Get notification icon based on category and emergency status
+     */
+    private fun getNotificationIcon(category: NotificationCategory, isEmergency: Boolean): Int {
+        return if (isEmergency) {
+            R.drawable.ic_emergency_notification
+        } else {
+            when (category) {
+                NotificationCategory.SHIPMENT -> R.drawable.ic_shipment_notification
+                NotificationCategory.MAINTENANCE -> R.drawable.ic_maintenance_notification
+                NotificationCategory.PAYMENT -> R.drawable.ic_payment_notification
+                NotificationCategory.DRIVER -> R.drawable.ic_driver_notification
+                NotificationCategory.TEMPERATURE -> R.drawable.ic_temperature_notification
+                NotificationCategory.DELAY -> R.drawable.ic_delay_notification
+                else -> R.drawable.ic_notification
+            }
+        }
+    }
+
+    /**
+     * Get notification priority based on notification priority
+     */
+    private fun getNotificationPriority(priority: NotificationPriority): Int {
+        return when (priority) {
+            NotificationPriority.EMERGENCY -> NotificationCompat.PRIORITY_HIGH
+            NotificationPriority.HIGH -> NotificationCompat.PRIORITY_HIGH
+            NotificationPriority.NORMAL -> NotificationCompat.PRIORITY_DEFAULT
+            NotificationPriority.LOW -> NotificationCompat.PRIORITY_LOW
+        }
+    }
+
+    /**
+     * Add action buttons to notification based on category
+     */
+    private fun addNotificationActions(
+        builder: NotificationCompat.Builder,
+        category: NotificationCategory,
+        data: Map<String, String>
+    ) {
+        when (category) {
+            NotificationCategory.SHIPMENT -> {
+                // Track shipment action
+                val trackIntent = Intent(this, MainActivity::class.java).apply {
+                    putExtra("action", "track_shipment")
+                    putExtra("shipment_id", data["shipmentId"])
+                }
+                val trackPendingIntent = PendingIntent.getActivity(
+                    this, 1, trackIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(
+                    R.drawable.ic_track,
+                    "تتبع",
+                    trackPendingIntent
+                )
+            }
+            
+            NotificationCategory.MAINTENANCE -> {
+                // Schedule maintenance action
+                val scheduleIntent = Intent(this, MainActivity::class.java).apply {
+                    putExtra("action", "schedule_maintenance")
+                    putExtra("vehicle_id", data["vehicleId"])
+                }
+                val schedulePendingIntent = PendingIntent.getActivity(
+                    this, 2, scheduleIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(
+                    R.drawable.ic_schedule,
+                    "جدولة",
+                    schedulePendingIntent
+                )
+            }
+            
+            NotificationCategory.PAYMENT -> {
+                // Make payment action
+                val payIntent = Intent(this, MainActivity::class.java).apply {
+                    putExtra("action", "make_payment")
+                    putExtra("payment_id", data["paymentId"])
+                }
+                val payPendingIntent = PendingIntent.getActivity(
+                    this, 3, payIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(
+                    R.drawable.ic_payment,
+                    "دفع",
+                    payPendingIntent
+                )
+            }
+            
+            NotificationCategory.EMERGENCY -> {
+                // Emergency response action
+                val emergencyIntent = Intent(this, MainActivity::class.java).apply {
+                    putExtra("action", "emergency_response")
+                    putExtra("emergency_id", data["emergencyId"])
+                }
+                val emergencyPendingIntent = PendingIntent.getActivity(
+                    this, 4, emergencyIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(
+                    R.drawable.ic_emergency,
+                    "استجابة طارئة",
+                    emergencyPendingIntent
+                )
+            }
+        }
+    }
+
+    /**
+     * Log notification received for analytics
+     */
+    private suspend fun logNotificationReceived(
+        remoteMessage: RemoteMessage,
+        result: Result<NotificationResult>
+    ) {
+        try {
+            val analyticsData = mapOf(
+                "messageId" to remoteMessage.messageId,
+                "from" to remoteMessage.from,
+                "to" to remoteMessage.to,
+                "collapseKey" to remoteMessage.collapseKey,
+                "messageType" to remoteMessage.messageType,
+                "sentTime" to remoteMessage.sentTime,
+                "ttl" to remoteMessage.ttl,
+                "data" to remoteMessage.data.toString(),
+                "notification" to remoteMessage.notification.toString(),
+                "result" to (result.getOrNull()?.status?.name ?: "FAILED"),
+                "timestamp" to System.currentTimeMillis()
+            )
+
+            notificationRepository.logNotificationReceived(analyticsData)
+            Timber.d("Notification received and logged: ${remoteMessage.messageId}")
+
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to log notification received")
+        }
+    }
+}
+
+/**
+ * Push Notification Service Interface
+ */
+interface IPushNotificationService {
+    suspend fun initialize(): Result<Boolean>
+    suspend fun sendNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean = false
+    ): Result<NotificationResult>
+    suspend fun sendInAppNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean = false
+    ): Result<NotificationResult>
+    suspend fun updateDeviceToken(token: String): Result<Boolean>
+    suspend fun subscribeToTopic(topic: String): Result<Boolean>
+    suspend fun unsubscribeFromTopic(topic: String): Result<Boolean>
+}
+
+/**
+ * Push Notification Service Implementation
+ */
+class PushNotificationServiceImpl @Inject constructor(
+    private val context: Context,
+    private val notificationRepository: NotificationRepository,
+    private val firebaseMessaging: FirebaseMessaging
+) : IPushNotificationService {
+
+    override suspend fun initialize(): Result<Boolean> {
+        return try {
+            // Get current FCM token
+            val token = firebaseMessaging.token.await()
+            
+            // Save token
+            notificationRepository.saveFCMToken(token)
+            
+            // Sync with server
+            notificationRepository.syncFCMTokenWithServer(token)
+            
+            Result.success(true)
+            
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun sendNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean
+    ): Result<NotificationResult> {
+        return try {
+            // This would send push notification via FCM API
+            // For now, we'll just log it
+            notificationRepository.logPushNotificationSent(notification.id.toString(), request)
+            
+            Result.success(
+                NotificationResult(
+                    id = notification.id.toString(),
+                    status = NotificationStatus.SENT,
+                    timestamp = java.util.Date()
+                )
+            )
+            
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun sendInAppNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean
+    ): Result<NotificationResult> {
+        return try {
+            // Save in-app notification to local database
+            notificationRepository.saveInAppNotification(notification)
+            
+            Result.success(
+                NotificationResult(
+                    id = notification.id.toString(),
+                    status = NotificationStatus.DELIVERED,
+                    timestamp = java.util.Date()
+                )
+            )
+            
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun updateDeviceToken(token: String): Result<Boolean> {
+        return try {
+            notificationRepository.saveFCMToken(token)
+            notificationRepository.syncFCMTokenWithServer(token)
+            Result.success(true)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun subscribeToTopic(topic: String): Result<Boolean> {
+        return try {
+            firebaseMessaging.subscribeToTopic(topic).await()
+            notificationRepository.logTopicSubscription(topic, true)
+            Result.success(true)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun unsubscribeFromTopic(topic: String): Result<Boolean> {
+        return try {
+            firebaseMessaging.unsubscribeFromTopic(topic).await()
+            notificationRepository.logTopicSubscription(topic, false)
+            Result.success(true)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+}
+
+/**
+ * Extension function for Firebase token
+ */
+suspend fun FirebaseMessaging.token(): String {
+    return suspendCancellableCoroutine { continuation ->
+        token.addOnSuccessListener { token ->
+            continuation.resume(token)
+        }.addOnFailureListener { exception ->
+            continuation.resumeWithException(exception)
+        }
+    }
+}
+
+/**
+ * Extension function for topic subscription
+ */
+suspend fun FirebaseMessaging.subscribeToTopic(topic: String): Unit {
+    return suspendCancellableCoroutine { continuation ->
+        subscribeToTopic(topic).addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                continuation.resume(Unit)
+            } else {
+                continuation.resumeWithException(task.exception ?: Exception("Failed to subscribe to topic"))
+            }
+        }
+    }
+}
+
+/**
+ * Extension function for topic unsubscription
+ */
+suspend fun FirebaseMessaging.unsubscribeFromTopic(topic: String): Unit {
+    return suspendCancellableCoroutine { continuation ->
+        unsubscribeFromTopic(topic).addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                continuation.resume(Unit)
+            } else {
+                continuation.resumeWithException(task.exception ?: Exception("Failed to unsubscribe from topic"))
+            }
+        }
+    }
+}

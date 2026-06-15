@@ -21,14 +21,24 @@ class DeliveryProofViewModel @Inject constructor(
     private val _error = MutableLiveData<String?>()
     val error: LiveData<String?> = _error
 
-    fun submitProof(shipmentId: String, signatureBase64: String?) {
+    fun submitProof(
+        shipmentId: String, 
+        signatureBase64: String, 
+        photos: List<String>,
+        tempOk: Boolean,
+        sealsOk: Boolean,
+        qtyOk: Boolean
+    ) {
         viewModelScope.launch {
             try {
                 val proof = DeliveryProof(
-                    signatureUrl = signatureBase64, // simplified
-                    photoUrl = null,
+                    images = photos,
+                    signature = signatureBase64,
+                    rating = 5,
                     notes = "تم التسليم بنجاح",
-                    recipientName = "العميل"
+                    tempVerified = tempOk,
+                    sealsVerified = sealsOk,
+                    qtyVerified = qtyOk
                 )
                 val response = api.submitDeliveryProof(shipmentId, proof)
                 if (response.isSuccessful) {

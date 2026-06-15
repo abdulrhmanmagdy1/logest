@@ -1,0 +1,370 @@
+package com.edham.logistics.core.security
+
+import com.edham.logistics.core.model.UserRole
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Policy Engine - Centralized permission and access control
+ * Provides secure role-based access control with caching and auditing
+ */
+@Singleton
+class PolicyEngine @Inject constructor() {
+    
+    // Permission cache for performance optimization
+    private val permissionCache = mutableMapOf<String, Boolean>()
+    private val rolePermissionCache = mutableMapOf<UserRole, Set<Permission>>()
+    
+    // Audit log for security events
+    private val auditLog = mutableListOf<SecurityAuditEvent>()
+    
+    /**
+     * Check if user has specific permission
+     */
+    fun hasPermission(userRole: UserRole, permission: Permission): Boolean {
+        val cacheKey = "${userRole.name}_${permission.name}"
+        
+        // Check cache first
+        permissionCache[cacheKey]?.let { return it }
+        
+        // Evaluate permission
+        val hasPermission = userRole.hasPermission(permission)
+        
+        // Cache result
+        permissionCache[cacheKey] = hasPermission
+        
+        // Log access attempt
+        logSecurityEvent(
+            eventType = SecurityEventType.PERMISSION_CHECK,
+            userRole = userRole,
+            permission = permission,
+            granted = hasPermission
+        )
+        
+        return hasPermission
+    }
+    
+    /**
+     * Check if user has any of the specified permissions
+     */
+    fun hasAnyPermission(userRole: UserRole, vararg permissions: Permission): Boolean {
+        return permissions.any { hasPermission(userRole, it) }
+    }
+    
+    /**
+     * Check if user has all of the specified permissions
+     */
+    fun hasAllPermissions(userRole: UserRole, vararg permissions: Permission): Boolean {
+        return permissions.all { hasPermission(userRole, it) }
+    }
+    
+    /**
+     * Check if user can access specific resource
+     */
+    fun canAccessResource(userRole: UserRole, resource: SecurityResource): Boolean {
+        return when (resource.type) {
+            ResourceType.DASHBOARD -> hasPermission(userRole, Permission.VIEW_DASHBOARD)
+            ResourceType.SHIPMENT -> when (resource.action) {
+                ResourceAction.CREATE -> hasPermission(userRole, Permission.CREATE_SHIPMENT)
+                ResourceAction.VIEW_OWN -> hasPermission(userRole, Permission.VIEW_OWN_SHIPMENTS)
+                ResourceAction.VIEW_ALL -> hasPermission(userRole, Permission.MANAGE_SHIPMENTS)
+                ResourceAction.TRACK -> hasPermission(userRole, Permission.TRACK_SHIPMENT)
+                ResourceAction.UPDATE -> hasPermission(userRole, Permission.MANAGE_SHIPMENTS)
+                else -> false
+            }
+            ResourceType.DRIVER -> when (resource.action) {
+                ResourceAction.ASSIGN -> hasPermission(userRole, Permission.ASSIGN_DRIVERS)
+                ResourceAction.VIEW_PERFORMANCE -> hasPermission(userRole, Permission.VIEW_DRIVER_PERFORMANCE)
+                ResourceAction.VIEW_OWN -> hasPermission(userRole, Permission.VIEW_OWN_TASKS_ONLY)
+                ResourceAction.UPDATE_LOCATION -> hasPermission(userRole, Permission.UPDATE_LOCATION)
+                ResourceAction.UPDATE_STATUS -> hasPermission(userRole, Permission.UPDATE_TASK_STATUS)
+                else -> false
+            }
+            ResourceType.FLEET -> when (resource.action) {
+                ResourceAction.VIEW -> hasPermission(userRole, Permission.VIEW_FLEET)
+                ResourceAction.MANAGE -> hasPermission(userRole, Permission.MANAGE_VEHICLES)
+                ResourceAction.VIEW_HEALTH -> hasPermission(userRole, Permission.VIEW_FLEET_HEALTH)
+                ResourceAction.VIEW_DIAGNOSTICS -> hasPermission(userRole, Permission.VIEW_VEHICLE_DIAGNOSTICS)
+                else -> false
+            }
+            ResourceType.FINANCIAL -> when (resource.action) {
+                ResourceAction.VIEW -> hasPermission(userRole, Permission.VIEW_TRANSACTIONS)
+                ResourceAction.MANAGE -> hasPermission(userRole, Permission.MANAGE_FINANCIAL_RECORDS)
+                ResourceAction.CREATE -> hasPermission(userRole, Permission.MANAGE_INVOICES)
+                ResourceAction.APPROVE -> hasPermission(userRole, Permission.APPROVE_PAYMENTS)
+                ResourceAction.EXPORT -> hasPermission(userRole, Permission.EXPORT_FINANCIAL_DATA)
+                ResourceAction.VIEW_ANALYTICS -> hasPermission(userRole, Permission.VIEW_FINANCIAL_ANALYTICS)
+                else -> false
+            }
+            ResourceType.OPERATIONS -> when (resource.action) {
+                ResourceAction.MANAGE -> hasPermission(userRole, Permission.MANAGE_OPERATIONS)
+                ResourceAction.DISPATCH -> hasPermission(userRole, Permission.MANAGE_DISPATCH)
+                ResourceAction.ACCESS -> hasPermission(userRole, Permission.ACCESS_OPERATIONS_ROOM)
+                else -> false
+            }
+            ResourceType.WORKSHOP -> when (resource.action) {
+                ResourceAction.MANAGE -> hasPermission(userRole, Permission.MANAGE_WORKSHOP_OPERATIONS)
+                ResourceAction.CREATE -> hasPermission(userRole, Permission.CREATE_MAINTENANCE_REQUESTS)
+                ResourceAction.UPDATE -> hasPermission(userRole, Permission.UPDATE_MAINTENANCE_STATUS)
+                ResourceAction.VIEW -> hasPermission(userRole, Permission.VIEW_FLEET_HEALTH)
+                else -> false
+            }
+            ResourceType.USER -> when (resource.action) {
+                ResourceAction.MANAGE -> hasPermission(userRole, Permission.MANAGE_USERS)
+                ResourceAction.MANAGE_ROLES -> hasPermission(userRole, Permission.MANAGE_ROLES)
+                ResourceAction.VIEW_PROFILE -> hasPermission(userRole, Permission.MANAGE_PROFILE)
+                ResourceAction.VIEW_WALLET -> hasPermission(userRole, Permission.VIEW_WALLET)
+                ResourceAction.MAKE_PAYMENT -> hasPermission(userRole, Permission.MAKE_PAYMENTS)
+                else -> false
+            }
+            ResourceType.REPORTS -> when (resource.action) {
+                ResourceAction.VIEW -> hasPermission(userRole, Permission.VIEW_REPORTS)
+                ResourceAction.CREATE -> hasPermission(userRole, Permission.GENERATE_REPORTS)
+                ResourceAction.VIEW_ANALYTICS -> hasPermission(userRole, Permission.VIEW_ANALYTICS)
+                else -> false
+            }
+            ResourceType.SYSTEM -> when (resource.action) {
+                ResourceAction.MANAGE -> hasPermission(userRole, Permission.MANAGE_SYSTEM)
+                ResourceAction.VIEW_LOGS -> hasPermission(userRole, Permission.VIEW_SYSTEM_LOGS)
+                else -> false
+            }
+        }
+    }
+    
+    /**
+     * Get all permissions for a role
+     */
+    fun getRolePermissions(userRole: UserRole): Set<Permission> {
+        rolePermissionCache[userRole]?.let { return it }
+        
+        val permissions = userRole.permissions
+        rolePermissionCache[userRole] = permissions
+        
+        return permissions
+    }
+    
+    /**
+     * Get all roles that have specific permission
+     */
+    fun getRolesWithPermission(permission: Permission): List<UserRole> {
+        return UserRole.getRolesWithPermission(permission)
+    }
+    
+    /**
+     * Check if user role can access another user's data
+     */
+    fun canAccessUserData(requesterRole: UserRole, targetRole: UserRole): Boolean {
+        // Users can access their own data
+        if (requesterRole == targetRole) return true
+        
+        // Admin can access all data
+        if (requesterRole == UserRole.ADMIN) return true
+        
+        // Supervisor can access driver and workshop data
+        if (requesterRole == UserRole.SUPERVISOR) {
+            return targetRole == UserRole.DRIVER || targetRole == UserRole.WORKSHOP
+        }
+        
+        // Accountant can access financial data of all roles
+        if (requesterRole == UserRole.ACCOUNTANT) {
+            return true // For financial operations only
+        }
+        
+        return false
+    }
+    
+    /**
+     * Validate role hierarchy for operations
+     */
+    fun validateRoleHierarchy(requesterRole: UserRole, targetRole: UserRole): Boolean {
+        return UserRole.hasHigherOrEqualPriority(requesterRole, targetRole)
+    }
+    
+    /**
+     * Get security context for user
+     */
+    fun getSecurityContext(userRole: UserRole): SecurityContext {
+        return SecurityContext(
+            userRole = userRole,
+            permissions = getRolePermissions(userRole),
+            canManageUsers = hasPermission(userRole, Permission.MANAGE_USERS),
+            canManageSystem = hasPermission(userRole, Permission.MANAGE_SYSTEM),
+            canAccessCriticalOperations = getRolePermissions(userRole)
+                .any { it.isCritical }
+        )
+    }
+    
+    /**
+     * Clear permission cache
+     */
+    fun clearCache() {
+        permissionCache.clear()
+        rolePermissionCache.clear()
+        Timber.d("PolicyEngine cache cleared")
+    }
+    
+    /**
+     * Get audit log
+     */
+    fun getAuditLog(): List<SecurityAuditEvent> {
+        return auditLog.toList()
+    }
+    
+    /**
+     * Clear audit log
+     */
+    fun clearAuditLog() {
+        auditLog.clear()
+        Timber.d("PolicyEngine audit log cleared")
+    }
+    
+    /**
+     * Get security statistics
+     */
+    fun getSecurityStatistics(): SecurityStatistics {
+        val totalChecks = auditLog.count { it.eventType == SecurityEventType.PERMISSION_CHECK }
+        val grantedChecks = auditLog.count { 
+            it.eventType == SecurityEventType.PERMISSION_CHECK && it.granted 
+        }
+        val deniedChecks = totalChecks - grantedChecks
+        
+        return SecurityStatistics(
+            totalPermissionChecks = totalChecks,
+            grantedPermissions = grantedChecks,
+            deniedPermissions = deniedChecks,
+            criticalAccessAttempts = auditLog.count { 
+                it.permission?.isCritical == true 
+            },
+            lastAuditTime = auditLog.maxOfOrNull { it.timestamp } ?: 0L
+        )
+    }
+    
+    /**
+     * Log security event
+     */
+    private fun logSecurityEvent(
+        eventType: SecurityEventType,
+        userRole: UserRole,
+        permission: Permission? = null,
+        resource: SecurityResource? = null,
+        granted: Boolean
+    ) {
+        val event = SecurityAuditEvent(
+            timestamp = System.currentTimeMillis(),
+            eventType = eventType,
+            userRole = userRole,
+            permission = permission,
+            resource = resource,
+            granted = granted
+        )
+        
+        auditLog.add(event)
+        
+        // Limit audit log size
+        if (auditLog.size > 1000) {
+            auditLog.removeFirst()
+        }
+        
+        Timber.d("Security event: $eventType for ${userRole.name} - ${if (granted) "GRANTED" else "DENIED"}")
+    }
+}
+
+/**
+ * Security resource definition
+ */
+data class SecurityResource(
+    val type: ResourceType,
+    val action: ResourceAction,
+    val resourceId: String? = null
+)
+
+/**
+ * Resource types
+ */
+enum class ResourceType {
+    DASHBOARD,
+    SHIPMENT,
+    DRIVER,
+    FLEET,
+    FINANCIAL,
+    OPERATIONS,
+    WORKSHOP,
+    USER,
+    REPORTS,
+    SYSTEM
+}
+
+/**
+ * Resource actions
+ */
+enum class ResourceAction {
+    VIEW,
+    CREATE,
+    UPDATE,
+    DELETE,
+    MANAGE,
+    ASSIGN,
+    TRACK,
+    APPROVE,
+    EXPORT,
+    ACCESS,
+    DISPATCH,
+    VIEW_PERFORMANCE,
+    VIEW_OWN,
+    VIEW_HEALTH,
+    VIEW_DIAGNOSTICS,
+    VIEW_LOGS,
+    MANAGE_ROLES,
+    VIEW_PROFILE,
+    VIEW_WALLET,
+    MAKE_PAYMENT,
+    VIEW_ANALYTICS,
+    UPDATE_LOCATION,
+    UPDATE_STATUS,
+    CREATE_MAINTENANCE_REQUESTS
+}
+
+/**
+ * Security context for user session
+ */
+data class SecurityContext(
+    val userRole: UserRole,
+    val permissions: Set<Permission>,
+    val canManageUsers: Boolean,
+    val canManageSystem: Boolean,
+    val canAccessCriticalOperations: Boolean
+)
+
+/**
+ * Security audit event
+ */
+data class SecurityAuditEvent(
+    val timestamp: Long,
+    val eventType: SecurityEventType,
+    val userRole: UserRole,
+    val permission: Permission?,
+    val resource: SecurityResource?,
+    val granted: Boolean
+)
+
+/**
+ * Security event types
+ */
+enum class SecurityEventType {
+    PERMISSION_CHECK,
+    RESOURCE_ACCESS,
+    ROLE_CHANGE,
+    SECURITY_VIOLATION
+}
+
+/**
+ * Security statistics
+ */
+data class SecurityStatistics(
+    val totalPermissionChecks: Int,
+    val grantedPermissions: Int,
+    val deniedPermissions: Int,
+    val criticalAccessAttempts: Int,
+    val lastAuditTime: Long
+)

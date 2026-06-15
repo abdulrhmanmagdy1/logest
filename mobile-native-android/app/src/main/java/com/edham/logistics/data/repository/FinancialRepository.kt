@@ -13,7 +13,9 @@ class FinancialRepository @Inject constructor(
     suspend fun approveExpense(id: String) = api.approveExpense(id)
     suspend fun rejectExpense(id: String, reason: String) = api.rejectExpense(id, reason)
     suspend fun getDebtAgingReport() = api.getDebtAgingReport()
+    suspend fun collectPayment(id: String, amount: Double, method: String, notes: String?) = api.collectPayment(id, amount, method, notes)
     suspend fun getWorkshopRequests() = api.getWorkshopRequests()
     suspend fun approveWorkshopRequest(id: String) = api.approveWorkshopRequest(id)
+    suspend fun submitReceiptVoucher(client: String, amt: Double, method: String) = api.submitReceiptVoucher(client, amt, method)
     suspend fun getStatementOfAccount(clientId: String) = api.getStatementOfAccount(clientId)
 }

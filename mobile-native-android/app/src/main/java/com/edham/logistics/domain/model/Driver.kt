@@ -1,0 +1,30 @@
+package com.edham.logistics.domain.model
+
+data class Driver(
+    val id: String,
+    val name: String,
+    val email: String,
+    val phone: String,
+    val nationalId: String,
+    val driverLicense: String,
+    val licenseExpiry: String,
+    val status: String,
+    val rating: Float,
+    val totalTrips: Int,
+    val completedTrips: Int,
+    val cancelledTrips: Int,
+    val currentLocation: String? = null,
+    val currentLatitude: Double? = null,
+    val currentLongitude: Double? = null,
+    val currentVehicleId: String? = null,
+    val currentShipmentId: String? = null,
+    val isOnline: Boolean = false,
+    val lastActiveTime: String? = null,
+    val profileImage: String? = null,
+    val hireDate: String,
+    val salary: Double,
+    val bankAccount: String? = null,
+    val emergencyContact: EmergencyContact,
+    val documents: List<DriverDocument> = emptyList(),
+    val performanceMetrics: DriverPerformance
+)

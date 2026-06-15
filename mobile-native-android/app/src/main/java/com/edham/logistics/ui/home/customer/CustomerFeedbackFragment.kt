@@ -10,7 +10,7 @@ import com.edham.logistics.R
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
-class CustomerFeedbackFragment : Fragment() {
+class CustomerFeedbackFragment : com.google.android.material.bottomsheet.BottomSheetDialogFragment() {
 
     override fun onCreateView(
         inflater: LayoutInflater,

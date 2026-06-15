@@ -1,0 +1,754 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.FleetAssignmentEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Live Fleet Monitor - Real-time fleet monitoring and tracking system
+ * 
+ * Features:
+ * - Real-time vehicle location tracking
+ * - Live fleet status monitoring
+ * - Geofence monitoring
+ * - Speed monitoring
+ * - Route deviation detection
+ * - Emergency alerts
+ * - Fleet performance metrics
+ */
+@Singleton
+class LiveFleetMonitor @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _monitoringState = MutableStateFlow<MonitoringState>(MonitoringState.Idle)
+    val monitoringState: StateFlow<MonitoringState> = _monitoringState.asStateFlow()
+    
+    private val _liveVehicles = MutableStateFlow<List<LiveVehicle>>(emptyList())
+    val liveVehicles: StateFlow<List<LiveVehicle>> = _liveVehicles.asStateFlow()
+    
+    private val _fleetMetrics = MutableStateFlow<FleetMetrics?>(null)
+    val fleetMetrics: StateFlow<FleetMetrics?> = _fleetMetrics.asStateFlow()
+    
+    private val _liveAlerts = MutableStateFlow<List<LiveAlert>>(emptyList())
+    val liveAlerts: StateFlow<List<LiveAlert>> = _liveAlerts.asStateFlow()
+    
+    private val _geofenceAlerts = MutableStateFlow<List<GeofenceAlert>>(emptyList())
+    val geofenceAlerts: StateFlow<List<GeofenceAlert>> = _geofenceAlerts.asStateFlow()
+    
+    private var isMonitoring = false
+    private val monitoredVehicles = mutableSetOf<Long>()
+    private val monitoringListeners = mutableListOf<FleetMonitoringListener>()
+    private val geofences = mutableMapOf<String, Geofence>()
+    
+    companion object {
+        private const val TAG = "LiveFleetMonitor"
+        private const val MONITORING_INTERVAL = 30000L // 30 seconds
+        private const val ALERT_RETENTION_TIME = 24 * 60 * 60 * 1000L // 24 hours
+        private const val MAX_LIVE_VEHICLES = 100
+    }
+    
+    init {
+        initializeGeofences()
+    }
+    
+    /**
+     * Start live fleet monitoring
+     */
+    suspend fun startMonitoring(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _monitoringState.value = MonitoringState.Starting
+                
+                // Load active vehicles
+                val activeVehicles = database.vehicleDao().getVehiclesByStatus(VehicleStatus.IN_USE)
+                
+                // Start monitoring each vehicle
+                activeVehicles.forEach { vehicle ->
+                    startVehicleMonitoring(vehicle.id)
+                }
+                
+                // Start periodic updates
+                startPeriodicUpdates()
+                
+                // Start geofence monitoring
+                startGeofenceMonitoring()
+                
+                isMonitoring = true
+                _monitoringState.value = MonitoringState.Monitoring
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _monitoringState.value = MonitoringState.Error("Failed to start monitoring: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Stop live fleet monitoring
+     */
+    suspend fun stopMonitoring(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                isMonitoring = false
+                
+                // Stop monitoring all vehicles
+                monitoredVehicles.forEach { vehicleId ->
+                    stopVehicleMonitoring(vehicleId)
+                }
+                
+                // Stop periodic updates
+                stopPeriodicUpdates()
+                
+                // Stop geofence monitoring
+                stopGeofenceMonitoring()
+                
+                _monitoringState.value = MonitoringState.Stopped
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _monitoringState.value = MonitoringState.Error("Failed to stop monitoring: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Start monitoring specific vehicle
+     */
+    suspend fun startVehicleMonitoring(vehicleId: Long): Result<LiveVehicle> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val assignment = database.fleetAssignmentDao().getActiveAssignmentByVehicle(vehicleId)
+                
+                // Create live vehicle
+                val liveVehicle = LiveVehicle(
+                    vehicleId = vehicle.id,
+                    vehicleIdString = vehicle.vehicleId,
+                    make = vehicle.make,
+                    model = vehicle.model,
+                    licensePlate = vehicle.licensePlate,
+                    vehicleType = vehicle.vehicleType,
+                    currentLocation = vehicle.currentLocation,
+                    latitude = vehicle.currentLatitude,
+                    longitude = vehicle.currentLongitude,
+                    speed = 0f,
+                    heading = 0f,
+                    fuelLevel = vehicle.fuelLevel,
+                    mileage = vehicle.mileage,
+                    status = vehicle.status,
+                    driverId = assignment?.driverId,
+                    lastUpdate = Date(),
+                    route = assignment?.route,
+                    estimatedArrival = null,
+                    nextStop = null,
+                    alerts = emptyList(),
+                    geofenceStatus = GeofenceStatus.INSIDE
+                )
+                
+                // Add to monitored vehicles
+                monitoredVehicles.add(vehicleId)
+                
+                // Update live vehicles list
+                updateLiveVehicles()
+                
+                // Start tracking
+                liveTrackingManager.startTracking(vehicle.vehicleId)
+                
+                Result.success(liveVehicle)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Stop monitoring specific vehicle
+     */
+    suspend fun stopVehicleMonitoring(vehicleId: Long): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                monitoredVehicles.remove(vehicleId)
+                
+                // Update live vehicles list
+                updateLiveVehicles()
+                
+                // Stop tracking
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                vehicle?.let {
+                    liveTrackingManager.stopTracking()
+                }
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update vehicle location
+     */
+    suspend fun updateVehicleLocation(
+        vehicleId: Long,
+        latitude: Double,
+        longitude: Double,
+        speed: Float,
+        heading: Float,
+        timestamp: Date = Date()
+    ): Result<LiveVehicle> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Update vehicle location in database
+                val updatedVehicle = vehicle.copy(
+                    currentLocation = "Lat: $latitude, Lng: $longitude",
+                    currentLatitude = latitude,
+                    currentLongitude = longitude,
+                    updatedAt = timestamp
+                )
+                database.vehicleDao().updateVehicle(updatedVehicle)
+                
+                // Update live vehicle
+                val liveVehicles = _liveVehicles.value.toMutableList()
+                val liveVehicleIndex = liveVehicles.indexOfFirst { it.vehicleId == vehicleId }
+                
+                if (liveVehicleIndex >= 0) {
+                    val liveVehicle = liveVehicles[liveVehicleIndex].copy(
+                        latitude = latitude,
+                        longitude = longitude,
+                        speed = speed,
+                        heading = heading,
+                        lastUpdate = timestamp
+                    )
+                    liveVehicles[liveVehicleIndex] = liveVehicle
+                    _liveVehicles.value = liveVehicles
+                    
+                    // Check for alerts
+                    checkVehicleAlerts(liveVehicle)
+                    
+                    // Check geofence status
+                    checkGeofenceStatus(liveVehicle)
+                    
+                    // Notify listeners
+                    notifyLocationUpdate(liveVehicle)
+                    
+                    Result.success(liveVehicle)
+                } else {
+                    throw Exception("Vehicle not being monitored")
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fleet metrics
+     */
+    suspend fun getFleetMetrics(): FleetMetrics {
+        return withContext(Dispatchers.IO) {
+            try {
+                val liveVehicles = _liveVehicles.value
+                val allVehicles = database.vehicleDao().getAllVehicles()
+                
+                val totalVehicles = allVehicles.size
+                val activeVehicles = liveVehicles.size
+                val averageSpeed = if (liveVehicles.isNotEmpty()) {
+                    liveVehicles.map { it.speed }.average().toFloat()
+                } else 0f
+                
+                val averageFuelLevel = if (liveVehicles.isNotEmpty()) {
+                    liveVehicles.map { it.fuelLevel }.average().toFloat()
+                } else 0f
+                
+                val vehiclesInMotion = liveVehicles.count { it.speed > 5f }
+                val vehiclesStopped = liveVehicles.count { it.speed <= 5f }
+                val vehiclesWithLowFuel = liveVehicles.count { it.fuelLevel < 20f }
+                val vehiclesWithAlerts = liveVehicles.count { it.alerts.isNotEmpty() }
+                
+                val totalDistance = liveVehicles.sumOf { it.mileage.toDouble() }
+                val averageDistance = if (liveVehicles.isNotEmpty()) {
+                    totalDistance / liveVehicles.size
+                } else 0.0
+                
+                FleetMetrics(
+                    totalVehicles = totalVehicles,
+                    activeVehicles = activeVehicles,
+                    vehiclesInMotion = vehiclesInMotion,
+                    vehiclesStopped = vehiclesStopped,
+                    averageSpeed = averageSpeed,
+                    averageFuelLevel = averageFuelLevel,
+                    vehiclesWithLowFuel = vehiclesWithLowFuel,
+                    vehiclesWithAlerts = vehiclesWithAlerts,
+                    totalDistance = totalDistance.toFloat(),
+                    averageDistance = averageDistance.toFloat(),
+                    lastUpdate = Date()
+                )
+                
+            } catch (e: Exception) {
+                FleetMetrics()
+            }
+        }
+    }
+    
+    /**
+     * Get vehicle route history
+     */
+    suspend fun getVehicleRouteHistory(vehicleId: Long, limit: Int = 100): List<LocationPoint> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Implementation would retrieve route history from tracking service
+                emptyList<LocationPoint>() // Placeholder
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+    }
+    
+    /**
+     * Create geofence
+     */
+    suspend fun createGeofence(geofence: Geofence): Result<Geofence> {
+        return withContext(Dispatchers.IO) {
+            try {
+                geofences[geofence.id] = geofence
+                
+                // Check all monitored vehicles against new geofence
+                _liveVehicles.value.forEach { vehicle ->
+                    checkGeofenceStatus(vehicle)
+                }
+                
+                Result.success(geofence)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Remove geofence
+     */
+    suspend fun removeGeofence(geofenceId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                geofences.remove(geofenceId)
+                Result.success(true)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get live alerts
+     */
+    suspend fun getLiveAlerts(severity: AlertSeverity? = null): List<LiveAlert> {
+        return withContext(Dispatchers.IO) {
+            val alerts = _liveAlerts.value
+            if (severity != null) {
+                alerts.filter { it.severity == severity }
+            } else {
+                alerts
+            }
+        }
+    }
+    
+    /**
+     * Add monitoring listener
+     */
+    fun addMonitoringListener(listener: FleetMonitoringListener) {
+        monitoringListeners.add(listener)
+    }
+    
+    /**
+     * Remove monitoring listener
+     */
+    fun removeMonitoringListener(listener: FleetMonitoringListener) {
+        monitoringListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private fun initializeGeofences() {
+        // Add default geofences
+        geofences["main_office"] = Geofence(
+            id = "main_office",
+            name = "Main Office",
+            latitude = 24.7136,
+            longitude = 46.6753,
+            radius = 500.0,
+            type = GeofenceType.OFFICE,
+            enabled = true
+        )
+        
+        geofences["warehouse"] = Geofence(
+            id = "warehouse",
+            name = "Main Warehouse",
+            latitude = 24.7136,
+            longitude = 46.6753,
+            radius = 1000.0,
+            type = GeofenceType.WAREHOUSE,
+            enabled = true
+        )
+    }
+    
+    private suspend fun updateLiveVehicles() {
+        val liveVehicles = mutableListOf<LiveVehicle>()
+        
+        monitoredVehicles.forEach { vehicleId ->
+            val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+            val assignment = database.fleetAssignmentDao().getActiveAssignmentByVehicle(vehicleId)
+            
+            if (vehicle != null) {
+                val liveVehicle = LiveVehicle(
+                    vehicleId = vehicle.id,
+                    vehicleIdString = vehicle.vehicleId,
+                    make = vehicle.make,
+                    model = vehicle.model,
+                    licensePlate = vehicle.licensePlate,
+                    vehicleType = vehicle.vehicleType,
+                    currentLocation = vehicle.currentLocation,
+                    latitude = vehicle.currentLatitude,
+                    longitude = vehicle.currentLongitude,
+                    speed = 0f,
+                    heading = 0f,
+                    fuelLevel = vehicle.fuelLevel,
+                    mileage = vehicle.mileage,
+                    status = vehicle.status,
+                    driverId = assignment?.driverId,
+                    lastUpdate = Date(),
+                    route = assignment?.route,
+                    estimatedArrival = null,
+                    nextStop = null,
+                    alerts = emptyList(),
+                    geofenceStatus = GeofenceStatus.INSIDE
+                )
+                liveVehicles.add(liveVehicle)
+            }
+        }
+        
+        _liveVehicles.value = liveVehicles.take(MAX_LIVE_VEHICLES)
+    }
+    
+    private fun startPeriodicUpdates() {
+        // Implementation would start periodic location updates
+    }
+    
+    private fun stopPeriodicUpdates() {
+        // Implementation would stop periodic updates
+    }
+    
+    private fun startGeofenceMonitoring() {
+        // Implementation would start geofence monitoring
+    }
+    
+    private fun stopGeofenceMonitoring() {
+        // Implementation would stop geofence monitoring
+    }
+    
+    private suspend fun checkVehicleAlerts(vehicle: LiveVehicle) {
+        val alerts = mutableListOf<LiveAlert>()
+        
+        // Speed alert
+        if (vehicle.speed > 120f) {
+            alerts.add(LiveAlert(
+                id = 0,
+                vehicleId = vehicle.vehicleId,
+                type = AlertType.SPEED_VIOLATION,
+                message = "Speed limit exceeded: ${vehicle.speed} km/h",
+                severity = AlertSeverity.HIGH,
+                timestamp = Date(),
+                location = "Lat: ${vehicle.latitude}, Lng: ${vehicle.longitude}",
+                resolved = false
+            ))
+        }
+        
+        // Low fuel alert
+        if (vehicle.fuelLevel < 15f) {
+            alerts.add(LiveAlert(
+                id = 0,
+                vehicleId = vehicle.vehicleId,
+                type = AlertType.LOW_FUEL,
+                message = "Low fuel level: ${vehicle.fuelLevel}%",
+                severity = AlertSeverity.MEDIUM,
+                timestamp = Date(),
+                location = "Lat: ${vehicle.latitude}, Lng: ${vehicle.longitude}",
+                resolved = false
+            ))
+        }
+        
+        // Update alerts
+        val currentAlerts = _liveAlerts.value.toMutableList()
+        currentAlerts.removeAll { it.vehicleId == vehicle.vehicleId }
+        currentAlerts.addAll(alerts)
+        _liveAlerts.value = currentAlerts
+        
+        // Notify listeners
+        alerts.forEach { alert ->
+            notifyAlert(alert)
+        }
+    }
+    
+    private suspend fun checkGeofenceStatus(vehicle: LiveVehicle) {
+        geofences.values.forEach { geofence ->
+            if (!geofence.enabled) return@forEach
+            
+            val distance = calculateDistance(
+                vehicle.latitude, vehicle.longitude,
+                geofence.latitude, geofence.longitude
+            )
+            
+            val isInside = distance <= geofence.radius
+            val currentStatus = vehicle.geofenceStatus
+            
+            if (isInside && currentStatus == GeofenceStatus.OUTSIDE) {
+                // Vehicle entered geofence
+                createGeofenceAlert(vehicle, geofence, GeofenceEventType.ENTERED)
+            } else if (!isInside && currentStatus == GeofenceStatus.INSIDE) {
+                // Vehicle exited geofence
+                createGeofenceAlert(vehicle, geofence, GeofenceEventType.EXITED)
+            }
+        }
+    }
+    
+    private suspend fun createGeofenceAlert(
+        vehicle: LiveVehicle,
+        geofence: Geofence,
+        eventType: GeofenceEventType
+    ) {
+        val alert = GeofenceAlert(
+            id = 0,
+            vehicleId = vehicle.vehicleId,
+            geofenceId = geofence.id,
+            geofenceName = geofence.name,
+            eventType = eventType,
+            message = "Vehicle ${eventType.name.toLowerCase()} ${geofence.name}",
+            timestamp = Date(),
+            location = "Lat: ${vehicle.latitude}, Lng: ${vehicle.longitude}",
+            resolved = false
+        )
+        
+        // Save alert
+        val alertId = database.geofenceAlertDao().insertAlert(alert)
+        val savedAlert = alert.copy(id = alertId)
+        
+        // Update alerts list
+        val currentAlerts = _geofenceAlerts.value.toMutableList()
+        currentAlerts.add(savedAlert)
+        _geofenceAlerts.value = currentAlerts
+        
+        // Notify listeners
+        notifyGeofenceAlert(savedAlert)
+    }
+    
+    private fun calculateDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val R = 6371 // Earth's radius in kilometers
+        val latDistance = Math.toRadians(lat2 - lat1)
+        val lonDistance = Math.toRadians(lon2 - lon1)
+        val a = Math.sin(latDistance / 2).pow(2) +
+                Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+                Math.sin(lonDistance / 2).pow(2)
+        val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+        return R * c * 1000 // Convert to meters
+    }
+    
+    private fun notifyLocationUpdate(vehicle: LiveVehicle) {
+        monitoringListeners.forEach { listener ->
+            listener.onLocationUpdate(vehicle)
+        }
+    }
+    
+    private fun notifyAlert(alert: LiveAlert) {
+        monitoringListeners.forEach { listener ->
+            listener.onAlert(alert)
+        }
+    }
+    
+    private fun notifyGeofenceAlert(alert: GeofenceAlert) {
+        monitoringListeners.forEach { listener ->
+            listener.onGeofenceAlert(alert)
+        }
+    }
+    
+    /**
+     * Get monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+    
+    /**
+     * Get monitored vehicles count
+     */
+    fun getMonitoredVehiclesCount(): Int = monitoredVehicles.size
+}
+
+/**
+ * Data classes
+ */
+data class LiveVehicle(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val make: String,
+    val model: String,
+    val licensePlate: String,
+    val vehicleType: VehicleType,
+    val currentLocation: String,
+    val latitude: Double,
+    val longitude: Double,
+    val speed: Float,
+    val heading: Float,
+    val fuelLevel: Float,
+    val mileage: Float,
+    val status: VehicleStatus,
+    val driverId: String?,
+    val lastUpdate: Date,
+    val route: String?,
+    val estimatedArrival: Date?,
+    val nextStop: String?,
+    val alerts: List<LiveAlert>,
+    val geofenceStatus: GeofenceStatus
+)
+
+data class FleetMetrics(
+    val totalVehicles: Int = 0,
+    val activeVehicles: Int = 0,
+    val vehiclesInMotion: Int = 0,
+    val vehiclesStopped: Int = 0,
+    val averageSpeed: Float = 0f,
+    val averageFuelLevel: Float = 0f,
+    val vehiclesWithLowFuel: Int = 0,
+    val vehiclesWithAlerts: Int = 0,
+    val totalDistance: Float = 0f,
+    val averageDistance: Float = 0f,
+    val lastUpdate: Date = Date()
+)
+
+data class LiveAlert(
+    val id: Long,
+    val vehicleId: Long,
+    val type: AlertType,
+    val message: String,
+    val severity: AlertSeverity,
+    val timestamp: Date,
+    val location: String,
+    val resolved: Boolean
+)
+
+data class Geofence(
+    val id: String,
+    val name: String,
+    val latitude: Double,
+    val longitude: Double,
+    val radius: Double,
+    val type: GeofenceType,
+    val enabled: Boolean = true
+)
+
+data class GeofenceAlert(
+    val id: Long,
+    val vehicleId: Long,
+    val geofenceId: String,
+    val geofenceName: String,
+    val eventType: GeofenceEventType,
+    val message: String,
+    val timestamp: Date,
+    val location: String,
+    val resolved: Boolean
+)
+
+data class LocationPoint(
+    val latitude: Double,
+    val longitude: Double,
+    val timestamp: Date,
+    val speed: Float,
+    val heading: Float
+)
+
+/**
+ * Interfaces
+ */
+interface FleetMonitoringListener {
+    fun onLocationUpdate(vehicle: LiveVehicle)
+    fun onAlert(alert: LiveAlert)
+    fun onGeofenceAlert(alert: GeofenceAlert)
+    fun onVehicleStatusChange(vehicleId: Long, oldStatus: VehicleStatus, newStatus: VehicleStatus)
+}
+
+/**
+ * Enums
+ */
+enum class MonitoringState {
+    Idle,
+    Starting,
+    Monitoring,
+    Stopping,
+    Stopped,
+    Error
+}
+
+enum class GeofenceStatus {
+    INSIDE,
+    OUTSIDE,
+    UNKNOWN
+}
+
+enum class AlertType {
+    SPEED_VIOLATION,
+    LOW_FUEL,
+    ENGINE_OFF,
+    UNAUTHORIZED_MOVEMENT,
+    GEOFENCE_VIOLATION,
+    MAINTENANCE_DUE,
+    EMERGENCY,
+    SYSTEM_ERROR
+}
+
+enum class AlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class GeofenceType {
+    OFFICE,
+    WAREHOUSE,
+    CUSTOMER,
+    RESTRICTED,
+    SERVICE_AREA
+}
+
+enum class GeofenceEventType {
+    ENTERED,
+    EXITED,
+    DWELLING
+}

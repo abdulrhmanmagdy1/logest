@@ -1,0 +1,1026 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.DriverEntity
+import com.edham.logistics.data.local.entity.FleetAssignmentEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Driver-Vehicle Mapping - Advanced driver-vehicle assignment and management system
+ * 
+ * Features:
+ * - Driver-vehicle compatibility matching
+ * - Assignment optimization
+ * - Performance tracking
+ * - Preference management
+ * - Skill-based routing
+ * - Compliance checking
+ * - Cost optimization
+ * - Schedule coordination
+ */
+@Singleton
+class DriverVehicleMapping @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _mappingState = MutableStateFlow<MappingState>(MappingState.Idle)
+    val mappingState: StateFlow<MappingState> = _mappingState.asStateFlow()
+    
+    private val _driverVehicleMappings = MutableStateFlow<Map<String, DriverVehicleMapping>>(emptyMap())
+    val driverVehicleMappings: StateFlow<Map<String, DriverVehicleMapping>> = _driverVehicleMappings.asStateFlow()
+    
+    private val _vehicleDriverMappings = MutableStateFlow<Map<Long, VehicleDriverMapping>>(emptyMap())
+    val vehicleDriverMappings: StateFlow<Map<Long, VehicleDriverMapping>> = _vehicleDriverMappings.asStateFlow()
+    
+    private val _compatibilityMatrix = MutableStateFlow<CompatibilityMatrix?>(null)
+    val compatibilityMatrix: StateFlow<CompatibilityMatrix?> = _compatibilityMatrix.asStateFlow()
+    
+    private val _mappingAnalytics = MutableStateFlow<MappingAnalytics?>(null)
+    val mappingAnalytics: StateFlow<MappingAnalytics?> = _mappingAnalytics.asStateState()
+    
+    private val _mappingRecommendations = MutableStateFlow<List<MappingRecommendation>>(emptyList())
+    val mappingRecommendations: StateFlow<List<MappingRecommendation>> = _mappingRecommendations.asStateFlow()
+    
+    private var isOptimizing = false
+    private val mappingListeners = mutableListOf<DriverVehicleMappingListener>()
+    
+    companion object {
+        private const val TAG = "DriverVehicleMapping"
+        private const val OPTIMIZATION_INTERVAL = 300000L // 5 minutes
+        private const val COMPATIBILITY_THRESHOLD = 0.7f
+        private const val PERFORMANCE_WEIGHT = 0.4f
+        private const val COMPATIBILITY_WEIGHT = 0.3f
+        private const val COST_WEIGHT = 0.2f
+        private const val PREFERENCE_WEIGHT = 0.1f
+    }
+    
+    /**
+     * Initialize driver-vehicle mapping system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _mappingState.value = MappingState.Initializing
+                
+                // Load current mappings
+                loadDriverVehicleMappings()
+                
+                // Generate compatibility matrix
+                generateCompatibilityMatrix()
+                
+                // Generate mapping analytics
+                generateMappingAnalytics()
+                
+                // Generate recommendations
+                generateMappingRecommendations()
+                
+                // Start optimization
+                startMappingOptimization()
+                
+                _mappingState.value = MappingState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _mappingState.value = MappingState.Error("Failed to initialize mapping: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create driver-vehicle mapping
+     */
+    suspend fun createMapping(request: CreateMappingRequest): Result<DriverVehicleMapping> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _mappingState.value = MappingState.CreatingMapping
+                
+                // Validate request
+                validateMappingRequest(request)
+                
+                // Get driver and vehicle
+                val driver = database.driverDao().getDriverById(request.driverId)
+                    ?: throw Exception("Driver not found")
+                
+                val vehicle = database.vehicleDao().getVehicleById(request.vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Check compatibility
+                val compatibility = calculateDriverVehicleCompatibility(driver, vehicle)
+                if (compatibility.overallScore < COMPATIBILITY_THRESHOLD) {
+                    throw Exception("Driver-vehicle compatibility score (${compatibility.overallScore}) below threshold ($COMPATIBILITY_THRESHOLD)")
+                }
+                
+                // Check availability
+                if (!isDriverAvailable(request.driverId)) {
+                    throw Exception("Driver is not available")
+                }
+                
+                if (!isVehicleAvailable(request.vehicleId)) {
+                    throw Exception("Vehicle is not available")
+                }
+                
+                // Create mapping
+                val mapping = DriverVehicleMapping(
+                    id = 0,
+                    driverId = request.driverId,
+                    vehicleId = request.vehicleId,
+                    mappingType = request.mappingType,
+                    compatibilityScore = compatibility.overallScore,
+                    performanceScore = 0f, // Will be calculated over time
+                    costScore = calculateCostScore(driver, vehicle),
+                    preferenceScore = calculatePreferenceScore(driver, vehicle),
+                    overallScore = calculateOverallScore(compatibility, driver, vehicle),
+                    status = MappingStatus.ACTIVE,
+                    assignmentDate = Date(),
+                    expectedEndDate = request.expectedEndDate,
+                    notes = request.notes,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save mapping
+                val mappingId = database.driverVehicleMappingDao().insertMapping(mapping)
+                val savedMapping = mapping.copy(id = mappingId)
+                
+                // Update driver and vehicle status
+                updateDriverStatus(request.driverId, DriverStatus.ASSIGNED)
+                updateVehicleStatus(request.vehicleId, VehicleStatus.IN_USE)
+                
+                // Update mappings
+                updateDriverVehicleMappings()
+                updateVehicleDriverMappings()
+                
+                // Notify listeners
+                notifyMappingCreated(savedMapping)
+                
+                _mappingState.value = MappingState.MappingCreated
+                Result.success(savedMapping)
+                
+            } catch (e: Exception) {
+                _mappingState.value = MappingState.Error("Failed to create mapping: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update mapping
+     */
+    suspend fun updateMapping(mappingId: Long, request: UpdateMappingRequest): Result<DriverVehicleMapping> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingMapping = database.driverVehicleMappingDao().getMappingById(mappingId)
+                    ?: throw Exception("Mapping not found")
+                
+                // Update mapping
+                val updatedMapping = existingMapping.copy(
+                    status = request.status ?: existingMapping.status,
+                    expectedEndDate = request.expectedEndDate ?: existingMapping.expectedEndDate,
+                    notes = request.notes ?: existingMapping.notes,
+                    updatedAt = Date()
+                )
+                
+                database.driverVehicleMappingDao().updateMapping(updatedMapping)
+                
+                // Update mappings
+                updateDriverVehicleMappings()
+                updateVehicleDriverMappings()
+                
+                // Notify listeners
+                notifyMappingUpdated(updatedMapping)
+                
+                Result.success(updatedMapping)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Remove mapping
+     */
+    suspend fun removeMapping(mappingId: Long, reason: String, removedBy: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val existingMapping = database.driverVehicleMappingDao().getMappingById(mappingId)
+                    ?: throw Exception("Mapping not found")
+                
+                // Update mapping status
+                val removedMapping = existingMapping.copy(
+                    status = MappingStatus.INACTIVE,
+                    updatedAt = Date()
+                )
+                
+                database.driverVehicleMappingDao().updateMapping(removedMapping)
+                
+                // Update driver and vehicle status
+                updateDriverStatus(existingMapping.driverId, DriverStatus.AVAILABLE)
+                updateVehicleStatus(existingMapping.vehicleId, VehicleStatus.AVAILABLE)
+                
+                // Update mappings
+                updateDriverVehicleMappings()
+                updateVehicleDriverMappings()
+                
+                // Notify listeners
+                notifyMappingRemoved(removedMapping, reason, removedBy)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get optimal driver for vehicle
+     */
+    suspend fun getOptimalDriverForVehicle(
+        vehicleId: Long,
+        criteria: MappingCriteria = MappingCriteria()
+    ): Result<DriverOptimization> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val availableDrivers = database.driverDao().getDriversByStatus(DriverStatus.AVAILABLE)
+                
+                val driverScores = availableDrivers.map { driver ->
+                    val compatibility = calculateDriverVehicleCompatibility(driver, vehicle)
+                    val performanceScore = calculateDriverPerformanceScore(driver)
+                    val costScore = calculateCostScore(driver, vehicle)
+                    val preferenceScore = calculatePreferenceScore(driver, vehicle)
+                    val overallScore = calculateOverallScore(compatibility, driver, vehicle)
+                    
+                    DriverScore(
+                        driverId = driver.id,
+                        driverName = driver.name,
+                        compatibilityScore = compatibility.overallScore,
+                        performanceScore = performanceScore,
+                        costScore = costScore,
+                        preferenceScore = preferenceScore,
+                        overallScore = overallScore,
+                        factors = listOf(
+                            "Compatibility: ${compatibility.overallScore}",
+                            "Performance: $performanceScore",
+                            "Cost: $costScore",
+                            "Preference: $preferenceScore"
+                        )
+                    )
+                }
+                
+                val sortedDrivers = driverScores.sortedByDescending { it.overallScore }
+                val bestDriver = sortedDrivers.firstOrNull()
+                
+                val optimization = DriverOptimization(
+                    vehicleId = vehicleId,
+                    vehicleIdString = vehicle.vehicleId,
+                    bestDriver = bestDriver,
+                    alternativeDrivers = sortedDrivers.drop(1).take(3),
+                    totalDriversConsidered = availableDrivers.size,
+                    optimizationScore = bestDriver?.overallScore ?: 0f,
+                    recommendations = generateDriverRecommendations(bestDriver, sortedDrivers)
+                )
+                
+                Result.success(optimization)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get optimal vehicle for driver
+     */
+    suspend fun getOptimalVehicleForDriver(
+        driverId: String,
+        criteria: MappingCriteria = MappingCriteria()
+    ): Result<VehicleOptimization> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val driver = database.driverDao().getDriverById(driverId)
+                    ?: throw Exception("Driver not found")
+                
+                val availableVehicles = database.vehicleDao().getVehiclesByStatus(VehicleStatus.AVAILABLE)
+                
+                val vehicleScores = availableVehicles.map { vehicle ->
+                    val compatibility = calculateDriverVehicleCompatibility(driver, vehicle)
+                    val performanceScore = calculateVehiclePerformanceScore(vehicle)
+                    val costScore = calculateCostScore(driver, vehicle)
+                    val preferenceScore = calculatePreferenceScore(driver, vehicle)
+                    val overallScore = calculateOverallScore(compatibility, driver, vehicle)
+                    
+                    VehicleScore(
+                        vehicleId = vehicle.id,
+                        vehicleIdString = vehicle.vehicleId,
+                        compatibilityScore = compatibility.overallScore,
+                        performanceScore = performanceScore,
+                        costScore = costScore,
+                        preferenceScore = preferenceScore,
+                        overallScore = overallScore,
+                        factors = listOf(
+                            "Compatibility: ${compatibility.overallScore}",
+                            "Performance: $performanceScore",
+                            "Cost: $costScore",
+                            "Preference: $preferenceScore"
+                        )
+                    )
+                }
+                
+                val sortedVehicles = vehicleScores.sortedByDescending { it.overallScore }
+                val bestVehicle = sortedVehicles.firstOrNull()
+                
+                val optimization = VehicleOptimization(
+                    driverId = driverId,
+                    driverName = driver.name,
+                    bestVehicle = bestVehicle,
+                    alternativeVehicles = sortedVehicles.drop(1).take(3),
+                    totalVehiclesConsidered = availableVehicles.size,
+                    optimizationScore = bestVehicle?.overallScore ?: 0f,
+                    recommendations = generateVehicleRecommendations(bestVehicle, sortedVehicles)
+                )
+                
+                Result.success(optimization)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get mapping analytics
+     */
+    suspend fun getMappingAnalytics(dateRange: DateRange = DateRange.last30Days()): MappingAnalytics {
+        return withContext(Dispatchers.IO) {
+            try {
+                val mappings = database.driverVehicleMappingDao().getAllMappings()
+                val drivers = database.driverDao().getAllDrivers()
+                val vehicles = database.vehicleDao().getAllVehicles()
+                
+                val totalMappings = mappings.size
+                val activeMappings = mappings.count { it.status == MappingStatus.ACTIVE }
+                val inactiveMappings = mappings.count { it.status == MappingStatus.INACTIVE }
+                
+                val averageCompatibilityScore = if (mappings.isNotEmpty()) {
+                    mappings.map { it.compatibilityScore }.average().toFloat()
+                } else 0f
+                
+                val averagePerformanceScore = if (mappings.isNotEmpty()) {
+                    mappings.map { it.performanceScore }.average().toFloat()
+                } else 0f
+                
+                val averageCostScore = if (mappings.isNotEmpty()) {
+                    mappings.map { it.costScore }.average().toFloat()
+                } else 0f
+                
+                val mappingsByType = mappings.groupBy { it.mappingType }.mapValues { it.value.size }
+                val driverUtilization = calculateDriverUtilization(mappings, drivers)
+                val vehicleUtilization = calculateVehicleUtilization(mappings, vehicles)
+                val mappingEfficiency = calculateMappingEfficiency(mappings, dateRange)
+                
+                MappingAnalytics(
+                    totalMappings = totalMappings,
+                    activeMappings = activeMappings,
+                    inactiveMappings = inactiveMappings,
+                    averageCompatibilityScore = averageCompatibilityScore,
+                    averagePerformanceScore = averagePerformanceScore,
+                    averageCostScore = averageCostScore,
+                    mappingsByType = mappingsByType,
+                    driverUtilization = driverUtilization,
+                    vehicleUtilization = vehicleUtilization,
+                    mappingEfficiency = mappingEfficiency,
+                    dateRange = dateRange
+                )
+                
+            } catch (e: Exception) {
+                MappingAnalytics()
+            }
+        }
+    }
+    
+    /**
+     * Optimize all mappings
+     */
+    suspend fun optimizeAllMappings(): Result<List<MappingOptimization>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (isOptimizing) {
+                    throw Exception("Optimization already in progress")
+                }
+                
+                isOptimizing = true
+                
+                val drivers = database.driverDao().getDriversByStatus(DriverStatus.AVAILABLE)
+                val vehicles = database.vehicleDao().getVehiclesByStatus(VehicleStatus.AVAILABLE)
+                val optimizations = mutableListOf<MappingOptimization>()
+                
+                // Optimize for each driver
+                drivers.forEach { driver ->
+                    val optimization = getOptimalVehicleForDriver(driver.id)
+                        .getOrNull()
+                    if (optimization != null) {
+                        optimizations.add(MappingOptimization(
+                            type = OptimizationType.DRIVER_OPTIMIZATION,
+                            driverId = driver.id,
+                            vehicleId = optimization.bestVehicle?.vehicleId,
+                            score = optimization.optimizationScore,
+                            recommendations = optimization.recommendations
+                        ))
+                    }
+                }
+                
+                // Optimize for each vehicle
+                vehicles.forEach { vehicle ->
+                    val optimization = getOptimalDriverForVehicle(vehicle.id)
+                        .getOrNull()
+                    if (optimization != null) {
+                        optimizations.add(MappingOptimization(
+                            type = OptimizationType.VEHICLE_OPTIMIZATION,
+                            driverId = optimization.bestDriver?.driverId,
+                            vehicleId = vehicle.id,
+                            score = optimization.optimizationScore,
+                            recommendations = optimization.recommendations
+                        ))
+                    }
+                }
+                
+                isOptimizing = false
+                Result.success(optimizations)
+                
+            } catch (e: Exception) {
+                isOptimizing = false
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add mapping listener
+     */
+    fun addDriverVehicleMappingListener(listener: DriverVehicleMappingListener) {
+        mappingListeners.add(listener)
+    }
+    
+    /**
+     * Remove mapping listener
+     */
+    fun removeDriverVehicleMappingListener(listener: DriverVehicleMappingListener) {
+        mappingListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadDriverVehicleMappings() {
+        val mappings = database.driverVehicleMappingDao().getAllMappings()
+        
+        val driverMappings = mappings.filter { it.status == MappingStatus.ACTIVE }
+            .groupBy { it.driverId }
+            .mapValues { it.value.first() }
+        
+        val vehicleMappings = mappings.filter { it.status == MappingStatus.ACTIVE }
+            .groupBy { it.vehicleId }
+            .mapValues { it.value.first() }
+        
+        _driverVehicleMappings.value = driverMappings
+        _vehicleDriverMappings.value = vehicleMappings
+    }
+    
+    private suspend fun generateCompatibilityMatrix() {
+        val drivers = database.driverDao().getAllDrivers()
+        val vehicles = database.vehicleDao().getAllVehicles()
+        
+        val matrix = CompatibilityMatrix(
+            driverIds = drivers.map { it.id },
+            vehicleIds = vehicles.map { it.id },
+            compatibilityScores = mutableMapOf(),
+            generatedAt = Date()
+        )
+        
+        drivers.forEach { driver ->
+            vehicles.forEach { vehicle ->
+                val compatibility = calculateDriverVehicleCompatibility(driver, vehicle)
+                matrix.compatibilityScores["${driver.id}-${vehicle.id}"] = compatibility.overallScore
+            }
+        }
+        
+        _compatibilityMatrix.value = matrix
+    }
+    
+    private suspend fun generateMappingAnalytics() {
+        val analytics = getMappingAnalytics()
+        _mappingAnalytics.value = analytics
+    }
+    
+    private suspend fun generateMappingRecommendations() {
+        val recommendations = mutableListOf<MappingRecommendation>()
+        
+        // Check for low compatibility mappings
+        val mappings = database.driverVehicleMappingDao().getAllMappings()
+        val lowCompatibilityMappings = mappings.filter { 
+            it.status == MappingStatus.ACTIVE && it.compatibilityScore < COMPATIBILITY_THRESHOLD
+        }
+        
+        lowCompatibilityMappings.forEach { mapping ->
+            recommendations.add(MappingRecommendation(
+                type = RecommendationType.COMPATIBILITY_IMPROVEMENT,
+                priority = RecommendationPriority.HIGH,
+                title = "Low compatibility mapping: ${mapping.driverId} -> ${mapping.vehicleId}",
+                description = "Compatibility score is ${mapping.compatibilityScore} (threshold: $COMPATIBILITY_THRESHOLD)",
+                action = "Consider reassigning driver or vehicle",
+                potentialImprovement = (COMPATIBILITY_THRESHOLD - mapping.compatibilityScore) * 100f
+            ))
+        }
+        
+        // Check for underutilized drivers
+        val driverUtilization = calculateDriverUtilization(mappings, database.driverDao().getAllDrivers())
+        val underutilizedDrivers = driverUtilization.filter { it.value < 50f }
+        
+        underutilizedDrivers.forEach { (driverId, utilization) ->
+            recommendations.add(MappingRecommendation(
+                type = RecommendationType.UTILIZATION_IMPROVEMENT,
+                priority = RecommendationPriority.MEDIUM,
+                title = "Underutilized driver: $driverId",
+                description = "Driver utilization is ${utilization}%",
+                action = "Assign more vehicles or consider driver sharing",
+                potentialImprovement = (100f - utilization) * 10f
+            ))
+        }
+        
+        _mappingRecommendations.value = recommendations
+    }
+    
+    private fun startMappingOptimization() {
+        // Implementation would start periodic optimization
+    }
+    
+    private fun validateMappingRequest(request: CreateMappingRequest) {
+        if (request.driverId.isBlank()) throw Exception("Driver ID is required")
+        if (request.vehicleId <= 0) throw Exception("Valid vehicle ID is required")
+        if (request.mappingType == null) throw Exception("Mapping type is required")
+    }
+    
+    private suspend fun isDriverAvailable(driverId: String): Boolean {
+        val driver = database.driverDao().getDriverById(driverId)
+        return driver?.status == DriverStatus.AVAILABLE
+    }
+    
+    private suspend fun isVehicleAvailable(vehicleId: Long): Boolean {
+        val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+        return vehicle?.status == VehicleStatus.AVAILABLE
+    }
+    
+    private fun calculateDriverVehicleCompatibility(driver: DriverEntity, vehicle: VehicleEntity): CompatibilityScore {
+        var score = 0f
+        val factors = mutableListOf<String>()
+        
+        // License compatibility
+        if (driver.licenseCategories.contains(vehicle.category)) {
+            score += 25f
+            factors.add("License compatible")
+        } else {
+            factors.add("License not compatible")
+        }
+        
+        // Vehicle type compatibility
+        if (driver.vehicleTypes.contains(vehicle.vehicleType)) {
+            score += 20f
+            factors.add("Vehicle type compatible")
+        } else {
+            factors.add("Vehicle type not compatible")
+        }
+        
+        // Experience level
+        if (driver.experienceYears >= 5) {
+            score += 15f
+            factors.add("Experienced driver")
+        }
+        
+        // Location proximity
+        if (driver.currentLocation == vehicle.currentLocation) {
+            score += 10f
+            factors.add("Same location")
+        }
+        
+        // Skills match
+        val matchingSkills = driver.skills.intersect(vehicle.requiredSkills.toSet())
+        score += (matchingSkills.size.toFloat() / vehicle.requiredSkills.size) * 20f
+        factors.add("Skills match: ${matchingSkills.size}/${vehicle.requiredSkills.size}")
+        
+        // Availability preference
+        if (driver.preferredShifts.contains("ANY") || driver.preferredShifts.contains("DAY")) {
+            score += 10f
+            factors.add("Shift preference compatible")
+        }
+        
+        return CompatibilityScore(
+            overallScore = score,
+            factors = factors
+        )
+    }
+    
+    private fun calculateDriverPerformanceScore(driver: DriverEntity): Float {
+        // Implementation would calculate based on historical performance
+        return 75f // Placeholder
+    }
+    
+    private fun calculateVehiclePerformanceScore(vehicle: VehicleEntity): Float {
+        // Implementation would calculate based on vehicle performance data
+        return 80f // Placeholder
+    }
+    
+    private fun calculateCostScore(driver: DriverEntity, vehicle: VehicleEntity): Float {
+        // Implementation would calculate based on driver cost and vehicle operating cost
+        return 70f // Placeholder
+    }
+    
+    private fun calculatePreferenceScore(driver: DriverEntity, vehicle: VehicleEntity): Float {
+        var score = 50f // Base score
+        
+        // Check if driver has preferences for this vehicle type
+        if (driver.preferredVehicleTypes.contains(vehicle.vehicleType)) {
+            score += 30f
+        }
+        
+        // Check if driver has avoided this vehicle type
+        if (driver.avoidedVehicleTypes.contains(vehicle.vehicleType)) {
+            score -= 20f
+        }
+        
+        return maxOf(0f, minOf(100f, score))
+    }
+    
+    private fun calculateOverallScore(
+        compatibility: CompatibilityScore,
+        driver: DriverEntity,
+        vehicle: VehicleEntity
+    ): Float {
+        val performanceScore = calculateDriverPerformanceScore(driver)
+        val costScore = calculateCostScore(driver, vehicle)
+        val preferenceScore = calculatePreferenceScore(driver, vehicle)
+        
+        return (compatibility.overallScore * COMPATIBILITY_WEIGHT +
+                performanceScore * PERFORMANCE_WEIGHT +
+                costScore * COST_WEIGHT +
+                preferenceScore * PREFERENCE_WEIGHT)
+    }
+    
+    private suspend fun updateDriverStatus(driverId: String, status: DriverStatus) {
+        val driver = database.driverDao().getDriverById(driverId)
+        driver?.let {
+            val updatedDriver = it.copy(status = status, updatedAt = Date())
+            database.driverDao().updateDriver(updatedDriver)
+        }
+    }
+    
+    private suspend fun updateVehicleStatus(vehicleId: Long, status: VehicleStatus) {
+        val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+        vehicle?.let {
+            val updatedVehicle = it.copy(status = status, updatedAt = Date())
+            database.vehicleDao().updateVehicle(updatedVehicle)
+        }
+    }
+    
+    private suspend fun updateDriverVehicleMappings() {
+        loadDriverVehicleMappings()
+    }
+    
+    private suspend fun updateVehicleDriverMappings() {
+        loadDriverVehicleMappings()
+    }
+    
+    private fun calculateDriverUtilization(
+        mappings: List<DriverVehicleMapping>,
+        drivers: List<DriverEntity>
+    ): Map<String, Float> {
+        return drivers.associate { driver ->
+            val driverMappings = mappings.filter { it.driverId == driver.id && it.status == MappingStatus.ACTIVE }
+            val utilizationRate = if (driverMappings.isNotEmpty()) {
+                driverMappings.size.toFloat() / drivers.size * 100f
+            } else 0f
+            driver.id to utilizationRate
+        }
+    }
+    
+    private fun calculateVehicleUtilization(
+        mappings: List<DriverVehicleMapping>,
+        vehicles: List<VehicleEntity>
+    ): Map<Long, Float> {
+        return vehicles.associate { vehicle ->
+            val vehicleMappings = mappings.filter { it.vehicleId == vehicle.id && it.status == MappingStatus.ACTIVE }
+            val utilizationRate = if (vehicleMappings.isNotEmpty()) {
+                vehicleMappings.size.toFloat() / vehicles.size * 100f
+            } else 0f
+            vehicle.id to utilizationRate
+        }
+    }
+    
+    private fun calculateMappingEfficiency(
+        mappings: List<DriverVehicleMapping>,
+        dateRange: DateRange
+    ): MappingEfficiency {
+        val activeMappings = mappings.filter { it.status == MappingStatus.ACTIVE }
+        val averageScore = if (activeMappings.isNotEmpty()) {
+            activeMappings.map { it.overallScore }.average().toFloat()
+        } else 0f
+        
+        return MappingEfficiency(
+            averageMappingScore = averageScore,
+            highPerformanceMappings = activeMappings.count { it.overallScore >= 80f },
+            lowPerformanceMappings = activeMappings.count { it.overallScore < 60f },
+            efficiencyTrend = TrendDirection.STABLE
+        )
+    }
+    
+    private fun generateDriverRecommendations(
+        bestDriver: DriverScore?,
+        allDrivers: List<DriverScore>
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (bestDriver != null) {
+            recommendations.add("Best match: ${bestDriver.driverName} (Score: ${bestDriver.overallScore})")
+            
+            if (bestDriver.compatibilityScore < 80f) {
+                recommendations.add("Consider driver training for better compatibility")
+            }
+            
+            if (bestDriver.costScore < 60f) {
+                recommendations.add("Consider cost optimization strategies")
+            }
+        }
+        
+        return recommendations
+    }
+    
+    private fun generateVehicleRecommendations(
+        bestVehicle: VehicleScore?,
+        allVehicles: List<VehicleScore>
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (bestVehicle != null) {
+            recommendations.add("Best match: ${bestVehicle.vehicleIdString} (Score: ${bestVehicle.overallScore})")
+            
+            if (bestVehicle.compatibilityScore < 80f) {
+                recommendations.add("Consider vehicle modifications or driver training")
+            }
+            
+            if (bestVehicle.performanceScore < 60f) {
+                recommendations.add("Consider vehicle maintenance or replacement")
+            }
+        }
+        
+        return recommendations
+    }
+    
+    private fun notifyMappingCreated(mapping: DriverVehicleMapping) {
+        mappingListeners.forEach { listener ->
+            listener.onMappingCreated(mapping)
+        }
+    }
+    
+    private fun notifyMappingUpdated(mapping: DriverVehicleMapping) {
+        mappingListeners.forEach { listener ->
+            listener.onMappingUpdated(mapping)
+        }
+    }
+    
+    private fun notifyMappingRemoved(mapping: DriverVehicleMapping, reason: String, removedBy: String) {
+        mappingListeners.forEach { listener ->
+            listener.onMappingRemoved(mapping, reason, removedBy)
+        }
+    }
+    
+    /**
+     * Get optimization status
+     */
+    fun isOptimizing(): Boolean = isOptimizing
+}
+
+/**
+ * Data classes
+ */
+data class CreateMappingRequest(
+    val driverId: String,
+    val vehicleId: Long,
+    val mappingType: MappingType,
+    val expectedEndDate: Date?,
+    val notes: String?
+)
+
+data class UpdateMappingRequest(
+    val status: MappingStatus? = null,
+    val expectedEndDate: Date? = null,
+    val notes: String? = null
+)
+
+data class DriverVehicleMapping(
+    val id: Long,
+    val driverId: String,
+    val vehicleId: Long,
+    val mappingType: MappingType,
+    val compatibilityScore: Float,
+    val performanceScore: Float,
+    val costScore: Float,
+    val preferenceScore: Float,
+    val overallScore: Float,
+    val status: MappingStatus,
+    val assignmentDate: Date,
+    val expectedEndDate: Date?,
+    val notes: String?,
+    val createdAt: Date,
+    val updatedAt: Date
+)
+
+data class VehicleDriverMapping(
+    val vehicleId: Long,
+    val driverId: String,
+    val mapping: DriverVehicleMapping
+)
+
+data class CompatibilityMatrix(
+    val driverIds: List<String>,
+    val vehicleIds: List<Long>,
+    val compatibilityScores: MutableMap<String, Float>,
+    val generatedAt: Date
+)
+
+data class MappingAnalytics(
+    val totalMappings: Int = 0,
+    val activeMappings: Int = 0,
+    val inactiveMappings: Int = 0,
+    val averageCompatibilityScore: Float = 0f,
+    val averagePerformanceScore: Float = 0f,
+    val averageCostScore: Float = 0f,
+    val mappingsByType: Map<MappingType, Int> = emptyMap(),
+    val driverUtilization: Map<String, Float> = emptyMap(),
+    val vehicleUtilization: Map<Long, Float> = emptyMap(),
+    val mappingEfficiency: MappingEfficiency = MappingEfficiency(),
+    val dateRange: DateRange = DateRange()
+)
+
+data class MappingEfficiency(
+    val averageMappingScore: Float = 0f,
+    val highPerformanceMappings: Int = 0,
+    val lowPerformanceMappings: Int = 0,
+    val efficiencyTrend: TrendDirection
+)
+
+data class MappingRecommendation(
+    val type: RecommendationType,
+    val priority: RecommendationPriority,
+    val title: String,
+    val description: String,
+    val action: String,
+    val potentialImprovement: Float
+)
+
+data class MappingCriteria(
+    val prioritizeCost: Boolean = false,
+    val prioritizePerformance: Boolean = false,
+    val prioritizeCompatibility: Boolean = true,
+    val requiredSkills: List<String> = emptyList(),
+    val maxDistance: Float? = null
+)
+
+data class DriverOptimization(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val bestDriver: DriverScore?,
+    val alternativeDrivers: List<DriverScore>,
+    val totalDriversConsidered: Int,
+    val optimizationScore: Float,
+    val recommendations: List<String>
+)
+
+data class VehicleOptimization(
+    val driverId: String,
+    val driverName: String,
+    val bestVehicle: VehicleScore?,
+    val alternativeVehicles: List<VehicleScore>,
+    val totalVehiclesConsidered: Int,
+    val optimizationScore: Float,
+    val recommendations: List<String>
+)
+
+data class DriverScore(
+    val driverId: String,
+    val driverName: String,
+    val compatibilityScore: Float,
+    val performanceScore: Float,
+    val costScore: Float,
+    val preferenceScore: Float,
+    val overallScore: Float,
+    val factors: List<String>
+)
+
+data class VehicleScore(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val compatibilityScore: Float,
+    val performanceScore: Float,
+    val costScore: Float,
+    val preferenceScore: Float,
+    val overallScore: Float,
+    val factors: List<String>
+)
+
+data class CompatibilityScore(
+    val overallScore: Float,
+    val factors: List<String>
+)
+
+data class MappingOptimization(
+    val type: OptimizationType,
+    val driverId: String?,
+    val vehicleId: Long?,
+    val score: Float,
+    val recommendations: List<String>
+)
+
+/**
+ * Interfaces
+ */
+interface DriverVehicleMappingListener {
+    fun onMappingCreated(mapping: DriverVehicleMapping)
+    fun onMappingUpdated(mapping: DriverVehicleMapping)
+    fun onMappingRemoved(mapping: DriverVehicleMapping, reason: String, removedBy: String)
+    fun onOptimizationCompleted(optimizations: List<MappingOptimization>)
+    fun onCompatibilityMatrixUpdated(matrix: CompatibilityMatrix)
+}
+
+/**
+ * Enums
+ */
+enum class MappingState {
+    Idle,
+    Initializing,
+    Ready,
+    CreatingMapping,
+    MappingCreated,
+    UpdatingMapping,
+    MappingUpdated,
+    RemovingMapping,
+    MappingRemoved,
+    Optimizing,
+    Error
+}
+
+enum class MappingType {
+    PERMANENT,
+    TEMPORARY,
+    ROTATING,
+    ON_DEMAND,
+    BACKUP
+}
+
+enum class MappingStatus {
+    ACTIVE,
+    INACTIVE,
+    SUSPENDED,
+    PENDING,
+    EXPIRED
+}
+
+enum class OptimizationType {
+    DRIVER_OPTIMIZATION,
+    VEHICLE_OPTIMIZATION,
+    COST_OPTIMIZATION,
+    PERFORMANCE_OPTIMIZATION
+}
+
+enum class RecommendationType {
+    COMPATIBILITY_IMPROVEMENT,
+    UTILIZATION_IMPROVEMENT,
+    COST_OPTIMIZATION,
+    PERFORMANCE_IMPROVEMENT
+}
+
+enum class RecommendationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

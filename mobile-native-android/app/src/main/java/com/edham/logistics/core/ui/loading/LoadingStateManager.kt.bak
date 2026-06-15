@@ -1,0 +1,465 @@
+package com.edham.logistics.core.ui.loading
+
+import android.view.View
+import android.view.ViewGroup
+import androidx.core.view.isVisible
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.edham.logistics.core.utils.Result
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+
+/**
+ * Loading state manager for consistent loading UI across the app
+ */
+class LoadingStateManager(
+    private val fragment: Fragment
+) {
+    
+    private val loadingViews = mutableListOf<LoadingView>()
+    private val skeletonViews = mutableListOf<SkeletonView>()
+    private var currentLoadingState: LoadingState = LoadingState.Idle
+    
+    /**
+     * Register a loading view
+     */
+    fun registerLoadingView(view: LoadingView) {
+        loadingViews.add(view)
+        updateViewState(view, currentLoadingState)
+    }
+    
+    /**
+     * Register a skeleton view
+     */
+    fun registerSkeletonView(view: SkeletonView) {
+        skeletonViews.add(view)
+        updateSkeletonState(view, currentLoadingState)
+    }
+    
+    /**
+     * Register multiple views
+     */
+    fun registerViews(views: List<View>) {
+        views.forEach { view ->
+            when (view) {
+                is LoadingView -> registerLoadingView(view)
+                is SkeletonView -> registerSkeletonView(view)
+                else -> {
+                    // Try to cast to loading interfaces
+                    if (view is ViewGroup) {
+                        registerChildViews(view)
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Register child views recursively
+     */
+    private fun registerChildViews(viewGroup: ViewGroup) {
+        for (i in 0 until viewGroup.childCount) {
+            val child = viewGroup.getChildAt(i)
+            when (child) {
+                is LoadingView -> registerLoadingView(child)
+                is SkeletonView -> registerSkeletonView(child)
+                is ViewGroup -> registerChildViews(child)
+            }
+        }
+    }
+    
+    /**
+     * Handle loading state from Result
+     */
+    fun <T> handleLoadingState(
+        result: Result<T>,
+        onLoading: (() -> Unit)? = null,
+        onSuccess: ((T) -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ) {
+        when (result) {
+            is Result.Loading -> {
+                setLoadingState(LoadingState.Loading)
+                onLoading?.invoke()
+            }
+            is Result.Success -> {
+                setLoadingState(LoadingState.Success)
+                onSuccess?.invoke(result.data)
+            }
+            is Result.Error -> {
+                setLoadingState(LoadingState.Error(result.exception))
+                onError?.invoke(result.exception)
+            }
+        }
+    }
+    
+    /**
+     * Handle loading state from Flow
+     */
+    fun <T> observeLoadingState(
+        flow: Flow<Result<T>>,
+        onLoading: (() -> Unit)? = null,
+        onSuccess: ((T) -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ) {
+        fragment.lifecycleScope.launch {
+            fragment.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                flow.collectLatest { result ->
+                    handleLoadingState(result, onLoading, onSuccess, onError)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Handle loading state from Flow with transformation
+     */
+    fun <T, R> observeLoadingState(
+        flow: Flow<T>,
+        transform: (T) -> Result<R>,
+        onLoading: (() -> Unit)? = null,
+        onSuccess: ((R) -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ) {
+        fragment.lifecycleScope.launch {
+            fragment.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                flow.map { transform(it) }
+                    .collectLatest { result ->
+                        handleLoadingState(result, onLoading, onSuccess, onError)
+                    }
+            }
+        }
+    }
+    
+    /**
+     * Set loading state manually
+     */
+    fun setLoadingState(state: LoadingState) {
+        currentLoadingState = state
+        updateAllViews()
+    }
+    
+    /**
+     * Show loading state
+     */
+    fun showLoading() {
+        setLoadingState(LoadingState.Loading)
+    }
+    
+    /**
+     * Show success state
+     */
+    fun showSuccess() {
+        setLoadingState(LoadingState.Success)
+    }
+    
+    /**
+     * Show error state
+     */
+    fun showError(error: Exception? = null) {
+        setLoadingState(LoadingState.Error(error))
+    }
+    
+    /**
+     * Show idle state
+     */
+    fun showIdle() {
+        setLoadingState(LoadingState.Idle)
+    }
+    
+    /**
+     * Update all views
+     */
+    private fun updateAllViews() {
+        loadingViews.forEach { view ->
+            updateViewState(view, currentLoadingState)
+        }
+        
+        skeletonViews.forEach { view ->
+            updateSkeletonState(view, currentLoadingState)
+        }
+    }
+    
+    /**
+     * Update loading view state
+     */
+    private fun updateViewState(view: LoadingView, state: LoadingState) {
+        when (state) {
+            is LoadingState.Loading -> {
+                view.showLoading()
+            }
+            is LoadingState.Success -> {
+                view.showSuccess()
+            }
+            is LoadingState.Error -> {
+                view.showError(state.error)
+            }
+            is LoadingState.Idle -> {
+                view.showIdle()
+            }
+        }
+    }
+    
+    /**
+     * Update skeleton view state
+     */
+    private fun updateSkeletonState(view: SkeletonView, state: LoadingState) {
+        when (state) {
+            is LoadingState.Loading -> {
+                view.showSkeleton()
+            }
+            else -> {
+                view.hideSkeleton()
+            }
+        }
+    }
+    
+    /**
+     * Clear all registered views
+     */
+    fun clearViews() {
+        loadingViews.clear()
+        skeletonViews.clear()
+    }
+}
+
+/**
+ * Loading state sealed class
+ */
+sealed class LoadingState {
+    object Idle : LoadingState()
+    object Loading : LoadingState()
+    object Success : LoadingState()
+    data class Error(val exception: Exception? = null) : LoadingState()
+}
+
+/**
+ * Interface for loading views
+ */
+interface LoadingView {
+    fun showLoading()
+    fun showSuccess()
+    fun showError(error: Exception? = null)
+    fun showIdle()
+}
+
+/**
+ * Interface for skeleton views
+ */
+interface SkeletonView {
+    fun showSkeleton()
+    fun hideSkeleton()
+}
+
+/**
+ * Extension function to make View implement LoadingView
+ */
+fun View.asLoadingView(
+    loadingView: View? = null,
+    successView: View? = null,
+    errorView: View? = null,
+    idleView: View? = null
+): LoadingView {
+    return object : LoadingView {
+        override fun showLoading() {
+            loadingView?.isVisible = true
+            successView?.isVisible = false
+            errorView?.isVisible = false
+            idleView?.isVisible = false
+        }
+        
+        override fun showSuccess() {
+            loadingView?.isVisible = false
+            successView?.isVisible = true
+            errorView?.isVisible = false
+            idleView?.isVisible = false
+        }
+        
+        override fun showError(error: Exception?) {
+            loadingView?.isVisible = false
+            successView?.isVisible = false
+            errorView?.isVisible = true
+            idleView?.isVisible = false
+        }
+        
+        override fun showIdle() {
+            loadingView?.isVisible = false
+            successView?.isVisible = false
+            errorView?.isVisible = false
+            idleView?.isVisible = true
+        }
+    }
+}
+
+/**
+ * Extension function to make View implement SkeletonView
+ */
+fun View.asSkeletonView(
+    skeletonView: View? = null
+): SkeletonView {
+    return object : SkeletonView {
+        override fun showSkeleton() {
+            this@asSkeletonView.isVisible = false
+            skeletonView?.isVisible = true
+        }
+        
+        override fun hideSkeleton() {
+            this@asSkeletonView.isVisible = true
+            skeletonView?.isVisible = false
+        }
+    }
+}
+
+/**
+ * Loading state manager for Activity
+ */
+class ActivityLoadingStateManager(
+    private val activity: androidx.appcompat.app.AppCompatActivity
+) {
+    
+    private val loadingViews = mutableListOf<LoadingView>()
+    private val skeletonViews = mutableListOf<SkeletonView>()
+    private var currentLoadingState: LoadingState = LoadingState.Idle
+    
+    /**
+     * Register a loading view
+     */
+    fun registerLoadingView(view: LoadingView) {
+        loadingViews.add(view)
+        updateViewState(view, currentLoadingState)
+    }
+    
+    /**
+     * Register a skeleton view
+     */
+    fun registerSkeletonView(view: SkeletonView) {
+        skeletonViews.add(view)
+        updateSkeletonState(view, currentLoadingState)
+    }
+    
+    /**
+     * Register multiple views
+     */
+    fun registerViews(views: List<View>) {
+        views.forEach { view ->
+            when (view) {
+                is LoadingView -> registerLoadingView(view)
+                is SkeletonView -> registerSkeletonView(view)
+                else -> {
+                    if (view is ViewGroup) {
+                        registerChildViews(view)
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Register child views recursively
+     */
+    private fun registerChildViews(viewGroup: ViewGroup) {
+        for (i in 0 until viewGroup.childCount) {
+            val child = viewGroup.getChildAt(i)
+            when (child) {
+                is LoadingView -> registerLoadingView(child)
+                is SkeletonView -> registerSkeletonView(child)
+                is ViewGroup -> registerChildViews(child)
+            }
+        }
+    }
+    
+    /**
+     * Set loading state manually
+     */
+    fun setLoadingState(state: LoadingState) {
+        currentLoadingState = state
+        updateAllViews()
+    }
+    
+    /**
+     * Show loading state
+     */
+    fun showLoading() {
+        setLoadingState(LoadingState.Loading)
+    }
+    
+    /**
+     * Show success state
+     */
+    fun showSuccess() {
+        setLoadingState(LoadingState.Success)
+    }
+    
+    /**
+     * Show error state
+     */
+    fun showError(error: Exception? = null) {
+        setLoadingState(LoadingState.Error(error))
+    }
+    
+    /**
+     * Show idle state
+     */
+    fun showIdle() {
+        setLoadingState(LoadingState.Idle)
+    }
+    
+    /**
+     * Update all views
+     */
+    private fun updateAllViews() {
+        loadingViews.forEach { view ->
+            updateViewState(view, currentLoadingState)
+        }
+        
+        skeletonViews.forEach { view ->
+            updateSkeletonState(view, currentLoadingState)
+        }
+    }
+    
+    /**
+     * Update loading view state
+     */
+    private fun updateViewState(view: LoadingView, state: LoadingState) {
+        when (state) {
+            is LoadingState.Loading -> {
+                view.showLoading()
+            }
+            is LoadingState.Success -> {
+                view.showSuccess()
+            }
+            is LoadingState.Error -> {
+                view.showError(state.error)
+            }
+            is LoadingState.Idle -> {
+                view.showIdle()
+            }
+        }
+    }
+    
+    /**
+     * Update skeleton view state
+     */
+    private fun updateSkeletonState(view: SkeletonView, state: LoadingState) {
+        when (state) {
+            is LoadingState.Loading -> {
+                view.showSkeleton()
+            }
+            else -> {
+                view.hideSkeleton()
+            }
+        }
+    }
+    
+    /**
+     * Clear all registered views
+     */
+    fun clearViews() {
+        loadingViews.clear()
+        skeletonViews.clear()
+    }
+}

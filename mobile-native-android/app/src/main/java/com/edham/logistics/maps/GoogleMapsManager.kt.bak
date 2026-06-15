@@ -1,0 +1,705 @@
+package com.edham.logistics.maps
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.location.Location
+import androidx.lifecycle.LifecycleOwner
+import com.edham.logistics.R
+import com.edham.logistics.data.local.entity.RouteEntity
+import com.edham.logistics.data.local.entity.RouteStopEntity
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.model.*
+import com.google.android.gms.maps.model.JointType.ROUND
+import com.google.maps.android.PolyUtil
+import com.google.maps.android.clustering.ClusterManager
+import com.google.maps.android.clustering.view.DefaultClusterRenderer
+import com.google.maps.android.ui.IconGenerator
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Google Maps Manager - Professional map integration and management
+ * 
+ * Features:
+ * - Interactive maps with live tracking
+ * - Animated vehicle movement
+ * - Route visualization
+ * - Real-time traffic
+ * - Custom markers and overlays
+ * - Clustering for multiple vehicles
+ * - Heat maps for activity
+ */
+@Singleton
+class GoogleMapsManager @Inject constructor(
+    private val context: Context,
+    private val liveTrackingManager: LiveTrackingManager
+) {
+    
+    private val _mapState = MutableStateFlow<MapState>(MapState.Initializing)
+    val mapState: StateFlow<MapState> = _mapState.asStateFlow()
+    
+    private val _currentMap = MutableStateFlow<GoogleMap?>(null)
+    val currentMap: StateFlow<GoogleMap?> = _currentMap.asStateFlow()
+    
+    private var googleMap: GoogleMap? = null
+    private var clusterManager: ClusterManager<VehicleClusterItem>? = null
+    private var vehicleMarkers: MutableMap<String, Marker> = mutableMapOf()
+    private var routePolylines: MutableMap<String, Polyline> = mutableMapOf()
+    private var stopMarkers: MutableMap<String, Marker> = mutableMapOf()
+    private var geofenceCircles: MutableMap<String, Circle> = mutableMapOf()
+    private var heatMapOverlay: GroundOverlay? = null
+    
+    private var isMapReady = false
+    private var currentLocation: Location? = null
+    private var mapStyle: MapStyle? = null
+    
+    companion object {
+        private const val TAG = "GoogleMapsManager"
+        private const val DEFAULT_ZOOM = 15f
+        private const val ROUTE_ZOOM = 13f
+        private const val OVERVIEW_ZOOM = 10f
+        private const val ANIMATION_DURATION = 2000L
+        private const val CLUSTERING_ENABLED = true
+        private const val HEAT_MAP_ENABLED = true
+    }
+    
+    /**
+     * Initialize Google Maps
+     */
+    fun initializeMap(
+        map: GoogleMap,
+        lifecycleOwner: LifecycleOwner,
+        coroutineScope: CoroutineScope
+    ) {
+        try {
+            googleMap = map
+            _currentMap.value = map
+            
+            // Configure map settings
+            configureMapSettings(map)
+            
+            // Initialize clustering
+            if (CLUSTERING_ENABLED) {
+                initializeClustering(map)
+            }
+            
+            // Set up map listeners
+            setupMapListeners(map)
+            
+            // Apply map style
+            applyMapStyle(map)
+            
+            // Start location tracking
+            startLocationTracking(coroutineScope)
+            
+            isMapReady = true
+            _mapState.value = MapState.Ready
+            
+        } catch (e: Exception) {
+            _mapState.value = MapState.Error("Failed to initialize map: ${e.message}")
+        }
+    }
+    
+    /**
+     * Configure map settings
+     */
+    private fun configureMapSettings(map: GoogleMap) {
+        map.apply {
+            // Map type
+            mapType = GoogleMap.MAP_TYPE_NORMAL
+            
+            // UI settings
+            uiSettings.apply {
+                isZoomControlsEnabled = true
+                isCompassEnabled = true
+                isMyLocationButtonEnabled = true
+                isMapToolbarEnabled = false
+                isZoomGesturesEnabled = true
+                isScrollGesturesEnabled = true
+                isRotateGesturesEnabled = true
+                isTiltGesturesEnabled = true
+            }
+            
+            // Location settings
+            isMyLocationEnabled = true
+            
+            // Traffic layer
+            isTrafficEnabled = true
+            
+            // Building layer
+            isBuildingsEnabled = true
+            
+            // Indoor layer
+            isIndoorEnabled = true
+        }
+    }
+    
+    /**
+     * Initialize clustering for multiple vehicles
+     */
+    private fun initializeClustering(map: GoogleMap) {
+        clusterManager = ClusterManager<VehicleClusterItem>(context, map)
+        
+        // Customize cluster renderer
+        clusterManager?.renderer = object : DefaultClusterRenderer<VehicleClusterItem>(
+            context,
+            map,
+            clusterManager!!
+        ) {
+            override fun onBeforeClusterItemRendered(
+                item: VehicleClusterItem,
+                markerOptions: MarkerOptions
+            ) {
+                markerOptions
+                    .icon(createVehicleMarker(item.vehicle))
+                    .title(item.vehicle.plateNumber)
+                    .snippet("Status: ${item.vehicle.status}")
+            }
+            
+            override fun onBeforeClusterRendered(
+                cluster: Cluster<VehicleClusterItem>,
+                markerOptions: MarkerOptions
+            ) {
+                val iconGenerator = IconGenerator(context)
+                iconGenerator.setBackground(context.getDrawable(R.drawable.cluster_background))
+                iconGenerator.setTextAppearance(R.style.ClusterTextAppearance)
+                iconGenerator.text = cluster.size.toString()
+                
+                markerOptions
+                    .icon(BitmapDescriptorFactory.fromBitmap(iconGenerator.makeIcon()))
+                    .anchor(0.5f, 0.5f)
+            }
+        }
+        
+        // Set up clustering
+        map.setOnCameraIdleListener(clusterManager)
+        map.setOnMarkerClickListener(clusterManager)
+    }
+    
+    /**
+     * Set up map listeners
+     */
+    private fun setupMapListeners(map: GoogleMap) {
+        // Camera move listener
+        map.setOnCameraMoveListener {
+            _mapState.value = MapState.CameraMoving
+        }
+        
+        // Camera idle listener
+        map.setOnCameraIdleListener {
+            _mapState.value = MapState.CameraIdle
+            clusterManager?.onCameraIdle()
+        }
+        
+        // Marker click listener
+        map.setOnMarkerClickListener { marker ->
+            handleMarkerClick(marker)
+            true
+        }
+        
+        // Map click listener
+        map.setOnMapClickListener { latLng ->
+            handleMapClick(latLng)
+        }
+        
+        // Info window click listener
+        map.setOnInfoWindowClickListener { marker ->
+            handleInfoWindowClick(marker)
+        }
+    }
+    
+    /**
+     * Apply map style (dark/light mode)
+     */
+    private fun applyMapStyle(map: GoogleMap) {
+        try {
+            val styleRes = when (isDarkMode()) {
+                true -> R.raw.map_style_dark
+                false -> R.raw.map_style_light
+            }
+            
+            mapStyle = MapStyle.loadRawResourceStyle(context, styleRes)
+            map.setMapStyle(mapStyle)
+            
+        } catch (e: Exception) {
+            // Fallback to default style
+        }
+    }
+    
+    /**
+     * Start location tracking
+     */
+    private fun startLocationTracking(coroutineScope: CoroutineScope) {
+        coroutineScope.launch {
+            liveTrackingManager.currentLocation.collect { location ->
+                location?.let {
+                    currentLocation = it
+                    updateCameraToLocation(it)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Add vehicle marker with animation
+     */
+    fun addVehicleMarker(vehicle: VehicleEntity, animate: Boolean = true) {
+        googleMap?.let { map ->
+            val position = LatLng(vehicle.lastLatitude, vehicle.lastLongitude)
+            
+            // Create marker options
+            val markerOptions = MarkerOptions()
+                .position(position)
+                .icon(createVehicleMarker(vehicle))
+                .title(vehicle.plateNumber)
+                .snippet("Status: ${vehicle.status}")
+                .anchor(0.5f, 0.5f)
+            
+            // Add marker to map
+            val marker = map.addMarker(markerOptions)
+            marker?.let {
+                vehicleMarkers[vehicle.id] = it
+                
+                // Animate if requested
+                if (animate) {
+                    animateMarkerAppearance(it)
+                }
+            }
+            
+            // Add to clustering if enabled
+            if (CLUSTERING_ENABLED) {
+                clusterManager?.addItem(VehicleClusterItem(vehicle))
+                clusterManager?.cluster()
+            }
+        }
+    }
+    
+    /**
+     * Update vehicle position with smooth animation
+     */
+    fun updateVehiclePosition(vehicleId: String, newLocation: LatLng, animate: Boolean = true) {
+        val marker = vehicleMarkers[vehicleId]
+        marker?.let {
+            if (animate) {
+                animateMarkerToPosition(it, newLocation)
+            } else {
+                it.position = newLocation
+            }
+        }
+    }
+    
+    /**
+     * Draw route on map
+     */
+    fun drawRoute(route: RouteEntity, animate: Boolean = true) {
+        googleMap?.let { map ->
+            // Remove existing route
+            routePolylines[route.id]?.remove()
+            
+            // Create polyline options
+            val polylineOptions = PolylineOptions()
+                .width(12f)
+                .color(getRouteColor(route.status))
+                .geodesic(true)
+                .jointType(ROUND)
+                .startCap(RoundCap())
+                .endCap(RoundCap())
+                .pattern(listOf(Dash(20f), Gap(10f)))
+            
+            // Add route points
+            route.stops.forEach { stop ->
+                polylineOptions.add(LatLng(stop.latitude, stop.longitude))
+            }
+            
+            // Add polyline to map
+            val polyline = map.addPolyline(polylineOptions)
+            routePolylines[route.id] = polyline
+            
+            // Animate if requested
+            if (animate) {
+                animateRouteAppearance(polyline)
+            }
+            
+            // Adjust camera to show route
+            adjustCameraToRoute(route)
+        }
+    }
+    
+    /**
+     * Add stop markers
+     */
+    fun addStopMarkers(stops: List<RouteStopEntity>) {
+        googleMap?.let { map ->
+            stops.forEach { stop ->
+                val position = LatLng(stop.latitude, stop.longitude)
+                
+                val markerOptions = MarkerOptions()
+                    .position(position)
+                    .icon(createStopMarker(stop))
+                    .title(stop.name)
+                    .snippet(stop.address)
+                    .anchor(0.5f, 0.5f)
+                
+                val marker = map.addMarker(markerOptions)
+                marker?.let {
+                    stopMarkers[stop.id] = it
+                }
+            }
+        }
+    }
+    
+    /**
+     * Add geofence circles
+     */
+    fun addGeofence(id: String, center: LatLng, radius: Float, color: Int) {
+        googleMap?.let { map ->
+            // Remove existing geofence
+            geofenceCircles[id]?.remove()
+            
+            val circleOptions = CircleOptions()
+                .center(center)
+                .radius(radius.toDouble())
+                .fillColor(color and 0x40FFFFFF) // Add transparency
+                .strokeColor(color)
+                .strokeWidth(3f)
+                .clickable(true)
+            
+            val circle = map.addCircle(circleOptions)
+            geofenceCircles[id] = circle
+        }
+    }
+    
+    /**
+     * Show traffic heatmap
+     */
+    fun showTrafficHeatmap(heatMapData: List<HeatMapPoint>) {
+        if (!HEAT_MAP_ENABLED) return
+        
+        googleMap?.let { map ->
+            // Remove existing heatmap
+            heatMapOverlay?.remove()
+            
+            // Create heatmap overlay
+            val bitmap = createHeatMapBitmap(heatMapData)
+            val bounds = calculateHeatMapBounds(heatMapData)
+            
+            val groundOverlayOptions = GroundOverlayOptions()
+                .image(BitmapDescriptorFactory.fromBitmap(bitmap))
+                .positionFromBounds(bounds)
+                .transparency(0.5f)
+            
+            heatMapOverlay = map.addGroundOverlay(groundOverlayOptions)
+        }
+    }
+    
+    /**
+     * Animate marker to new position
+     */
+    private fun animateMarkerToPosition(marker: Marker, newPosition: LatLng) {
+        val startPosition = marker.position
+        val startLat = startPosition.latitude
+        val startLng = startPosition.longitude
+        val endLat = newPosition.latitude
+        val endLng = newPosition.longitude
+        
+        val animator = ValueAnimator.ofFloat(0f, 1f)
+        animator.duration = ANIMATION_DURATION
+        animator.addUpdateListener { animation ->
+            val fraction = animation.animatedValue as Float
+            val lat = startLat + (endLat - startLat) * fraction
+            val lng = startLng + (endLng - startLng) * fraction
+            marker.position = LatLng(lat, lng)
+        }
+        animator.start()
+    }
+    
+    /**
+     * Animate marker appearance
+     */
+    private fun animateMarkerAppearance(marker: Marker) {
+        marker.alpha = 0f
+        marker.scaleY = 0f
+        marker.scaleX = 0f
+        
+        marker.animate()
+            .alpha(1f)
+            .scaleY(1f)
+            .scaleX(1f)
+            .setDuration(300)
+            .start()
+    }
+    
+    /**
+     * Animate route appearance
+     */
+    private fun animateRouteAppearance(polyline: Polyline) {
+        // Animate route drawing
+        val animator = ValueAnimator.ofFloat(0f, 1f)
+        animator.duration = ANIMATION_DURATION
+        animator.addUpdateListener { animation ->
+            val fraction = animation.animatedValue as Float
+            // Update polyline appearance based on fraction
+            polyline.color = Color.argb((255 * fraction).toInt(), 
+                Color.red(getRouteColor(RouteStatus.ACTIVE)),
+                Color.green(getRouteColor(RouteStatus.ACTIVE)),
+                Color.blue(getRouteColor(RouteStatus.ACTIVE)))
+        }
+        animator.start()
+    }
+    
+    /**
+     * Update camera to current location
+     */
+    private fun updateCameraToLocation(location: Location) {
+        googleMap?.let { map ->
+            val position = LatLng(location.latitude, location.longitude)
+            val cameraUpdate = CameraUpdateFactory.newLatLngZoom(position, DEFAULT_ZOOM)
+            map.animateCamera(cameraUpdate, 1000, null)
+        }
+    }
+    
+    /**
+     * Adjust camera to show entire route
+     */
+    private fun adjustCameraToRoute(route: RouteEntity) {
+        googleMap?.let { map ->
+            if (route.stops.isNotEmpty()) {
+                val boundsBuilder = LatLngBounds.Builder()
+                route.stops.forEach { stop ->
+                    boundsBuilder.include(LatLng(stop.latitude, stop.longitude))
+                }
+                
+                val bounds = boundsBuilder.build()
+                val padding = 100 // 100px padding
+                val cameraUpdate = CameraUpdateFactory.newLatLngBounds(bounds, padding)
+                map.animateCamera(cameraUpdate, 1000, null)
+            }
+        }
+    }
+    
+    /**
+     * Handle marker click
+     */
+    private fun handleMarkerClick(marker: Marker): Boolean {
+        // Show vehicle details or stop information
+        marker.showInfoWindow()
+        return true
+    }
+    
+    /**
+     * Handle map click
+     */
+    private fun handleMapClick(latLng: LatLng) {
+        // Clear selection or add new point
+        _mapState.value = MapState.MapClicked(latLng)
+    }
+    
+    /**
+     * Handle info window click
+     */
+    private fun handleInfoWindowClick(marker: Marker) {
+        // Navigate to details screen
+        _mapState.value = MapState.InfoWindowClicked(marker)
+    }
+    
+    /**
+     * Create vehicle marker icon
+     */
+    private fun createVehicleMarker(vehicle: VehicleEntity): BitmapDescriptor {
+        val iconGenerator = IconGenerator(context)
+        iconGenerator.setBackground(context.getDrawable(getVehicleIcon(vehicle.type)))
+        iconGenerator.setTextAppearance(R.style.VehicleMarkerTextAppearance)
+        iconGenerator.text = vehicle.plateNumber
+        
+        return BitmapDescriptorFactory.fromBitmap(iconGenerator.makeIcon())
+    }
+    
+    /**
+     * Create stop marker icon
+     */
+    private fun createStopMarker(stop: RouteStopEntity): BitmapDescriptor {
+        val iconGenerator = IconGenerator(context)
+        iconGenerator.setBackground(context.getDrawable(getStopIcon(stop.type)))
+        iconGenerator.setTextAppearance(R.style.StopMarkerTextAppearance)
+        iconGenerator.text = stop.sequence.toString()
+        
+        return BitmapDescriptorFactory.fromBitmap(iconGenerator.makeIcon())
+    }
+    
+    /**
+     * Get route color based on status
+     */
+    private fun getRouteColor(status: RouteStatus): Int {
+        return when (status) {
+            RouteStatus.ACTIVE -> Color.parseColor("#FF6B35")
+            RouteStatus.COMPLETED -> Color.parseColor("#22C55E")
+            RouteStatus.CANCELLED -> Color.parseColor("#EF4444")
+            RouteStatus.DELAYED -> Color.parseColor("#F59E0B")
+            else -> Color.parseColor("#8B5CF6")
+        }
+    }
+    
+    /**
+     * Get vehicle icon resource
+     */
+    private fun getVehicleIcon(vehicleType: String): Int {
+        return when (vehicleType.lowercase()) {
+            "truck" -> R.drawable.ic_truck_marker
+            "van" -> R.drawable.ic_van_marker
+            "motorcycle" -> R.drawable.ic_motorcycle_marker
+            else -> R.drawable.ic_vehicle_marker
+        }
+    }
+    
+    /**
+     * Get stop icon resource
+     */
+    private fun getStopIcon(stopType: String): Int {
+        return when (stopType.lowercase()) {
+            "pickup" -> R.drawable.ic_pickup_marker
+            "delivery" -> R.drawable.ic_delivery_marker
+            "warehouse" -> R.drawable.ic_warehouse_marker
+            else -> R.drawable.ic_stop_marker
+        }
+    }
+    
+    /**
+     * Check if dark mode is enabled
+     */
+    private fun isDarkMode(): Boolean {
+        // Implementation would check system theme
+        return false
+    }
+    
+    /**
+     * Create heatmap bitmap
+     */
+    private fun createHeatMapBitmap(data: List<HeatMapPoint>): Bitmap {
+        // Implementation would create heatmap visualization
+        val width = 512
+        val height = 512
+        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    }
+    
+    /**
+     * Calculate heatmap bounds
+     */
+    private fun calculateHeatMapBounds(data: List<HeatMapPoint>): LatLngBounds {
+        val boundsBuilder = LatLngBounds.Builder()
+        data.forEach { point ->
+            boundsBuilder.include(LatLng(point.latitude, point.longitude))
+        }
+        return boundsBuilder.build()
+    }
+    
+    /**
+     * Clear all markers and overlays
+     */
+    fun clearMap() {
+        googleMap?.let { map ->
+            // Clear markers
+            vehicleMarkers.values.forEach { it.remove() }
+            vehicleMarkers.clear()
+            
+            // Clear polylines
+            routePolylines.values.forEach { it.remove() }
+            routePolylines.clear()
+            
+            // Clear stop markers
+            stopMarkers.values.forEach { it.remove() }
+            stopMarkers.clear()
+            
+            // Clear geofences
+            geofenceCircles.values.forEach { it.remove() }
+            geofenceCircles.clear()
+            
+            // Clear heatmap
+            heatMapOverlay?.remove()
+            heatMapOverlay = null
+            
+            // Clear clustering
+            clusterManager?.clearItems()
+        }
+    }
+    
+    /**
+     * Get map snapshot
+     */
+    fun getMapSnapshot(callback: (Bitmap?) -> Unit) {
+        googleMap?.let { map ->
+            map.snapshot { bitmap ->
+                callback(bitmap)
+            }
+        }
+    }
+    
+    /**
+     * Set map type
+     */
+    fun setMapType(mapType: Int) {
+        googleMap?.mapType = mapType
+    }
+    
+    /**
+     * Enable/disable traffic layer
+     */
+    fun setTrafficEnabled(enabled: Boolean) {
+        googleMap?.isTrafficEnabled = enabled
+    }
+    
+    /**
+     * Enable/disable clustering
+     */
+    fun setClusteringEnabled(enabled: Boolean) {
+        // Implementation would enable/disable clustering
+    }
+}
+
+/**
+ * Data classes
+ */
+data class VehicleClusterItem(
+    val vehicle: VehicleEntity
+) : ClusterItem {
+    override fun getPosition(): LatLng {
+        return LatLng(vehicle.lastLatitude, vehicle.lastLongitude)
+    }
+    
+    override fun getTitle(): String {
+        return vehicle.plateNumber
+    }
+    
+    override fun getSnippet(): String {
+        return "Status: ${vehicle.status}"
+    }
+}
+
+data class HeatMapPoint(
+    val latitude: Double,
+    val longitude: Double,
+    val intensity: Float
+)
+
+/**
+ * Map state
+ */
+sealed class MapState {
+    object Initializing : MapState()
+    object Ready : MapState()
+    object CameraMoving : MapState()
+    object CameraIdle : MapState()
+    data class MapClicked(val position: LatLng) : MapState()
+    data class InfoWindowClicked(val marker: Marker) : MapState()
+    data class Error(val message: String) : MapState()
+}

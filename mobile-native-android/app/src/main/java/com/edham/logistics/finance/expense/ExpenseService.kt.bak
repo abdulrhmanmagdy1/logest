@@ -1,0 +1,694 @@
+package com.edham.logistics.finance.expense
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.ExpenseApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Expense Service - Manages expense tracking and categorization
+ * 
+ * Features:
+ * - Expense creation and management
+ * - Expense categorization and subcategories
+ * - Expense approval workflow
+ * - Receipt management
+ * - Expense analytics and reporting
+ * - Budget tracking and alerts
+ * - Expense policy enforcement
+ * - Multi-currency support
+ */
+@Singleton
+class ExpenseService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val expenseApi: ExpenseApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _expenseState = MutableStateFlow<ExpenseState>(ExpenseState.Idle)
+    val expenseState: StateFlow<ExpenseState> = _expenseState.asStateFlow()
+    
+    private val _expenses = MutableStateFlow<List<Expense>>(emptyList())
+    val expenses: StateFlow<List<Expense>> = _expenses.asStateFlow()
+    
+    private val _expenseStats = MutableStateFlow<ExpenseStats>(ExpenseStats())
+    val expenseStats: StateFlow<ExpenseStats> = _expenseStats.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "ExpenseService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val MAX_EXPENSE_AMOUNT = 50000f
+        private const val AUTO_APPROVAL_THRESHOLD = 1000f
+        private const val RECEIPT_REQUIRED_THRESHOLD = 500f
+    }
+    
+    /**
+     * Initialize expense service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _expenseState.value = ExpenseState.Initializing
+                
+                // Load expense configuration
+                loadExpenseConfiguration()
+                
+                // Load expense categories
+                loadExpenseCategories()
+                
+                // Load recent expenses
+                loadRecentExpenses()
+                
+                isInitialized = true
+                _expenseState.value = ExpenseState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _expenseState.value = ExpenseState.Error("Failed to initialize expense service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create expense
+     */
+    suspend fun createExpense(
+        expenseRequest: ExpenseRequest
+    ): Result<Expense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Expense service not initialized")
+                }
+                
+                _expenseState.value = ExpenseState.Processing
+                
+                // Validate expense request
+                validateExpenseRequest(expenseRequest)
+                
+                // Create expense
+                val expense = Expense(
+                    id = UUID.randomUUID().toString(),
+                    userId = expenseRequest.userId,
+                    amount = expenseRequest.amount,
+                    currency = expenseRequest.currency ?: DEFAULT_CURRENCY,
+                    category = expenseRequest.category,
+                    subcategory = expenseRequest.subcategory,
+                    description = expenseRequest.description,
+                    date = expenseRequest.date,
+                    receiptUrl = expenseRequest.receiptUrl,
+                    status = ExpenseStatus.PENDING,
+                    metadata = expenseRequest.metadata,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save to database
+                val savedExpense = database.expenseDao().insertExpense(expense.toEntity())
+                    .let { id -> expense.copy(id = id.toString()) }
+                
+                // Add to expenses list
+                addToExpenses(savedExpense)
+                
+                // Check for auto-approval
+                if (shouldAutoApprove(expenseRequest)) {
+                    processAutoApproval(savedExpense)
+                } else {
+                    // Submit for approval
+                    submitForApproval(savedExpense)
+                }
+                
+                // Update stats
+                updateExpenseStats()
+                
+                _expenseState.value = ExpenseState.Ready
+                Result.success(savedExpense)
+                
+            } catch (e: Exception) {
+                _expenseState.value = ExpenseState.Error("Expense creation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update expense
+     */
+    suspend fun updateExpense(
+        expense: Expense
+    ): Result<Expense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Expense service not initialized")
+                }
+                
+                _expenseState.value = ExpenseState.Processing
+                
+                // Validate expense
+                validateExpense(expense)
+                
+                // Update in database
+                database.expenseDao().updateExpense(expense.toEntity())
+                
+                // Update in list
+                updateExpenseInList(expense)
+                
+                // Update stats
+                updateExpenseStats()
+                
+                _expenseState.value = ExpenseState.Ready
+                Result.success(expense)
+                
+            } catch (e: Exception) {
+                _expenseState.value = ExpenseState.Error("Expense update failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process expense approval
+     */
+    suspend fun processExpenseApproval(
+        expenseId: String,
+        approved: Boolean,
+        approverId: String,
+        notes: String? = null
+    ): Result<Expense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val expense = _expenses.value.find { it.id == expenseId }
+                    ?: throw Exception("Expense not found")
+                
+                if (expense.status != ExpenseStatus.PENDING) {
+                    throw Exception("Expense is not pending approval")
+                }
+                
+                _expenseState.value = ExpenseState.Processing
+                
+                val updatedExpense = if (approved) {
+                    expense.copy(
+                        status = ExpenseStatus.APPROVED,
+                        approvedBy = approverId,
+                        approvalNotes = notes,
+                        approvedAt = Date(),
+                        updatedAt = Date()
+                    )
+                } else {
+                    expense.copy(
+                        status = ExpenseStatus.REJECTED,
+                        rejectedBy = approverId,
+                        rejectionReason = notes,
+                        rejectedAt = Date(),
+                        updatedAt = Date()
+                    )
+                }
+                
+                // Update in database
+                database.expenseDao().updateExpense(updatedExpense.toEntity())
+                
+                // Update in list
+                updateExpenseInList(updatedExpense)
+                
+                // Update stats
+                updateExpenseStats()
+                
+                _expenseState.value = ExpenseState.Ready
+                Result.success(updatedExpense)
+                
+            } catch (e: Exception) {
+                _expenseState.value = ExpenseState.Error("Expense approval processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get expense by ID
+     */
+    suspend fun getExpense(expenseId: String): Expense? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _expenses.value.find { it.id == expenseId }
+                    ?: database.expenseDao().getExpenseById(expenseId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get expense history
+     */
+    suspend fun getExpenseHistory(
+        userId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        category: ExpenseCategory? = null,
+        status: ExpenseStatus? = null
+    ): Result<List<Expense>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val expenses = database.expenseDao().getExpenseHistory(
+                    userId = userId?.toLong(),
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    category = category,
+                    status = status
+                ).map { it.toDomainModel() }
+                
+                Result.success(expenses)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get pending expenses
+     */
+    suspend fun getPendingExpenses(): Result<List<Expense>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val expenses = database.expenseDao().getExpensesByStatus(ExpenseStatus.PENDING)
+                    .map { it.toDomainModel() }
+                
+                Result.success(expenses)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get expense analytics
+     */
+    suspend fun getExpenseAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<ExpenseAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val expenses = getExpenseHistory(null, dateRange).getOrThrow()
+                
+                val analytics = ExpenseAnalytics(
+                    totalExpenses = expenses.size,
+                    totalAmount = expenses.sumOf { it.amount.toDouble() }.toFloat(),
+                    approvedExpenses = expenses.count { it.status == ExpenseStatus.APPROVED },
+                    pendingExpenses = expenses.count { it.status == ExpenseStatus.PENDING },
+                    rejectedExpenses = expenses.count { it.status == ExpenseStatus.REJECTED },
+                    averageExpenseAmount = if (expenses.isNotEmpty()) expenses.map { it.amount }.average().toFloat() else 0f,
+                    categoryStats = expenses.groupBy { it.category }.mapValues { it.value.size },
+                    subcategoryStats = expenses.groupBy { it.subcategory }.mapValues { it.value.size },
+                    monthlyStats = calculateMonthlyExpenseStats(expenses),
+                    topExpenses = expenses.sortedByDescending { it.amount }.take(10),
+                    budgetUtilization = calculateBudgetUtilization(expenses, dateRange)
+                )
+                
+                Result.success(analytics)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fuel expenses
+     */
+    suspend fun getFuelExpenses(
+        dateRange: DateRange = DateRange.currentMonth()
+    ): Float {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.expenseDao().getExpensesByCategoryAndDateRange(
+                    ExpenseCategory.FUEL,
+                    dateRange.startDate,
+                    dateRange.endDate
+                ).sumOf { it.amount.toDouble() }.toFloat()
+            } catch (e: Exception) {
+                0f
+            }
+        }
+    }
+    
+    /**
+     * Get maintenance expenses
+     */
+    suspend fun getMaintenanceExpenses(
+        dateRange: DateRange = DateRange.currentMonth()
+    ): Float {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.expenseDao().getExpensesByCategoryAndDateRange(
+                    ExpenseCategory.MAINTENANCE,
+                    dateRange.startDate,
+                    dateRange.endDate
+                ).sumOf { it.amount.toDouble() }.toFloat()
+            } catch (e: Exception) {
+                0f
+            }
+        }
+    }
+    
+    /**
+     * Upload expense receipt
+     */
+    suspend fun uploadExpenseReceipt(
+        expenseId: String,
+        receiptFile: ByteArray,
+        fileName: String
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Expense service not initialized")
+                }
+                
+                _expenseState.value = ExpenseState.Processing
+                
+                // Upload receipt to cloud storage
+                val uploadResult = expenseApi.uploadReceipt(receiptFile, fileName)
+                
+                if (uploadResult.success) {
+                    val receiptUrl = uploadResult.data ?: throw Exception("Failed to get receipt URL")
+                    
+                    // Update expense with receipt URL
+                    val expense = getExpense(expenseId) ?: throw Exception("Expense not found")
+                    val updatedExpense = expense.copy(
+                        receiptUrl = receiptUrl,
+                        updatedAt = Date()
+                    )
+                    
+                    updateExpense(updatedExpense)
+                    
+                    _expenseState.value = ExpenseState.Ready
+                    Result.success(receiptUrl)
+                } else {
+                    throw Exception(uploadResult.message ?: "Receipt upload failed")
+                }
+                
+            } catch (e: Exception) {
+                _expenseState.value = ExpenseState.Error("Receipt upload failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadExpenseConfiguration() {
+        // Load expense configuration from API or local storage
+    }
+    
+    private suspend fun loadExpenseCategories() {
+        // Load expense categories from API or local storage
+    }
+    
+    private suspend fun loadRecentExpenses() {
+        try {
+            val expenses = database.expenseDao().getRecentExpenses(50)
+                .map { it.toDomainModel() }
+            
+            _expenses.value = expenses
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun validateExpenseRequest(request: ExpenseRequest) {
+        if (request.amount <= 0) throw Exception("Expense amount must be positive")
+        if (request.amount > MAX_EXPENSE_AMOUNT) throw Exception("Expense amount exceeds maximum limit")
+        if (request.userId.isBlank()) throw Exception("User ID cannot be empty")
+        if (request.category == null) throw Exception("Expense category is required")
+        if (request.description.isBlank()) throw Exception("Expense description is required")
+        if (request.date == null) throw Exception("Expense date is required")
+        
+        // Check if receipt is required
+        if (request.amount >= RECEIPT_REQUIRED_THRESHOLD && request.receiptUrl.isNullOrBlank()) {
+            throw Exception("Receipt is required for expenses above ${RECEIPT_REQUIRED_THRESHOLD}")
+        }
+    }
+    
+    private fun validateExpense(expense: Expense) {
+        if (expense.amount <= 0) throw Exception("Expense amount must be positive")
+        if (expense.amount > MAX_EXPENSE_AMOUNT) throw Exception("Expense amount exceeds maximum limit")
+        if (expense.userId.isBlank()) throw Exception("User ID cannot be empty")
+        if (expense.category == null) throw Exception("Expense category is required")
+        if (expense.description.isBlank()) throw Exception("Expense description is required")
+    }
+    
+    private fun shouldAutoApprove(request: ExpenseRequest): Boolean {
+        // Auto-approve if amount is below threshold and category allows it
+        return request.amount <= AUTO_APPROVAL_THRESHOLD && 
+               request.category in listOf(ExpenseCategory.FUEL, ExpenseCategory.MAINTENANCE)
+    }
+    
+    private suspend fun processAutoApproval(expense: Expense) {
+        try {
+            val approvedExpense = expense.copy(
+                status = ExpenseStatus.APPROVED,
+                approvedBy = "SYSTEM",
+                approvalNotes = "Auto-approved",
+                approvedAt = Date(),
+                updatedAt = Date()
+            )
+            
+            // Update in database
+            database.expenseDao().updateExpense(approvedExpense.toEntity())
+            
+            // Update in list
+            updateExpenseInList(approvedExpense)
+            
+            // Update stats
+            updateExpenseStats()
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun submitForApproval(expense: Expense) {
+        try {
+            // Send notification to approvers
+            // This would integrate with the notification system
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun addToExpenses(expense: Expense) {
+        val currentExpenses = _expenses.value.toMutableList()
+        currentExpenses.add(0, expense) // Add to beginning
+        
+        // Keep only last 100 expenses in cache
+        if (currentExpenses.size > 100) {
+            currentExpenses.removeAt(currentExpenses.size - 1)
+        }
+        
+        _expenses.value = currentExpenses
+    }
+    
+    private fun updateExpenseInList(expense: Expense) {
+        val currentExpenses = _expenses.value.toMutableList()
+        val index = currentExpenses.indexOfFirst { it.id == expense.id }
+        
+        if (index != -1) {
+            currentExpenses[index] = expense
+            _expenses.value = currentExpenses
+        }
+    }
+    
+    private suspend fun updateExpenseStats() {
+        try {
+            val expenses = _expenses.value
+            val stats = ExpenseStats(
+                totalExpenses = expenses.size,
+                pendingExpenses = expenses.count { it.status == ExpenseStatus.PENDING },
+                approvedExpenses = expenses.count { it.status == ExpenseStatus.APPROVED },
+                rejectedExpenses = expenses.count { it.status == ExpenseStatus.REJECTED },
+                totalAmount = expenses.sumOf { it.amount.toDouble() }.toFloat(),
+                averageAmount = if (expenses.isNotEmpty()) expenses.map { it.amount }.average().toFloat() else 0f,
+                categoryStats = expenses.groupBy { it.category }.mapValues { it.value.size }
+            )
+            
+            _expenseStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun calculateMonthlyExpenseStats(expenses: List<Expense>): Map<String, MonthlyExpenseStats> {
+        return expenses.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.date
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { (_, monthExpenses) ->
+            MonthlyExpenseStats(
+                expenseCount = monthExpenses.size,
+                totalAmount = monthExpenses.sumOf { it.amount.toDouble() }.toFloat(),
+                averageAmount = if (monthExpenses.isNotEmpty()) monthExpenses.map { it.amount }.average().toFloat() else 0f,
+                approvedExpenses = monthExpenses.count { it.status == ExpenseStatus.APPROVED }
+            )
+        }
+    }
+    
+    private fun calculateBudgetUtilization(
+        expenses: List<Expense>,
+        dateRange: DateRange
+    ): BudgetUtilization {
+        // This would integrate with a budget management system
+        val totalExpenses = expenses.sumOf { it.amount.toDouble() }.toFloat()
+        val budgetLimit = getBudgetLimit(dateRange) // This would fetch from budget system
+        
+        return BudgetUtilization(
+            totalExpenses = totalExpenses,
+            budgetLimit = budgetLimit,
+            utilizationPercentage = if (budgetLimit > 0) (totalExpenses / budgetLimit) * 100f else 0f,
+            remainingBudget = maxOf(0f, budgetLimit - totalExpenses),
+            isOverBudget = totalExpenses > budgetLimit
+        )
+    }
+    
+    private fun getBudgetLimit(dateRange: DateRange): Float {
+        // This would integrate with a budget management system
+        // For now, return a default value
+        return 10000f // Default monthly budget
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class ExpenseRequest(
+    val userId: String,
+    val amount: Float,
+    val currency: String? = null,
+    val category: ExpenseCategory,
+    val subcategory: String? = null,
+    val description: String,
+    val date: Date,
+    val receiptUrl: String? = null,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class Expense(
+    val id: String = "",
+    val userId: String,
+    val amount: Float,
+    val currency: String,
+    val category: ExpenseCategory,
+    val subcategory: String? = null,
+    val description: String,
+    val date: Date,
+    val receiptUrl: String? = null,
+    val status: ExpenseStatus,
+    val approvedBy: String? = null,
+    val approvalNotes: String? = null,
+    val rejectedBy: String? = null,
+    val rejectionReason: String? = null,
+    val approvedAt: Date? = null,
+    val rejectedAt: Date? = null,
+    val metadata: Map<String, String> = emptyMap(),
+    val createdAt: Date = Date(),
+    val updatedAt: Date = Date()
+)
+
+data class ExpenseAnalytics(
+    val totalExpenses: Int,
+    val totalAmount: Float,
+    val approvedExpenses: Int,
+    val pendingExpenses: Int,
+    val rejectedExpenses: Int,
+    val averageExpenseAmount: Float,
+    val categoryStats: Map<ExpenseCategory, Int>,
+    val subcategoryStats: Map<String, Int>,
+    val monthlyStats: Map<String, MonthlyExpenseStats>,
+    val topExpenses: List<Expense>,
+    val budgetUtilization: BudgetUtilization
+)
+
+data class ExpenseStats(
+    val totalExpenses: Int = 0,
+    val pendingExpenses: Int = 0,
+    val approvedExpenses: Int = 0,
+    val rejectedExpenses: Int = 0,
+    val totalAmount: Float = 0f,
+    val averageAmount: Float = 0f,
+    val categoryStats: Map<ExpenseCategory, Int> = emptyMap()
+)
+
+data class MonthlyExpenseStats(
+    val expenseCount: Int,
+    val totalAmount: Float,
+    val averageAmount: Float,
+    val approvedExpenses: Int
+)
+
+data class BudgetUtilization(
+    val totalExpenses: Float,
+    val budgetLimit: Float,
+    val utilizationPercentage: Float,
+    val remainingBudget: Float,
+    val isOverBudget: Boolean
+)
+
+/**
+ * Enums
+ */
+enum class ExpenseState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class ExpenseCategory {
+    FUEL,
+    MAINTENANCE,
+    INSURANCE,
+    TIRES,
+    PARTS,
+    TOLLS,
+    PARKING,
+    MEALS,
+    ACCOMMODATION,
+    OFFICE_SUPPLIES,
+    UTILITIES,
+    MARKETING,
+    TRAINING,
+    LEGAL,
+    OTHER
+}
+
+enum class ExpenseStatus {
+    PENDING,
+    APPROVED,
+    REJECTED,
+    CANCELLED
+}

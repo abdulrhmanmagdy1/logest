@@ -1,0 +1,341 @@
+package com.edham.logistics.security
+
+import android.content.Context
+import android.util.Base64
+import android.util.Log
+import okhttp3.CertificatePinner
+import okhttp3.OkHttpClient
+import okhttp3.tls.HandshakeCertificates
+import java.io.InputStream
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.cert.Certificate
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import javax.inject.Inject
+import javax.inject.Singleton
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.X509TrustManager
+
+/**
+ * SSL Pinning Manager - Handles SSL certificate pinning for secure API connections
+ * 
+ * Features:
+ * - Certificate pinning
+ * - Public key pinning
+ * - Certificate validation
+ * - Custom trust store
+ * - Fallback to system trust store
+ */
+@Singleton
+class SSLPinningManager @Inject constructor(
+    private val context: Context
+) {
+    
+    private val TAG = "SSLPinningManager"
+    
+    // Certificate pins for production
+    private val productionPins = listOf(
+        "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", // Production cert 1
+        "sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=", // Production cert 2
+        "sha256/CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="  // Production cert 3
+    )
+    
+    // Certificate pins for development
+    private val developmentPins = listOf(
+        "sha256/DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="  // Development cert
+    )
+    
+    /**
+     * Create OkHttpClient with SSL pinning
+     */
+    fun createSecureOkHttpClient(isDevelopment: Boolean = false): OkHttpClient.Builder {
+        val certificatePinner = createCertificatePinner(isDevelopment)
+        
+        return OkHttpClient.Builder()
+            .certificatePinner(certificatePinner)
+            .sslSocketFactory(createSSLSocketFactory(isDevelopment))
+            .build()
+            .newBuilder()
+    }
+    
+    /**
+     * Create certificate pinner
+     */
+    private fun createCertificatePinner(isDevelopment: Boolean): CertificatePinner {
+        val pins = if (isDevelopment) {
+            developmentPins
+        } else {
+            productionPins
+        }
+        
+        return CertificatePinner.Builder()
+            .add("api.edhamlogistics.com", *pins.toTypedArray())
+            .add("*.edhamlogistics.com", *pins.toTypedArray())
+            .add("*.amazonaws.com", *pins.toTypedArray()) // For AWS API Gateway
+            .build()
+    }
+    
+    /**
+     * Create SSL socket factory with custom trust store
+     */
+    private fun createSSLSocketFactory(isDevelopment: Boolean): javax.net.ssl.SSLSocketFactory {
+        val trustManagers = if (isDevelopment) {
+            // In development, use system trust store + custom certificates
+            createDevelopmentTrustManagers()
+        } else {
+            // In production, use only custom certificates
+            createProductionTrustManagers()
+        }
+        
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, trustManagers, null)
+        
+        return sslContext.socketFactory
+    }
+    
+    /**
+     * Create trust managers for development environment
+     */
+    private fun createDevelopmentTrustManagers(): Array<javax.net.ssl.TrustManager> {
+        try {
+            // Load custom certificates from assets
+            val customCertificates = loadCustomCertificates()
+            
+            // Create trust manager with both system and custom certificates
+            val trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            val keyStore = createKeyStoreWithCertificates(customCertificates)
+            
+            trustManagerFactory.init(keyStore)
+            return trustManagerFactory.trustManagers
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating development trust managers", e)
+            // Fallback to system trust store
+            return createSystemTrustManagers()
+        }
+    }
+    
+    /**
+     * Create trust managers for production environment
+     */
+    private fun createProductionTrustManagers(): Array<javax.net.ssl.TrustManager> {
+        try {
+            // Load only custom certificates from assets
+            val customCertificates = loadCustomCertificates()
+            
+            if (customCertificates.isEmpty()) {
+                throw Exception("No custom certificates found for production")
+            }
+            
+            val trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            val keyStore = createKeyStoreWithCertificates(customCertificates)
+            
+            trustManagerFactory.init(keyStore)
+            return trustManagerFactory.trustManagers
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating production trust managers", e)
+            throw RuntimeException("Failed to create secure SSL context", e)
+        }
+    }
+    
+    /**
+     * Create system trust managers as fallback
+     */
+    private fun createSystemTrustManagers(): Array<javax.net.ssl.TrustManager> {
+        val trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+        trustManagerFactory.init(null as KeyStore?)
+        return trustManagerFactory.trustManagers
+    }
+    
+    /**
+     * Load custom certificates from assets
+     */
+    private fun loadCustomCertificates(): List<X509Certificate> {
+        val certificates = mutableListOf<X509Certificate>()
+        
+        try {
+            // Load certificate files from assets
+            val certificateFiles = listOf(
+                "certificates/edham_prod.cer",
+                "certificates/edham_prod_2.cer",
+                "certificates/aws_root.cer"
+            )
+            
+            certificateFiles.forEach { fileName ->
+                try {
+                    val certificate = loadCertificateFromAssets(fileName)
+                    if (certificate != null) {
+                        certificates.add(certificate)
+                        Log.d(TAG, "Loaded certificate: $fileName")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to load certificate: $fileName", e)
+                }
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading custom certificates", e)
+        }
+        
+        return certificates
+    }
+    
+    /**
+     * Load a single certificate from assets
+     */
+    private fun loadCertificateFromAssets(fileName: String): X509Certificate? {
+        return try {
+            val inputStream: InputStream = context.assets.open(fileName)
+            val certificateFactory = CertificateFactory.getInstance("X.509")
+            val certificate = certificateFactory.generateCertificate(inputStream) as X509Certificate
+            inputStream.close()
+            certificate
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load certificate: $fileName", e)
+            null
+        }
+    }
+    
+    /**
+     * Create KeyStore with certificates
+     */
+    private fun createKeyStoreWithCertificates(certificates: List<X509Certificate>): KeyStore {
+        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+        keyStore.load(null, null)
+        
+        certificates.forEachIndexed { index, certificate ->
+            keyStore.setCertificateEntry("cert_$index", certificate)
+        }
+        
+        return keyStore
+    }
+    
+    /**
+     * Generate SHA-256 hash for certificate pinning
+     */
+    fun generateCertificateHash(certificate: X509Certificate): String {
+        return try {
+            val publicKey = certificate.publicKey.encoded
+            val digest = MessageDigest.getInstance("SHA-256")
+            digest.digest(publicKey)
+            val hash = Base64.encodeToString(digest.digest(), Base64.NO_WRAP)
+            "sha256/$hash"
+        } catch (e: Exception) {
+            Log.e(TAG, "Error generating certificate hash", e)
+            throw RuntimeException("Failed to generate certificate hash", e)
+        }
+    }
+    
+    /**
+     * Validate certificate chain
+     */
+    fun validateCertificateChain(certificate: X509Certificate): Boolean {
+        return try {
+            // Check if certificate is expired
+            certificate.checkValidity()
+            
+            // Check if certificate is trusted
+            val trustManagers = createSystemTrustManagers()
+            val trustManager = trustManagers[0] as X509TrustManager
+            
+            // Verify certificate chain
+            trustManager.checkServerTrusted(arrayOf(certificate))
+            
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Certificate validation failed", e)
+            false
+        }
+    }
+    
+    /**
+     * Get certificate information
+     */
+    fun getCertificateInfo(certificate: X509Certificate): CertificateInfo {
+        return CertificateInfo(
+            subject = certificate.subjectDN.toString(),
+            issuer = certificate.issuerDN.toString(),
+            serialNumber = certificate.serialNumber.toString(),
+            validFrom = certificate.notBefore,
+            validUntil = certificate.notAfter,
+            signatureAlgorithm = certificate.sigAlgName,
+            hash = generateCertificateHash(certificate)
+        )
+    }
+    
+    /**
+     * Update certificate pins (for runtime updates)
+     */
+    fun updateCertificatePins(newPins: List<String>, isDevelopment: Boolean = false) {
+        try {
+            val certificatePinner = createCertificatePinner(isDevelopment)
+            // This would require recreating the OkHttpClient
+            Log.i(TAG, "Certificate pins updated")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update certificate pins", e)
+        }
+    }
+    
+    /**
+     * Check if SSL pinning is enabled
+     */
+    fun isSSLPinningEnabled(): Boolean {
+        return try {
+            val prefs = context.getSharedPreferences("security_prefs", Context.MODE_PRIVATE)
+            prefs.getBoolean("ssl_pinning_enabled", true)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking SSL pinning status", e)
+            true // Default to enabled
+        }
+    }
+    
+    /**
+     * Enable/disable SSL pinning
+     */
+    fun setSSLPinningEnabled(enabled: Boolean) {
+        try {
+            val prefs = context.getSharedPreferences("security_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putBoolean("ssl_pinning_enabled", enabled).apply()
+            Log.i(TAG, "SSL pinning ${if (enabled) "enabled" else "disabled"}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting SSL pinning status", e)
+        }
+    }
+    
+    /**
+     * Get current certificate pins
+     */
+    fun getCurrentPins(isDevelopment: Boolean): List<String> {
+        return if (isDevelopment) {
+            developmentPins
+        } else {
+            productionPins
+        }
+    }
+}
+
+/**
+ * Certificate information data class
+ */
+data class CertificateInfo(
+    val subject: String,
+    val issuer: String,
+    val serialNumber: String,
+    val validFrom: java.util.Date,
+    val validUntil: java.util.Date,
+    val signatureAlgorithm: String,
+    val hash: String
+) {
+    fun isValid(): Boolean {
+        val now = java.util.Date()
+        return now.after(validFrom) && now.before(validUntil)
+    }
+    
+    fun isExpiringSoon(days: Int = 30): Boolean {
+        val futureDate = java.util.Date(System.currentTimeMillis() + (days * 24 * 60 * 60 * 1000L))
+        return validUntil.before(futureDate)
+    }
+}

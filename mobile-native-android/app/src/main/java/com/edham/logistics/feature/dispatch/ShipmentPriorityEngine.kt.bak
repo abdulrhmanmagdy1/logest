@@ -1,0 +1,543 @@
+package com.edham.logistics.feature.dispatch
+
+import android.util.Log
+import com.edham.logistics.data.model.Shipment
+import com.edham.logistics.data.model.Customer
+import com.edham.logistics.feature.dispatch.utils.PriorityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.temporal.ChronoUnit
+import kotlin.math.max
+
+/**
+ * Shipment Priority Engine - Advanced priority calculation and management
+ * Calculates shipment priorities based on multiple factors and business rules
+ */
+class ShipmentPriorityEngine {
+    
+    companion object {
+        private const val TAG = "ShipmentPriorityEngine"
+        
+        // Priority weights (can be adjusted based on business needs)
+        private const val URGENCY_WEIGHT = 0.35
+        private const val CUSTOMER_WEIGHT = 0.25
+        private const val DISTANCE_WEIGHT = 0.20
+        private const val TIME_WEIGHT = 0.15
+        private const val REVENUE_WEIGHT = 0.05
+        
+        // Priority thresholds
+        private const val URGENT_THRESHOLD = 80.0
+        private const val HIGH_THRESHOLD = 60.0
+        private const val NORMAL_THRESHOLD = 40.0
+        
+        // Time sensitivity factors
+        private const val EXPRESS_MULTIPLIER = 1.5
+        private const val STANDARD_MULTIPLIER = 1.0
+        private const val DELAYED_MULTIPLIER = 2.0
+        
+        // Customer tier multipliers
+        private const val VIP_MULTIPLIER = 1.3
+        private const val PREMIUM_MULTIPLIER = 1.2
+        private const val STANDARD_MULTIPLIER = 1.0
+    }
+    
+    /**
+     * Calculate comprehensive priority score for a shipment
+     */
+    suspend fun calculatePriorityScore(
+        shipment: Shipment,
+        customer: Customer? = null,
+        distanceFromDepot: Double? = null
+    ): PriorityResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Base urgency score
+                val urgencyScore = calculateUrgencyScore(shipment)
+                
+                // Customer score
+                val customerScore = calculateCustomerScore(shipment, customer)
+                
+                // Distance score
+                val distanceScore = calculateDistanceScore(shipment, distanceFromDepot)
+                
+                // Time sensitivity score
+                val timeScore = calculateTimeScore(shipment)
+                
+                // Revenue score
+                val revenueScore = calculateRevenueScore(shipment)
+                
+                // Calculate weighted total score
+                val totalScore = (urgencyScore * URGENCY_WEIGHT) +
+                               (customerScore * CUSTOMER_WEIGHT) +
+                               (distanceScore * DISTANCE_WEIGHT) +
+                               (timeScore * TIME_WEIGHT) +
+                               (revenueScore * REVENUE_WEIGHT)
+                
+                // Apply multipliers
+                val finalScore = applyMultipliers(totalScore, shipment, customer)
+                
+                // Determine priority level
+                val priorityLevel = determinePriorityLevel(finalScore)
+                
+                // Calculate confidence score
+                val confidenceScore = calculateConfidenceScore(shipment, customer)
+                
+                val result = PriorityResult(
+                    shipmentId = shipment.id,
+                    baseScore = totalScore,
+                    finalScore = finalScore,
+                    priorityLevel = priorityLevel,
+                    urgencyScore = urgencyScore,
+                    customerScore = customerScore,
+                    distanceScore = distanceScore,
+                    timeScore = timeScore,
+                    revenueScore = revenueScore,
+                    confidenceScore = confidenceScore,
+                    factors = PriorityFactors(
+                        urgency = urgencyScore > 70,
+                        customerTier = customer != null && customer.tier != "STANDARD",
+                        isExpress = shipment.isExpress,
+                        isDelayed = calculateIsDelayed(shipment),
+                        highRevenue = shipment.revenue > 1000.0
+                    ),
+                    calculatedAt = LocalDateTime.now()
+                )
+                
+                Log.d(TAG, "Priority calculated for shipment ${shipment.id}: ${result.priorityLevel} (score: ${result.finalScore})")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error calculating priority for shipment ${shipment.id}", e)
+                PriorityResult.createDefault(shipment.id)
+            }
+        }
+    }
+    
+    /**
+     * Calculate urgency score based on shipment properties
+     */
+    private fun calculateUrgencyScore(shipment: Shipment): Double {
+        var score = 50.0 // Base score
+        
+        // Priority level
+        when (shipment.priority.uppercase()) {
+            "URGENT" -> score += 40
+            "HIGH" -> score += 25
+            "NORMAL" -> score += 10
+            "LOW" -> score -= 10
+        }
+        
+        // Time since creation (older shipments get higher priority)
+        val hoursSinceCreation = ChronoUnit.HOURS.between(
+            shipment.createdAt,
+            LocalDateTime.now()
+        )
+        
+        when {
+            hoursSinceCreation > 24 -> score += 20 // More than a day
+            hoursSinceCreation > 12 -> score += 15 // More than 12 hours
+            hoursSinceCreation > 6 -> score += 10 // More than 6 hours
+            hoursSinceCreation > 2 -> score += 5  // More than 2 hours
+        }
+        
+        // Special requirements
+        if (shipment.requiresRefrigeration) score += 8
+        if (shipment.isHazardous) score += 12
+        if (shipment.requiresInsurance) score += 5
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate customer score based on customer properties
+     */
+    private fun calculateCustomerScore(shipment: Shipment, customer: Customer?): Double {
+        var score = 50.0 // Base score
+        
+        if (customer != null) {
+            // Customer tier
+            when (customer.tier.uppercase()) {
+                "VIP" -> score += 30
+                "PREMIUM" -> score += 20
+                "STANDARD" -> score += 5
+                else -> score += 0
+            }
+            
+            // Customer rating
+            if (customer.rating != null) {
+                when {
+                    customer.rating >= 4.8 -> score += 15
+                    customer.rating >= 4.5 -> score += 10
+                    customer.rating >= 4.0 -> score += 5
+                    customer.rating < 3.5 -> score -= 10
+                }
+            }
+            
+            // Historical performance
+            if (customer.onTimeDeliveryRate != null) {
+                when {
+                    customer.onTimeDeliveryRate >= 95 -> score += 10
+                    customer.onTimeDeliveryRate >= 90 -> score += 5
+                    customer.onTimeDeliveryRate < 80 -> score -= 5
+                }
+            }
+            
+            // Volume of business
+            if (customer.monthlyShipments != null) {
+                when {
+                    customer.monthlyShipments >= 50 -> score += 10
+                    customer.monthlyShipments >= 20 -> score += 5
+                    customer.monthlyShipments >= 10 -> score += 2
+                }
+            }
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate distance score based on proximity to depot
+     */
+    private fun calculateDistanceScore(
+        shipment: Shipment,
+        distanceFromDepot: Double?
+    ): Double {
+        var score = 50.0 // Base score
+        
+        val distance = distanceFromDepot ?: shipment.distanceFromDepot ?: 0.0
+        
+        when {
+            distance <= 5 -> score += 30   // Within 5km
+            distance <= 10 -> score += 20  // Within 10km
+            distance <= 20 -> score += 10  // Within 20km
+            distance <= 50 -> score += 5   // Within 50km
+            distance > 100 -> score -= 10   // More than 100km
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate time sensitivity score
+     */
+    private fun calculateTimeScore(shipment: Shipment): Double {
+        var score = 50.0 // Base score
+        
+        // Express shipments
+        if (shipment.isExpress) {
+            score += 25
+        }
+        
+        // Time windows
+        if (shipment.deliveryTimeWindow != null) {
+            val timeUntilDeadline = ChronoUnit.MINUTES.between(
+                LocalDateTime.now(),
+                shipment.deliveryTimeWindow
+            )
+            
+            when {
+                timeUntilDeadline <= 60 -> score += 20  // Less than 1 hour
+                timeUntilDeadline <= 180 -> score += 15 // Less than 3 hours
+                timeUntilDeadline <= 360 -> score += 10 // Less than 6 hours
+                timeUntilDeadline <= 720 -> score += 5  // Less than 12 hours
+            }
+        }
+        
+        // Weekend/holiday deliveries
+        val now = LocalDateTime.now()
+        val isWeekend = now.dayOfWeek.value in setOf(6, 7) // Saturday, Sunday
+        
+        if (isWeekend && !shipment.isWeekendDelivery) {
+            score -= 10 // Weekend delivery when not preferred
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate revenue score
+     */
+    private fun calculateRevenueScore(shipment: Shipment): Double {
+        var score = 50.0 // Base score
+        
+        val revenue = shipment.revenue ?: 0.0
+        
+        when {
+            revenue >= 5000 -> score += 20
+            revenue >= 2000 -> score += 15
+            revenue >= 1000 -> score += 10
+            revenue >= 500 -> score += 5
+            revenue < 100 -> score -= 5
+        }
+        
+        // Profit margin consideration
+        val profitMargin = shipment.profitMargin ?: 0.0
+        when {
+            profitMargin >= 30 -> score += 10
+            profitMargin >= 20 -> score += 5
+            profitMargin < 10 -> score -= 5
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Apply business rule multipliers
+     */
+    private fun applyMultipliers(
+        baseScore: Double,
+        shipment: Shipment,
+        customer: Customer?
+    ): Double {
+        var finalScore = baseScore
+        
+        // Express shipment multiplier
+        if (shipment.isExpress) {
+            finalScore *= EXPRESS_MULTIPLIER
+        }
+        
+        // Customer tier multiplier
+        if (customer != null) {
+            when (customer.tier.uppercase()) {
+                "VIP" -> finalScore *= VIP_MULTIPLIER
+                "PREMIUM" -> finalScore *= PREMIUM_MULTIPLIER
+                else -> finalScore *= STANDARD_MULTIPLIER
+            }
+        }
+        
+        // Delayed shipment multiplier
+        if (calculateIsDelayed(shipment)) {
+            finalScore *= DELAYED_MULTIPLIER
+        }
+        
+        return finalScore.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Determine priority level based on score
+     */
+    private fun determinePriorityLevel(score: Double): PriorityLevel {
+        return when {
+            score >= URGENT_THRESHOLD -> PriorityLevel.URGENT
+            score >= HIGH_THRESHOLD -> PriorityLevel.HIGH
+            score >= NORMAL_THRESHOLD -> PriorityLevel.NORMAL
+            else -> PriorityLevel.LOW
+        }
+    }
+    
+    /**
+     * Calculate confidence score for priority calculation
+     */
+    private fun calculateConfidenceScore(
+        shipment: Shipment,
+        customer: Customer?
+    ): Double {
+        var confidence = 80.0 // Base confidence
+        
+        // Data completeness
+        var dataCompleteness = 0
+        var totalFields = 0
+        
+        // Check shipment fields
+        totalFields += 8
+        if (shipment.priority.isNotBlank()) dataCompleteness++
+        if (shipment.revenue != null) dataCompleteness++
+        if (shipment.weight > 0) dataCompleteness++
+        if (shipment.volume > 0) dataCompleteness++
+        if (shipment.pickupAddress.isNotBlank()) dataCompleteness++
+        if (shipment.deliveryAddress.isNotBlank()) dataCompleteness++
+        if (shipment.customerId.isNotBlank()) dataCompleteness++
+        if (shipment.createdAt != null) dataCompleteness++
+        
+        // Check customer fields
+        if (customer != null) {
+            totalFields += 4
+            if (customer.tier.isNotBlank()) dataCompleteness++
+            if (customer.rating != null) dataCompleteness++
+            if (customer.onTimeDeliveryRate != null) dataCompleteness++
+            if (customer.monthlyShipments != null) dataCompleteness++
+        }
+        
+        val completenessRatio = dataCompleteness.toDouble() / totalFields
+        confidence += (completenessRatio - 0.5) * 40
+        
+        // Data recency
+        val hoursSinceCreation = ChronoUnit.HOURS.between(
+            shipment.createdAt,
+            LocalDateTime.now()
+        )
+        
+        when {
+            hoursSinceCreation <= 1 -> confidence += 10
+            hoursSinceCreation <= 6 -> confidence += 5
+            hoursSinceCreation <= 24 -> confidence += 2
+            hoursSinceCreation > 168 -> confidence -= 10 // More than a week old
+        }
+        
+        return confidence.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Check if shipment is delayed
+     */
+    private fun calculateIsDelayed(shipment: Shipment): Boolean {
+        if (shipment.deliveryTimeWindow == null) return false
+        
+        val timeUntilDeadline = ChronoUnit.MINUTES.between(
+            LocalDateTime.now(),
+            shipment.deliveryTimeWindow
+        )
+        
+        return timeUntilDeadline < 0 // Past deadline
+    }
+    
+    /**
+     * Prioritize a list of shipments
+     */
+    suspend fun prioritizeShipments(
+        shipments: List<Shipment>,
+        customers: Map<String, Customer> = emptyMap()
+    ): List<PriorityResult> {
+        return withContext(Dispatchers.IO) {
+            shipments.map { shipment ->
+                val customer = customers[shipment.customerId]
+                calculatePriorityScore(shipment, customer)
+            }.sortedByDescending { it.finalScore }
+        }
+    }
+    
+    /**
+     * Get priority statistics for a list of shipments
+     */
+    suspend fun getPriorityStatistics(
+        priorityResults: List<PriorityResult>
+    ): PriorityStatistics {
+        return withContext(Dispatchers.IO) {
+            val totalShipments = priorityResults.size
+            
+            val priorityDistribution = PriorityLevel.values().associateWith { level ->
+                priorityResults.count { it.priorityLevel == level }
+            }
+            
+            val averageScore = priorityResults.map { it.finalScore }.average()
+            val averageConfidence = priorityResults.map { it.confidenceScore }.average()
+            
+            val highConfidenceCount = priorityResults.count { it.confidenceScore >= 80 }
+            val urgentCount = priorityResults.count { it.priorityLevel == PriorityLevel.URGENT }
+            
+            PriorityStatistics(
+                totalShipments = totalShipments,
+                priorityDistribution = priorityDistribution,
+                averageScore = averageScore,
+                averageConfidence = averageConfidence,
+                highConfidenceCount = highConfidenceCount,
+                urgentCount = urgentCount,
+                calculatedAt = LocalDateTime.now()
+            )
+        }
+    }
+    
+    /**
+     * Update priority rules based on business needs
+     */
+    fun updatePriorityRules(rules: PriorityRules) {
+        // This would update the weights and thresholds
+        // Implementation would depend on how rules are stored
+        Log.i(TAG, "Priority rules updated: $rules")
+    }
+}
+
+/**
+ * Data class for priority calculation result
+ */
+data class PriorityResult(
+    val shipmentId: String,
+    val baseScore: Double,
+    val finalScore: Double,
+    val priorityLevel: PriorityLevel,
+    val urgencyScore: Double,
+    val customerScore: Double,
+    val distanceScore: Double,
+    val timeScore: Double,
+    val revenueScore: Double,
+    val confidenceScore: Double,
+    val factors: PriorityFactors,
+    val calculatedAt: LocalDateTime
+) {
+    companion object {
+        fun createDefault(shipmentId: String): PriorityResult {
+            return PriorityResult(
+                shipmentId = shipmentId,
+                baseScore = 50.0,
+                finalScore = 50.0,
+                priorityLevel = PriorityLevel.NORMAL,
+                urgencyScore = 50.0,
+                customerScore = 50.0,
+                distanceScore = 50.0,
+                timeScore = 50.0,
+                revenueScore = 50.0,
+                confidenceScore = 50.0,
+                factors = PriorityFactors(
+                    urgency = false,
+                    customerTier = false,
+                    isExpress = false,
+                    isDelayed = false,
+                    highRevenue = false
+                ),
+                calculatedAt = LocalDateTime.now()
+            )
+        }
+    }
+}
+
+/**
+ * Priority levels enum
+ */
+enum class PriorityLevel(val value: String, val weight: Double) {
+    URGENT("URGENT", 4.0),
+    HIGH("HIGH", 3.0),
+    NORMAL("NORMAL", 2.0),
+    LOW("LOW", 1.0)
+}
+
+/**
+ * Priority factors data class
+ */
+data class PriorityFactors(
+    val urgency: Boolean,
+    val customerTier: Boolean,
+    val isExpress: Boolean,
+    val isDelayed: Boolean,
+    val highRevenue: Boolean
+)
+
+/**
+ * Priority statistics data class
+ */
+data class PriorityStatistics(
+    val totalShipments: Int,
+    val priorityDistribution: Map<PriorityLevel, Int>,
+    val averageScore: Double,
+    val averageConfidence: Double,
+    val highConfidenceCount: Int,
+    val urgentCount: Int,
+    val calculatedAt: LocalDateTime
+)
+
+/**
+ * Priority rules configuration
+ */
+data class PriorityRules(
+    val urgencyWeight: Double = 0.35,
+    val customerWeight: Double = 0.25,
+    val distanceWeight: Double = 0.20,
+    val timeWeight: Double = 0.15,
+    val revenueWeight: Double = 0.05,
+    val urgentThreshold: Double = 80.0,
+    val highThreshold: Double = 60.0,
+    val normalThreshold: Double = 40.0,
+    val expressMultiplier: Double = 1.5,
+    val vipMultiplier: Double = 1.3,
+    val premiumMultiplier: Double = 1.2
+)

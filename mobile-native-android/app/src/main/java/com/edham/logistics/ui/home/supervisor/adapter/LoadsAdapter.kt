@@ -8,8 +8,10 @@ import androidx.recyclerview.widget.RecyclerView
 import com.edham.logistics.R
 import com.edham.logistics.feature.driver.data.models.Trip
 
-class LoadsAdapter(private var trips: List<Trip>) :
-    RecyclerView.Adapter<LoadsAdapter.ViewHolder>() {
+class LoadsAdapter(
+    private var loads: List<Trip>,
+    private val onItemClick: (Trip) -> Unit
+) : RecyclerView.Adapter<LoadsAdapter.ViewHolder>() {
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val loadId: TextView = view.findViewById(R.id.tvLoadId)
@@ -27,34 +29,36 @@ class LoadsAdapter(private var trips: List<Trip>) :
     }
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
-        val trip = trips[position]
-        holder.loadId.text = "#${trip.tripId}"
-        holder.clientName.text = trip.routeSummary // Use routeSummary for client placeholder if needed
-        holder.route.text = "${trip.origin} ← ${trip.destination}"
-        holder.weight.text = "${trip.distance} كم" // Placeholder weight with distance
-        holder.content.text = "حمولة مبردة" // Placeholder
-        holder.statusBadge.text = trip.status
+        val load = loads[position]
+        holder.itemView.setOnClickListener { onItemClick(load) }
+
+        holder.loadId.text = load.tripId
+        holder.clientName.text = "عميل إدهام" // Trip model missing clientName
+        holder.route.text = "${load.origin} ← ${load.destination}"
+        holder.weight.text = "25 طن" // Trip model missing weight
+        holder.content.text = "حمولة مبردة" // Placeholder or extract if added to Load
+        holder.statusBadge.text = load.status
         
-        when(trip.status.uppercase()) {
+        when(load.status.uppercase()) {
             "COMPLETED", "DELIVERED" -> {
-                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.html_success))
-                holder.statusBadge.setBackgroundResource(R.drawable.ed_badge_success)
+                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.status_success))
+                holder.statusBadge.setBackgroundResource(R.drawable.bg_role_badge)
             }
             "IN_TRANSIT", "STARTED" -> {
-                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.html_info))
-                holder.statusBadge.setBackgroundResource(R.drawable.badge_info)
+                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.status_info))
+                holder.statusBadge.setBackgroundResource(R.drawable.bg_tag_blue)
             }
             else -> {
-                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.html_warning))
-                holder.statusBadge.setBackgroundResource(R.drawable.warning_badge_background)
+                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.status_warning))
+                holder.statusBadge.setBackgroundResource(R.drawable.bg_tag_orange)
             }
         }
     }
 
-    override fun getItemCount() = trips.size
+    override fun getItemCount() = loads.size
 
-    fun updateData(newTrips: List<Trip>) {
-        this.trips = newTrips
+    fun updateData(newLoads: List<Trip>) {
+        this.loads = newLoads
         notifyDataSetChanged()
     }
 }

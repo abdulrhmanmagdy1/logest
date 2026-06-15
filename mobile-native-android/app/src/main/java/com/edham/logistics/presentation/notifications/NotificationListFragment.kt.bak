@@ -1,0 +1,361 @@
+package com.edham.logistics.presentation.notifications
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentNotificationListBinding
+import com.edham.logistics.core.notifications.NotificationEvent
+import com.edham.logistics.core.notifications.NotificationPriority
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+
+/**
+ * Notification List Fragment - Displays list of notifications
+ * Provides filtering, searching, and management capabilities
+ */
+@AndroidEntryPoint
+class NotificationListFragment : Fragment() {
+
+    private var _binding: FragmentNotificationListBinding? = null
+    private val binding get() = _binding!!
+
+    private val viewModel: NotificationViewModel by viewModels()
+    private lateinit var notificationAdapter: NotificationAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentNotificationListBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupRecyclerView()
+        setupObservers()
+        setupClickListeners()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
+    /**
+     * Setup RecyclerView
+     */
+    private fun setupRecyclerView() {
+        notificationAdapter = NotificationAdapter(
+            onNotificationClick = { notification ->
+                // Handle notification click
+                viewModel.markNotificationAsRead(notification.id)
+            },
+            onNotificationDelete = { notification ->
+                // Handle notification delete
+                showDeleteConfirmationDialog(notification)
+            }
+        )
+
+        binding.recyclerViewNotifications.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = notificationAdapter
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                    super.onScrolled(recyclerView, dx, dy)
+                    // Handle scroll events if needed
+                }
+            })
+        }
+    }
+
+    /**
+     * Setup observers
+     */
+    private fun setupObservers() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe notifications
+            viewModel.notifications.collectLatest { notifications ->
+                notificationAdapter.submitList(notifications)
+                updateEmptyState(notifications.isEmpty())
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe unread notifications
+            viewModel.unreadNotifications.collectLatest { unreadNotifications ->
+                binding.textViewUnreadCount.text = unreadNotifications.size.toString()
+                binding.textViewUnreadCount.visibility = 
+                    if (unreadNotifications.isNotEmpty()) View.VISIBLE else View.GONE
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe loading state
+            viewModel.isLoading.collectLatest { isLoading ->
+                binding.progressBar.visibility = 
+                    if (isLoading) View.VISIBLE else View.GONE
+                binding.swipeRefreshLayout.isRefreshing = isLoading
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe error messages
+            viewModel.errorMessage.collectLatest { errorMessage ->
+                errorMessage?.let {
+                    showErrorDialog(it)
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe search query
+            viewModel.searchQuery.collectLatest { query ->
+                // Apply search filter
+                notificationAdapter.getFilter().filter(query)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe event filter
+            viewModel.selectedEvent.collectLatest { event ->
+                // Apply event filter
+                notificationAdapter.filterByEvent(event)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            // Observe priority filter
+            viewModel.selectedPriority.collectLatest { priority ->
+                // Apply priority filter
+                notificationAdapter.filterByPriority(priority)
+            }
+        }
+    }
+
+    /**
+     * Setup click listeners
+     */
+    private fun setupClickListeners() {
+        // Swipe to refresh
+        binding.swipeRefreshLayout.setOnRefreshListener {
+            viewModel.refresh()
+        }
+
+        // Search
+        binding.editTextSearch.setOnEditorActionListener { _, _, _ ->
+            val query = binding.editTextSearch.text.toString()
+            viewModel.searchNotifications(query)
+            true
+        }
+
+        // Filter buttons
+        binding.buttonFilterEvent.setOnClickListener {
+            showEventFilterDialog()
+        }
+
+        binding.buttonFilterPriority.setOnClickListener {
+            showPriorityFilterDialog()
+        }
+
+        // Clear filters
+        binding.buttonClearFilters.setOnClickListener {
+            viewModel.clearFilters()
+            binding.editTextSearch.text?.clear()
+        }
+
+        // Mark all as read
+        binding.buttonMarkAllRead.setOnClickListener {
+            showMarkAllReadDialog()
+        }
+
+        // Clear all
+        binding.buttonClearAll.setOnClickListener {
+            showClearAllDialog()
+        }
+
+        // Export
+        binding.buttonExport.setOnClickListener {
+            showExportDialog()
+        }
+
+        // Preferences
+        binding.buttonPreferences.setOnClickListener {
+            showPreferencesDialog()
+        }
+    }
+
+    /**
+     * Update empty state
+     */
+    private fun updateEmptyState(isEmpty: Boolean) {
+        if (isEmpty) {
+            binding.recyclerViewNotifications.visibility = View.GONE
+            binding.layoutEmptyState.visibility = View.VISIBLE
+        } else {
+            binding.recyclerViewNotifications.visibility = View.VISIBLE
+            binding.layoutEmptyState.visibility = View.GONE
+        }
+    }
+
+    /**
+     * Show delete confirmation dialog
+     */
+    private fun showDeleteConfirmationDialog(notification: SmartNotification) {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.delete_notification_title))
+            .setMessage(getString(R.string.delete_notification_message, notification.title))
+            .setPositiveButton(getString(R.string.delete)) { _, _ ->
+                viewModel.deleteNotification(notification.id)
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    /**
+     * Show event filter dialog
+     */
+    private fun showEventFilterDialog() {
+        val events = NotificationEvent.values()
+        val eventNames = events.map { 
+            when (it) {
+                NotificationEvent.SHIPMENT_DELAYED -> getString(R.string.shipment_delayed)
+                NotificationEvent.SHIPMENT_DELIVERED -> getString(R.string.shipment_delivered)
+                NotificationEvent.SHIPMENT_PICKED_UP -> getString(R.string.shipment_picked_up)
+                NotificationEvent.TEMPERATURE_ISSUE -> getString(R.string.temperature_issue)
+                NotificationEvent.PAYMENT_OVERDUE -> getString(R.string.payment_overdue)
+                NotificationEvent.PAYMENT_RECEIVED -> getString(R.string.payment_received)
+                NotificationEvent.SYSTEM_UPDATE -> getString(R.string.system_update)
+                NotificationEvent.MAINTENANCE_SCHEDULED -> getString(R.string.maintenance_scheduled)
+            }
+        }.toTypedArray()
+
+        var selectedIndex = -1
+
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.filter_by_event))
+            .setSingleChoiceItems(eventNames, selectedIndex) { dialog, which ->
+                selectedIndex = which
+            }
+            .setPositiveButton(getString(R.string.apply)) { _, _ ->
+                if (selectedIndex >= 0) {
+                    viewModel.filterByEvent(events[selectedIndex])
+                }
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    /**
+     * Show priority filter dialog
+     */
+    private fun showPriorityFilterDialog() {
+        val priorities = NotificationPriority.values()
+        val priorityNames = priorities.map {
+            when (it) {
+                NotificationPriority.CRITICAL -> getString(R.string.priority_critical)
+                NotificationPriority.HIGH -> getString(R.string.priority_high)
+                NotificationPriority.NORMAL -> getString(R.string.priority_normal)
+                NotificationPriority.LOW -> getString(R.string.priority_low)
+            }
+        }.toTypedArray()
+
+        var selectedIndex = -1
+
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.filter_by_priority))
+            .setSingleChoiceItems(priorityNames, selectedIndex) { dialog, which ->
+                selectedIndex = which
+            }
+            .setPositiveButton(getString(R.string.apply)) { _, _ ->
+                if (selectedIndex >= 0) {
+                    viewModel.filterByPriority(priorities[selectedIndex])
+                }
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    /**
+     * Show mark all as read dialog
+     */
+    private fun showMarkAllReadDialog() {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.mark_all_read_title))
+            .setMessage(getString(R.string.mark_all_read_message))
+            .setPositiveButton(getString(R.string.mark_all_read)) { _, _ ->
+                viewModel.markAllNotificationsAsRead()
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    /**
+     * Show clear all dialog
+     */
+    private fun showClearAllDialog() {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.clear_all_title))
+            .setMessage(getString(R.string.clear_all_message))
+            .setPositiveButton(getString(R.string.clear_all)) { _, _ ->
+                viewModel.clearAllNotifications()
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    /**
+     * Show export dialog
+     */
+    private fun showExportDialog() {
+        val formats = arrayOf("JSON", "CSV", "XML")
+        var selectedIndex = 0
+
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.export_notifications))
+            .setSingleChoiceItems(formats, selectedIndex) { _, which ->
+                selectedIndex = which
+            }
+            .setPositiveButton(getString(R.string.export)) { _, _ ->
+                val format = when (selectedIndex) {
+                    0 -> ExportFormat.JSON
+                    1 -> ExportFormat.CSV
+                    2 -> ExportFormat.XML
+                    else -> ExportFormat.JSON
+                }
+                viewModel.exportNotifications(format)
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    /**
+     * Show preferences dialog
+     */
+    private fun showPreferencesDialog() {
+        // Navigate to preferences fragment or show dialog
+        // This would open the NotificationPreferencesFragment
+    }
+
+    /**
+     * Show error dialog
+     */
+    private fun showErrorDialog(message: String) {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(getString(R.string.error))
+            .setMessage(message)
+            .setPositiveButton(getString(R.string.ok), null)
+            .show()
+    }
+}

@@ -1,0 +1,233 @@
+package com.edham.logistics.feature.tracking.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.tracking.domain.usecase.*
+import com.edham.logistics.feature.tracking.domain.model.*
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import com.google.android.gms.maps.model.LatLng
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class CustomerTrackingViewModel @Inject constructor(
+    private val getShipmentTrackingUseCase: GetShipmentTrackingUseCase,
+    private val calculateETAUseCase: CalculateETAUseCase,
+    private val getRouteHistoryUseCase: GetRouteHistoryUseCase
+) : BaseViewModel<CustomerTrackingViewModel.CustomerTrackingUiState>() {
+
+    private val _uiState = MutableStateFlow(CustomerTrackingUiState())
+    val uiState: StateFlow<CustomerTrackingUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): CustomerTrackingUiState = CustomerTrackingUiState()
+
+    fun initialize(shipmentId: String) {
+        _uiState.value = _uiState.value.copy(shipmentId = shipmentId)
+        loadShipmentTracking(shipmentId)
+        startRealTimeUpdates(shipmentId)
+    }
+
+    fun loadShipmentTracking(shipmentId: String) {
+        viewModelScope.launch {
+            when (val result = getShipmentTrackingUseCase(shipmentId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        shipmentTracking = result.data,
+                        isLoading = false,
+                        error = null
+                    )}
+                    
+                    // Calculate ETA if not available
+                    if (result.data.estimatedArrivalTime == null) {
+                        calculateETA(result.data)
+                    }
+                }
+                is Result.Error -> {
+                    updateUiState { copy(
+                        isLoading = false,
+                        error = result.exception.message ?: "فشل تحميل بيانات التتبع"
+                    )}
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun startRealTimeUpdates(shipmentId: String) {
+        viewModelScope.launch {
+            getShipmentTrackingUseCase.observeShipmentTracking(shipmentId).collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            shipmentTracking = result.data,
+                            error = null
+                        )}
+                        
+                        // Recalculate ETA on location updates
+                        calculateETA(result.data)
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(error = result.exception.message ?: "خطأ في التحديثات المباشرة") }
+                    }
+                    is Result.Loading -> {
+                        // Handle loading state if needed
+                    }
+                }
+            }
+        }
+    }
+
+    private fun calculateETA(tracking: ShipmentTracking) {
+        viewModelScope.launch {
+            when (val result = calculateETAUseCase(
+                currentLocation = tracking.currentLocation,
+                destinationLocation = tracking.destinationLocation,
+                currentSpeed = tracking.speed
+            )) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        estimatedArrivalTime = result.data,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل حساب وقت الوصول") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun loadRouteHistory(shipmentId: String) {
+        viewModelScope.launch {
+            when (val result = getRouteHistoryUseCase(shipmentId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        routeHistory = result.data,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل سجل المسار") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun refreshTracking() {
+        _uiState.value.shipmentId?.let { shipmentId ->
+            loadShipmentTracking(shipmentId)
+        }
+    }
+
+    fun shareTracking(shipmentId: String) {
+        // Generate tracking URL
+        val trackingUrl = "https://edham-logistics.com/track/$shipmentId"
+        updateUiState { copy(
+            shareUrl = trackingUrl,
+            actionSuccess = "تم إنشاء رابط التتبع"
+        )}
+    }
+
+    fun clearShareUrl() {
+        updateUiState { copy(shareUrl = null) }
+    }
+
+    fun clearSuccess() {
+        updateUiState { copy(actionSuccess = null) }
+    }
+
+    fun toggleMapStyle() {
+        updateUiState { copy(isDarkMap = !_uiState.value.isDarkMap) }
+    }
+
+    fun toggleTrafficLayer() {
+        updateUiState { copy(showTrafficLayer = !_uiState.value.showTrafficLayer) }
+    }
+
+    fun centerMapOnVehicle() {
+        _uiState.value.shipmentTracking?.let { tracking ->
+            updateUiState { copy(
+                mapCenter = tracking.currentLocation,
+                mapZoom = 15f
+            )}
+        }
+    }
+
+    fun centerMapOnDestination() {
+        _uiState.value.shipmentTracking?.let { tracking ->
+            updateUiState { copy(
+                mapCenter = tracking.destinationLocation,
+                mapZoom = 15f
+            )}
+        }
+    }
+
+    fun showFullRoute() {
+        _uiState.value.shipmentTracking?.let { tracking ->
+            val allPoints = listOf(
+                tracking.pickupLocation,
+                *tracking.routePoints.toTypedArray(),
+                tracking.destinationLocation
+            )
+            updateUiState { copy(
+                showFullRoute = true,
+                routePoints = allPoints
+            )}
+        }
+    }
+
+    fun hideFullRoute() {
+        updateUiState { copy(
+            showFullRoute = false,
+            routePoints = emptyList()
+        )}
+    }
+
+    fun contactDriver() {
+        _uiState.value.shipmentTracking?.let { tracking ->
+            updateUiState { copy(
+                driverPhone = tracking.driverPhone,
+                actionSuccess = "رقم هاتف السائق: ${tracking.driverPhone}"
+            )}
+        }
+    }
+
+    fun reportIssue() {
+        // Navigate to issue reporting
+        updateUiState { copy(actionSuccess = "تم فتح نموذج الإبلاغ عن مشكلة") }
+    }
+
+    data class CustomerTrackingUiState(
+        val isLoading: Boolean = false,
+        val shipmentId: String? = null,
+        val shipmentTracking: ShipmentTracking? = null,
+        val routeHistory: RouteHistory? = null,
+        val estimatedArrivalTime: Long? = null,
+        val shareUrl: String? = null,
+        val driverPhone: String? = null,
+        val mapCenter: LatLng? = null,
+        val mapZoom: Float = 12f,
+        val isDarkMap: Boolean = false,
+        val showTrafficLayer: Boolean = true,
+        val showFullRoute: Boolean = false,
+        val routePoints: List<LatLng> = emptyList(),
+        val error: String? = null,
+        val actionSuccess: String? = null
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = copy(actionSuccess = message)
+    }
+}

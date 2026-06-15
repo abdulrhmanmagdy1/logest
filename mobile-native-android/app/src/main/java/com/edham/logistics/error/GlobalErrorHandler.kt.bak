@@ -1,0 +1,293 @@
+package com.edham.logistics.error
+
+import android.content.Context
+import android.util.Log
+import com.edham.logistics.R
+import com.edham.logistics.data.remote.ApiResult
+import com.edham.logistics.data.remote.model.ApiErrorResponse
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.retry
+import retrofit2.HttpException
+import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import javax.net.ssl.SSLException
+
+/**
+ * Global Error Handler
+ * Central error handling system for API failures with user-friendly messages
+ */
+class GlobalErrorHandler(private val context: Context) {
+    
+    companion object {
+        private const val TAG = "GlobalErrorHandler"
+        private const val MAX_RETRY_ATTEMPTS = 3
+        private const val RETRY_DELAY_MS = 1000L
+    }
+    
+    /**
+     * Handle API errors and return user-friendly messages
+     */
+    fun handleApiError(throwable: Throwable): ErrorResult {
+        return when (throwable) {
+            is HttpException -> handleHttpException(throwable)
+            is IOException -> handleNetworkError(throwable)
+            is SocketTimeoutException -> handleTimeoutError(throwable)
+            is UnknownHostException -> handleHostError(throwable)
+            is SSLException -> handleSSLError(throwable)
+            else -> handleGenericError(throwable)
+        }
+    }
+    
+    /**
+     * Handle HTTP errors (4xx, 5xx)
+     */
+    private fun handleHttpException(exception: HttpException): ErrorResult {
+        val errorCode = exception.code()
+        val errorResponse = try {
+            exception.response()?.errorBody()?.string()
+        } catch (e: Exception) {
+            null
+        }
+        
+        return when (errorCode) {
+            400 -> ErrorResult(
+                type = ErrorType.VALIDATION_ERROR,
+                title = context.getString(R.string.error_bad_request_title),
+                message = context.getString(R.string.error_bad_request_message),
+                isRetryable = false,
+                userAction = UserAction.CHECK_INPUT
+            )
+            
+            401 -> ErrorResult(
+                type = ErrorType.AUTHENTICATION_ERROR,
+                title = context.getString(R.string.error_unauthorized_title),
+                message = context.getString(R.string.error_unauthorized_message),
+                isRetryable = false,
+                userAction = UserAction.LOGIN_AGAIN
+            )
+            
+            403 -> ErrorResult(
+                type = ErrorType.AUTHORIZATION_ERROR,
+                title = context.getString(R.string.error_forbidden_title),
+                message = context.getString(R.string.error_forbidden_message),
+                isRetryable = false,
+                userAction = UserAction.CONTACT_SUPPORT
+            )
+            
+            404 -> ErrorResult(
+                type = ErrorType.NOT_FOUND_ERROR,
+                title = context.getString(R.string.error_not_found_title),
+                message = context.getString(R.string.error_not_found_message),
+                isRetryable = false,
+                userAction = UserAction.REFRESH
+            )
+            
+            429 -> ErrorResult(
+                type = ErrorType.RATE_LIMIT_ERROR,
+                title = context.getString(R.string.error_rate_limit_title),
+                message = context.getString(R.string.error_rate_limit_message),
+                isRetryable = true,
+                retryDelay = 60000L, // 1 minute
+                userAction = UserAction.WAIT_AND_RETRY
+            )
+            
+            in 500..599 -> ErrorResult(
+                type = ErrorType.SERVER_ERROR,
+                title = context.getString(R.string.error_server_title),
+                message = context.getString(R.string.error_server_message),
+                isRetryable = true,
+                userAction = UserAction.RETRY
+            )
+            
+            else -> ErrorResult(
+                type = ErrorType.UNKNOWN_ERROR,
+                title = context.getString(R.string.error_unknown_title),
+                message = context.getString(R.string.error_unknown_message),
+                isRetryable = true,
+                userAction = UserAction.RETRY
+            )
+        }
+    }
+    
+    /**
+     * Handle network errors
+     */
+    private fun handleNetworkError(exception: IOException): ErrorResult {
+        return ErrorResult(
+            type = ErrorType.NETWORK_ERROR,
+            title = context.getString(R.string.error_network_title),
+            message = context.getString(R.string.error_network_message),
+            isRetryable = true,
+            userAction = UserAction.CHECK_CONNECTION
+        )
+    }
+    
+    /**
+     * Handle timeout errors
+     */
+    private fun handleTimeoutError(exception: SocketTimeoutException): ErrorResult {
+        return ErrorResult(
+            type = ErrorType.TIMEOUT_ERROR,
+            title = context.getString(R.string.error_timeout_title),
+            message = context.getString(R.string.error_timeout_message),
+            isRetryable = true,
+            userAction = UserAction.RETRY
+        )
+    }
+    
+    /**
+     * Handle host errors
+     */
+    private fun handleHostError(exception: UnknownHostException): ErrorResult {
+        return ErrorResult(
+            type = ErrorType.HOST_ERROR,
+            title = context.getString(R.string.error_host_title),
+            message = context.getString(R.string.error_host_message),
+            isRetryable = true,
+            userAction = UserAction.CHECK_CONNECTION
+        )
+    }
+    
+    /**
+     * Handle SSL errors
+     */
+    private fun handleSSLError(exception: SSLException): ErrorResult {
+        return ErrorResult(
+            type = ErrorType.SSL_ERROR,
+            title = context.getString(R.string.error_ssl_title),
+            message = context.getString(R.string.error_ssl_message),
+            isRetryable = false,
+            userAction = UserAction.CONTACT_SUPPORT
+        )
+    }
+    
+    /**
+     * Handle generic errors
+     */
+    private fun handleGenericError(exception: Throwable): ErrorResult {
+        return ErrorResult(
+            type = ErrorType.UNKNOWN_ERROR,
+            title = context.getString(R.string.error_generic_title),
+            message = context.getString(R.string.error_generic_message),
+            isRetryable = true,
+            userAction = UserAction.RETRY
+        )
+    }
+    
+    /**
+     * Execute API call with retry mechanism
+     */
+    fun <T> executeWithRetry(
+        apiCall: suspend () -> T,
+        maxRetries: Int = MAX_RETRY_ATTEMPTS,
+        retryDelay: Long = RETRY_DELAY_MS
+    ): Flow<ApiResult<T>> = flow {
+        try {
+            val result = apiCall()
+            emit(ApiResult.Success(result))
+        } catch (e: Exception) {
+            val errorResult = handleApiError(e)
+            emit(ApiResult.Error(errorResult))
+        }
+    }.retry(maxRetries) { throwable ->
+        val errorResult = handleApiError(throwable)
+        val shouldRetry = errorResult.isRetryable
+        
+        if (shouldRetry) {
+            Log.w(TAG, "Retrying API call after ${retryDelay}ms delay", throwable)
+            kotlinx.coroutines.delay(retryDelay)
+        }
+        
+        shouldRetry
+    }.catch { throwable ->
+        // Final error after all retries
+        val errorResult = handleApiError(throwable)
+        emit(ApiResult.Error(errorResult))
+    }
+    
+    /**
+     * Log error for developers
+     */
+    fun logError(tag: String, error: Throwable, context: String? = null) {
+        val logMessage = buildString {
+            append("Error occurred")
+            context?.let { append(" in context: $it") }
+            append("\nType: ${error::class.simpleName}")
+            append("\nMessage: ${error.message}")
+            error.stackTrace.take(5).forEach { element ->
+                append("\n    at $element")
+            }
+        }
+        
+        when (error) {
+            is HttpException -> Log.e(tag, logMessage, error)
+            is IOException -> Log.w(tag, logMessage, error)
+            else -> Log.e(tag, logMessage, error)
+        }
+    }
+    
+    /**
+     * Get user-friendly error message
+     */
+    fun getUserFriendlyMessage(errorType: ErrorType): String {
+        return when (errorType) {
+            ErrorType.NETWORK_ERROR -> context.getString(R.string.error_network_user_message)
+            ErrorType.TIMEOUT_ERROR -> context.getString(R.string.error_timeout_user_message)
+            ErrorType.SERVER_ERROR -> context.getString(R.string.error_server_user_message)
+            ErrorType.AUTHENTICATION_ERROR -> context.getString(R.string.error_auth_user_message)
+            ErrorType.AUTHORIZATION_ERROR -> context.getString(R.string.error_permission_user_message)
+            ErrorType.VALIDATION_ERROR -> context.getString(R.string.error_validation_user_message)
+            ErrorType.NOT_FOUND_ERROR -> context.getString(R.string.error_not_found_user_message)
+            ErrorType.RATE_LIMIT_ERROR -> context.getString(R.string.error_rate_limit_user_message)
+            ErrorType.SSL_ERROR -> context.getString(R.string.error_ssl_user_message)
+            ErrorType.HOST_ERROR -> context.getString(R.string.error_host_user_message)
+            ErrorType.UNKNOWN_ERROR -> context.getString(R.string.error_unknown_user_message)
+        }
+    }
+}
+
+/**
+ * Error result data class
+ */
+data class ErrorResult(
+    val type: ErrorType,
+    val title: String,
+    val message: String,
+    val isRetryable: Boolean,
+    val retryDelay: Long = 1000L,
+    val userAction: UserAction,
+    val technicalDetails: String? = null
+)
+
+/**
+ * Error types
+ */
+enum class ErrorType {
+    NETWORK_ERROR,
+    TIMEOUT_ERROR,
+    SERVER_ERROR,
+    AUTHENTICATION_ERROR,
+    AUTHORIZATION_ERROR,
+    VALIDATION_ERROR,
+    NOT_FOUND_ERROR,
+    RATE_LIMIT_ERROR,
+    SSL_ERROR,
+    HOST_ERROR,
+    UNKNOWN_ERROR
+}
+
+/**
+ * User actions for error recovery
+ */
+enum class UserAction {
+    RETRY,
+    CHECK_CONNECTION,
+    LOGIN_AGAIN,
+    CONTACT_SUPPORT,
+    CHECK_INPUT,
+    WAIT_AND_RETRY,
+    REFRESH
+}

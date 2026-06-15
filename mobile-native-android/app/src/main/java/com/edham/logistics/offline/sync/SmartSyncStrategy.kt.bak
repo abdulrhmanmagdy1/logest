@@ -1,0 +1,850 @@
+package com.edham.logistics.offline.sync
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Smart Sync Strategy - Intelligent synchronization with adaptive strategies
+ * Implements machine learning-based sync decisions, priority management, and performance optimization
+ */
+
+// Temporarily disabled due to missing dependencies
+// @Singleton
+// class SmartSyncStrategy @Inject constructor(
+//     private val networkMonitor: NetworkMonitor,
+//     private val syncQueue: SyncQueue,
+//     private val deltaSyncManager: DeltaSyncManager,
+//     private val autoSyncManager: AutoSyncManager,
+//     private val retryManager: RetryManager
+// ) {
+class SmartSyncStrategy {
+
+    private val syncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    // Sync strategy configuration
+    private val syncStrategies = mutableMapOf<SyncContext, SyncStrategy>()
+    private val performanceMetrics = mutableMapOf<SyncStrategy, StrategyPerformance>()
+    
+    // Learning data
+    private val syncHistory = mutableListOf<SyncRecord>()
+    private val networkConditions = mutableListOf<NetworkCondition>()
+    private val userPatterns = mutableMapOf<String, UserPattern>()
+    
+    // Smart sync statistics
+    private val _smartSyncStats = MutableStateFlow(SmartSyncStats())
+    val smartSyncStats: StateFlow<SmartSyncStats> = _smartSyncStats.asStateFlow()
+
+    init {
+        initializeStrategies()
+        startSmartSyncProcessor()
+    }
+
+    /**
+     * Initialize sync strategies
+     */
+    private fun initializeStrategies() {
+        syncStrategies[SyncContext.HIGH_PRIORITY] = SyncStrategy(
+            name = "HIGH_PRIORITY",
+            interval = 30000L, // 30 seconds
+            batchSize = 5,
+            retryAttempts = 5,
+            priority = 1,
+            requiresNetwork = true,
+            adaptive = true
+        )
+        
+        syncStrategies[SyncContext.NORMAL_PRIORITY] = SyncStrategy(
+            name = "NORMAL_PRIORITY",
+            interval = 60000L, // 1 minute
+            batchSize = 10,
+            retryAttempts = 3,
+            priority = 2,
+            requiresNetwork = true,
+            adaptive = true
+        )
+        
+        syncStrategies[SyncContext.LOW_PRIORITY] = SyncStrategy(
+            name = "LOW_PRIORITY",
+            interval = 300000L, // 5 minutes
+            batchSize = 20,
+            retryAttempts = 2,
+            priority = 3,
+            requiresNetwork = false, // Can sync when network is available
+            adaptive = true
+        )
+        
+        syncStrategies[SyncContext.BACKGROUND] = SyncStrategy(
+            name = "BACKGROUND",
+            interval = 600000L, // 10 minutes
+            batchSize = 50,
+            retryAttempts = 1,
+            priority = 4,
+            requiresNetwork = false,
+            adaptive = true
+        )
+        
+        syncStrategies[SyncContext.EMERGENCY] = SyncStrategy(
+            name = "EMERGENCY",
+            interval = 5000L, // 5 seconds
+            batchSize = 1,
+            retryAttempts = 10,
+            priority = 0, // Highest priority
+            requiresNetwork = true,
+            adaptive = false // Fixed strategy for emergencies
+        )
+    }
+
+    /**
+     * Start smart sync processor
+     */
+    private fun startSmartSyncProcessor() {
+        syncScope.launch {
+            while (isActive) {
+                try {
+                    // Analyze current conditions
+                    val currentConditions = analyzeCurrentConditions()
+                    
+                    // Select optimal strategy for each context
+                    syncStrategies.forEach { (context, strategy) ->
+                        val optimizedStrategy = optimizeStrategy(context, strategy, currentConditions)
+                        
+                        // Execute sync if conditions are met
+                        if (shouldExecuteSync(context, optimizedStrategy, currentConditions)) {
+                            executeSmartSync(context, optimizedStrategy)
+                        }
+                    }
+                    
+                    // Update learning data
+                    updateLearningData()
+                    
+                    // Adapt strategies based on performance
+                    adaptStrategies()
+                    
+                    delay(30000) // Check every 30 seconds
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in smart sync processor")
+                    delay(60000) // Wait longer on error
+                }
+            }
+        }
+    }
+
+    /**
+     * Execute smart sync for a context
+     */
+    private suspend fun executeSmartSync(context: SyncContext, strategy: SyncStrategy) {
+        val startTime = System.currentTimeMillis()
+        var success = false
+        var operationsProcessed = 0
+        var errors = 0
+
+        try {
+            Timber.d("Executing smart sync for $context with strategy ${strategy.name}")
+            
+            // Get operations for this context
+            val operations = getOperationsForContext(context)
+            
+            if (operations.isEmpty()) {
+                Timber.d("No operations to sync for $context")
+                return
+            }
+            
+            // Process operations in batches
+            val batches = operations.chunked(strategy.batchSize)
+            
+            for (batch in batches) {
+                if (!networkMonitor.isOnline() && strategy.requiresNetwork) {
+                    Timber.d("Network required but unavailable, pausing sync for $context")
+                    break
+                }
+                
+                val batchResult = processBatch(batch, strategy)
+                operationsProcessed += batchResult.processed
+                errors += batchResult.errors
+                
+                if (!batchResult.success) {
+                    Timber.w("Batch failed for $context: ${batchResult.error}")
+                }
+            }
+            
+            success = errors == 0
+            
+            // Record sync attempt
+            recordSyncAttempt(context, strategy, operationsProcessed, errors, System.currentTimeMillis() - startTime)
+            
+            Timber.d("Smart sync completed for $context: $operationsProcessed operations, $errors errors")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error executing smart sync for $context")
+            errors++
+            recordSyncAttempt(context, strategy, operationsProcessed, errors, System.currentTimeMillis() - startTime)
+        }
+    }
+
+    /**
+     * Process a batch of operations
+     */
+    private suspend fun processBatch(operations: List<SyncOperation>, strategy: SyncStrategy): BatchResult {
+        try {
+            when (strategy.name) {
+                "HIGH_PRIORITY", "EMERGENCY" -> {
+                    // Process immediately with high priority
+                    return processHighPriorityBatch(operations)
+                }
+                "NORMAL_PRIORITY" -> {
+                    // Use delta sync for efficiency
+                    return processDeltaSyncBatch(operations)
+                }
+                "LOW_PRIORITY", "BACKGROUND" -> {
+                    // Use adaptive batching
+                    return processAdaptiveBatch(operations)
+                }
+                else -> {
+                    return processStandardBatch(operations)
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error processing batch")
+            return BatchResult(false, 0, 1, e.message)
+        }
+    }
+
+    /**
+     * Process high priority batch
+     */
+    private suspend fun processHighPriorityBatch(operations: List<SyncOperation>): BatchResult {
+        return try {
+            var processed = 0
+            var errors = 0
+            
+            for (operation in operations) {
+                try {
+                    // Process immediately without queuing
+                    val result = processOperationImmediately(operation)
+                    if (result) {
+                        processed++
+                        syncQueue.markCompleted(operation.id)
+                    } else {
+                        errors++
+                        syncQueue.markFailed(operation.id, "Immediate processing failed")
+                    }
+                } catch (e: Exception) {
+                    Timber.e(e, "Error processing high priority operation ${operation.id}")
+                    errors++
+                    syncQueue.markFailed(operation.id, e.message ?: "Unknown error")
+                }
+            }
+            
+            BatchResult(errors == 0, processed, errors, null)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error in high priority batch processing")
+            BatchResult(false, 0, operations.size, e.message)
+        }
+    }
+
+    /**
+     * Process delta sync batch
+     */
+    private suspend fun processDeltaSyncBatch(operations: List<SyncOperation>): BatchResult {
+        return try {
+            // Use delta sync manager for efficient processing
+            val deltaResult = deltaSyncManager.performDeltaSync()
+            
+            BatchResult(
+                success = deltaResult.success,
+                processed = deltaResult.entitiesSynced,
+                errors = deltaResult.errors,
+                error = if (deltaResult.errors > 0) "Delta sync errors" else null
+            )
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error in delta sync batch processing")
+            BatchResult(false, 0, operations.size, e.message)
+        }
+    }
+
+    /**
+     * Process adaptive batch
+     */
+    private suspend fun processAdaptiveBatch(operations: List<SyncOperation>): BatchResult {
+        return try {
+            // Analyze current network conditions and adapt accordingly
+            val networkQuality = networkMonitor.getNetworkQuality()
+            
+            when (networkQuality) {
+                NetworkQuality.EXCELLENT -> {
+                    // Process all operations at once
+                    processStandardBatch(operations)
+                }
+                NetworkQuality.GOOD -> {
+                    // Process in smaller batches
+                    val smallerBatches = operations.chunked(maxOf(1, operations.size / 2))
+                    var totalProcessed = 0
+                    var totalErrors = 0
+                    
+                    for (batch in smallerBatches) {
+                        val result = processStandardBatch(batch)
+                        totalProcessed += result.processed
+                        totalErrors += result.errors
+                    }
+                    
+                    BatchResult(totalErrors == 0, totalProcessed, totalErrors, null)
+                }
+                NetworkQuality.FAIR, NetworkQuality.POOR -> {
+                    // Process one by one with delays
+                    var processed = 0
+                    var errors = 0
+                    
+                    for (operation in operations) {
+                        val result = processStandardBatch(listOf(operation))
+                        processed += result.processed
+                        errors += result.errors
+                        
+                        // Add delay for poor network
+                        if (networkQuality == NetworkQuality.POOR) {
+                            delay(1000)
+                        }
+                    }
+                    
+                    BatchResult(errors == 0, processed, errors, null)
+                }
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error in adaptive batch processing")
+            BatchResult(false, 0, operations.size, e.message)
+        }
+    }
+
+    /**
+     * Process standard batch
+     */
+    private suspend fun processStandardBatch(operations: List<SyncOperation>): BatchResult {
+        return try {
+            var processed = 0
+            var errors = 0
+            
+            for (operation in operations) {
+                try {
+                    // Standard processing through sync queue
+                    syncQueue.enqueue(operation)
+                    processed++
+                } catch (e: Exception) {
+                    Timber.e(e, "Error processing operation ${operation.id}")
+                    errors++
+                }
+            }
+            
+            BatchResult(errors == 0, processed, errors, null)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error in standard batch processing")
+            BatchResult(false, 0, operations.size, e.message)
+        }
+    }
+
+    /**
+     * Process operation immediately
+     */
+    private suspend fun processOperationImmediately(operation: SyncOperation): Boolean {
+        return try {
+            // Simulate immediate processing
+            when (operation.type) {
+                OperationType.UPDATE_STATUS -> {
+                    delay(100) // Quick update
+                    true
+                }
+                OperationType.UPDATE_LOCATION -> {
+                    delay(200) // Location update
+                    true
+                }
+                else -> {
+                    delay(500) // Other operations
+                    true
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error in immediate processing")
+            false
+        }
+    }
+
+    /**
+     * Get operations for a specific context
+     */
+    private suspend fun getOperationsForContext(context: SyncContext): List<SyncOperation> {
+        return try {
+            val allOperations = syncQueue.getPendingOperations()
+            
+            when (context) {
+                SyncContext.EMERGENCY -> {
+                    allOperations.filter { 
+                        it.type in listOf(OperationType.UPDATE_STATUS, OperationType.UPDATE_LOCATION) &&
+                        it.timestamp > System.currentTimeMillis() - 300000 // Last 5 minutes
+                    }
+                }
+                SyncContext.HIGH_PRIORITY -> {
+                    allOperations.filter { 
+                        it.type in listOf(OperationType.CREATE_SHIPMENT, OperationType.UPDATE_SHIPMENT) &&
+                        it.retryCount < 3
+                    }
+                }
+                SyncContext.NORMAL_PRIORITY -> {
+                    allOperations.filter { 
+                        it.type in listOf(OperationType.DELETE_SHIPMENT, OperationType.UPLOAD_PROOF) &&
+                        it.retryCount < 2
+                    }
+                }
+                SyncContext.LOW_PRIORITY -> {
+                    allOperations.filter { 
+                        it.type in listOf(OperationType.SYNC_SHIPMENTS, OperationType.SYNC_MAPS_DATA) &&
+                        it.retryCount < 1
+                    }
+                }
+                SyncContext.BACKGROUND -> {
+                    allOperations.filter { it.retryCount == 0 }
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting operations for context $context")
+            emptyList()
+        }
+    }
+
+    /**
+     * Analyze current conditions
+     */
+    private fun analyzeCurrentConditions(): CurrentConditions {
+        return try {
+            val networkStatus = networkMonitor.observeNetworkStatus().first()
+            val networkQuality = networkMonitor.getNetworkQuality()
+            val batteryLevel = getBatteryLevel()
+            val deviceLoad = getDeviceLoad()
+            
+            CurrentConditions(
+                networkStatus = networkStatus,
+                networkQuality = networkQuality,
+                batteryLevel = batteryLevel,
+                deviceLoad = deviceLoad,
+                timeOfDay = getCurrentTimeOfDay(),
+                dayOfWeek = getCurrentDayOfWeek()
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Error analyzing current conditions")
+            CurrentConditions(
+                networkStatus = NetworkStatus.OFFLINE,
+                networkQuality = NetworkQuality.POOR,
+                batteryLevel = 50,
+                deviceLoad = 50,
+                timeOfDay = TimeOfDay.MORNING,
+                dayOfWeek = DayOfWeek.WEEKDAY
+            )
+        }
+    }
+
+    /**
+     * Optimize strategy based on conditions
+     */
+    private fun optimizeStrategy(
+        context: SyncContext,
+        baseStrategy: SyncStrategy,
+        conditions: CurrentConditions
+    ): SyncStrategy {
+        if (!baseStrategy.adaptive) {
+            return baseStrategy
+        }
+        
+        var optimizedStrategy = baseStrategy
+        
+        // Adapt based on network quality
+        when (conditions.networkQuality) {
+            NetworkQuality.EXCELLENT -> {
+                optimizedStrategy = optimizedStrategy.copy(
+                    interval = (baseStrategy.interval * 0.5).toLong(),
+                    batchSize = (baseStrategy.batchSize * 1.5).toInt()
+                )
+            }
+            NetworkQuality.GOOD -> {
+                // Keep current settings
+            }
+            NetworkQuality.FAIR -> {
+                optimizedStrategy = optimizedStrategy.copy(
+                    interval = (baseStrategy.interval * 1.5).toLong(),
+                    batchSize = maxOf(1, (baseStrategy.batchSize * 0.7).toInt())
+                )
+            }
+            NetworkQuality.POOR -> {
+                optimizedStrategy = optimizedStrategy.copy(
+                    interval = (baseStrategy.interval * 2.0).toLong(),
+                    batchSize = maxOf(1, (baseStrategy.batchSize * 0.5).toInt())
+                )
+            }
+        }
+        
+        // Adapt based on battery level
+        if (conditions.batteryLevel < 20) {
+            optimizedStrategy = optimizedStrategy.copy(
+                interval = (optimizedStrategy.interval * 2.0).toLong(),
+                batchSize = maxOf(1, (optimizedStrategy.batchSize * 0.5).toInt())
+            )
+        } else if (conditions.batteryLevel > 80) {
+            optimizedStrategy = optimizedStrategy.copy(
+                interval = (optimizedStrategy.interval * 0.8).toLong()
+            )
+        }
+        
+        // Adapt based on device load
+        if (conditions.deviceLoad > 80) {
+            optimizedStrategy = optimizedStrategy.copy(
+                interval = (optimizedStrategy.interval * 1.5).toLong(),
+                batchSize = maxOf(1, (optimizedStrategy.batchSize * 0.7).toInt())
+            )
+        }
+        
+        // Adapt based on time of day
+        when (conditions.timeOfDay) {
+            TimeOfDay.NIGHT -> {
+                optimizedStrategy = optimizedStrategy.copy(
+                    interval = (optimizedStrategy.interval * 1.5).toLong()
+                )
+            }
+            TimeOfDay.BUSINESS_HOURS -> {
+                optimizedStrategy = optimizedStrategy.copy(
+                    interval = (optimizedStrategy.interval * 0.8).toLong()
+                )
+            }
+            else -> {}
+        }
+        
+        return optimizedStrategy
+    }
+
+    /**
+     * Determine if sync should be executed
+     */
+    private fun shouldExecuteSync(
+        context: SyncContext,
+        strategy: SyncStrategy,
+        conditions: CurrentConditions
+    ): Boolean {
+        // Check network requirements
+        if (strategy.requiresNetwork && conditions.networkStatus != NetworkStatus.ONLINE) {
+            return false
+        }
+        
+        // Check if enough time has passed since last sync
+        val lastSync = getLastSyncTime(context)
+        if (System.currentTimeMillis() - lastSync < strategy.interval) {
+            return false
+        }
+        
+        // Check if there are operations to sync
+        val operations = getOperationsForContext(context)
+        if (operations.isEmpty()) {
+            return false
+        }
+        
+        // Check emergency conditions
+        if (context == SyncContext.EMERGENCY) {
+            return true
+        }
+        
+        return true
+    }
+
+    /**
+     * Update learning data
+     */
+    private fun updateLearningData() {
+        try {
+            // Update network conditions
+            val currentConditions = analyzeCurrentConditions()
+            networkConditions.add(NetworkCondition(
+                timestamp = System.currentTimeMillis(),
+                networkQuality = currentConditions.networkQuality,
+                batteryLevel = currentConditions.batteryLevel,
+                deviceLoad = currentConditions.deviceLoad
+            ))
+            
+            // Keep only last 24 hours of data
+            val twentyFourHoursAgo = System.currentTimeMillis() - (24 * 60 * 60 * 1000L)
+            networkConditions.removeIf { it.timestamp < twentyFourHoursAgo }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error updating learning data")
+        }
+    }
+
+    /**
+     * Adapt strategies based on performance
+     */
+    private fun adaptStrategies() {
+        try {
+            syncStrategies.forEach { (context, strategy) ->
+                val performance = getStrategyPerformance(strategy)
+                
+                if (performance != null) {
+                    // Adapt based on success rate
+                    if (performance.successRate < 0.8) {
+                        // Low success rate, increase retry attempts
+                        val adaptedStrategy = strategy.copy(
+                            retryAttempts = minOf(10, strategy.retryAttempts + 1)
+                        )
+                        syncStrategies[context] = adaptedStrategy
+                    } else if (performance.successRate > 0.95) {
+                        // High success rate, can reduce retry attempts
+                        val adaptedStrategy = strategy.copy(
+                            retryAttempts = maxOf(1, strategy.retryAttempts - 1)
+                        )
+                        syncStrategies[context] = adaptedStrategy
+                    }
+                    
+                    // Adapt based on average processing time
+                    if (performance.averageProcessingTime > 5000) { // 5 seconds
+                        val adaptedStrategy = strategy.copy(
+                            batchSize = maxOf(1, strategy.batchSize - 1)
+                        )
+                        syncStrategies[context] = adaptedStrategy
+                    } else if (performance.averageProcessingTime < 1000) { // 1 second
+                        val adaptedStrategy = strategy.copy(
+                            batchSize = minOf(50, strategy.batchSize + 1)
+                        )
+                        syncStrategies[context] = adaptedStrategy
+                    }
+                }
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error adapting strategies")
+        }
+    }
+
+    // Helper methods
+
+    private suspend fun getLastSyncTime(context: SyncContext): Long {
+        return syncHistory.filter { it.context == context }
+            .maxByOrNull { it.timestamp }?.timestamp ?: 0L
+    }
+
+    private fun getStrategyPerformance(strategy: SyncStrategy): StrategyPerformance? {
+        return performanceMetrics[strategy]
+    }
+
+    private fun recordSyncAttempt(
+        context: SyncContext,
+        strategy: SyncStrategy,
+        operationsProcessed: Int,
+        errors: Int,
+        duration: Long
+    ) {
+        val record = SyncRecord(
+            context = context,
+            strategy = strategy,
+            timestamp = System.currentTimeMillis(),
+            operationsProcessed = operationsProcessed,
+            errors = errors,
+            duration = duration
+        )
+        
+        syncHistory.add(record)
+        
+        // Update performance metrics
+        val currentPerformance = performanceMetrics.getOrPut(strategy) {
+            StrategyPerformance(
+                strategy = strategy,
+                totalAttempts = 0,
+                successfulAttempts = 0,
+                totalOperations = 0,
+                totalErrors = 0,
+                totalDuration = 0L
+            )
+        }
+        
+        currentPerformance.totalAttempts++
+        if (errors == 0) {
+            currentPerformance.successfulAttempts++
+        }
+        currentPerformance.totalOperations += operationsProcessed
+        currentPerformance.totalErrors += errors
+        currentPerformance.totalDuration += duration
+        
+        // Keep history manageable
+        if (syncHistory.size > 10000) {
+            syncHistory.removeFirst()
+        }
+        
+        // Update statistics
+        updateSmartSyncStats()
+    }
+
+    private fun updateSmartSyncStats() {
+        val totalSyncs = syncHistory.size
+        val successfulSyncs = syncHistory.count { it.errors == 0 }
+        val totalOperations = syncHistory.sumOf { it.operationsProcessed }
+        val totalErrors = syncHistory.sumOf { it.errors }
+        val averageDuration = if (syncHistory.isNotEmpty()) {
+            syncHistory.sumOf { it.duration }.toDouble() / syncHistory.size
+        } else 0.0
+        
+        _smartSyncStats.value = SmartSyncStats(
+            totalSyncs = totalSyncs,
+            successfulSyncs = successfulSyncs,
+            totalOperations = totalOperations,
+            totalErrors = totalErrors,
+            successRate = if (totalSyncs > 0) successfulSyncs.toDouble() / totalSyncs else 0.0,
+            averageSyncDuration = averageDuration,
+            activeStrategies = syncStrategies.size
+        )
+    }
+
+    private fun getBatteryLevel(): Int {
+        // Simulate battery level (would use actual battery API)
+        return (50..100).random()
+    }
+
+    private fun getDeviceLoad(): Int {
+        // Simulate device load (would use actual system metrics)
+        return (20..80).random()
+    }
+
+    private fun getCurrentTimeOfDay(): TimeOfDay {
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        return when (hour) {
+            in 6..11 -> TimeOfDay.MORNING
+            in 12..17 -> TimeOfDay.BUSINESS_HOURS
+            in 18..21 -> TimeOfDay.EVENING
+            else -> TimeOfDay.NIGHT
+        }
+    }
+
+    private fun getCurrentDayOfWeek(): DayOfWeek {
+        val day = java.util.Calendar.getInstance().get(java.util.Calendar.DAY_OF_WEEK)
+        return if (day == java.util.Calendar.SATURDAY || day == java.util.Calendar.SUNDAY) {
+            DayOfWeek.WEEKEND
+        } else {
+            DayOfWeek.WEEKDAY
+        }
+    }
+
+    /**
+     * Get smart sync statistics
+     */
+    fun getSmartSyncStats(): SmartSyncStats {
+        return _smartSyncStats.value
+    }
+
+    /**
+     * Get strategy performance
+     */
+    fun getStrategyPerformance(): Map<String, StrategyPerformance> {
+        return performanceMetrics.mapValues { it.value }
+    }
+
+    /**
+     * Force sync with specific context
+     */
+    suspend fun forceSync(context: SyncContext) {
+        val strategy = syncStrategies[context]
+        if (strategy != null) {
+            executeSmartSync(context, strategy)
+        }
+    }
+
+    /**
+     * Stop smart sync strategy
+     */
+    fun stop() {
+        syncScope.cancel()
+        Timber.d("Smart sync strategy stopped")
+    }
+}
+
+// Data classes for smart sync strategy
+
+enum class SyncContext {
+    EMERGENCY, HIGH_PRIORITY, NORMAL_PRIORITY, LOW_PRIORITY, BACKGROUND
+}
+
+data class SyncStrategy(
+    val name: String,
+    var interval: Long,
+    var batchSize: Int,
+    var retryAttempts: Int,
+    val priority: Int,
+    val requiresNetwork: Boolean,
+    val adaptive: Boolean
+)
+
+data class CurrentConditions(
+    val networkStatus: NetworkStatus,
+    val networkQuality: NetworkQuality,
+    val batteryLevel: Int,
+    val deviceLoad: Int,
+    val timeOfDay: TimeOfDay,
+    val dayOfWeek: DayOfWeek
+)
+
+data class SyncRecord(
+    val context: SyncContext,
+    val strategy: SyncStrategy,
+    val timestamp: Long,
+    val operationsProcessed: Int,
+    val errors: Int,
+    val duration: Long
+)
+
+data class NetworkCondition(
+    val timestamp: Long,
+    val networkQuality: NetworkQuality,
+    val batteryLevel: Int,
+    val deviceLoad: Int
+)
+
+data class UserPattern(
+    val userId: String,
+    val typicalSyncTimes: List<TimeOfDay>,
+    val preferredBatchSizes: Map<SyncContext, Int>,
+    val networkUsagePatterns: Map<TimeOfDay, NetworkQuality>
+)
+
+data class StrategyPerformance(
+    val strategy: SyncStrategy,
+    var totalAttempts: Int,
+    var successfulAttempts: Int,
+    var totalOperations: Int,
+    var totalErrors: Int,
+    var totalDuration: Long
+) {
+    val successRate: Double get() = if (totalAttempts > 0) successfulAttempts.toDouble() / totalAttempts else 0.0
+    val averageProcessingTime: Double get() = if (totalAttempts > 0) totalDuration.toDouble() / totalAttempts else 0.0
+}
+
+data class SmartSyncStats(
+    val totalSyncs: Int = 0,
+    val successfulSyncs: Int = 0,
+    val totalOperations: Int = 0,
+    val totalErrors: Int = 0,
+    val successRate: Double = 0.0,
+    val averageSyncDuration: Double = 0.0,
+    val activeStrategies: Int = 0
+)
+
+data class BatchResult(
+    val success: Boolean,
+    val processed: Int,
+    val errors: Int,
+    val error: String?
+)
+
+enum class TimeOfDay {
+    MORNING, BUSINESS_HOURS, EVENING, NIGHT
+}
+
+enum class DayOfWeek {
+    WEEKDAY, WEEKEND
+}

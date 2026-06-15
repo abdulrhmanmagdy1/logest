@@ -1,0 +1,308 @@
+package com.edham.logistics.performance
+
+import android.app.ActivityManager
+import android.content.Context
+import android.os.Build
+import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.lang.ref.WeakReference
+import kotlin.system.measureTimeMillis
+
+/**
+ * Memory Manager for Edham Logistics
+ * مدير الذاكرة لتطبيق إدهام اللوجستي
+ */
+class MemoryManager private constructor(private val context: Context) {
+
+    companion object {
+        @Volatile
+        private var INSTANCE: MemoryManager? = null
+
+        fun getInstance(context: Context): MemoryManager {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: MemoryManager(context.applicationContext).also { INSTANCE = it }
+            }
+        }
+
+        // Memory thresholds in MB
+        private const val LOW_MEMORY_THRESHOLD = 50
+        private const val CRITICAL_MEMORY_THRESHOLD = 30
+        private const val OPTIMAL_MEMORY_THRESHOLD = 100
+    }
+
+    private val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    private val memoryInfo = ActivityManager.MemoryInfo()
+    private val weakReferences = mutableMapOf<String, WeakReference<Any>>()
+
+    /**
+     * Get current memory usage information
+     * الحصول على معلومات استخدام الذاكرة الحالية
+     */
+    fun getMemoryInfo(): MemoryUsageInfo {
+        activityManager.getMemoryInfo(memoryInfo)
+        
+        val runtime = Runtime.getRuntime()
+        val totalMemory = runtime.totalMemory() / (1024 * 1024) // MB
+        val freeMemory = runtime.freeMemory() / (1024 * 1024) // MB
+        val usedMemory = totalMemory - freeMemory
+        val maxMemory = runtime.maxMemory() / (1024 * 1024) // MB
+        
+        return MemoryUsageInfo(
+            totalMemory = totalMemory,
+            usedMemory = usedMemory,
+            freeMemory = freeMemory,
+            maxMemory = maxMemory,
+            availableMemory = memoryInfo.availMem / (1024 * 1024),
+            threshold = memoryInfo.threshold / (1024 * 1024),
+            isLowMemory = memoryInfo.lowMemory
+        )
+    }
+
+    /**
+     * Check if device is running low on memory
+     * التحقق مما إذا كان الجهاز يعاني من نقص في الذاكرة
+     */
+    fun isLowMemory(): Boolean {
+        activityManager.getMemoryInfo(memoryInfo)
+        return memoryInfo.lowMemory
+    }
+
+    /**
+     * Get memory usage percentage
+     * الحصول على نسبة استخدام الذاكرة
+     */
+    fun getMemoryUsagePercentage(): Float {
+        val info = getMemoryInfo()
+        return (info.usedMemory.toFloat() / info.maxMemory) * 100
+    }
+
+    /**
+     * Optimize memory usage
+     * تحسين استخدام الذاكرة
+     */
+    fun optimizeMemory() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // Clear weak references that are null
+                weakReferences.entries.removeAll { it.value.get() == null }
+                
+                // Force garbage collection if memory is low
+                if (isLowMemory()) {
+                    System.gc()
+                    System.runFinalization()
+                }
+                
+                // Trim caches
+                trimCaches()
+                
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    /**
+     * Add weak reference for memory tracking
+     * إضافة مرجع ضعيف لتتبع الذاكرة
+     */
+    fun addWeakReference(key: String, obj: Any) {
+        weakReferences[key] = WeakReference(obj)
+    }
+
+    /**
+     * Get object from weak reference
+     * الحصول على كائن من المرجع الضعيف
+     */
+    fun getFromWeakReference(key: String): Any? {
+        return weakReferences[key]?.get()
+    }
+
+    /**
+     * Remove weak reference
+     * إزالة المرجع الضعيف
+     */
+    fun removeWeakReference(key: String) {
+        weakReferences.remove(key)
+    }
+
+    /**
+     * Trim caches and release memory
+     * قطع التخزين المؤقت وتحرير الذاكرة
+     */
+    private fun trimCaches() {
+        try {
+            // Clear image cache
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                // Clear Glide cache if available
+                // Glide.get(context).clearMemory()
+            }
+            
+            // Clear other caches
+            context.cacheDir.deleteRecursively()
+            context.externalCacheDir?.deleteRecursively()
+            
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Monitor memory usage and trigger optimizations
+     * مراقبة استخدام الذاكرة وتشغيل التحسينات
+     */
+    fun startMemoryMonitoring() {
+        CoroutineScope(Dispatchers.IO).launch {
+            while (true) {
+                try {
+                    val memoryInfo = getMemoryInfo()
+                    val usagePercentage = getMemoryUsagePercentage()
+                    
+                    when {
+                        usagePercentage > 90 -> {
+                            // Critical memory usage
+                            optimizeMemory()
+                            System.gc()
+                        }
+                        usagePercentage > 75 -> {
+                            // High memory usage
+                            trimCaches()
+                        }
+                        usagePercentage > 60 -> {
+                            // Moderate memory usage
+                            weakReferences.entries.removeAll { it.value.get() == null }
+                        }
+                    }
+                    
+                    // Check every 30 seconds
+                    kotlinx.coroutines.delay(30000)
+                    
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    kotlinx.coroutines.delay(60000) // Wait longer on error
+                }
+            }
+        }
+    }
+
+    /**
+     * Get memory optimization suggestions
+     * الحصول على اقتراحات تحسين الذاكرة
+     */
+    fun getMemoryOptimizationSuggestions(): List<String> {
+        val suggestions = mutableListOf<String>()
+        val memoryInfo = getMemoryInfo()
+        val usagePercentage = getMemoryUsagePercentage()
+        
+        when {
+            usagePercentage > 90 -> {
+                suggestions.add("استخدام الذاكرة حرج جداً! يجب إغلاق بعض التطبيقات.")
+                suggestions.add("فكر في إعادة تشغيل التطبيق لتحرير الذاكرة.")
+            }
+            usagePercentage > 75 -> {
+                suggestions.add("استخدام الذاكرة مرتفع. حاول تحرير بعض المساحة.")
+                suggestions.add("يمكنك مسح ذاكرة التخزين المؤقت.")
+            }
+            usagePercentage > 60 -> {
+                suggestions.add("استخدام الذاكرة متوسط. مراقبة الأداء.")
+            }
+            else -> {
+                suggestions.add("استخدام الذاكرة جيد.")
+            }
+        }
+        
+        if (memoryInfo.isLowMemory) {
+            suggestions.add("الجهاز يعاني من نقص في الذاكرة.")
+        }
+        
+        return suggestions
+    }
+
+    /**
+     * Memory usage information data class
+     */
+    data class MemoryUsageInfo(
+        val totalMemory: Long,
+        val usedMemory: Long,
+        val freeMemory: Long,
+        val maxMemory: Long,
+        val availableMemory: Long,
+        val threshold: Long,
+        val isLowMemory: Boolean
+    )
+}
+
+/**
+ * Memory-aware Activity base class
+ * فئة نشاط مدركة للذاكرة
+ */
+abstract class MemoryAwareActivity : AppCompatActivity() {
+    
+    private val memoryManager: MemoryManager by lazy { 
+        MemoryManager.getInstance(this) 
+    }
+    
+    override fun onLowMemory() {
+        super.onLowMemory()
+        memoryManager.optimizeMemory()
+        onLowMemoryCallback()
+    }
+    
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        when (level) {
+            TRIM_MEMORY_RUNNING_CRITICAL -> {
+                memoryManager.optimizeMemory()
+                onCriticalMemoryTrim()
+            }
+            TRIM_MEMORY_RUNNING_LOW -> {
+                memoryManager.trimCaches()
+                onLowMemoryTrim()
+            }
+            TRIM_MEMORY_RUNNING_MODERATE -> {
+                memoryManager.removeWeakReference("${this::class.java.name}_temp")
+                onModerateMemoryTrim()
+            }
+        }
+    }
+    
+    protected open fun onLowMemoryCallback() {}
+    protected open fun onCriticalMemoryTrim() {}
+    protected open fun onLowMemoryTrim() {}
+    protected open fun onModerateMemoryTrim() {}
+}
+
+/**
+ * Memory optimization utilities
+ * أدوات تحسين الذاكرة
+ */
+object MemoryUtils {
+    
+    /**
+     * Measure execution time and memory usage
+     * قياس وقت التنفيذ واستخدام الذاكرة
+     */
+    inline fun <T> measureMemoryAndTime(operation: () -> T): Pair<T, MemoryMetrics> {
+        val runtime = Runtime.getRuntime()
+        val memoryBefore = runtime.totalMemory() - runtime.freeMemory()
+        
+        val time = measureTimeMillis {
+            return operation()
+        }
+        
+        val memoryAfter = runtime.totalMemory() - runtime.freeMemory()
+        val memoryUsed = memoryAfter - memoryBefore
+        
+        return operation() to MemoryMetrics(time, memoryUsed)
+    }
+    
+    /**
+     * Memory metrics data class
+     */
+    data class MemoryMetrics(
+        val executionTimeMs: Long,
+        val memoryUsedBytes: Long
+    )
+}

@@ -1,0 +1,709 @@
+package com.edham.logistics.feature.dispatch
+
+import android.util.Log
+import com.edham.logistics.data.model.Driver
+import com.edham.logistics.data.model.Shipment
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.temporal.ChronoUnit
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Delay Handling Service - Advanced delay detection and resolution
+ * Detects delays, analyzes causes, and implements resolution strategies
+ */
+class DelayHandlingService {
+    
+    companion object {
+        private const val TAG = "DelayHandlingService"
+        
+        // Delay thresholds (in minutes)
+        private const val MINOR_DELAY_THRESHOLD = 15
+        private const val MODERATE_DELAY_THRESHOLD = 30
+        private const val SEVERE_DELAY_THRESHOLD = 60
+        private const val CRITICAL_DELAY_THRESHOLD = 120
+        
+        // Delay causes
+        enum class DelayCause {
+            TRAFFIC,               // Traffic congestion
+            WEATHER,               // Weather conditions
+            VEHICLE_BREAKDOWN,      // Vehicle mechanical issues
+            DRIVER_UNAVAILABLE,      // Driver availability issues
+            ROUTE_OPTIMIZATION,     // Route optimization delays
+            CUSTOMER_DELAY,         // Customer-related delays
+            REGULATORY_ISSUES,     // Regulatory/compliance issues
+            TECHNICAL_ISSUES,       // Technical system issues
+            UNKNOWN                 // Unknown cause
+        }
+        
+        // Delay severity levels
+        enum class DelaySeverity {
+            NONE,       // No delay
+            MINOR,      // 15-30 minutes delay
+            MODERATE,   // 30-60 minutes delay
+            SEVERE,     // 60-120 minutes delay
+            CRITICAL     // > 120 minutes delay
+        }
+        
+        // Resolution strategies
+        enum class ResolutionStrategy {
+            NOTIFY_CUSTOMER,        // Notify customer of delay
+            REROUTE_DRIVER,         // Reroute driver to alternative route
+            ASSIGN_BACKUP_DRIVER,    // Assign backup driver
+            EXTEND_DEADLINE,        // Extend delivery deadline
+            COMPENSATE_CUSTOMER,     // Provide compensation to customer
+            ESCALATE_TO_SUPERVISOR, // Escalate to supervisor
+            AUTOMATIC_RESCHEDULE,    // Automatically reschedule
+            MANUAL_INTERVENTION     // Manual intervention required
+        }
+    }
+    
+    /**
+     * Detect and handle delays in shipments
+     */
+    suspend fun detectAndHandleDelays(
+        shipments: List<Shipment>,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime = LocalDateTime.now()
+    ): DelayHandlingResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Detecting delays in ${shipments.size} shipments")
+                
+                val delays = mutableListOf<Delay>()
+                val delayMetrics = mutableMapOf<DelayCause, Int>()
+                
+                // Analyze each shipment for delays
+                shipments.forEach { shipment ->
+                    val delayAnalysis = analyzeShipmentDelay(shipment, drivers, currentTime)
+                    
+                    if (delayAnalysis.hasDelay) {
+                        val delay = createDelayRecord(shipment, delayAnalysis, currentTime)
+                        delays.add(delay)
+                        
+                        // Update delay metrics
+                        delayMetrics[delay.cause] = (delayMetrics[delay.cause] ?: 0) + 1
+                        
+                        // Implement automatic resolution
+                        val resolution = implementAutomaticResolution(delay, drivers, currentTime)
+                        delay.resolution = resolution
+                    }
+                }
+                
+                // Calculate delay statistics
+                val statistics = calculateDelayStatistics(delays, delayMetrics)
+                
+                // Generate recommendations
+                val recommendations = generateDelayRecommendations(delays, statistics)
+                
+                val result = DelayHandlingResult(
+                    totalShipments = shipments.size,
+                    totalDelays = delays.size,
+                    delays = delays,
+                    delayStatistics = statistics,
+                    recommendations = recommendations,
+                    requiresImmediateAction = delays.any { it.severity == DelaySeverity.CRITICAL },
+                    processedAt = currentTime
+                )
+                
+                Log.d(TAG, "Delay handling completed: ${delays.size} delays detected")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in delay detection and handling", e)
+                DelayHandlingResult.createEmpty(currentTime)
+            }
+        }
+    }
+    
+    /**
+     * Analyze shipment for potential delays
+     */
+    private fun analyzeShipmentDelay(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): DelayAnalysis {
+        val originalETA = shipment.estimatedDeliveryTime
+        val currentETA = calculateCurrentETA(shipment, drivers, currentTime)
+        
+        if (originalETA == null || currentETA == null) {
+            return DelayAnalysis(
+                hasDelay = false,
+                delayMinutes = 0,
+                severity = DelaySeverity.NONE,
+                cause = DelayCause.UNKNOWN,
+                confidence = 0.0
+            )
+        }
+        
+        val delayMinutes = ChronoUnit.MINUTES.between(originalETA, currentETA)
+        val hasDelay = delayMinutes > MINOR_DELAY_THRESHOLD
+        
+        if (!hasDelay) {
+            return DelayAnalysis(
+                hasDelay = false,
+                delayMinutes = 0,
+                severity = DelaySeverity.NONE,
+                cause = DelayCause.UNKNOWN,
+                confidence = 0.0
+            )
+        }
+        
+        // Determine severity
+        val severity = when {
+            delayMinutes >= CRITICAL_DELAY_THRESHOLD -> DelaySeverity.CRITICAL
+            delayMinutes >= SEVERE_DELAY_THRESHOLD -> DelaySeverity.SEVERE
+            delayMinutes >= MODERATE_DELAY_THRESHOLD -> DelaySeverity.MODERATE
+            else -> DelaySeverity.MINOR
+        }
+        
+        // Analyze potential causes
+        val cause = analyzeDelayCause(shipment, drivers, delayMinutes, currentTime)
+        
+        // Calculate confidence
+        val confidence = calculateDelayConfidence(shipment, delayMinutes, cause)
+        
+        return DelayAnalysis(
+            hasDelay = hasDelay,
+            delayMinutes = delayMinutes.toInt(),
+            severity = severity,
+            cause = cause,
+            confidence = confidence
+        )
+    }
+    
+    /**
+     * Calculate current ETA based on real-time data
+     */
+    private fun calculateCurrentETA(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): LocalDateTime? {
+        val driver = drivers.find { it.id == shipment.assignedDriverId }
+        
+        if (driver == null || driver.currentLocation == null) {
+            return shipment.estimatedDeliveryTime
+        }
+        
+        // Calculate remaining distance and time
+        val remainingDistance = calculateRemainingDistance(shipment, driver)
+        val averageSpeed = calculateAverageSpeed(driver, shipment)
+        val remainingTime = remainingDistance / averageSpeed // in hours
+        
+        return currentTime.plusMinutes((remainingTime * 60).toLong())
+    }
+    
+    /**
+     * Analyze the cause of delay
+     */
+    private fun analyzeDelayCause(
+        shipment: Shipment,
+        drivers: List<Driver>,
+        delayMinutes: Long,
+        currentTime: LocalDateTime
+    ): DelayCause {
+        val driver = drivers.find { it.id == shipment.assignedDriverId }
+        
+        // Check traffic conditions
+        if (isTrafficLikely(shipment, currentTime)) {
+            return DelayCause.TRAFFIC
+        }
+        
+        // Check weather conditions
+        if (isWeatherAffected(shipment, currentTime)) {
+            return DelayCause.WEATHER
+        }
+        
+        // Check vehicle issues
+        if (driver?.vehicle?.status == Driver.Vehicle.Status.MAINTENANCE_REQUIRED) {
+            return DelayCause.VEHICLE_BREAKDOWN
+        }
+        
+        // Check driver availability
+        if (driver?.status == Driver.Status.BREAK || driver?.status == Driver.Status.OFF_DUTY) {
+            return DelayCause.DRIVER_UNAVAILABLE
+        }
+        
+        // Check route optimization
+        if (isRouteInefficient(shipment, driver)) {
+            return DelayCause.ROUTE_OPTIMIZATION
+        }
+        
+        // Check regulatory issues
+        if (hasRegulatoryIssues(shipment, currentTime)) {
+            return DelayCause.REGULATORY_ISSUES
+        }
+        
+        // Check technical issues
+        if (hasTechnicalIssues(shipment)) {
+            return DelayCause.TECHNICAL_ISSUES
+        }
+        
+        return DelayCause.UNKNOWN
+    }
+    
+    /**
+     * Calculate confidence in delay analysis
+     */
+    private fun calculateDelayConfidence(
+        shipment: Shipment,
+        delayMinutes: Long,
+        cause: DelayCause
+    ): Double {
+        var confidence = 50.0 // Base confidence
+        
+        // Higher confidence for longer delays
+        confidence += minOf(30.0, delayMinutes / 4.0)
+        
+        // Higher confidence for known causes
+        if (cause != DelayCause.UNKNOWN) {
+            confidence += 20.0
+        }
+        
+        // Higher confidence with complete data
+        if (shipment.assignedDriverId != null && 
+            shipment.estimatedDeliveryTime != null &&
+            shipment.pickupLocation != null &&
+            shipment.deliveryLocation != null) {
+            confidence += 10.0
+        }
+        
+        return confidence.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Create delay record
+     */
+    private fun createDelayRecord(
+        shipment: Shipment,
+        analysis: DelayAnalysis,
+        currentTime: LocalDateTime
+    ): Delay {
+        return Delay(
+            id = generateDelayId(),
+            shipmentId = shipment.id,
+            driverId = shipment.assignedDriverId,
+            originalETA = shipment.estimatedDeliveryTime,
+            currentETA = calculateCurrentETA(shipment, emptyList(), currentTime),
+            delayMinutes = analysis.delayMinutes,
+            severity = analysis.severity,
+            cause = analysis.cause,
+            confidence = analysis.confidence,
+            detectedAt = currentTime,
+            status = Delay.Status.DETECTED
+        )
+    }
+    
+    /**
+     * Implement automatic resolution for delay
+     */
+    private fun implementAutomaticResolution(
+        delay: Delay,
+        drivers: List<Driver>,
+        currentTime: LocalDateTime
+    ): DelayResolution {
+        val strategy = determineResolutionStrategy(delay)
+        
+        return when (strategy) {
+            ResolutionStrategy.NOTIFY_CUSTOMER -> {
+                createCustomerNotification(delay)
+                DelayResolution(
+                    strategy = strategy,
+                    implemented = true,
+                    requiresManualIntervention = false,
+                    estimatedResolutionTime = "5 minutes",
+                    resolutionNotes = "Customer notified of delay"
+                )
+            }
+            
+            ResolutionStrategy.REROUTE_DRIVER -> {
+                val newRoute = calculateAlternativeRoute(delay, drivers)
+                DelayResolution(
+                    strategy = strategy,
+                    implemented = newRoute != null,
+                    requiresManualIntervention = newRoute == null,
+                    estimatedResolutionTime = "15 minutes",
+                    resolutionNotes = if (newRoute != null) "Driver rerouted to alternative route" else "No alternative route available"
+                )
+            }
+            
+            ResolutionStrategy.ASSIGN_BACKUP_DRIVER -> {
+                val backupDriver = findBackupDriver(delay, drivers)
+                DelayResolution(
+                    strategy = strategy,
+                    implemented = backupDriver != null,
+                    requiresManualIntervention = backupDriver == null,
+                    estimatedResolutionTime = "30 minutes",
+                    resolutionNotes = if (backupDriver != null) "Backup driver ${backupDriver.name} assigned" else "No backup driver available"
+                )
+            }
+            
+            ResolutionStrategy.EXTEND_DEADLINE -> {
+                val newDeadline = calculateExtendedDeadline(delay)
+                DelayResolution(
+                    strategy = strategy,
+                    implemented = true,
+                    requiresManualIntervention = false,
+                    estimatedResolutionTime = "2 minutes",
+                    resolutionNotes = "Delivery deadline extended to $newDeadline"
+                )
+            }
+            
+            ResolutionStrategy.ESCALATE_TO_SUPERVISOR -> {
+                escalateToSupervisor(delay)
+                DelayResolution(
+                    strategy = strategy,
+                    implemented = true,
+                    requiresManualIntervention = true,
+                    estimatedResolutionTime = "10 minutes",
+                    resolutionNotes = "Escalated to supervisor for manual intervention"
+                )
+            }
+            
+            else -> {
+                DelayResolution(
+                    strategy = ResolutionStrategy.MANUAL_INTERVENTION,
+                    implemented = false,
+                    requiresManualIntervention = true,
+                    estimatedResolutionTime = "Unknown",
+                    resolutionNotes = "Manual intervention required"
+                )
+            }
+        }
+    }
+    
+    /**
+     * Determine resolution strategy based on delay
+     */
+    private fun determineResolutionStrategy(delay: Delay): ResolutionStrategy {
+        return when (delay.severity) {
+            DelaySeverity.MINOR -> ResolutionStrategy.NOTIFY_CUSTOMER
+            DelaySeverity.MODERATE -> ResolutionStrategy.REROUTE_DRIVER
+            DelaySeverity.SEVERE -> ResolutionStrategy.ASSIGN_BACKUP_DRIVER
+            DelaySeverity.CRITICAL -> ResolutionStrategy.ESCALATE_TO_SUPERVISOR
+            else -> ResolutionStrategy.MANUAL_INTERVENTION
+        }
+    }
+    
+    /**
+     * Calculate delay statistics
+     */
+    private fun calculateDelayStatistics(
+        delays: List<Delay>,
+        delayMetrics: Map<DelayCause, Int>
+    ): DelayStatistics {
+        val severityDistribution = DelaySeverity.values().associateWith { severity ->
+            delays.count { it.severity == severity }
+        }
+        
+        val averageDelayMinutes = if (delays.isNotEmpty()) {
+            delays.map { it.delayMinutes }.average()
+        } else {
+            0.0
+        }
+        
+        val maxDelayMinutes = delays.maxOfOrNull { it.delayMinutes } ?: 0
+        
+        return DelayStatistics(
+            totalDelays = delays.size,
+            averageDelayMinutes = averageDelayMinutes,
+            maxDelayMinutes = maxDelayMinutes,
+            severityDistribution = severityDistribution,
+            causeDistribution = delayMetrics,
+            criticalDelays = delays.count { it.severity == DelaySeverity.CRITICAL },
+            severeDelays = delays.count { it.severity == DelaySeverity.SEVERE },
+            moderateDelays = delays.count { it.severity == DelaySeverity.MODERATE },
+            minorDelays = delays.count { it.severity == DelaySeverity.MINOR },
+            calculatedAt = LocalDateTime.now()
+        )
+    }
+    
+    /**
+     * Generate delay handling recommendations
+     */
+    private fun generateDelayRecommendations(
+        delays: List<Delay>,
+        statistics: DelayStatistics
+    ): List<DelayRecommendation> {
+        val recommendations = mutableListOf<DelayRecommendation>()
+        
+        // Critical delays - immediate action
+        if (statistics.criticalDelays > 0) {
+            recommendations.add(
+                DelayRecommendation(
+                    priority = DelayRecommendation.Priority.URGENT,
+                    description = "Address ${statistics.criticalDelays} critical delays immediately",
+                    suggestedActions = listOf(
+                        "Escalate to operations manager",
+                        "Contact affected customers",
+                        "Assign backup resources"
+                    ),
+                    estimatedImpact = "High - Customer satisfaction at risk",
+                    requiresImmediateAction = true
+                )
+            )
+        }
+        
+        // Common delay causes
+        val mostCommonCause = statistics.causeDistribution.maxByOrNull { it.value }?.key
+        if (mostCommonCause != null) {
+            when (mostCommonCause) {
+                DelayCause.TRAFFIC -> {
+                    recommendations.add(
+                        DelayRecommendation(
+                            priority = DelayRecommendation.Priority.HIGH,
+                            description = "Traffic-related delays detected",
+                            suggestedActions = listOf(
+                                "Implement real-time traffic monitoring",
+                                "Use alternative routing",
+                                "Adjust delivery schedules"
+                            ),
+                            estimatedImpact = "Medium - Affects delivery efficiency",
+                            requiresImmediateAction = false
+                        )
+                    )
+                }
+                
+                DelayCause.VEHICLE_BREAKDOWN -> {
+                    recommendations.add(
+                        DelayRecommendation(
+                            priority = DelayRecommendation.Priority.HIGH,
+                            description = "Vehicle breakdowns causing delays",
+                            suggestedActions = listOf(
+                                "Increase preventive maintenance",
+                                "Prepare backup vehicles",
+                                "Review vehicle maintenance schedules"
+                            ),
+                            estimatedImpact = "High - Affects fleet availability",
+                            requiresImmediateAction = false
+                        )
+                    )
+                }
+                
+                DelayCause.WEATHER -> {
+                    recommendations.add(
+                        DelayRecommendation(
+                            priority = DelayRecommendation.Priority.MEDIUM,
+                            description = "Weather-related delays detected",
+                            suggestedActions = listOf(
+                                "Implement weather monitoring",
+                                "Adjust delivery windows",
+                                "Communicate weather impacts to customers"
+                            ),
+                            estimatedImpact = "Medium - Seasonal impact",
+                            requiresImmediateAction = false
+                        )
+                    )
+                }
+                
+                else -> {
+                    // Handle other causes
+                }
+            }
+        }
+        
+        // Average delay optimization
+        if (statistics.averageDelayMinutes > MODERATE_DELAY_THRESHOLD) {
+            recommendations.add(
+                DelayRecommendation(
+                    priority = DelayRecommendation.Priority.MEDIUM,
+                    description = "Average delay time exceeds acceptable limits",
+                    suggestedActions = listOf(
+                        "Review scheduling algorithms",
+                        "Optimize route planning",
+                        "Improve driver training"
+                    ),
+                    estimatedImpact = "Medium - Operational efficiency",
+                    requiresImmediateAction = false
+                )
+            )
+        }
+        
+        return recommendations
+    }
+    
+    // Helper methods for delay analysis
+    
+    private fun calculateRemainingDistance(shipment: Shipment, driver: Driver): Double {
+        // Simplified calculation - would use actual routing API
+        return 50.0 // Placeholder
+    }
+    
+    private fun calculateAverageSpeed(driver: Driver, shipment: Shipment): Double {
+        // Simplified calculation - would use historical data
+        return 40.0 // Placeholder (km/h)
+    }
+    
+    private fun isTrafficLikely(shipment: Shipment, currentTime: LocalDateTime): Boolean {
+        val hour = currentTime.hour
+        return hour in 7..9 || hour in 17..19 // Rush hours
+    }
+    
+    private fun isWeatherAffected(shipment: Shipment, currentTime: LocalDateTime): Boolean {
+        // Simplified - would integrate with weather API
+        return false // Placeholder
+    }
+    
+    private fun isRouteInefficient(shipment: Shipment, driver: Driver?): Boolean {
+        // Simplified - would use route optimization
+        return false // Placeholder
+    }
+    
+    private fun hasRegulatoryIssues(shipment: Shipment, currentTime: LocalDateTime): Boolean {
+        // Check for delivery time restrictions, etc.
+        return false // Placeholder
+    }
+    
+    private fun hasTechnicalIssues(shipment: Shipment): Boolean {
+        // Check for system issues, GPS problems, etc.
+        return false // Placeholder
+    }
+    
+    private fun createCustomerNotification(delay: Delay) {
+        // Send notification to customer about delay
+        Log.d(TAG, "Notifying customer about delay: ${delay.id}")
+    }
+    
+    private fun calculateAlternativeRoute(delay: Delay, drivers: List<Driver>): String? {
+        // Calculate alternative route
+        return "Alternative route calculated" // Placeholder
+    }
+    
+    private fun findBackupDriver(delay: Delay, drivers: List<Driver>): Driver? {
+        return drivers.firstOrNull { driver ->
+            driver.id != delay.driverId &&
+            driver.status == Driver.Status.AVAILABLE &&
+            driver.vehicle?.status == Driver.Vehicle.Status.AVAILABLE
+        }
+    }
+    
+    private fun calculateExtendedDeadline(delay: Delay): LocalDateTime {
+        return LocalDateTime.now().plusHours(2) // Placeholder
+    }
+    
+    private fun escalateToSupervisor(delay: Delay) {
+        Log.d(TAG, "Escalating delay ${delay.id} to supervisor")
+    }
+    
+    private fun generateDelayId(): String {
+        return "delay_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    }
+}
+
+/**
+ * Delay analysis data class
+ */
+data class DelayAnalysis(
+    val hasDelay: Boolean,
+    val delayMinutes: Int,
+    val severity: DelayHandlingService.DelaySeverity,
+    val cause: DelayHandlingService.DelayCause,
+    val confidence: Double
+)
+
+/**
+ * Delay data class
+ */
+data class Delay(
+    val id: String,
+    val shipmentId: String,
+    val driverId: String?,
+    val originalETA: LocalDateTime?,
+    val currentETA: LocalDateTime?,
+    val delayMinutes: Int,
+    val severity: DelayHandlingService.DelaySeverity,
+    val cause: DelayHandlingService.DelayCause,
+    val confidence: Double,
+    val detectedAt: LocalDateTime,
+    val status: Status,
+    val resolution: DelayResolution? = null
+) {
+    enum class Status {
+        DETECTED, RESOLVED, ESCALATED, IGNORED
+    }
+}
+
+/**
+ * Delay resolution data class
+ */
+data class DelayResolution(
+    val strategy: DelayHandlingService.ResolutionStrategy,
+    val implemented: Boolean,
+    val requiresManualIntervention: Boolean,
+    val estimatedResolutionTime: String,
+    val resolutionNotes: String,
+    val resolvedAt: LocalDateTime? = null
+)
+
+/**
+ * Delay statistics data class
+ */
+data class DelayStatistics(
+    val totalDelays: Int,
+    val averageDelayMinutes: Double,
+    val maxDelayMinutes: Int,
+    val severityDistribution: Map<DelayHandlingService.DelaySeverity, Int>,
+    val causeDistribution: Map<DelayHandlingService.DelayCause, Int>,
+    val criticalDelays: Int,
+    val severeDelays: Int,
+    val moderateDelays: Int,
+    val minorDelays: Int,
+    val calculatedAt: LocalDateTime
+)
+
+/**
+ * Delay recommendation data class
+ */
+data class DelayRecommendation(
+    val priority: Priority,
+    val description: String,
+    val suggestedActions: List<String>,
+    val estimatedImpact: String,
+    val requiresImmediateAction: Boolean
+) {
+    enum class Priority {
+        URGENT, HIGH, MEDIUM, LOW
+    }
+}
+
+/**
+ * Delay handling result data class
+ */
+data class DelayHandlingResult(
+    val totalShipments: Int,
+    val totalDelays: Int,
+    val delays: List<Delay>,
+    val delayStatistics: DelayStatistics,
+    val recommendations: List<DelayRecommendation>,
+    val requiresImmediateAction: Boolean,
+    val processedAt: LocalDateTime
+) {
+    companion object {
+        fun createEmpty(currentTime: LocalDateTime): DelayHandlingResult {
+            return DelayHandlingResult(
+                totalShipments = 0,
+                totalDelays = 0,
+                delays = emptyList(),
+                delayStatistics = DelayStatistics(
+                    totalDelays = 0,
+                    averageDelayMinutes = 0.0,
+                    maxDelayMinutes = 0,
+                    severityDistribution = emptyMap(),
+                    causeDistribution = emptyMap(),
+                    criticalDelays = 0,
+                    severeDelays = 0,
+                    moderateDelays = 0,
+                    minorDelays = 0,
+                    calculatedAt = currentTime
+                ),
+                recommendations = emptyList(),
+                requiresImmediateAction = false,
+                processedAt = currentTime
+            )
+        }
+    }
+}

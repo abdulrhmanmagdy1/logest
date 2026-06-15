@@ -36,16 +36,16 @@ class FleetAdapter(private var vehicles: List<VehicleItem>) :
         holder.status.text = vehicle.status
         
         when(vehicle.status.uppercase()) {
-            "ACTIVE", "READY" -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.html_success))
-            "MAINTENANCE" -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.html_warning))
-            "OFFLINE" -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.html_danger))
+            "ACTIVE", "READY" -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.status_success))
+            "MAINTENANCE" -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.status_warning))
+            "OFFLINE", "GROUNDED" -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.status_error))
         }
         
         // Temperature warning
         if (vehicle.temperature > -5.0) {
-            holder.temp.setTextColor(holder.itemView.context.getColor(R.color.html_danger))
+            holder.temp.setTextColor(holder.itemView.context.getColor(R.color.status_error))
         } else {
-            holder.temp.setTextColor(holder.itemView.context.getColor(R.color.html_info))
+            holder.temp.setTextColor(holder.itemView.context.getColor(R.color.status_info))
         }
     }
 

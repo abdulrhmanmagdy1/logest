@@ -1,0 +1,1057 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.FleetAssignmentEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Fleet Utilization Analytics - Comprehensive fleet utilization analysis and reporting system
+ * 
+ * Features:
+ * - Vehicle utilization tracking
+ * - Driver performance analysis
+ * - Route efficiency analysis
+ * - Cost per mile analysis
+ * - Asset optimization recommendations
+ * - Predictive utilization modeling
+ * - Benchmarking analysis
+ * - ROI calculations
+ */
+@Singleton
+class FleetUtilizationAnalytics @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _analyticsState = MutableStateFlow<AnalyticsState>(AnalyticsState.Idle)
+    val analyticsState: StateFlow<AnalyticsState> = _analyticsState.asStateFlow()
+    
+    private val _utilizationMetrics = MutableStateFlow<UtilizationMetrics?>(null)
+    val utilizationMetrics: StateFlow<UtilizationMetrics?> = _utilizationMetrics.asStateFlow()
+    
+    private val _vehicleUtilization = MutableStateFlow<Map<Long, VehicleUtilization>>(emptyMap())
+    val vehicleUtilization: StateFlow<Map<Long, VehicleUtilization>> = _vehicleUtilization.asStateFlow()
+    
+    private val _driverPerformance = MutableStateFlow<Map<String, DriverPerformance>>(emptyMap())
+    val driverPerformance: StateFlow<Map<String, DriverPerformance>> = _driverPerformance.asStateFlow()
+    
+    private val _routeEfficiency = MutableStateFlow<RouteEfficiencyAnalysis?>(null)
+    val routeEfficiency: StateFlow<RouteEfficiencyAnalysis?> = _routeEfficiency.asStateFlow()
+    
+    private val _costAnalysis = MutableStateFlow<CostAnalysis?>(null)
+    val costAnalysis: StateFlow<CostAnalysis?> = _costAnalysis.asStateFlow()
+    
+    private val _optimizationRecommendations = MutableStateFlow<List<OptimizationRecommendation>>(emptyList())
+    val optimizationRecommendations: StateFlow<List<OptimizationRecommendation>> = _optimizationRecommendations.asStateFlow()
+    
+    companion object {
+        private const val TAG = "FleetUtilizationAnalytics"
+        private const val IDEAL_UTILIZATION_RATE = 85f // 85% utilization is ideal
+        private const val LOW_UTILIZATION_THRESHOLD = 60f
+        private const val HIGH_UTILIZATION_THRESHOLD = 95f
+        private const val COST_PER_MILE_TARGET = 1.50f // Target cost per mile
+    }
+    
+    /**
+     * Generate comprehensive utilization analytics
+     */
+    suspend fun generateUtilizationAnalytics(dateRange: DateRange = DateRange.last30Days()): Result<FleetUtilizationReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Generating
+                
+                // Get data
+                val vehicles = database.vehicleDao().getAllVehicles()
+                val assignments = database.fleetAssignmentDao().getAllAssignments()
+                
+                // Generate utilization metrics
+                val utilizationMetrics = generateUtilizationMetrics(vehicles, assignments, dateRange)
+                _utilizationMetrics.value = utilizationMetrics
+                
+                // Generate vehicle utilization
+                val vehicleUtilization = generateVehicleUtilization(vehicles, assignments, dateRange)
+                _vehicleUtilization.value = vehicleUtilization
+                
+                // Generate driver performance
+                val driverPerformance = generateDriverPerformance(assignments, dateRange)
+                _driverPerformance.value = driverPerformance
+                
+                // Generate route efficiency analysis
+                val routeEfficiency = generateRouteEfficiencyAnalysis(assignments, dateRange)
+                _routeEfficiency.value = routeEfficiency
+                
+                // Generate cost analysis
+                val costAnalysis = generateCostAnalysis(vehicles, assignments, dateRange)
+                _costAnalysis.value = costAnalysis
+                
+                // Generate optimization recommendations
+                val recommendations = generateOptimizationRecommendations(
+                    utilizationMetrics,
+                    vehicleUtilization,
+                    driverPerformance,
+                    routeEfficiency,
+                    costAnalysis
+                )
+                _optimizationRecommendations.value = recommendations
+                
+                // Create comprehensive report
+                val report = FleetUtilizationReport(
+                    dateRange = dateRange,
+                    utilizationMetrics = utilizationMetrics,
+                    vehicleUtilization = vehicleUtilization,
+                    driverPerformance = driverPerformance,
+                    routeEfficiency = routeEfficiency,
+                    costAnalysis = costAnalysis,
+                    optimizationRecommendations = recommendations,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Completed
+                Result.success(report)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to generate analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get vehicle utilization details
+     */
+    suspend fun getVehicleUtilizationDetails(
+        vehicleId: Long,
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<VehicleUtilizationDetails> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val assignments = database.fleetAssignmentDao()
+                    .getAssignmentsByVehicleAndDateRange(vehicleId, dateRange.startDate, dateRange.endDate)
+                
+                val totalAssignments = assignments.size
+                val activeAssignments = assignments.count { it.status == AssignmentStatus.ACTIVE || it.status == AssignmentStatus.COMPLETED }
+                
+                val totalOperatingHours = assignments.filter { it.startedAt != null && it.endedAt != null }
+                    .sumOf { assignment ->
+                        (assignment.endedAt!!.time - assignment.startedAt!!.time) / (1000 * 60 * 60) // Convert to hours
+                    }
+                
+                val totalDistance = assignments.sumOf { assignment ->
+                    (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+                }
+                
+                val totalRevenue = calculateVehicleRevenue(vehicleId, assignments)
+                val totalCosts = calculateVehicleCosts(vehicleId, assignments)
+                
+                val utilizationRate = calculateVehicleUtilizationRate(vehicle, assignments, dateRange)
+                val costPerMile = if (totalDistance > 0) totalCosts / totalDistance else 0f
+                val revenuePerMile = if (totalDistance > 0) totalRevenue / totalDistance else 0f
+                
+                val dailyUtilization = calculateDailyUtilization(vehicleId, assignments, dateRange)
+                val utilizationTrend = analyzeUtilizationTrend(vehicleId, dateRange)
+                
+                val details = VehicleUtilizationDetails(
+                    vehicleId = vehicleId,
+                    vehicleIdString = vehicle.vehicleId,
+                    dateRange = dateRange,
+                    totalAssignments = totalAssignments,
+                    activeAssignments = activeAssignments,
+                    totalOperatingHours = totalOperatingHours.toFloat(),
+                    totalDistance = totalDistance,
+                    utilizationRate = utilizationRate,
+                    costPerMile = costPerMile,
+                    revenuePerMile = revenuePerMile,
+                    totalRevenue = totalRevenue,
+                    totalCosts = totalCosts,
+                    dailyUtilization = dailyUtilization,
+                    utilizationTrend = utilizationTrend,
+                    performanceRating = determinePerformanceRating(utilizationRate, costPerMile, revenuePerMile)
+                )
+                
+                Result.success(details)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get driver performance analytics
+     */
+    suspend fun getDriverPerformanceAnalytics(
+        driverId: String,
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<DriverPerformanceAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val assignments = database.fleetAssignmentDao()
+                    .getAssignmentsByDriverAndDateRange(driverId, dateRange.startDate, dateRange.endDate)
+                
+                val totalAssignments = assignments.size
+                val completedAssignments = assignments.count { it.status == AssignmentStatus.COMPLETED }
+                val onTimeDeliveries = assignments.count { it.status == AssignmentStatus.COMPLETED && isOnTimeDelivery(it) }
+                
+                val totalDistance = assignments.sumOf { assignment ->
+                    (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+                }
+                
+                val totalOperatingHours = assignments.filter { it.startedAt != null && it.endedAt != null }
+                    .sumOf { assignment ->
+                        (assignment.endedAt!!.time - assignment.startedAt!!.time) / (1000 * 60 * 60)
+                    }
+                
+                val totalRevenue = calculateDriverRevenue(assignments)
+                val fuelConsumption = calculateDriverFuelConsumption(assignments)
+                
+                val completionRate = if (totalAssignments > 0) completedAssignments.toFloat() / totalAssignments else 0f
+                val onTimeRate = if (completedAssignments > 0) onTimeDeliveries.toFloat() / completedAssignments else 0f
+                val averageDistancePerAssignment = if (completedAssignments > 0) totalDistance / completedAssignments else 0f
+                val averageTimePerAssignment = if (completedAssignments > 0) totalOperatingHours / completedAssignments else 0f
+                
+                val efficiencyScore = calculateDriverEfficiencyScore(
+                    completionRate,
+                    onTimeRate,
+                    averageDistancePerAssignment,
+                    fuelConsumption
+                )
+                
+                val performanceTrend = analyzeDriverPerformanceTrend(driverId, dateRange)
+                val ranking = getDriverRanking(driverId, dateRange)
+                
+                val analytics = DriverPerformanceAnalytics(
+                    driverId = driverId,
+                    dateRange = dateRange,
+                    totalAssignments = totalAssignments,
+                    completedAssignments = completedAssignments,
+                    onTimeDeliveries = onTimeDeliveries,
+                    completionRate = completionRate,
+                    onTimeRate = onTimeRate,
+                    totalDistance = totalDistance,
+                    totalOperatingHours = totalOperatingHours.toFloat(),
+                    averageDistancePerAssignment = averageDistancePerAssignment,
+                    averageTimePerAssignment = averageTimePerAssignment,
+                    totalRevenue = totalRevenue,
+                    fuelConsumption = fuelConsumption,
+                    efficiencyScore = efficiencyScore,
+                    performanceTrend = performanceTrend,
+                    ranking = ranking,
+                    performanceRating = determineDriverPerformanceRating(efficiencyScore)
+                )
+                
+                Result.success(analytics)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fleet benchmarking
+     */
+    suspend fun getFleetBenchmarking(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<FleetBenchmarking> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val currentMetrics = _utilizationMetrics.value
+                    ?: generateUtilizationMetrics(database.vehicleDao().getAllVehicles(), database.fleetAssignmentDao().getAllAssignments(), dateRange)
+                
+                val industryBenchmarks = getIndustryBenchmarks()
+                val historicalBenchmarks = getHistoricalBenchmarks(dateRange)
+                
+                val utilizationBenchmark = BenchmarkComparison(
+                    actual = currentMetrics.overallUtilizationRate,
+                    industry = industryBenchmarks.utilizationRate,
+                    historical = historicalBenchmarks.utilizationRate,
+                    performance = determineBenchmarkPerformance(currentMetrics.overallUtilizationRate, industryBenchmarks.utilizationRate)
+                )
+                
+                val costBenchmark = BenchmarkComparison(
+                    actual = currentMetrics.averageCostPerMile,
+                    industry = industryBenchmarks.costPerMile,
+                    historical = historicalBenchmarks.costPerMile,
+                    performance = determineBenchmarkPerformance(industryBenchmarks.costPerMile, currentMetrics.averageCostPerMile)
+                )
+                
+                val efficiencyBenchmark = BenchmarkComparison(
+                    actual = currentMetrics.fleetEfficiencyScore,
+                    industry = industryBenchmarks.efficiencyScore,
+                    historical = historicalBenchmarks.efficiencyScore,
+                    performance = determineBenchmarkPerformance(currentMetrics.fleetEfficiencyScore, industryBenchmarks.efficiencyScore)
+                )
+                
+                val overallScore = (utilizationBenchmark.performance.score + costBenchmark.performance.score + efficiencyBenchmark.performance.score) / 3f
+                
+                val benchmarking = FleetBenchmarking(
+                    dateRange = dateRange,
+                    utilizationBenchmark = utilizationBenchmark,
+                    costBenchmark = costBenchmark,
+                    efficiencyBenchmark = efficiencyBenchmark,
+                    overallScore = overallScore,
+                    industryAverages = industryBenchmarks,
+                    historicalAverages = historicalBenchmarks,
+                    recommendations = generateBenchmarkingRecommendations(utilizationBenchmark, costBenchmark, efficiencyBenchmark)
+                )
+                
+                Result.success(benchmarking)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get ROI analysis
+     */
+    suspend fun getROIAnalysis(
+        dateRange: DateRange = DateRange.last12Months()
+    ): Result<ROIAnalysis> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicles = database.vehicleDao().getAllVehicles()
+                val assignments = database.fleetAssignmentDao().getAllAssignments()
+                
+                val totalRevenue = calculateTotalRevenue(assignments, dateRange)
+                val totalCosts = calculateTotalCosts(vehicles, assignments, dateRange)
+                val totalInvestment = vehicles.sumOf { it.purchasePrice ?: 0f }
+                
+                val roi = if (totalInvestment > 0) ((totalRevenue - totalCosts) / totalInvestment) * 100f else 0f
+                val paybackPeriod = if (totalRevenue - totalCosts > 0) totalInvestment / (totalRevenue - totalCosts) else 0f
+                
+                val revenueByVehicle = vehicles.associate { vehicle ->
+                    vehicle.id to calculateVehicleRevenue(vehicle.id, assignments.filter { it.vehicleId == vehicle.id })
+                }
+                
+                val costsByVehicle = vehicles.associate { vehicle ->
+                    vehicle.id to calculateVehicleCosts(vehicle.id, assignments.filter { it.vehicleId == vehicle.id })
+                }
+                
+                val roiByVehicle = vehicles.associate { vehicle ->
+                    val revenue = revenueByVehicle[vehicle.id] ?: 0f
+                    val costs = costsByVehicle[vehicle.id] ?: 0f
+                    val investment = vehicle.purchasePrice ?: 0f
+                    vehicle.id to if (investment > 0) ((revenue - costs) / investment) * 100f else 0f
+                }
+                
+                val monthlyROI = calculateMonthlyROI(assignments, vehicles, dateRange)
+                val roiTrend = analyzeROITrend(dateRange)
+                
+                val analysis = ROIAnalysis(
+                    dateRange = dateRange,
+                    totalRevenue = totalRevenue,
+                    totalCosts = totalCosts,
+                    totalInvestment = totalInvestment,
+                    roi = roi,
+                    paybackPeriod = paybackPeriod,
+                    revenueByVehicle = revenueByVehicle,
+                    costsByVehicle = costsByVehicle,
+                    roiByVehicle = roiByVehicle,
+                    monthlyROI = monthlyROI,
+                    roiTrend = roiTrend,
+                    projectedAnnualROI = roi * 12f // Simplified projection
+                )
+                
+                Result.success(analysis)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun generateUtilizationMetrics(
+        vehicles: List<VehicleEntity>,
+        assignments: List<FleetAssignmentEntity>,
+        dateRange: DateRange
+    ): UtilizationMetrics {
+        val totalVehicles = vehicles.size
+        val activeVehicles = vehicles.count { it.status == VehicleStatus.IN_USE }
+        val availableVehicles = vehicles.count { it.status == VehicleStatus.AVAILABLE }
+        
+        val totalOperatingHours = assignments.filter { it.startedAt != null && it.endedAt != null }
+            .sumOf { assignment ->
+                (assignment.endedAt!!.time - assignment.startedAt!!.time) / (1000 * 60 * 60)
+            }.toFloat()
+        
+        val totalDistance = assignments.sumOf { assignment ->
+            (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+        }
+        
+        val totalRevenue = calculateTotalRevenue(assignments, dateRange)
+        val totalCosts = calculateTotalCosts(vehicles, assignments, dateRange)
+        
+        val overallUtilizationRate = if (totalVehicles > 0) {
+            activeVehicles.toFloat() / totalVehicles * 100f
+        } else 0f
+        
+        val averageCostPerMile = if (totalDistance > 0) totalCosts / totalDistance else 0f
+        val averageRevenuePerMile = if (totalDistance > 0) totalRevenue / totalDistance else 0f
+        
+        val fleetEfficiencyScore = calculateFleetEfficiencyScore(
+            overallUtilizationRate,
+            averageCostPerMile,
+            averageRevenuePerMile
+        )
+        
+        return UtilizationMetrics(
+            totalVehicles = totalVehicles,
+            activeVehicles = activeVehicles,
+            availableVehicles = availableVehicles,
+            totalOperatingHours = totalOperatingHours,
+            totalDistance = totalDistance,
+            overallUtilizationRate = overallUtilizationRate,
+            averageCostPerMile = averageCostPerMile,
+            averageRevenuePerMile = averageRevenuePerMile,
+            totalRevenue = totalRevenue,
+            totalCosts = totalCosts,
+            fleetEfficiencyScore = fleetEfficiencyScore
+        )
+    }
+    
+    private suspend fun generateVehicleUtilization(
+        vehicles: List<VehicleEntity>,
+        assignments: List<FleetAssignmentEntity>,
+        dateRange: DateRange
+    ): Map<Long, VehicleUtilization> {
+        return vehicles.associate { vehicle ->
+            val vehicleAssignments = assignments.filter { it.vehicleId == vehicle.id }
+            val utilizationRate = calculateVehicleUtilizationRate(vehicle, vehicleAssignments, dateRange)
+            val costPerMile = calculateVehicleCostPerMile(vehicle.id, vehicleAssignments)
+            val revenuePerMile = calculateVehicleRevenuePerMile(vehicle.id, vehicleAssignments)
+            
+            vehicle.id to VehicleUtilization(
+                vehicleId = vehicle.id,
+                vehicleIdString = vehicle.vehicleId,
+                utilizationRate = utilizationRate,
+                costPerMile = costPerMile,
+                revenuePerMile = revenuePerMile,
+                totalDistance = vehicleAssignments.sumOf { assignment ->
+                    (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+                },
+                totalOperatingHours = vehicleAssignments.filter { it.startedAt != null && it.endedAt != null }
+                    .sumOf { assignment ->
+                        (assignment.endedAt!!.time - assignment.startedAt!!.time) / (1000 * 60 * 60)
+                    }.toFloat(),
+                performanceRating = determinePerformanceRating(utilizationRate, costPerMile, revenuePerMile)
+            )
+        }
+    }
+    
+    private suspend fun generateDriverPerformance(
+        assignments: List<FleetAssignmentEntity>,
+        dateRange: DateRange
+    ): Map<String, DriverPerformance> {
+        return assignments.groupBy { it.driverId }.mapValues { (_, driverAssignments) ->
+            val completedAssignments = driverAssignments.count { it.status == AssignmentStatus.COMPLETED }
+            val onTimeDeliveries = driverAssignments.count { assignment ->
+                assignment.status == AssignmentStatus.COMPLETED && isOnTimeDelivery(assignment)
+            }
+            
+            val completionRate = if (driverAssignments.isNotEmpty()) {
+                completedAssignments.toFloat() / driverAssignments.size
+            } else 0f
+            
+            val onTimeRate = if (completedAssignments > 0) {
+                onTimeDeliveries.toFloat() / completedAssignments
+            } else 0f
+            
+            val totalDistance = driverAssignments.sumOf { assignment ->
+                (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+            }
+            
+            val efficiencyScore = calculateDriverEfficiencyScore(
+                completionRate,
+                onTimeRate,
+                if (completedAssignments > 0) totalDistance / completedAssignments else 0f,
+                0f // Fuel consumption would be calculated from fuel data
+            )
+            
+            DriverPerformance(
+                driverId = driverAssignments.first().driverId,
+                totalAssignments = driverAssignments.size,
+                completedAssignments = completedAssignments,
+                completionRate = completionRate,
+                onTimeRate = onTimeRate,
+                totalDistance = totalDistance,
+                efficiencyScore = efficiencyScore,
+                performanceRating = determineDriverPerformanceRating(efficiencyScore)
+            )
+        }
+    }
+    
+    private fun generateRouteEfficiencyAnalysis(
+        assignments: List<FleetAssignmentEntity>,
+        dateRange: DateRange
+    ): RouteEfficiencyAnalysis {
+        val completedAssignments = assignments.filter { it.status == AssignmentStatus.COMPLETED }
+        
+        val averageRouteDistance = if (completedAssignments.isNotEmpty()) {
+            completedAssignments.sumOf { assignment ->
+                (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+            }.toDouble() / completedAssignments.size
+        } else 0.0
+        
+        val averageRouteTime = completedAssignments.filter { it.startedAt != null && it.endedAt != null }
+            .map { assignment ->
+                (assignment.endedAt!!.time - assignment.startedAt!!.time) / (1000 * 60 * 60)
+            }.average()
+        
+        val routeEfficiencyScore = if (averageRouteTime > 0) {
+            (averageRouteDistance / averageRouteTime).toFloat()
+        } else 0f
+        
+        return RouteEfficiencyAnalysis(
+            averageRouteDistance = averageRouteDistance.toFloat(),
+            averageRouteTime = averageRouteTime.toFloat(),
+            routeEfficiencyScore = routeEfficiencyScore,
+            optimizedRoutes = completedAssignments.count { it.route?.contains("OPTIMIZED") == true },
+            deviationRate = calculateRouteDeviationRate(completedAssignments)
+        )
+    }
+    
+    private fun generateCostAnalysis(
+        vehicles: List<VehicleEntity>,
+        assignments: List<FleetAssignmentEntity>,
+        dateRange: DateRange
+    ): CostAnalysis {
+        val totalCosts = calculateTotalCosts(vehicles, assignments, dateRange)
+        val totalDistance = assignments.sumOf { assignment ->
+            (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+        }
+        
+        val costPerMile = if (totalDistance > 0) totalCosts / totalDistance else 0f
+        val costBreakdown = calculateCostBreakdown(vehicles, assignments, dateRange)
+        
+        return CostAnalysis(
+            totalCosts = totalCosts,
+            costPerMile = costPerMile,
+            costBreakdown = costBreakdown,
+            costTrend = analyzeCostTrend(dateRange)
+        )
+    }
+    
+    private fun generateOptimizationRecommendations(
+        utilizationMetrics: UtilizationMetrics,
+        vehicleUtilization: Map<Long, VehicleUtilization>,
+        driverPerformance: Map<String, DriverPerformance>,
+        routeEfficiency: RouteEfficiencyAnalysis,
+        costAnalysis: CostAnalysis
+    ): List<OptimizationRecommendation> {
+        val recommendations = mutableListOf<OptimizationRecommendation>()
+        
+        // Low utilization vehicles
+        val lowUtilizationVehicles = vehicleUtilization.filter { it.value.utilizationRate < LOW_UTILIZATION_THRESHOLD }
+        lowUtilizationVehicles.forEach { (vehicleId, utilization) ->
+            recommendations.add(OptimizationRecommendation(
+                type = OptimizationType.VEHICLE_UTILIZATION,
+                priority = RecommendationPriority.HIGH,
+                title = "Low utilization for ${utilization.vehicleIdString}",
+                description = "Vehicle utilization is ${utilization.utilizationRate}% (below ${LOW_UTILIZATION_THRESHOLD}% threshold)",
+                potentialSavings = calculatePotentialSavingsForLowUtilization(vehicleId, utilization),
+                actions = listOf(
+                    "Review assignment patterns",
+                    "Consider vehicle sharing",
+                    "Evaluate if vehicle is needed",
+                    "Optimize scheduling"
+                )
+            ))
+        }
+        
+        // High cost vehicles
+        val highCostVehicles = vehicleUtilization.filter { it.value.costPerMile > COST_PER_MILE_TARGET * 1.2f }
+        highCostVehicles.forEach { (vehicleId, utilization) ->
+            recommendations.add(OptimizationRecommendation(
+                type = OptimizationType.COST_OPTIMIZATION,
+                priority = RecommendationPriority.MEDIUM,
+                title = "High operating costs for ${utilization.vehicleIdString}",
+                description = "Cost per mile is ${utilization.costPerMile} (target: $COST_PER_MILE_TARGET)",
+                potentialSavings = calculatePotentialSavingsForHighCost(vehicleId, utilization),
+                actions = listOf(
+                    "Review maintenance schedule",
+                    "Analyze fuel consumption",
+                    "Check tire pressure",
+                    "Optimize routes"
+                )
+            ))
+        }
+        
+        // Poor driver performance
+        val poorPerformingDrivers = driverPerformance.filter { it.value.efficiencyScore < 70f }
+        poorPerformingDrivers.forEach { (driverId, performance) ->
+            recommendations.add(OptimizationRecommendation(
+                type = OptimizationType.DRIVER_PERFORMANCE,
+                priority = RecommendationPriority.MEDIUM,
+                title = "Low performance for driver $driverId",
+                description = "Efficiency score is ${performance.efficiencyScore}% (below target)",
+                potentialSavings = calculatePotentialSavingsForDriver(driverId, performance),
+                actions = listOf(
+                    "Provide additional training",
+                    "Review driving habits",
+                    "Consider route optimization",
+                    "Monitor fuel consumption"
+                )
+            ))
+        }
+        
+        return recommendations
+    }
+    
+    private fun calculateVehicleUtilizationRate(
+        vehicle: VehicleEntity,
+        assignments: List<FleetAssignmentEntity>,
+        dateRange: DateRange
+    ): Float {
+        val vehicleAssignments = assignments.filter { it.vehicleId == vehicle.id }
+        val totalOperatingTime = vehicleAssignments.filter { it.startedAt != null && it.endedAt != null }
+            .sumOf { assignment ->
+                (assignment.endedAt!!.time - assignment.startedAt!!.time)
+            }
+        
+        val totalTimeRange = dateRange.endDate.time - dateRange.startDate.time
+        return if (totalTimeRange > 0) {
+            (totalOperatingTime.toFloat() / totalTimeRange) * 100f
+        } else 0f
+    }
+    
+    private fun calculateVehicleCostPerMile(vehicleId: Long, assignments: List<FleetAssignmentEntity>): Float {
+        val totalDistance = assignments.sumOf { assignment ->
+            (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+        }
+        
+        val totalCosts = calculateVehicleCosts(vehicleId, assignments)
+        return if (totalDistance > 0) totalCosts / totalDistance else 0f
+    }
+    
+    private fun calculateVehicleRevenuePerMile(vehicleId: Long, assignments: List<FleetAssignmentEntity>): Float {
+        val totalDistance = assignments.sumOf { assignment ->
+            (assignment.endMileage ?: assignment.startMileage) - assignment.startMileage
+        }
+        
+        val totalRevenue = calculateVehicleRevenue(vehicleId, assignments)
+        return if (totalDistance > 0) totalRevenue / totalDistance else 0f
+    }
+    
+    private fun calculateTotalRevenue(assignments: List<FleetAssignmentEntity>, dateRange: DateRange): Float {
+        // Implementation would calculate revenue from assignments
+        return assignments.sumOf { 500f }.toFloat() // Placeholder
+    }
+    
+    private fun calculateTotalCosts(vehicles: List<VehicleEntity>, assignments: List<FleetAssignmentEntity>, dateRange: DateRange): Float {
+        // Implementation would calculate total costs including fuel, maintenance, insurance, etc.
+        return vehicles.sumOf { 1000f } + assignments.sumOf { 200f } // Placeholder
+    }
+    
+    private fun calculateVehicleRevenue(vehicleId: Long, assignments: List<FleetAssignmentEntity>): Float {
+        val vehicleAssignments = assignments.filter { it.vehicleId == vehicleId }
+        return vehicleAssignments.sumOf { 500f } // Placeholder
+    }
+    
+    private fun calculateVehicleCosts(vehicleId: Long, assignments: List<FleetAssignmentEntity>): Float {
+        val vehicleAssignments = assignments.filter { it.vehicleId == vehicleId }
+        return vehicleAssignments.sumOf { 200f } + 1000f // Placeholder
+    }
+    
+    private fun calculateDriverRevenue(assignments: List<FleetAssignmentEntity>): Float {
+        return assignments.sumOf { 500f } // Placeholder
+    }
+    
+    private fun calculateDriverFuelConsumption(assignments: List<FleetAssignmentEntity>): Float {
+        return assignments.sumOf { 50f } // Placeholder
+    }
+    
+    private fun calculateDriverEfficiencyScore(
+        completionRate: Float,
+        onTimeRate: Float,
+        averageDistance: Float,
+        fuelConsumption: Float
+    ): Float {
+        return (completionRate * 0.4f + onTimeRate * 0.3f + (averageDistance / 100f) * 0.2f + (100f - fuelConsumption) / 100f * 0.1f) * 100f
+    }
+    
+    private fun determinePerformanceRating(utilizationRate: Float, costPerMile: Float, revenuePerMile: Float): PerformanceRating {
+        val score = (utilizationRate / IDEAL_UTILIZATION_RATE) * 0.4f +
+                    (COST_PER_MILE_TARGET / costPerMile) * 0.3f +
+                    (revenuePerMile / 2f) * 0.3f
+        
+        return when {
+            score >= 0.9f -> PerformanceRating.EXCELLENT
+            score >= 0.8f -> PerformanceRating.GOOD
+            score >= 0.7f -> PerformanceRating.AVERAGE
+            score >= 0.6f -> PerformanceLevel.BELOW_AVERAGE
+            else -> PerformanceLevel.POOR
+        }
+    }
+    
+    private fun determineDriverPerformanceRating(efficiencyScore: Float): PerformanceRating {
+        return when {
+            efficiencyScore >= 90f -> PerformanceRating.EXCELLENT
+            efficiencyScore >= 80f -> PerformanceRating.GOOD
+            efficiencyScore >= 70f -> PerformanceRating.AVERAGE
+            efficiencyScore >= 60f -> PerformanceLevel.BELOW_AVERAGE
+            else -> PerformanceLevel.POOR
+        }
+    }
+    
+    private fun isOnTimeDelivery(assignment: FleetAssignmentEntity): Boolean {
+        // Implementation would check if delivery was on time
+        return true // Placeholder
+    }
+    
+    private fun calculateDailyUtilization(vehicleId: Long, assignments: List<FleetAssignmentEntity>, dateRange: DateRange): Map<String, Float> {
+        // Implementation would calculate daily utilization
+        return emptyMap() // Placeholder
+    }
+    
+    private fun analyzeUtilizationTrend(vehicleId: Long, dateRange: DateRange): TrendAnalysis {
+        // Implementation would analyze utilization trend
+        return TrendAnalysis(TrendDirection.STABLE, 0f, 0f) // Placeholder
+    }
+    
+    private fun analyzeDriverPerformanceTrend(driverId: String, dateRange: DateRange): TrendAnalysis {
+        // Implementation would analyze driver performance trend
+        return TrendAnalysis(TrendDirection.STABLE, 0f, 0f) // Placeholder
+    }
+    
+    private fun getDriverRanking(driverId: String, dateRange: DateRange): Int {
+        // Implementation would calculate driver ranking
+        return 1 // Placeholder
+    }
+    
+    private fun calculateFleetEfficiencyScore(utilizationRate: Float, costPerMile: Float, revenuePerMile: Float): Float {
+        return (utilizationRate * 0.4f + (COST_PER_MILE_TARGET / costPerMile) * 0.3f + (revenuePerMile / 2f) * 0.3f) * 100f
+    }
+    
+    private fun getIndustryBenchmarks(): IndustryBenchmarks {
+        return IndustryBenchmarks(
+            utilizationRate = 75f,
+            costPerMile = 1.50f,
+            efficiencyScore = 80f
+        )
+    }
+    
+    private fun getHistoricalBenchmarks(dateRange: DateRange): IndustryBenchmarks {
+        // Implementation would calculate historical benchmarks
+        return IndustryBenchmarks(
+            utilizationRate = 70f,
+            costPerMile = 1.60f,
+            efficiencyScore = 75f
+        )
+    }
+    
+    private fun determineBenchmarkPerformance(actual: Float, benchmark: Float): BenchmarkPerformance {
+        val ratio = actual / benchmark
+        val score = when {
+            ratio >= 1.1f -> 100f
+            ratio >= 1.0f -> 90f
+            ratio >= 0.9f -> 80f
+            ratio >= 0.8f -> 70f
+            else -> 60f
+        }
+        
+        return BenchmarkPerformance(
+            actual = actual,
+            benchmark = benchmark,
+            ratio = ratio,
+            score = score
+        )
+    }
+    
+    private fun generateBenchmarkingRecommendations(
+        utilization: BenchmarkComparison,
+        cost: BenchmarkComparison,
+        efficiency: BenchmarkComparison
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (utilization.ratio < 0.9f) {
+            recommendations.add("Improve vehicle utilization to meet industry standards")
+        }
+        
+        if (cost.ratio > 1.1f) {
+            recommendations.add("Reduce operating costs to improve competitiveness")
+        }
+        
+        if (efficiency.ratio < 0.9f) {
+            recommendations.add("Focus on operational efficiency improvements")
+        }
+        
+        return recommendations
+    }
+    
+    private fun calculateCostBreakdown(vehicles: List<VehicleEntity>, assignments: List<FleetAssignmentEntity>, dateRange: DateRange): Map<String, Float> {
+        return mapOf(
+            "Fuel" to 40f,
+            "Maintenance" to 25f,
+            "Insurance" to 15f,
+            "Labor" to 20f
+        ) // Placeholder
+    }
+    
+    private fun analyzeCostTrend(dateRange: DateRange): TrendAnalysis {
+        // Implementation would analyze cost trend
+        return TrendAnalysis(TrendDirection.INCREASING, 5f, 0.7f)
+    }
+    
+    private fun calculateRouteDeviationRate(assignments: List<FleetAssignmentEntity>): Float {
+        // Implementation would calculate route deviation rate
+        return 15f // Placeholder
+    }
+    
+    private fun calculatePotentialSavingsForLowUtilization(vehicleId: Long, utilization: VehicleUtilization): Float {
+        // Implementation would calculate potential savings
+        return 500f // Placeholder
+    }
+    
+    private fun calculatePotentialSavingsForHighCost(vehicleId: Long, utilization: VehicleUtilization): Float {
+        // Implementation would calculate potential savings
+        return 300f // Placeholder
+    }
+    
+    private fun calculatePotentialSavingsForDriver(driverId: String, performance: DriverPerformance): Float {
+        // Implementation would calculate potential savings
+        return 200f // Placeholder
+    }
+    
+    private fun calculateMonthlyROI(assignments: List<FleetAssignmentEntity>, vehicles: List<VehicleEntity>, dateRange: DateRange): Map<String, Float> {
+        // Implementation would calculate monthly ROI
+        return emptyMap() // Placeholder
+    }
+    
+    private fun analyzeROITrend(dateRange: DateRange): TrendAnalysis {
+        // Implementation would analyze ROI trend
+        return TrendAnalysis(TrendDirection.INCREASING, 3f, 0.8f)
+    }
+    
+    /**
+     * Get analytics state
+     */
+    fun getAnalyticsState(): AnalyticsState = _analyticsState.value
+}
+
+/**
+ * Data classes
+ */
+data class FleetUtilizationReport(
+    val dateRange: DateRange,
+    val utilizationMetrics: UtilizationMetrics,
+    val vehicleUtilization: Map<Long, VehicleUtilization>,
+    val driverPerformance: Map<String, DriverPerformance>,
+    val routeEfficiency: RouteEfficiencyAnalysis,
+    val costAnalysis: CostAnalysis,
+    val optimizationRecommendations: List<OptimizationRecommendation>,
+    val generatedAt: Date
+)
+
+data class UtilizationMetrics(
+    val totalVehicles: Int,
+    val activeVehicles: Int,
+    val availableVehicles: Int,
+    val totalOperatingHours: Float,
+    val totalDistance: Float,
+    val overallUtilizationRate: Float,
+    val averageCostPerMile: Float,
+    val averageRevenuePerMile: Float,
+    val totalRevenue: Float,
+    val totalCosts: Float,
+    val fleetEfficiencyScore: Float
+)
+
+data class VehicleUtilization(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val utilizationRate: Float,
+    val costPerMile: Float,
+    val revenuePerMile: Float,
+    val totalDistance: Float,
+    val totalOperatingHours: Float,
+    val performanceRating: PerformanceRating
+)
+
+data class DriverPerformance(
+    val driverId: String,
+    val totalAssignments: Int,
+    val completedAssignments: Int,
+    val completionRate: Float,
+    val onTimeRate: Float,
+    val totalDistance: Float,
+    val efficiencyScore: Float,
+    val performanceRating: PerformanceRating
+)
+
+data class VehicleUtilizationDetails(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val dateRange: DateRange,
+    val totalAssignments: Int,
+    val activeAssignments: Int,
+    val totalOperatingHours: Float,
+    val totalDistance: Float,
+    val utilizationRate: Float,
+    val costPerMile: Float,
+    val revenuePerMile: Float,
+    val totalRevenue: Float,
+    val totalCosts: Float,
+    val dailyUtilization: Map<String, Float>,
+    val utilizationTrend: TrendAnalysis,
+    val performanceRating: PerformanceRating
+)
+
+data class DriverPerformanceAnalytics(
+    val driverId: String,
+    val dateRange: DateRange,
+    val totalAssignments: Int,
+    val completedAssignments: Int,
+    val onTimeDeliveries: Int,
+    val completionRate: Float,
+    val onTimeRate: Float,
+    val totalDistance: Float,
+    val totalOperatingHours: Float,
+    val averageDistancePerAssignment: Float,
+    val averageTimePerAssignment: Float,
+    val totalRevenue: Float,
+    val fuelConsumption: Float,
+    val efficiencyScore: Float,
+    val performanceTrend: TrendAnalysis,
+    val ranking: Int,
+    val performanceRating: PerformanceRating
+)
+
+data class RouteEfficiencyAnalysis(
+    val averageRouteDistance: Float,
+    val averageRouteTime: Float,
+    val routeEfficiencyScore: Float,
+    val optimizedRoutes: Int,
+    val deviationRate: Float
+)
+
+data class CostAnalysis(
+    val totalCosts: Float,
+    val costPerMile: Float,
+    val costBreakdown: Map<String, Float>,
+    val costTrend: TrendAnalysis
+)
+
+data class OptimizationRecommendation(
+    val type: OptimizationType,
+    val priority: RecommendationPriority,
+    val title: String,
+    val description: String,
+    val potentialSavings: Float,
+    val actions: List<String>
+)
+
+data class FleetBenchmarking(
+    val dateRange: DateRange,
+    val utilizationBenchmark: BenchmarkComparison,
+    val costBenchmark: BenchmarkComparison,
+    val efficiencyBenchmark: BenchmarkComparison,
+    val overallScore: Float,
+    val industryAverages: IndustryBenchmarks,
+    val historicalAverages: IndustryBenchmarks,
+    val recommendations: List<String>
+)
+
+data class ROIAnalysis(
+    val dateRange: DateRange,
+    val totalRevenue: Float,
+    val totalCosts: Float,
+    val totalInvestment: Float,
+    val roi: Float,
+    val paybackPeriod: Float,
+    val revenueByVehicle: Map<Long, Float>,
+    val costsByVehicle: Map<Long, Float>,
+    val roiByVehicle: Map<Long, Float>,
+    val monthlyROI: Map<String, Float>,
+    val roiTrend: TrendAnalysis,
+    val projectedAnnualROI: Float
+)
+
+data class BenchmarkComparison(
+    val actual: Float,
+    val industry: Float,
+    val historical: Float,
+    val performance: BenchmarkPerformance
+)
+
+data class BenchmarkPerformance(
+    val actual: Float,
+    val benchmark: Float,
+    val ratio: Float,
+    val score: Float
+)
+
+data class IndustryBenchmarks(
+    val utilizationRate: Float,
+    val costPerMile: Float,
+    val efficiencyScore: Float
+)
+
+data class TrendAnalysis(
+    val direction: TrendDirection,
+    val changePercentage: Float,
+    val strength: Float
+)
+
+/**
+ * Enums
+ */
+enum class AnalyticsState {
+    Idle,
+    Generating,
+    Completed,
+    Error
+}
+
+enum class OptimizationType {
+    VEHICLE_UTILIZATION,
+    COST_OPTIMIZATION,
+    DRIVER_PERFORMANCE,
+    ROUTE_OPTIMIZATION,
+    MAINTENANCE_OPTIMIZATION,
+    FLEET_SIZE_OPTIMIZATION
+}
+
+enum class RecommendationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class PerformanceRating {
+    EXCELLENT,
+    GOOD,
+    AVERAGE,
+    BELOW_AVERAGE,
+    POOR
+}
+
+enum class TrendDirection {
+    INCREASING,
+    DECREASING,
+    STABLE
+}

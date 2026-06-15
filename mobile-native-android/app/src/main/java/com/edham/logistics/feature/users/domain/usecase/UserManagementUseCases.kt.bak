@@ -1,0 +1,760 @@
+package com.edham.logistics.feature.users.domain.usecase
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.users.domain.model.*
+import com.edham.logistics.feature.users.domain.repository.UserRepository
+import kotlinx.coroutines.flow.Flow
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * User management use cases for comprehensive user and role management
+ */
+@Singleton
+class CreateUserUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(request: CreateUserRequest): Result<User> {
+        return try {
+            // Validate request
+            validateCreateRequest(request)
+            
+            // Create user
+            val user = userRepository.createUser(request)
+            
+            // Log activity
+            logUserActivity(
+                userId = user.id,
+                action = ActivityAction.CREATE,
+                resource = "User",
+                resourceId = user.id,
+                details = mapOf(
+                    "username" to request.username,
+                    "email" to request.email,
+                    "role" to request.role.name,
+                    "createdBy" to "current_user"
+                )
+            )
+            
+            Result.Success(user)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun validateCreateRequest(request: CreateUserRequest) {
+        // Check if username exists
+        val existingUsername = userRepository.getUserByUsername(request.username)
+        if (existingUsername is Result.Success) {
+            throw IllegalArgumentException("Username already exists")
+        }
+        
+        // Check if email exists
+        val existingEmail = userRepository.getUserByEmail(request.email)
+        if (existingEmail is Result.Success) {
+            throw IllegalArgumentException("Email already exists")
+        }
+        
+        // Validate phone number if provided
+        request.phoneNumber?.let { phone ->
+            if (!isValidPhoneNumber(phone)) {
+                throw IllegalArgumentException("Invalid phone number")
+            }
+        }
+        
+        // Validate password strength
+        if (!isPasswordStrong(request.password)) {
+            throw IllegalArgumentException("Password does not meet security requirements")
+        }
+    }
+    
+    private fun isValidPhoneNumber(phone: String): Boolean {
+        return phone.matches(Regex("^[+]?[1-9][\\d]{0,15}$"))
+    }
+    
+    private fun isPasswordStrong(password: String): Boolean {
+        return password.length >= 8 &&
+               password.any { it.isUpperCase() } &&
+               password.any { it.isLowerCase() } &&
+               password.any { it.isDigit() } &&
+               password.any { !it.isLetterOrDigit() }
+    }
+    
+    private suspend fun logUserActivity(
+        userId: String,
+        action: ActivityAction,
+        resource: String?,
+        resourceId: String?,
+        details: Map<String, Any>
+    ) {
+        val activityLog = UserActivityLog(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = userId,
+            action = action,
+            resource = resource,
+            resourceId = resourceId,
+            details = details,
+            ipAddress = null,
+            userAgent = null,
+            deviceId = null,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            sessionId = null,
+            success = true,
+            errorMessage = null
+        )
+        
+        userRepository.logUserActivity(activityLog)
+    }
+}
+
+@Singleton
+class UpdateUserUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(request: UpdateUserRequest): Result<User> {
+        return try {
+            // Validate request
+            validateUpdateRequest(request)
+            
+            // Get existing user
+            val existingUserResult = userRepository.getUserById(request.id)
+            val existingUser = when (existingUserResult) {
+                is Result.Success -> existingUserResult.data
+                is Result.Error -> throw existingUserResult.exception
+            }
+            
+            // Update user
+            val updatedUser = userRepository.updateUser(request)
+            
+            // Log changes
+            logUserChanges(existingUser, updatedUser)
+            
+            Result.Success(updatedUser)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun validateUpdateRequest(request: UpdateUserRequest) {
+        // Check if user exists
+        val userResult = userRepository.getUserById(request.id)
+        if (userResult is Result.Error) {
+            throw IllegalArgumentException("User not found")
+        }
+        
+        // Validate username if changed
+        request.username?.let { username ->
+            val existingUsername = userRepository.getUserByUsername(username)
+            if (existingUsername is Result.Success && existingUsername.data.id != request.id) {
+                throw IllegalArgumentException("Username already exists")
+            }
+        }
+        
+        // Validate email if changed
+        request.email?.let { email ->
+            val existingEmail = userRepository.getUserByEmail(email)
+            if (existingEmail is Result.Success && existingEmail.data.id != request.id) {
+                throw IllegalArgumentException("Email already exists")
+            }
+        }
+        
+        // Validate phone number if provided
+        request.phoneNumber?.let { phone ->
+            if (!isValidPhoneNumber(phone)) {
+                throw IllegalArgumentException("Invalid phone number")
+            }
+        }
+    }
+    
+    private suspend fun logUserChanges(oldUser: User, newUser: User) {
+        val changes = mutableMapOf<String, Any>()
+        
+        if (oldUser.username != newUser.username) {
+            changes["username"] = mapOf("old" to oldUser.username, "new" to newUser.username)
+        }
+        if (oldUser.email != newUser.email) {
+            changes["email"] = mapOf("old" to oldUser.email, "new" to newUser.email)
+        }
+        if (oldUser.firstName != newUser.firstName) {
+            changes["firstName"] = mapOf("old" to oldUser.firstName, "new" to newUser.firstName)
+        }
+        if (oldUser.lastName != newUser.lastName) {
+            changes["lastName"] = mapOf("old" to oldUser.lastName, "new" to newUser.lastName)
+        }
+        if (oldUser.role != newUser.role) {
+            changes["role"] = mapOf("old" to oldUser.role.name, "new" to newUser.role.name)
+        }
+        if (oldUser.status != newUser.status) {
+            changes["status"] = mapOf("old" to oldUser.status.name, "new" to newUser.status.name)
+        }
+        if (oldUser.isActive != newUser.isActive) {
+            changes["isActive"] = mapOf("old" to oldUser.isActive, "new" to newUser.isActive)
+        }
+        
+        if (changes.isNotEmpty()) {
+            logUserActivity(
+                userId = newUser.id,
+                action = ActivityAction.UPDATE,
+                resource = "User",
+                resourceId = newUser.id,
+                details = changes
+            )
+        }
+    }
+    
+    private suspend fun logUserActivity(
+        userId: String,
+        action: ActivityAction,
+        resource: String?,
+        resourceId: String?,
+        details: Map<String, Any>
+    ) {
+        val activityLog = UserActivityLog(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = userId,
+            action = action,
+            resource = resource,
+            resourceId = resourceId,
+            details = details,
+            ipAddress = null,
+            userAgent = null,
+            deviceId = null,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            sessionId = null,
+            success = true,
+            errorMessage = null
+        )
+        
+        userRepository.logUserActivity(activityLog)
+    }
+}
+
+@Singleton
+class DisableUserUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(userId: String, reason: String): Result<User> {
+        return try {
+            // Get user
+            val userResult = userRepository.getUserById(userId)
+            val user = when (userResult) {
+                is Result.Success -> userResult.data
+                is Result.Error -> throw userResult.exception
+            }
+            
+            // Check if user can be disabled
+            if (user.role == UserRole.ADMIN) {
+                throw IllegalArgumentException("Cannot disable admin users")
+            }
+            
+            // Disable user
+            val disabledUser = userRepository.disableUser(userId, reason)
+            
+            // Log activity
+            logUserActivity(
+                userId = userId,
+                action = ActivityAction.DISABLE,
+                resource = "User",
+                resourceId = userId,
+                details = mapOf(
+                    "reason" to reason,
+                    "previousStatus" to user.status.name
+                )
+            )
+            
+            // Terminate all sessions
+            userRepository.terminateAllUserSessions(userId)
+            
+            Result.Success(disabledUser)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun logUserActivity(
+        userId: String,
+        action: ActivityAction,
+        resource: String?,
+        resourceId: String?,
+        details: Map<String, Any>
+    ) {
+        val activityLog = UserActivityLog(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = userId,
+            action = action,
+            resource = resource,
+            resourceId = resourceId,
+            details = details,
+            ipAddress = null,
+            userAgent = null,
+            deviceId = null,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            sessionId = null,
+            success = true,
+            errorMessage = null
+        )
+        
+        userRepository.logUserActivity(activityLog)
+    }
+}
+
+@Singleton
+class EnableUserUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(userId: String, reason: String): Result<User> {
+        return try {
+            // Get user
+            val userResult = userRepository.getUserById(userId)
+            val user = when (userResult) {
+                is Result.Success -> userResult.data
+                is Result.Error -> throw userResult.exception
+            }
+            
+            // Enable user
+            val enabledUser = userRepository.enableUser(userId, reason)
+            
+            // Log activity
+            logUserActivity(
+                userId = userId,
+                action = ActivityAction.ENABLE,
+                resource = "User",
+                resourceId = userId,
+                details = mapOf(
+                    "reason" to reason,
+                    "previousStatus" to user.status.name
+                )
+            )
+            
+            Result.Success(enabledUser)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun logUserActivity(
+        userId: String,
+        action: ActivityAction,
+        resource: String?,
+        resourceId: String?,
+        details: Map<String, Any>
+    ) {
+        val activityLog = UserActivityLog(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = userId,
+            action = action,
+            resource = resource,
+            resourceId = resourceId,
+            details = details,
+            ipAddress = null,
+            userAgent = null,
+            deviceId = null,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            sessionId = null,
+            success = true,
+            errorMessage = null
+        )
+        
+        userRepository.logUserActivity(activityLog)
+    }
+}
+
+@Singleton
+class ChangeUserRoleUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(userId: String, newRole: UserRole, reason: String): Result<User> {
+        return try {
+            // Get user
+            val userResult = userRepository.getUserById(userId)
+            val user = when (userResult) {
+                is Result.Success -> userResult.data
+                is Result.Error -> throw userResult.exception
+            }
+            
+            // Validate role change
+            validateRoleChange(user, newRole)
+            
+            // Change role
+            val updatedUser = userRepository.changeUserRole(userId, newRole, reason)
+            
+            // Log activity
+            logUserActivity(
+                userId = userId,
+                action = ActivityAction.ROLE_CHANGE,
+                resource = "User",
+                resourceId = userId,
+                details = mapOf(
+                    "oldRole" to user.role.name,
+                    "newRole" to newRole.name,
+                    "reason" to reason
+                )
+            )
+            
+            // Terminate all sessions for security
+            userRepository.terminateAllUserSessions(userId)
+            
+            Result.Success(updatedUser)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private fun validateRoleChange(user: User, newRole: UserRole) {
+        // Prevent self-role change
+        if (user.id == "current_user_id") { // Would get from context
+            throw IllegalArgumentException("Cannot change your own role")
+        }
+        
+        // Prevent role downgrade for certain conditions
+        if (user.role.level > newRole.level) {
+            // Additional validation logic
+        }
+    }
+    
+    private suspend fun logUserActivity(
+        userId: String,
+        action: ActivityAction,
+        resource: String?,
+        resourceId: String?,
+        details: Map<String, Any>
+    ) {
+        val activityLog = UserActivityLog(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = userId,
+            action = action,
+            resource = resource,
+            resourceId = resourceId,
+            details = details,
+            ipAddress = null,
+            userAgent = null,
+            deviceId = null,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            sessionId = null,
+            success = true,
+            errorMessage = null
+        )
+        
+        userRepository.logUserActivity(activityLog)
+    }
+}
+
+@Singleton
+class GetUserUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(userId: String): Result<User> {
+        return userRepository.getUserById(userId)
+    }
+}
+
+@Singleton
+class GetUsersUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(filters: UserSearchFilters): Result<UserSearchResponse> {
+        return userRepository.searchUsers(filters)
+    }
+}
+
+@Singleton
+class GetUserStatisticsUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(): Result<UserStatistics> {
+        return userRepository.getUserStatistics()
+    }
+}
+
+@Singleton
+class GetUserActivityLogsUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(
+        userId: String,
+        limit: Int = 50,
+        offset: Int = 0
+    ): Result<List<UserActivityLog>> {
+        return userRepository.getUserActivityLogs(userId, limit, offset)
+    }
+}
+
+@Singleton
+class GetLoginHistoryUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(
+        userId: String,
+        limit: Int = 50,
+        offset: Int = 0
+    ): Result<List<LoginHistory>> {
+        return userRepository.getLoginHistory(userId, limit, offset)
+    }
+}
+
+@Singleton
+class BulkUserOperationUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(operation: BulkUserOperation): Result<BulkOperationResult> {
+        return try {
+            val results = mutableListOf<UserOperationResult>()
+            val errors = mutableListOf<String>()
+            var successCount = 0
+            
+            operation.userIds.forEach { userId ->
+                try {
+                    val result = performOperation(userId, operation)
+                    results.add(result)
+                    if (result.success) {
+                        successCount++
+                    } else {
+                        errors.add("User $userId: ${result.error}")
+                    }
+                } catch (e: Exception) {
+                    results.add(UserOperationResult(userId, false, e.message))
+                    errors.add("User $userId: ${e.message}")
+                }
+            }
+            
+            val bulkResult = BulkOperationResult(
+                operation = operation.operation,
+                totalUsers = operation.userIds.size,
+                successfulUsers = successCount,
+                failedUsers = operation.userIds.size - successCount,
+                results = results,
+                errors = errors
+            )
+            
+            // Log bulk operation
+            logBulkOperation(operation, bulkResult)
+            
+            Result.Success(bulkResult)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun performOperation(userId: String, operation: BulkUserOperation): UserOperationResult {
+        return when (operation.operation) {
+            BulkOperationType.ENABLE -> {
+                val result = userRepository.enableUser(userId, "Bulk enable operation")
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.DISABLE -> {
+                val result = userRepository.disableUser(userId, "Bulk disable operation")
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.SUSPEND -> {
+                val result = userRepository.suspendUser(userId, "Bulk suspend operation")
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.UNSUSPEND -> {
+                val result = userRepository.unsuspendUser(userId, "Bulk unsuspend operation")
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.LOCK -> {
+                val result = userRepository.lockUser(userId, "Bulk lock operation")
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.UNLOCK -> {
+                val result = userRepository.unlockUser(userId, "Bulk unlock operation")
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.DELETE -> {
+                val result = userRepository.deleteUser(userId, "Bulk delete operation")
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.ROLE_CHANGE -> {
+                val newRole = operation.parameters?.get("role") as? UserRole
+                if (newRole != null) {
+                    val result = userRepository.changeUserRole(userId, newRole, "Bulk role change operation")
+                    UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+                } else {
+                    UserOperationResult(userId, false, "Role not specified")
+                }
+            }
+            BulkOperationType.PASSWORD_RESET -> {
+                val result = userRepository.resetUserPassword(userId, "Bulk password reset")
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.EMAIL_VERIFY -> {
+                val result = userRepository.verifyUserEmail(userId)
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            BulkOperationType.PHONE_VERIFY -> {
+                val result = userRepository.verifyUserPhone(userId)
+                UserOperationResult(userId, result is Result.Success, if (result is Result.Error) result.exception.message else null)
+            }
+            else -> {
+                UserOperationResult(userId, false, "Unsupported operation")
+            }
+        }
+    }
+    
+    private suspend fun logBulkOperation(operation: BulkUserOperation, result: BulkOperationResult) {
+        val activityLog = UserActivityLog(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = "system",
+            action = ActivityAction.SYSTEM_ACCESS,
+            resource = "BulkOperation",
+            resourceId = null,
+            details = mapOf(
+                "operation" to operation.operation.name,
+                "totalUsers" to operation.userIds.size,
+                "successfulUsers" to result.successfulUsers,
+                "failedUsers" to result.failedUsers
+            ),
+            ipAddress = null,
+            userAgent = null,
+            deviceId = null,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            sessionId = null,
+            success = result.failedUsers == 0,
+            errorMessage = if (result.errors.isNotEmpty()) result.errors.joinToString("; ") else null
+        )
+        
+        userRepository.logUserActivity(activityLog)
+    }
+}
+
+@Singleton
+class GetUserPermissionsUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(userId: String): Result<Set<Permission>> {
+        return userRepository.getUserPermissions(userId)
+    }
+}
+
+@Singleton
+class GrantUserPermissionsUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(userId: String, permissions: Set<Permission>, reason: String): Result<User> {
+        return try {
+            val result = userRepository.grantUserPermissions(userId, permissions, reason)
+            
+            // Log activity
+            logUserActivity(
+                userId = userId,
+                action = ActivityAction.PERMISSION_GRANT,
+                resource = "User",
+                resourceId = userId,
+                details = mapOf(
+                    "permissions" to permissions.map { it.name },
+                    "reason" to reason
+                )
+            )
+            
+            result
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun logUserActivity(
+        userId: String,
+        action: ActivityAction,
+        resource: String?,
+        resourceId: String?,
+        details: Map<String, Any>
+    ) {
+        val activityLog = UserActivityLog(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = userId,
+            action = action,
+            resource = resource,
+            resourceId = resourceId,
+            details = details,
+            ipAddress = null,
+            userAgent = null,
+            deviceId = null,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            sessionId = null,
+            success = true,
+            errorMessage = null
+        )
+        
+        userRepository.logUserActivity(activityLog)
+    }
+}
+
+@Singleton
+class RevokeUserPermissionsUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    suspend operator fun invoke(userId: String, permissions: Set<Permission>, reason: String): Result<User> {
+        return try {
+            val result = userRepository.revokeUserPermissions(userId, permissions, reason)
+            
+            // Log activity
+            logUserActivity(
+                userId = userId,
+                action = ActivityAction.PERMISSION_REVOKE,
+                resource = "User",
+                resourceId = userId,
+                details = mapOf(
+                    "permissions" to permissions.map { it.name },
+                    "reason" to reason
+                )
+            )
+            
+            result
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private suspend fun logUserActivity(
+        userId: String,
+        action: ActivityAction,
+        resource: String?,
+        resourceId: String?,
+        details: Map<String, Any>
+    ) {
+        val activityLog = UserActivityLog(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = userId,
+            action = action,
+            resource = resource,
+            resourceId = resourceId,
+            details = details,
+            ipAddress = null,
+            userAgent = null,
+            deviceId = null,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            sessionId = null,
+            success = true,
+            errorMessage = null
+        )
+        
+        userRepository.logUserActivity(activityLog)
+    }
+}
+
+@Singleton
+class ObserveUserActivityUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    operator fun invoke(userId: String): Flow<List<UserActivityLog>> {
+        return userRepository.observeUserActivity(userId)
+    }
+}
+
+@Singleton
+class ObserveLoginHistoryUseCase @Inject constructor(
+    private val userRepository: UserRepository
+) {
+    operator fun invoke(userId: String): Flow<List<LoginHistory>> {
+        return userRepository.observeLoginHistory(userId)
+    }
+}

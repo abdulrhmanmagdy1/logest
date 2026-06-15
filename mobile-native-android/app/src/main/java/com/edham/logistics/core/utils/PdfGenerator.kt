@@ -21,11 +21,17 @@ object PdfGenerator {
         val canvas: Canvas = page.canvas
         val paint = Paint()
 
-        // Branding
+        // Branding & Metadata
         paint.color = Color.parseColor("#104C64") // Edham Teal
         paint.textSize = 24f
-        canvas.drawText("Edham Logistics — كشف حساب", 40f, 50f, paint)
+        canvas.drawText("Edham Logistics — كشف حساب رسمي", 40f, 50f, paint)
         
+        paint.color = Color.GRAY
+        paint.textSize = 10f
+        val timeStamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+        canvas.drawText("تاريخ الإصدار: $timeStamp", 40f, 70f, paint)
+        canvas.drawText("الرقم المرجعي: ${java.util.UUID.randomUUID().toString().take(8).uppercase()}", 40f, 85f, paint)
+
         paint.color = Color.BLACK
         paint.textSize = 14f
         canvas.drawText("العميل: ${soa.clientName}", 40f, 100f, paint)

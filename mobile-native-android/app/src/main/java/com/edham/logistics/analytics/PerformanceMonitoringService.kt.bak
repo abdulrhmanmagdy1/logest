@@ -1,0 +1,1051 @@
+package com.edham.logistics.analytics
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.PerformanceMonitoringApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Performance Monitoring Service - Real-time system performance monitoring
+ * 
+ * Features:
+ * - Real-time KPI monitoring
+ * - System health tracking
+ * - Performance metrics collection
+ * - Alert management for performance issues
+ * - Performance trend analysis
+ * - Resource utilization monitoring
+ * - Performance optimization recommendations
+ */
+@Singleton
+class PerformanceMonitoringService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val performanceMonitoringApi: PerformanceMonitoringApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _performanceState = MutableStateFlow<PerformanceState>(PerformanceState.Idle)
+    val performanceState: StateFlow<PerformanceState> = _performanceState.asStateFlow()
+    
+    private val _currentKPIs = MutableStateFlow<CurrentKPIs>(CurrentKPIs())
+    val currentKPIs: StateFlow<CurrentKPIs> = _currentKPIs.asStateFlow()
+    
+    private val _performanceMetrics = MutableStateFlow<PerformanceMetrics>(PerformanceMetrics())
+    val performanceMetrics: StateFlow<PerformanceMetrics> = _performanceMetrics.asStateFlow()
+    
+    private val _performanceAlerts = MutableStateFlow<List<PerformanceAlert>>(emptyList())
+    val performanceAlerts: StateFlow<List<PerformanceAlert>> = _performanceAlerts.asStateFlow()
+    
+    private var isInitialized = false
+    private var monitoringTimer: Timer? = null
+    
+    companion object {
+        private const val TAG = "PerformanceMonitoringService"
+        private const val MONITORING_INTERVAL_MS = 30000L // 30 seconds
+        private const val KPI_UPDATE_INTERVAL_MS = 10000L // 10 seconds
+        private const val ALERT_CACHE_SIZE = 100
+        private const val PERFORMANCE_HISTORY_SIZE = 1000
+    }
+    
+    /**
+     * Initialize performance monitoring service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _performanceState.value = PerformanceState.Initializing
+                
+                // Load current KPIs
+                loadCurrentKPIs()
+                
+                // Load performance metrics
+                loadPerformanceMetrics()
+                
+                // Load performance alerts
+                loadPerformanceAlerts()
+                
+                // Initialize monitoring
+                initializeMonitoring()
+                
+                // Start monitoring timer
+                startMonitoringTimer()
+                
+                // Start KPI update timer
+                startKPIUpdateTimer()
+                
+                isInitialized = true
+                _performanceState.value = PerformanceState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _performanceState.value = PerformanceState.Error("Failed to initialize performance monitoring: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get current KPIs
+     */
+    suspend fun getCurrentKPIs(): Result<CurrentKPIs> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Performance monitoring service not initialized")
+                }
+                
+                _performanceState.value = PerformanceState.Collecting
+                
+                // Calculate real-time KPIs
+                val kpis = CurrentKPIs(
+                    activeShipments = database.shipmentDao().getActiveShipmentsCount(),
+                    totalVehicles = database.vehicleDao().getTotalVehiclesCount(),
+                    activeDrivers = database.driverDao().getActiveDriversCount(),
+                    todayRevenue = database.invoiceDao().getTodayRevenue(),
+                    todayExpenses = database.expenseDao().getTodayExpenses(),
+                    netProfit = calculateNetProfit(),
+                    onTimeDeliveryRate = calculateOnTimeDeliveryRate(),
+                    fuelEfficiency = calculateFuelEfficiency(),
+                    averageTemperature = calculateAverageTemperature(),
+                    systemUptime = calculateSystemUptime(),
+                    apiResponseTime = calculateAPIResponseTime(),
+                    databasePerformance = calculateDatabasePerformance(),
+                    lastUpdated = Date()
+                )
+                
+                _currentKPIs.value = kpis
+                _performanceState.value = PerformanceState.Ready
+                Result.success(kpis)
+                
+            } catch (e: Exception) {
+                _performanceState.value = PerformanceState.Error("Failed to get current KPIs: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    suspend fun getPerformanceMetrics(
+        timeRange: TimeRange = TimeRange.LAST_24_HOURS
+    ): Result<PerformanceMetrics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Performance monitoring service not initialized")
+                }
+                
+                _performanceState.value = PerformanceState.Collecting
+                
+                // Get date range
+                val dateRange = getDateRange(timeRange)
+                
+                // Calculate performance metrics
+                val metrics = PerformanceMetrics(
+                    timeRange = timeRange,
+                    systemHealth = calculateSystemHealth(dateRange),
+                    resourceUtilization = calculateResourceUtilization(dateRange),
+                    apiPerformance = calculateAPIPerformance(dateRange),
+                    databasePerformance = calculateDatabasePerformance(dateRange),
+                    userExperience = calculateUserExperience(dateRange),
+                    businessMetrics = calculateBusinessMetrics(dateRange),
+                    alerts = calculateAlertMetrics(dateRange),
+                    trends = calculatePerformanceTrends(dateRange),
+                    recommendations = generatePerformanceRecommendations(dateRange),
+                    generatedAt = Date()
+                )
+                
+                _performanceMetrics.value = metrics
+                _performanceState.value = PerformanceState.Ready
+                Result.success(metrics)
+                
+            } catch (e: Exception) {
+                _performanceState.value = PerformanceState.Error("Failed to get performance metrics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get performance alerts
+     */
+    suspend fun getPerformanceAlerts(
+        severity: AlertSeverity? = null,
+        status: AlertStatus? = null,
+        timeRange: TimeRange? = null,
+        page: Int = 0,
+        pageSize: Int = 50
+    ): Result<AlertHistoryResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val dateRange = timeRange?.let { getDateRange(it) }
+                
+                val alerts = database.performanceAlertDao().getPerformanceAlerts(
+                    severity = severity,
+                    status = status,
+                    startDate = dateRange?.startDate,
+                    endDate = dateRange?.endDate,
+                    limit = pageSize,
+                    offset = page * pageSize
+                ).map { it.toDomainModel() }
+                
+                val totalCount = database.performanceAlertDao().getPerformanceAlertsCount(
+                    severity = severity,
+                    status = status,
+                    startDate = dateRange?.startDate,
+                    endDate = dateRange?.endDate
+                )
+                
+                Result.success(
+                    AlertHistoryResult(
+                        alerts = alerts,
+                        totalCount = totalCount,
+                        page = page,
+                        pageSize = pageSize,
+                        totalPages = (totalCount + pageSize - 1) / pageSize
+                    )
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create performance alert
+     */
+    suspend fun createPerformanceAlert(
+        type: AlertType,
+        severity: AlertSeverity,
+        title: String,
+        message: String,
+        metadata: Map<String, Any> = emptyMap()
+    ): Result<PerformanceAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Performance monitoring service not initialized")
+                }
+                
+                _performanceState.value = PerformanceState.CreatingAlert
+                
+                val alert = PerformanceAlert(
+                    id = UUID.randomUUID().toString(),
+                    type = type,
+                    severity = severity,
+                    title = title,
+                    message = message,
+                    status = AlertStatus.ACTIVE,
+                    metadata = metadata,
+                    createdAt = Date(),
+                    resolvedAt = null,
+                    resolvedBy = null
+                )
+                
+                // Save to database
+                val savedAlert = database.performanceAlertDao().insertPerformanceAlert(alert.toEntity())
+                    .let { id -> alert.copy(id = id.toString()) }
+                
+                // Add to cache
+                addToPerformanceAlerts(savedAlert)
+                
+                // Send notification if high severity
+                if (severity == AlertSeverity.HIGH || severity == AlertSeverity.CRITICAL) {
+                    sendPerformanceAlertNotification(savedAlert)
+                }
+                
+                _performanceState.value = PerformanceState.Ready
+                Result.success(savedAlert)
+                
+            } catch (e: Exception) {
+                _performanceState.value = PerformanceState.Error("Failed to create performance alert: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Resolve performance alert
+     */
+    suspend fun resolvePerformanceAlert(
+        alertId: String,
+        resolvedBy: String,
+        resolution: String
+    ): Result<PerformanceAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Performance monitoring service not initialized")
+                }
+                
+                _performanceState.value = PerformanceState.ResolvingAlert
+                
+                val alert = getPerformanceAlertById(alertId)
+                    ?: throw Exception("Performance alert not found")
+                
+                val resolvedAlert = alert.copy(
+                    status = AlertStatus.RESOLVED,
+                    resolvedAt = Date(),
+                    resolvedBy = resolvedBy,
+                    resolution = resolution
+                )
+                
+                // Update in database
+                database.performanceAlertDao().updatePerformanceAlert(resolvedAlert.toEntity())
+                
+                // Update in cache
+                updatePerformanceAlertInList(resolvedAlert)
+                
+                _performanceState.value = PerformanceState.Ready
+                Result.success(resolvedAlert)
+                
+            } catch (e: Exception) {
+                _performanceState.value = PerformanceState.Error("Failed to resolve performance alert: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get performance trends
+     */
+    suspend fun getPerformanceTrends(
+        metric: PerformanceMetric,
+        timeRange: TimeRange = TimeRange.LAST_7_DAYS
+    ): Result<List<PerformanceTrendPoint>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val dateRange = getDateRange(timeRange)
+                
+                val trends = when (metric) {
+                    PerformanceMetric.RESPONSE_TIME -> {
+                        database.performanceMetricsDao().getResponseTimeTrends(dateRange.startDate, dateRange.endDate)
+                            .map { PerformanceTrendPoint(it.timestamp, it.value) }
+                    }
+                    PerformanceMetric.THROUGHPUT -> {
+                        database.performanceMetricsDao().getThroughputTrends(dateRange.startDate, dateRange.endDate)
+                            .map { PerformanceTrendPoint(it.timestamp, it.value) }
+                    }
+                    PerformanceMetric.ERROR_RATE -> {
+                        database.performanceMetricsDao().getErrorRateTrends(dateRange.startDate, dateRange.endDate)
+                            .map { PerformanceTrendPoint(it.timestamp, it.value) }
+                    }
+                    PerformanceMetric.CPU_USAGE -> {
+                        database.performanceMetricsDao().getCpuUsageTrends(dateRange.startDate, dateRange.endDate)
+                            .map { PerformanceTrendPoint(it.timestamp, it.value) }
+                    }
+                    PerformanceMetric.MEMORY_USAGE -> {
+                        database.performanceMetricsDao().getMemoryUsageTrends(dateRange.startDate, dateRange.endDate)
+                            .map { PerformanceTrendPoint(it.timestamp, it.value) }
+                    }
+                    PerformanceMetric.DATABASE_PERFORMANCE -> {
+                        database.performanceMetricsDao().getDatabasePerformanceTrends(dateRange.startDate, dateRange.endDate)
+                            .map { PerformanceTrendPoint(it.timestamp, it.value) }
+                    }
+                }
+                
+                Result.success(trends)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get performance recommendations
+     */
+    suspend fun getPerformanceRecommendations(
+        timeRange: TimeRange = TimeRange.LAST_7_DAYS
+    ): Result<List<PerformanceRecommendation>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val dateRange = getDateRange(timeRange)
+                val metrics = getPerformanceMetrics(timeRange).getOrThrow()
+                
+                val recommendations = mutableListOf<PerformanceRecommendation>()
+                
+                // System health recommendations
+                if (metrics.systemHealth.overallScore < 70) {
+                    recommendations.add(
+                        PerformanceRecommendation(
+                            type = RecommendationType.SYSTEM_HEALTH,
+                            priority = RecommendationPriority.HIGH,
+                            title = "System Health Degraded",
+                            description = "Overall system health score is below optimal levels",
+                            action = "Review system logs and identify performance bottlenecks"
+                        )
+                    )
+                }
+                
+                // Resource utilization recommendations
+                if (metrics.resourceUtilization.cpuUsage > 80) {
+                    recommendations.add(
+                        PerformanceRecommendation(
+                            type = RecommendationType.RESOURCE_OPTIMIZATION,
+                            priority = RecommendationPriority.MEDIUM,
+                            title = "High CPU Usage",
+                            description = "CPU usage is consistently above 80%",
+                            action = "Consider scaling up resources or optimizing CPU-intensive operations"
+                        )
+                    )
+                }
+                
+                if (metrics.resourceUtilization.memoryUsage > 85) {
+                    recommendations.add(
+                        PerformanceRecommendation(
+                            type = RecommendationType.RESOURCE_OPTIMIZATION,
+                            priority = RecommendationPriority.MEDIUM,
+                            title = "High Memory Usage",
+                            description = "Memory usage is consistently above 85%",
+                            action = "Review memory leaks and optimize memory usage patterns"
+                        )
+                    )
+                }
+                
+                // API performance recommendations
+                if (metrics.apiPerformance.averageResponseTime > 2000) {
+                    recommendations.add(
+                        PerformanceRecommendation(
+                            type = RecommendationType.API_OPTIMIZATION,
+                            priority = RecommendationPriority.HIGH,
+                            title = "Slow API Response Time",
+                            description = "Average API response time is above 2 seconds",
+                            action = "Optimize database queries and implement caching strategies"
+                        )
+                    )
+                }
+                
+                if (metrics.apiPerformance.errorRate > 5) {
+                    recommendations.add(
+                        PerformanceRecommendation(
+                            type = RecommendationType.API_OPTIMIZATION,
+                            priority = RecommendationPriority.CRITICAL,
+                            title = "High API Error Rate",
+                            description = "API error rate is above 5%",
+                            action = "Review error logs and fix critical API issues"
+                        )
+                    )
+                }
+                
+                // Database performance recommendations
+                if (metrics.databasePerformance.averageQueryTime > 1000) {
+                    recommendations.add(
+                        PerformanceRecommendation(
+                            type = RecommendationType.DATABASE_OPTIMIZATION,
+                            priority = RecommendationPriority.MEDIUM,
+                            title = "Slow Database Queries",
+                            description = "Average database query time is above 1 second",
+                            action = "Optimize database indexes and review slow queries"
+                        )
+                    )
+                }
+                
+                // User experience recommendations
+                if (metrics.userExperience.averageLoadTime > 3000) {
+                    recommendations.add(
+                        PerformanceRecommendation(
+                            type = RecommendationType.USER_EXPERIENCE,
+                            priority = RecommendationPriority.HIGH,
+                            title = "Slow Page Load Times",
+                            description = "Average page load time is above 3 seconds",
+                            action = "Optimize frontend assets and implement lazy loading"
+                        )
+                    )
+                }
+                
+                Result.success(recommendations)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadCurrentKPIs() {
+        try {
+            val kpis = CurrentKPIs(
+                activeShipments = database.shipmentDao().getActiveShipmentsCount(),
+                totalVehicles = database.vehicleDao().getTotalVehiclesCount(),
+                activeDrivers = database.driverDao().getActiveDriversCount(),
+                todayRevenue = database.invoiceDao().getTodayRevenue(),
+                todayExpenses = database.expenseDao().getTodayExpenses(),
+                netProfit = calculateNetProfit(),
+                onTimeDeliveryRate = calculateOnTimeDeliveryRate(),
+                fuelEfficiency = calculateFuelEfficiency(),
+                averageTemperature = calculateAverageTemperature(),
+                systemUptime = calculateSystemUptime(),
+                apiResponseTime = calculateAPIResponseTime(),
+                databasePerformance = calculateDatabasePerformance(),
+                lastUpdated = Date()
+            )
+            
+            _currentKPIs.value = kpis
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun loadPerformanceMetrics() {
+        try {
+            val metrics = PerformanceMetrics(
+                timeRange = TimeRange.LAST_24_HOURS,
+                systemHealth = calculateSystemHealth(getDateRange(TimeRange.LAST_24_HOURS)),
+                resourceUtilization = calculateResourceUtilization(getDateRange(TimeRange.LAST_24_HOURS)),
+                apiPerformance = calculateAPIPerformance(getDateRange(TimeRange.LAST_24_HOURS)),
+                databasePerformance = calculateDatabasePerformance(),
+                userExperience = calculateUserExperience(getDateRange(TimeRange.LAST_24_HOURS)),
+                businessMetrics = calculateBusinessMetrics(getDateRange(TimeRange.LAST_24_HOURS)),
+                alerts = calculateAlertMetrics(getDateRange(TimeRange.LAST_24_HOURS)),
+                trends = calculatePerformanceTrends(getDateRange(TimeRange.LAST_24_HOURS)),
+                recommendations = generatePerformanceRecommendations(getDateRange(TimeRange.LAST_24_HOURS)),
+                generatedAt = Date()
+            )
+            
+            _performanceMetrics.value = metrics
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun loadPerformanceAlerts() {
+        try {
+            val alerts = database.performanceAlertDao().getRecentPerformanceAlerts(ALERT_CACHE_SIZE)
+                .map { it.toDomainModel() }
+            
+            _performanceAlerts.value = alerts
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun initializeMonitoring() {
+        // Initialize performance monitoring
+    }
+    
+    private fun startMonitoringTimer() {
+        monitoringTimer = Timer()
+        monitoringTimer?.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                // Collect performance metrics
+                collectPerformanceMetrics()
+            }
+        }, 0, MONITORING_INTERVAL_MS)
+    }
+    
+    private fun startKPIUpdateTimer() {
+        Timer().scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                // Update current KPIs
+                getCurrentKPIs()
+            }
+        }, 0, KPI_UPDATE_INTERVAL_MS)
+    }
+    
+    private suspend fun collectPerformanceMetrics() {
+        try {
+            // Collect system performance metrics
+            val metrics = PerformanceMetrics(
+                timeRange = TimeRange.LAST_24_HOURS,
+                systemHealth = calculateSystemHealth(getDateRange(TimeRange.LAST_24_HOURS)),
+                resourceUtilization = calculateResourceUtilization(getDateRange(TimeRange.LAST_24_HOURS)),
+                apiPerformance = calculateAPIPerformance(getDateRange(TimeRange.LAST_24_HOURS)),
+                databasePerformance = calculateDatabasePerformance(),
+                userExperience = calculateUserExperience(getDateRange(TimeRange.LAST_24_HOURS)),
+                businessMetrics = calculateBusinessMetrics(getDateRange(TimeRange.LAST_24_HOURS)),
+                alerts = calculateAlertMetrics(getDateRange(TimeRange.LAST_24_HOURS)),
+                trends = calculatePerformanceTrends(getDateRange(TimeRange.LAST_24_HOURS)),
+                recommendations = generatePerformanceRecommendations(getDateRange(TimeRange.LAST_24_HOURS)),
+                generatedAt = Date()
+            )
+            
+            _performanceMetrics.value = metrics
+            
+            // Check for performance alerts
+            checkForPerformanceAlerts(metrics)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun checkForPerformanceAlerts(metrics: PerformanceMetrics) {
+        try {
+            // Check system health
+            if (metrics.systemHealth.overallScore < 50) {
+                createPerformanceAlert(
+                    type = AlertType.SYSTEM_HEALTH,
+                    severity = AlertSeverity.CRITICAL,
+                    title = "Critical System Health",
+                    message = "System health score is critically low: ${metrics.systemHealth.overallScore}"
+                )
+            }
+            
+            // Check API performance
+            if (metrics.apiPerformance.errorRate > 10) {
+                createPerformanceAlert(
+                    type = AlertType.API_PERFORMANCE,
+                    severity = AlertSeverity.HIGH,
+                    title = "High API Error Rate",
+                    message = "API error rate is ${metrics.apiPerformance.errorRate}%"
+                )
+            }
+            
+            // Check resource utilization
+            if (metrics.resourceUtilization.cpuUsage > 90) {
+                createPerformanceAlert(
+                    type = AlertType.RESOURCE_UTILIZATION,
+                    severity = AlertSeverity.HIGH,
+                    title = "Critical CPU Usage",
+                    message = "CPU usage is ${metrics.resourceUtilization.cpuUsage}%"
+                )
+            }
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun sendPerformanceAlertNotification(alert: PerformanceAlert) {
+        // Send performance alert notification
+    }
+    
+    private fun getDateRange(timeRange: TimeRange): DateRange {
+        val calendar = Calendar.getInstance()
+        val endDate = calendar.time
+        
+        return when (timeRange) {
+            TimeRange.LAST_1_HOUR -> {
+                calendar.add(Calendar.HOUR_OF_DAY, -1)
+                DateRange(calendar.time, endDate)
+            }
+            TimeRange.LAST_24_HOURS -> {
+                calendar.add(Calendar.DAY_OF_MONTH, -1)
+                DateRange(calendar.time, endDate)
+            }
+            TimeRange.LAST_7_DAYS -> {
+                calendar.add(Calendar.DAY_OF_MONTH, -7)
+                DateRange(calendar.time, endDate)
+            }
+            TimeRange.LAST_30_DAYS -> {
+                calendar.add(Calendar.DAY_OF_MONTH, -30)
+                DateRange(calendar.time, endDate)
+            }
+        }
+    }
+    
+    private suspend fun calculateNetProfit(): Double {
+        val todayRevenue = database.invoiceDao().getTodayRevenue()
+        val todayExpenses = database.expenseDao().getTodayExpenses()
+        return todayRevenue - todayExpenses
+    }
+    
+    private suspend fun calculateOnTimeDeliveryRate(): Float {
+        val completedShipments = database.shipmentDao().getCompletedShipmentsCount(
+            Date().apply { add(Calendar.DAY_OF_MONTH, -30) },
+            Date()
+        )
+        val delayedShipments = database.shipmentDao().getDelayedShipmentsCount(
+            Date().apply { add(Calendar.DAY_OF_MONTH, -30) },
+            Date()
+        )
+        
+        return if (completedShipments > 0) {
+            ((completedShipments - delayedShipments).toFloat() / completedShipments) * 100f
+        } else {
+            0f
+        }
+    }
+    
+    private suspend fun calculateFuelEfficiency(): Float {
+        return database.fuelExpenseDao().getAverageFuelEfficiency(
+            Date().apply { add(Calendar.DAY_OF_MONTH, -30) },
+            Date()
+        )
+    }
+    
+    private suspend fun calculateAverageTemperature(): Float {
+        return database.temperatureLogDao().getTodayAverageTemperature()
+    }
+    
+    private fun calculateSystemUptime(): Long {
+        // Calculate system uptime in milliseconds
+        return Runtime.getRuntime().totalMemory()
+    }
+    
+    private suspend fun calculateAPIResponseTime(): Double {
+        return database.performanceMetricsDao().getAverageAPIResponseTime(
+            Date().apply { add(Calendar.HOUR_OF_DAY, -1) },
+            Date()
+        )
+    }
+    
+    private suspend fun calculateDatabasePerformance(): DatabasePerformance {
+        return DatabasePerformance(
+            averageQueryTime = database.performanceMetricsDao().getAverageQueryTime(
+                Date().apply { add(Calendar.HOUR_OF_DAY, -1) },
+                Date()
+            ),
+            connectionPoolUsage = database.performanceMetricsDao().getConnectionPoolUsage(),
+            cacheHitRate = database.performanceMetricsDao().getCacheHitRate()
+        )
+    }
+    
+    private suspend fun calculateSystemHealth(dateRange: DateRange): SystemHealth {
+        val uptime = calculateSystemUptime()
+        val errorRate = database.performanceMetricsDao().getErrorRate(dateRange.startDate, dateRange.endDate)
+        val responseTime = database.performanceMetricsDao().getAverageAPIResponseTime(dateRange.startDate, dateRange.endDate)
+        
+        val score = when {
+            uptime > 0.95 && errorRate < 1 && responseTime < 500 -> 100f
+            uptime > 0.90 && errorRate < 2 && responseTime < 1000 -> 80f
+            uptime > 0.80 && errorRate < 5 && responseTime < 2000 -> 60f
+            uptime > 0.70 && errorRate < 10 && responseTime < 5000 -> 40f
+            else -> 20f
+        }
+        
+        return SystemHealth(
+            overallScore = score,
+            uptime = uptime,
+            errorRate = errorRate,
+            responseTime = responseTime,
+            status = when {
+                score >= 80 -> HealthStatus.EXCELLENT
+                score >= 60 -> HealthStatus.GOOD
+                score >= 40 -> HealthStatus.FAIR
+                score >= 20 -> HealthStatus.POOR
+                else -> HealthStatus.CRITICAL
+            }
+        )
+    }
+    
+    private suspend fun calculateResourceUtilization(dateRange: DateRange): ResourceUtilization {
+        return ResourceUtilization(
+            cpuUsage = database.performanceMetricsDao().getAverageCPUUsage(dateRange.startDate, dateRange.endDate),
+            memoryUsage = database.performanceMetricsDao().getAverageMemoryUsage(dateRange.startDate, dateRange.endDate),
+            diskUsage = database.performanceMetricsDao().getAverageDiskUsage(dateRange.startDate, dateRange.endDate),
+            networkUsage = database.performanceMetricsDao().getAverageNetworkUsage(dateRange.startDate, dateRange.endDate)
+        )
+    }
+    
+    private suspend fun calculateAPIPerformance(dateRange: DateRange): APIPerformance {
+        return APIPerformance(
+            averageResponseTime = database.performanceMetricsDao().getAverageAPIResponseTime(dateRange.startDate, dateRange.endDate),
+            throughput = database.performanceMetricsDao().getThroughput(dateRange.startDate, dateRange.endDate),
+            errorRate = database.performanceMetricsDao().getErrorRate(dateRange.startDate, dateRange.endDate),
+            requestsPerSecond = database.performanceMetricsDao().getRequestsPerSecond(dateRange.startDate, dateRange.endDate)
+        )
+    }
+    
+    private suspend fun calculateUserExperience(dateRange: DateRange): UserExperience {
+        return UserExperience(
+            averageLoadTime = database.performanceMetricsDao().getAverageLoadTime(dateRange.startDate, dateRange.endDate),
+            bounceRate = database.performanceMetricsDao().getBounceRate(dateRange.startDate, dateRange.endDate),
+            userSatisfactionScore = database.performanceMetricsDao().getUserSatisfactionScore(dateRange.startDate, dateRange.endDate),
+            pageViews = database.performanceMetricsDao().getPageViews(dateRange.startDate, dateRange.endDate)
+        )
+    }
+    
+    private suspend fun calculateBusinessMetrics(dateRange: DateRange): BusinessMetrics {
+        return BusinessMetrics(
+            revenue = database.invoiceDao().getTotalRevenue(dateRange.startDate, dateRange.endDate),
+            expenses = database.expenseDao().getTotalExpenses(dateRange.startDate, dateRange.endDate),
+            profit = database.invoiceDao().getTotalRevenue(dateRange.startDate, dateRange.endDate) - 
+                    database.expenseDao().getTotalExpenses(dateRange.startDate, dateRange.endDate),
+            shipments = database.shipmentDao().getShipmentsCount(dateRange.startDate, dateRange.endDate),
+            deliveries = database.shipmentDao().getCompletedShipmentsCount(dateRange.startDate, dateRange.endDate),
+            customerAcquisition = database.customerDao().getNewCustomersCount(dateRange.startDate, dateRange.endDate)
+        )
+    }
+    
+    private suspend fun calculateAlertMetrics(dateRange: DateRange): AlertMetrics {
+        return AlertMetrics(
+            totalAlerts = database.performanceAlertDao().getPerformanceAlertsCount(dateRange.startDate, dateRange.endDate),
+            criticalAlerts = database.performanceAlertDao().getPerformanceAlertsCountBySeverity(AlertSeverity.CRITICAL, dateRange.startDate, dateRange.endDate),
+            highAlerts = database.performanceAlertDao().getPerformanceAlertsCountBySeverity(AlertSeverity.HIGH, dateRange.startDate, dateRange.endDate),
+            resolvedAlerts = database.performanceAlertDao().getPerformanceAlertsCountByStatus(AlertStatus.RESOLVED, dateRange.startDate, dateRange.endDate),
+            averageResolutionTime = database.performanceAlertDao().getAverageResolutionTime(dateRange.startDate, dateRange.endDate)
+        )
+    }
+    
+    private suspend fun calculatePerformanceTrends(dateRange: DateRange): Map<PerformanceMetric, List<PerformanceTrendPoint>> {
+        return mapOf(
+            PerformanceMetric.RESPONSE_TIME to getPerformanceTrends(PerformanceMetric.RESPONSE_TIME, TimeRange.LAST_7_DAYS).getOrThrow(),
+            PerformanceMetric.THROUGHPUT to getPerformanceTrends(PerformanceMetric.THROUGHPUT, TimeRange.LAST_7_DAYS).getOrThrow(),
+            PerformanceMetric.ERROR_RATE to getPerformanceTrends(PerformanceMetric.ERROR_RATE, TimeRange.LAST_7_DAYS).getOrThrow(),
+            PerformanceMetric.CPU_USAGE to getPerformanceTrends(PerformanceMetric.CPU_USAGE, TimeRange.LAST_7_DAYS).getOrThrow(),
+            PerformanceMetric.MEMORY_USAGE to getPerformanceTrends(PerformanceMetric.MEMORY_USAGE, TimeRange.LAST_7_DAYS).getOrThrow(),
+            PerformanceMetric.DATABASE_PERFORMANCE to getPerformanceTrends(PerformanceMetric.DATABASE_PERFORMANCE, TimeRange.LAST_7_DAYS).getOrThrow()
+        )
+    }
+    
+    private suspend fun generatePerformanceRecommendations(dateRange: DateRange): List<PerformanceRecommendation> {
+        return getPerformanceRecommendations(TimeRange.LAST_7_DAYS).getOrThrow()
+    }
+    
+    private suspend fun getPerformanceAlertById(alertId: String): PerformanceAlert? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _performanceAlerts.value.find { it.id == alertId }
+                    ?: database.performanceAlertDao().getPerformanceAlertById(alertId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    private fun addToPerformanceAlerts(alert: PerformanceAlert) {
+        val currentAlerts = _performanceAlerts.value.toMutableList()
+        currentAlerts.add(0, alert) // Add to beginning
+        
+        // Keep only ALERT_CACHE_SIZE alerts in cache
+        if (currentAlerts.size > ALERT_CACHE_SIZE) {
+            currentAlerts.removeAt(currentAlerts.size - 1)
+        }
+        
+        _performanceAlerts.value = currentAlerts
+    }
+    
+    private fun updatePerformanceAlertInList(alert: PerformanceAlert) {
+        val currentAlerts = _performanceAlerts.value.toMutableList()
+        val index = currentAlerts.indexOfFirst { it.id == alert.id }
+        
+        if (index != -1) {
+            currentAlerts[index] = alert
+            _performanceAlerts.value = currentAlerts
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        monitoringTimer?.cancel()
+        monitoringTimer = null
+    }
+}
+
+/**
+ * Data classes
+ */
+data class CurrentKPIs(
+    val activeShipments: Int = 0,
+    val totalVehicles: Int = 0,
+    val activeDrivers: Int = 0,
+    val todayRevenue: Double = 0.0,
+    val todayExpenses: Double = 0.0,
+    val netProfit: Double = 0.0,
+    val onTimeDeliveryRate: Float = 0f,
+    val fuelEfficiency: Float = 0f,
+    val averageTemperature: Float = 0f,
+    val systemUptime: Long = 0L,
+    val apiResponseTime: Double = 0.0,
+    val databasePerformance: DatabasePerformance = DatabasePerformance(),
+    val lastUpdated: Date = Date()
+)
+
+data class PerformanceMetrics(
+    val timeRange: TimeRange = TimeRange.LAST_24_HOURS,
+    val systemHealth: SystemHealth = SystemHealth(),
+    val resourceUtilization: ResourceUtilization = ResourceUtilization(),
+    val apiPerformance: APIPerformance = APIPerformance(),
+    val databasePerformance: DatabasePerformance = DatabasePerformance(),
+    val userExperience: UserExperience = UserExperience(),
+    val businessMetrics: BusinessMetrics = BusinessMetrics(),
+    val alerts: AlertMetrics = AlertMetrics(),
+    val trends: Map<PerformanceMetric, List<PerformanceTrendPoint>> = emptyMap(),
+    val recommendations: List<PerformanceRecommendation> = emptyList(),
+    val generatedAt: Date = Date()
+)
+
+data class PerformanceAlert(
+    val id: String = "",
+    val type: AlertType,
+    val severity: AlertSeverity,
+    val title: String,
+    val message: String,
+    val status: AlertStatus,
+    val metadata: Map<String, Any> = emptyMap(),
+    val createdAt: Date,
+    val resolvedAt: Date? = null,
+    val resolvedBy: String? = null,
+    val resolution: String? = null
+)
+
+data class AlertHistoryResult(
+    val alerts: List<PerformanceAlert>,
+    val totalCount: Int,
+    val page: Int,
+    val pageSize: Int,
+    val totalPages: Int
+)
+
+data class PerformanceTrendPoint(
+    val timestamp: Date,
+    val value: Double
+)
+
+data class PerformanceRecommendation(
+    val type: RecommendationType,
+    val priority: RecommendationPriority,
+    val title: String,
+    val description: String,
+    val action: String
+)
+
+// Supporting data classes
+data class SystemHealth(
+    val overallScore: Float = 0f,
+    val uptime: Double = 0.0,
+    val errorRate: Float = 0f,
+    val responseTime: Double = 0.0,
+    val status: HealthStatus = HealthStatus.GOOD
+)
+
+data class ResourceUtilization(
+    val cpuUsage: Float = 0f,
+    val memoryUsage: Float = 0f,
+    val diskUsage: Float = 0f,
+    val networkUsage: Float = 0f
+)
+
+data class APIPerformance(
+    val averageResponseTime: Double = 0.0,
+    val throughput: Double = 0.0,
+    val errorRate: Float = 0f,
+    val requestsPerSecond: Double = 0.0
+)
+
+data class DatabasePerformance(
+    val averageQueryTime: Double = 0.0,
+    val connectionPoolUsage: Float = 0f,
+    val cacheHitRate: Float = 0f
+)
+
+data class UserExperience(
+    val averageLoadTime: Double = 0.0,
+    val bounceRate: Float = 0f,
+    val userSatisfactionScore: Float = 0f,
+    val pageViews: Int = 0
+)
+
+data class BusinessMetrics(
+    val revenue: Double = 0.0,
+    val expenses: Double = 0.0,
+    val profit: Double = 0.0,
+    val shipments: Int = 0,
+    val deliveries: Int = 0,
+    val customerAcquisition: Int = 0
+)
+
+data class AlertMetrics(
+    val totalAlerts: Int = 0,
+    val criticalAlerts: Int = 0,
+    val highAlerts: Int = 0,
+    val resolvedAlerts: Int = 0,
+    val averageResolutionTime: Double = 0.0
+)
+
+data class DateRange(
+    val startDate: Date,
+    val endDate: Date
+)
+
+/**
+ * Enums
+ */
+enum class PerformanceState {
+    Idle,
+    Initializing,
+    Ready,
+    Collecting,
+    CreatingAlert,
+    ResolvingAlert,
+    Error
+}
+
+enum class TimeRange {
+    LAST_1_HOUR,
+    LAST_24_HOURS,
+    LAST_7_DAYS,
+    LAST_30_DAYS
+}
+
+enum class AlertType {
+    SYSTEM_HEALTH,
+    API_PERFORMANCE,
+    RESOURCE_UTILIZATION,
+    DATABASE_PERFORMANCE,
+    USER_EXPERIENCE,
+    BUSINESS_METRICS
+}
+
+enum class AlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class AlertStatus {
+    ACTIVE,
+    RESOLVED,
+    DISMISSED
+}
+
+enum class PerformanceMetric {
+    RESPONSE_TIME,
+    THROUGHPUT,
+    ERROR_RATE,
+    CPU_USAGE,
+    MEMORY_USAGE,
+    DATABASE_PERFORMANCE
+}
+
+enum class HealthStatus {
+    EXCELLENT,
+    GOOD,
+    FAIR,
+    POOR,
+    CRITICAL
+}
+
+enum class RecommendationType {
+    SYSTEM_HEALTH,
+    RESOURCE_OPTIMIZATION,
+    API_OPTIMIZATION,
+    DATABASE_OPTIMIZATION,
+    USER_EXPERIENCE
+}
+
+enum class RecommendationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

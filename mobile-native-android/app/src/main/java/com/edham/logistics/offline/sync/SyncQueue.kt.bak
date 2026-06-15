@@ -1,0 +1,419 @@
+package com.edham.logistics.offline.sync
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Sync Queue System
+ * Manages offline operations and queues them for synchronization
+ * Handles priority, batching, and retry logic
+ */
+
+@Singleton
+class SyncQueue @Inject constructor(
+    private val syncDatabase: SyncDatabase
+) {
+
+    private val operationIdGenerator = AtomicLong(0)
+    private val memoryQueue = ConcurrentLinkedQueue<SyncOperation>()
+    private val processingQueue = MutableStateFlow<List<SyncOperation>>(emptyList())
+    
+    // Priority queues for different operation types
+    private val highPriorityQueue = ConcurrentLinkedQueue<SyncOperation>()
+    private val normalPriorityQueue = ConcurrentLinkedQueue<SyncOperation>()
+    private val lowPriorityQueue = ConcurrentLinkedQueue<SyncOperation>()
+    
+    private val queueScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    init {
+        // Load pending operations from database on startup
+        loadPendingOperations()
+        
+        // Start queue processing
+        startQueueProcessing()
+    }
+
+    /**
+     * Enqueue a new sync operation
+     */
+    suspend fun enqueue(operation: SyncOperation): Result<String> {
+        return try {
+            val operationWithId = operation.copy(
+                id = generateOperationId(),
+                timestamp = System.currentTimeMillis()
+            )
+            
+            // Add to appropriate priority queue
+            when (getOperationPriority(operation.type)) {
+                SyncPriority.HIGH -> highPriorityQueue.offer(operationWithId)
+                SyncPriority.NORMAL -> normalPriorityQueue.offer(operationWithId)
+                SyncPriority.LOW -> lowPriorityQueue.offer(operationWithId)
+            }
+            
+            // Save to database for persistence
+            syncDatabase.insertOperation(operationWithId.toEntity())
+            
+            // Update processing queue
+            updateProcessingQueue()
+            
+            Timber.d("Enqueued operation: ${operation.type} for ${operation.entityType}:${operation.entityId}")
+            Result.success(operationWithId.id)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error enqueuing operation")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get next operation to process
+     */
+    suspend fun dequeue(): SyncOperation? {
+        return try {
+            // Check priority queues in order
+            val operation = highPriorityQueue.poll() 
+                ?: normalPriorityQueue.poll()
+                ?: lowPriorityQueue.poll()
+            
+            if (operation != null) {
+                // Mark as in progress
+                val updatedOperation = operation.copy(status = SyncStatus.IN_PROGRESS)
+                syncDatabase.updateOperationStatus(
+                    updatedOperation.id,
+                    "IN_PROGRESS",
+                    updatedOperation.retryCount,
+                    updatedOperation.lastError,
+                    updatedOperation.nextRetryTime
+                )
+                
+                updateProcessingQueue()
+                Timber.d("Dequeued operation: ${operation.type}")
+            }
+            
+            operation
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error dequeuing operation")
+            null
+        }
+    }
+
+    /**
+     * Get all pending operations
+     */
+    suspend fun getPendingOperations(): List<SyncOperation> {
+        return try {
+            val entities = syncDatabase.getPendingOperations()
+            entities.map { it.toSyncOperation() }
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting pending operations")
+            emptyList()
+        }
+    }
+
+    /**
+     * Get operations ready for retry
+     */
+    suspend fun getRetryableOperations(): List<SyncOperation> {
+        return try {
+            val currentTime = System.currentTimeMillis()
+            val entities = syncDatabase.getRetryableOperations(currentTime)
+            entities.map { it.toSyncOperation() }
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting retryable operations")
+            emptyList()
+        }
+    }
+
+    /**
+     * Mark operation as completed
+     */
+    suspend fun markCompleted(operationId: String): Result<Unit> {
+        return try {
+            syncDatabase.updateOperationStatus(operationId, "COMPLETED", 0, null, 0)
+            
+            // Remove from memory queues
+            removeFromMemoryQueues(operationId)
+            updateProcessingQueue()
+            
+            Timber.d("Marked operation as completed: $operationId")
+            Result.success(Unit)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error marking operation as completed")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Mark operation as failed and schedule retry
+     */
+    suspend fun markFailed(operationId: String, error: String): Result<Unit> {
+        return try {
+            val operation = getOperationById(operationId)
+            if (operation != null) {
+                val retryCount = operation.retryCount + 1
+                val maxRetries = operation.maxRetries
+                
+                if (retryCount >= maxRetries) {
+                    // Max retries reached, mark as permanently failed
+                    syncDatabase.updateOperationStatus(
+                        operationId, 
+                        "FAILED_PERMANENTLY", 
+                        retryCount, 
+                        error, 
+                        0
+                    )
+                    removeFromMemoryQueues(operationId)
+                } else {
+                    // Schedule retry with exponential backoff
+                    val nextRetryTime = calculateRetryTime(retryCount)
+                    syncDatabase.updateOperationStatus(
+                        operationId, 
+                        "FAILED", 
+                        retryCount, 
+                        error, 
+                        nextRetryTime
+                    )
+                    
+                    // Re-add to appropriate queue for retry
+                    val retryOperation = operation.copy(
+                        retryCount = retryCount,
+                        lastError = error,
+                        nextRetryTime = nextRetryTime
+                    )
+                    
+                    when (getOperationPriority(operation.type)) {
+                        SyncPriority.HIGH -> highPriorityQueue.offer(retryOperation)
+                        SyncPriority.NORMAL -> normalPriorityQueue.offer(retryOperation)
+                        SyncPriority.LOW -> lowPriorityQueue.offer(retryOperation)
+                    }
+                }
+                
+                updateProcessingQueue()
+                Timber.d("Marked operation as failed: $operationId, retry: $retryCount/$maxRetries")
+            }
+            
+            Result.success(Unit)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error marking operation as failed")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get queue statistics
+     */
+    fun getQueueStats(): Flow<SyncQueueStats> {
+        return processingQueue.map { operations ->
+            SyncQueueStats(
+                totalOperations = operations.size,
+                pendingOperations = operations.count { it.status == SyncStatus.PENDING },
+                inProgressOperations = operations.count { it.status == SyncStatus.IN_PROGRESS },
+                failedOperations = operations.count { it.status == SyncStatus.FAILED },
+                highPriorityCount = highPriorityQueue.size,
+                normalPriorityCount = normalPriorityQueue.size,
+                lowPriorityCount = lowPriorityQueue.size
+            )
+        }
+    }
+
+    /**
+     * Clear completed operations older than specified time
+     */
+    suspend fun clearCompletedOperations(olderThan: Long): Result<Int> {
+        return try {
+            val deletedCount = syncDatabase.deleteCompletedOperations(olderThan)
+            Timber.d("Cleared $deletedCount completed operations")
+            Result.success(deletedCount)
+        } catch (e: Exception) {
+            Timber.e(e, "Error clearing completed operations")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get operations by entity type and ID
+     */
+    suspend fun getOperationsByEntity(entityType: String, entityId: String): List<SyncOperation> {
+        return try {
+            val entities = syncDatabase.getOperationsByEntity(entityType, entityId)
+            entities.map { it.toSyncOperation() }
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting operations by entity")
+            emptyList()
+        }
+    }
+
+    // Private methods
+
+    private fun loadPendingOperations() {
+        queueScope.launch {
+            try {
+                val pendingEntities = syncDatabase.getPendingOperations()
+                val retryableEntities = syncDatabase.getRetryableOperations(System.currentTimeMillis())
+                
+                val allEntities = pendingEntities + retryableEntities
+                
+                for (entity in allEntities) {
+                    val operation = entity.toSyncOperation()
+                    
+                    when (getOperationPriority(operation.type)) {
+                        SyncPriority.HIGH -> highPriorityQueue.offer(operation)
+                        SyncPriority.NORMAL -> normalPriorityQueue.offer(operation)
+                        SyncPriority.LOW -> lowPriorityQueue.offer(operation)
+                    }
+                }
+                
+                updateProcessingQueue()
+                Timber.d("Loaded ${allEntities.size} pending operations from database")
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error loading pending operations")
+            }
+        }
+    }
+
+    private fun startQueueProcessing() {
+        queueScope.launch {
+            while (isActive) {
+                try {
+                    // Process retryable operations
+                    val retryableOps = getRetryableOperations()
+                    for (operation in retryableOps) {
+                        // Move retryable operations back to their priority queues
+                        when (getOperationPriority(operation.type)) {
+                            SyncPriority.HIGH -> highPriorityQueue.offer(operation)
+                            SyncPriority.NORMAL -> normalPriorityQueue.offer(operation)
+                            SyncPriority.LOW -> lowPriorityQueue.offer(operation)
+                        }
+                    }
+                    
+                    updateProcessingQueue()
+                    delay(5000) // Check every 5 seconds
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in queue processing")
+                    delay(10000) // Wait longer on error
+                }
+            }
+        }
+    }
+
+    private fun updateProcessingQueue() {
+        val allOperations = mutableListOf<SyncOperation>()
+        allOperations.addAll(highPriorityQueue)
+        allOperations.addAll(normalPriorityQueue)
+        allOperations.addAll(lowPriorityQueue)
+        processingQueue.value = allOperations
+    }
+
+    private fun generateOperationId(): String {
+        return "sync_op_${operationIdGenerator.incrementAndGet()}_${System.currentTimeMillis()}"
+    }
+
+    private fun getOperationPriority(operationType: OperationType): SyncPriority {
+        return when (operationType) {
+            OperationType.CREATE_SHIPMENT -> SyncPriority.HIGH
+            OperationType.UPDATE_STATUS -> SyncPriority.HIGH
+            OperationType.UPDATE_LOCATION -> SyncPriority.NORMAL
+            OperationType.UPDATE_SHIPMENT -> SyncPriority.NORMAL
+            OperationType.DELETE_SHIPMENT -> SyncPriority.NORMAL
+            OperationType.UPLOAD_PROOF -> SyncPriority.LOW
+            OperationType.SYNC_SHIPMENTS -> SyncPriority.LOW
+            OperationType.SYNC_MAPS_DATA -> SyncPriority.LOW
+        }
+    }
+
+    private fun calculateRetryTime(retryCount: Int): Long {
+        // Exponential backoff: 30s, 1min, 2min, 4min, 8min, max 30min
+        val delay = (30L * Math.pow(2.0, (retryCount - 1).toDouble())).toLong()
+        return System.currentTimeMillis() + delay.coerceAtMost(TimeUnit.MINUTES.toMillis(30))
+    }
+
+    private suspend fun getOperationById(operationId: String): SyncOperation? {
+        return try {
+            processingQueue.value.find { it.id == operationId }
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting operation by ID")
+            null
+        }
+    }
+
+    private fun removeFromMemoryQueues(operationId: String) {
+        highPriorityQueue.removeIf { it.id == operationId }
+        normalPriorityQueue.removeIf { it.id == operationId }
+        lowPriorityQueue.removeIf { it.id == operationId }
+    }
+}
+
+/**
+ * Sync Queue Statistics
+ */
+data class SyncQueueStats(
+    val totalOperations: Int,
+    val pendingOperations: Int,
+    val inProgressOperations: Int,
+    val failedOperations: Int,
+    val highPriorityCount: Int,
+    val normalPriorityCount: Int,
+    val lowPriorityCount: Int
+)
+
+/**
+ * Sync Priority Levels
+ */
+enum class SyncPriority {
+    HIGH,    // Critical operations (create shipment, update status)
+    NORMAL,  // Regular operations (update shipment, update location)
+    LOW      // Background operations (upload proof, sync data)
+}
+
+/**
+ * Extension functions for converting between entities and domain objects
+ */
+fun SyncOperationEntity.toSyncOperation(): SyncOperation {
+    return SyncOperation(
+        id = id,
+        type = OperationType.valueOf(operationType),
+        data = data,
+        timestamp = timestamp,
+        status = when (status) {
+            "PENDING" -> SyncStatus.PENDING
+            "IN_PROGRESS" -> SyncStatus.IN_PROGRESS
+            "COMPLETED" -> SyncStatus.SYNCED
+            "FAILED" -> SyncStatus.FAILED
+            "FAILED_PERMANENTLY" -> SyncStatus.FAILED
+            else -> SyncStatus.PENDING
+        },
+        retryCount = retryCount
+    )
+}
+
+fun SyncOperation.toEntity(): SyncOperationEntity {
+    return SyncOperationEntity(
+        id = id,
+        operationType = type.name,
+        entityType = this::class.simpleName ?: "UNKNOWN",
+        entityId = id,
+        data = data.toString(),
+        timestamp = timestamp,
+        status = when (status) {
+            SyncStatus.PENDING -> "PENDING"
+            SyncStatus.IN_PROGRESS -> "IN_PROGRESS"
+            SyncStatus.SYNCED -> "COMPLETED"
+            SyncStatus.FAILED -> "FAILED"
+            SyncStatus.CONFLICT -> "FAILED"
+        },
+        retryCount = retryCount,
+        maxRetries = 3,
+        lastError = null,
+        nextRetryTime = 0
+    )
+}

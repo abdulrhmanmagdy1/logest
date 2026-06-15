@@ -1,0 +1,225 @@
+package com.edham.logistics.data.local.database
+
+import android.content.Context
+import androidx.room.*
+import androidx.sqlite.db.SupportSQLiteDatabase
+import com.edham.logistics.domain.model.ShipmentStatus
+import com.edham.logistics.domain.model.DriverStatus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
+
+/**
+ * Room Database for Edham Logistics
+ * قاعدة بيانات محلية باستخدام Room
+ */
+@Database(
+    entities = [
+        com.edham.logistics.data.local.database.entities.ShipmentEntity::class,
+        DriverEntity::class,
+        VehicleEntity::class,
+        NotificationEntity::class,
+        UserEntity::class,
+        AddressEntity::class,
+        PaymentEntity::class,
+        MaintenanceEntity::class,
+        RouteEntity::class,
+        com.edham.logistics.data.local.entity.RouteHistoryEntity::class,
+        com.edham.logistics.data.local.entity.LocationUpdateEntity::class,
+        com.edham.logistics.data.local.entity.SpeedViolationEntity::class,
+        com.edham.logistics.data.local.entity.TemperatureReadingEntity::class,
+        com.edham.logistics.data.local.entity.LocationEntity::class,
+        com.edham.logistics.data.local.entity.FuelConsumptionEntity::class,
+        com.edham.logistics.data.local.entity.ShipmentStatusEntity::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(Converters::class)
+abstract class EdhamDatabase : RoomDatabase() {
+    
+    abstract fun shipmentDao(): ShipmentDao
+    abstract fun driverDao(): DriverDao
+    abstract fun vehicleDao(): VehicleDao
+    abstract fun notificationDao(): NotificationDao
+    abstract fun userDao(): UserDao
+    abstract fun addressDao(): AddressDao
+    abstract fun paymentDao(): PaymentDao
+    abstract fun maintenanceDao(): MaintenanceDao
+    abstract fun routeDao(): com.edham.logistics.data.local.database.dao.RouteDao
+    abstract fun routeHistoryDao(): com.edham.logistics.data.local.database.dao.RouteHistoryDao
+    abstract fun locationUpdateDao(): com.edham.logistics.data.local.database.dao.LocationUpdateDao
+    abstract fun speedViolationDao(): com.edham.logistics.data.local.database.dao.SpeedViolationDao
+    abstract fun temperatureReadingDao(): com.edham.logistics.data.local.database.dao.TemperatureReadingDao
+    abstract fun locationDao(): com.edham.logistics.data.local.database.dao.LocationDao
+    abstract fun fuelConsumptionDao(): com.edham.logistics.data.local.database.dao.FuelConsumptionDao
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: EdhamDatabase? = null
+        
+        fun getDatabase(context: Context): EdhamDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    EdhamDatabase::class.java,
+                    "edham_database"
+                )
+                    .fallbackToDestructiveMigration()
+                    .addCallback(DatabaseCallback())
+                    .build()
+                INSTANCE = instance
+                instance
+            }
+        }
+        
+        private class DatabaseCallback : RoomDatabase.Callback() {
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                super.onCreate(db)
+                
+                // Create indexes for better performance
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_shipments_status` ON `shipments` (`status`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_shipments_user_id` ON `shipments` (`user_id`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_shipments_created_at` ON `shipments` (`created_at`)")
+                
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_drivers_status` ON `drivers` (`status`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_drivers_user_id` ON `drivers` (`user_id`)")
+                
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_vehicles_status` ON `vehicles` (`status`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_vehicles_type` ON `vehicles` (`type`)")
+                
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_notifications_user_id` ON `notifications` (`user_id`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_notifications_read` ON `notifications` (`is_read`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_notifications_created_at` ON `notifications` (`created_at`)")
+                
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_payments_shipment_id` ON `payments` (`shipment_id`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_payments_status` ON `payments` (`status`)")
+                
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_maintenance_vehicle_id` ON `maintenance` (`vehicle_id`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_maintenance_status` ON `maintenance` (`status`)")
+            }
+        }
+    }
+}
+
+/**
+ * Type Converters for Room
+ */
+class Converters {
+    @TypeConverter
+    fun fromStringList(value: List<String>): String {
+        return value.joinToString(",")
+    }
+    
+    @TypeConverter
+    fun toStringList(value: String): List<String> {
+        return if (value.isEmpty()) emptyList() else value.split(",")
+    }
+    
+    @TypeConverter
+    fun fromTimestamp(value: Long?): java.util.Date? {
+        return value?.let { java.util.Date(it) }
+    }
+    
+    @TypeConverter
+    fun dateToTimestamp(date: java.util.Date?): Long? {
+        return date?.time
+    }
+    
+    @TypeConverter
+    fun fromStatusHistoryList(value: List<com.edham.logistics.data.local.database.entities.StatusHistory>): String {
+        return value.joinToString(";") { "${it.status},${it.timestamp.time},${it.location ?: ""},${it.notes ?: ""},${it.updatedBy ?: ""}" }
+    }
+    
+    @TypeConverter
+    fun toStatusHistoryList(value: String): List<com.edham.logistics.data.local.database.entities.StatusHistory> {
+        return if (value.isEmpty()) emptyList() else value.split(";").map { entry ->
+            val parts = entry.split(",")
+            com.edham.logistics.data.local.database.entities.StatusHistory(
+                status = parts[0],
+                timestamp = java.util.Date(parts[1].toLong()),
+                location = if (parts[2].isEmpty()) null else parts[2],
+                notes = if (parts[3].isEmpty()) null else parts[3],
+                updatedBy = if (parts[4].isEmpty()) null else parts[4]
+            )
+        }
+    }
+    
+    @TypeConverter
+    fun fromShipmentStatus(status: ShipmentStatus): String {
+        return status.name
+    }
+    
+    @TypeConverter
+    fun toShipmentStatus(status: String): ShipmentStatus {
+        return ShipmentStatus.valueOf(status)
+    }
+    
+    @TypeConverter
+    fun fromDriverStatus(status: DriverStatus): String {
+        return status.name
+    }
+    
+    @TypeConverter
+    fun toDriverStatus(status: String): DriverStatus {
+        return DriverStatus.valueOf(status)
+    }
+    
+    @TypeConverter
+    fun fromVehicleStatus(status: VehicleStatus): String {
+        return status.name
+    }
+    
+    @TypeConverter
+    fun toVehicleStatus(status: String): VehicleStatus {
+        return VehicleStatus.valueOf(status)
+    }
+    
+    @TypeConverter
+    fun fromNotificationPriority(priority: NotificationPriority): String {
+        return priority.name
+    }
+    
+    @TypeConverter
+    fun toNotificationPriority(priority: String): NotificationPriority {
+        return NotificationPriority.valueOf(priority)
+    }
+    
+    @TypeConverter
+    fun fromPaymentMethod(method: PaymentMethod): String {
+        return method.name
+    }
+    
+    @TypeConverter
+    fun toPaymentMethod(method: String): PaymentMethod {
+        return PaymentMethod.valueOf(method)
+    }
+    
+    @TypeConverter
+    fun fromStringMap(value: Map<String, Any>): String {
+        return value.entries.joinToString(";") { "${it.key}=${it.value}" }
+    }
+    
+    @TypeConverter
+    fun toStringMap(value: String): Map<String, Any> {
+        return if (value.isEmpty()) emptyMap() else value.split(";").associate { entry ->
+            val parts = entry.split("=", limit = 2)
+            parts[0] to (if (parts.size > 1) parts[1] else "")
+        }
+    }
+}
+
+/**
+ * Enums for the database
+ * Note: ShipmentStatus and DriverStatus are now imported from domain.model
+ */
+enum class VehicleStatus {
+    ACTIVE, INACTIVE, MAINTENANCE, OUT_OF_SERVICE
+}
+
+enum class NotificationPriority {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+enum class PaymentMethod {
+    CASH, CREDIT_CARD, BANK_TRANSFER, MOBILE_MONEY, CHECK
+}

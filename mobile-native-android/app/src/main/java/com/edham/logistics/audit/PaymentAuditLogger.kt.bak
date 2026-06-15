@@ -1,0 +1,599 @@
+package com.edham.logistics.audit
+
+import kotlinx.coroutines.runBlocking
+
+/**
+ * Payment Audit Logger - Specialized audit logging for payment operations
+ */
+class PaymentAuditLogger private constructor() {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: PaymentAuditLogger? = null
+        
+        fun getInstance(): PaymentAuditLogger {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: PaymentAuditLogger().also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private var auditSystem: AuditLogSystem? = null
+    
+    /**
+     * Initialize with audit system
+     */
+    fun initialize(auditSystem: AuditLogSystem) {
+        this.auditSystem = auditSystem
+    }
+    
+    /**
+     * Log payment creation
+     */
+    fun logPaymentCreation(
+        userId: String,
+        payment: Map<String, Any>
+    ) {
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = payment["id"].toString(),
+            operation = AuditOperation.PAYMENT,
+            description = "Payment created: ${payment["invoiceNumber"]} - ${payment["amount"]}",
+            beforePayment = null,
+            afterPayment = payment,
+            metadata = mapOf(
+                "invoiceNumber" to payment["invoiceNumber"],
+                "amount" to payment["amount"],
+                "currency" to payment["currency"],
+                "paymentMethod" to payment["paymentMethod"],
+                "customerId" to payment["customerId"]
+            )
+        )
+    }
+    
+    /**
+     * Log payment update
+     */
+    fun logPaymentUpdate(
+        userId: String,
+        paymentId: String,
+        beforePayment: Map<String, Any>,
+        afterPayment: Map<String, Any>,
+        changedFields: List<String>
+    ) {
+        val description = buildString {
+            append("Payment updated: ${afterPayment["invoiceNumber"]}")
+            if (changedFields.isNotEmpty()) {
+                append(" - Changed fields: ${changedFields.joinToString(", ")}")
+            }
+        }
+        
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = description,
+            beforePayment = beforePayment,
+            afterPayment = afterPayment,
+            metadata = mapOf(
+                "invoiceNumber" to afterPayment["invoiceNumber"],
+                "amount" to afterPayment["amount"],
+                "changedFields" to changedFields,
+                "updateType" to "PAYMENT_UPDATE"
+            )
+        )
+    }
+    
+    /**
+     * Log payment status change
+     */
+    fun logPaymentStatusChange(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        oldStatus: String,
+        newStatus: String,
+        reason: String? = null
+    ) {
+        auditSystem?.logStatusChange(
+            userId = userId,
+            entityType = "PAYMENT",
+            entityId = paymentId,
+            oldStatus = oldStatus,
+            newStatus = newStatus,
+            reason = reason
+        )
+        
+        // Also log detailed payment operation
+        val description = buildString {
+            append("Payment status changed: $invoiceNumber")
+            append(" from $oldStatus to $newStatus")
+            if (reason != null) {
+                append(" - Reason: $reason")
+            }
+        }
+        
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.STATUS_CHANGE,
+            description = description,
+            beforePayment = mapOf("status" to oldStatus),
+            afterPayment = mapOf("status" to newStatus),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "oldStatus" to oldStatus,
+                "newStatus" to newStatus,
+                "reason" to reason
+            )
+        )
+    }
+    
+    /**
+     * Log payment processing
+     */
+    fun logPaymentProcessing(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        paymentMethod: String,
+        amount: Double,
+        processingResult: Boolean,
+        transactionId: String? = null,
+        failureReason: String? = null
+    ) {
+        val description = if (processingResult) {
+            "Payment processed successfully: $invoiceNumber - $amount via $paymentMethod"
+        } else {
+            "Payment processing failed: $invoiceNumber - ${failureReason ?: "Unknown reason"}"
+        }
+        
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = description,
+            beforePayment = mapOf("status" to "PENDING"),
+            afterPayment = if (processingResult) {
+                mapOf(
+                    "status" to "COMPLETED",
+                    "transactionId" to (transactionId ?: ""),
+                    "processedAt" to System.currentTimeMillis()
+                )
+            } else {
+                mapOf(
+                    "status" to "FAILED",
+                    "failureReason" to failureReason,
+                    "failedAt" to System.currentTimeMillis()
+                )
+            },
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "paymentMethod" to paymentMethod,
+                "amount" to amount,
+                "processingResult" to processingResult,
+                "transactionId" to transactionId,
+                "failureReason" to failureReason,
+                "processedBy" to userId
+            ),
+            logLevel = if (processingResult) AuditLogLevel.INFO else AuditLogLevel.WARNING
+        )
+    }
+    
+    /**
+     * Log payment refund
+     */
+    fun logPaymentRefund(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        refundAmount: Double,
+        refundReason: String,
+        refundMethod: String
+    ) {
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = "Payment refunded: $invoiceNumber - $refundAmount - $refundReason",
+            beforePayment = mapOf("status" to "COMPLETED"),
+            afterPayment = mapOf(
+                "status" to "REFUNDED",
+                "refundAmount" to refundAmount,
+                "refundReason" to refundReason,
+                "refundMethod" to refundMethod,
+                "refundedAt" to System.currentTimeMillis()
+            ),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "refundAmount" to refundAmount,
+                "refundReason" to refundReason,
+                "refundMethod" to refundMethod,
+                "refundedBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment cancellation
+     */
+    fun logPaymentCancellation(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        cancellationReason: String
+    ) {
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = "Payment cancelled: $invoiceNumber - $cancellationReason",
+            beforePayment = mapOf("status" to "PENDING"),
+            afterPayment = mapOf(
+                "status" to "CANCELLED",
+                "cancellationReason" to cancellationReason,
+                "cancelledAt" to System.currentTimeMillis()
+            ),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "cancellationReason" to cancellationReason,
+                "cancelledBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment method change
+     */
+    fun logPaymentMethodChange(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        oldMethod: String,
+        newMethod: String,
+        reason: String
+    ) {
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = "Payment method changed: $invoiceNumber from $oldMethod to $newMethod",
+            beforePayment = mapOf("paymentMethod" to oldMethod),
+            afterPayment = mapOf("paymentMethod" to newMethod),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "oldMethod" to oldMethod,
+                "newMethod" to newMethod,
+                "changeReason" to reason,
+                "changedBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment amount adjustment
+     */
+    fun logPaymentAmountAdjustment(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        oldAmount: Double,
+        newAmount: Double,
+        adjustmentReason: String
+    ) {
+        val description = "Payment amount adjusted: $invoiceNumber from $oldAmount to $newAmount"
+        
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = description,
+            beforePayment = mapOf("amount" to oldAmount),
+            afterPayment = mapOf("amount" to newAmount),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "oldAmount" to oldAmount,
+                "newAmount" to newAmount,
+                "amountDifference" to (newAmount - oldAmount),
+                "adjustmentReason" to adjustmentReason,
+                "adjustedBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment due date change
+     */
+    fun logPaymentDueDateChange(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        oldDueDate: Long,
+        newDueDate: Long,
+        reason: String
+    ) {
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = "Payment due date changed: $invoiceNumber",
+            beforePayment = mapOf("dueDate" to oldDueDate),
+            afterPayment = mapOf("dueDate" to newDueDate),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "oldDueDate" to oldDueDate,
+                "newDueDate" to newDueDate,
+                "dueDateChangeReason" to reason,
+                "changedBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment discount application
+     */
+    fun logPaymentDiscountApplication(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        originalAmount: Double,
+        discountAmount: Double,
+        discountReason: String,
+        discountCode: String? = null
+    ) {
+        val finalAmount = originalAmount - discountAmount
+        val description = "Discount applied: $invoiceNumber - $discountAmount"
+        
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = description,
+            beforePayment = mapOf(
+                "amount" to originalAmount,
+                "discountAmount" to 0.0
+            ),
+            afterPayment = mapOf(
+                "amount" to finalAmount,
+                "discountAmount" to discountAmount,
+                "finalAmount" to finalAmount
+            ),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "originalAmount" to originalAmount,
+                "discountAmount" to discountAmount,
+                "finalAmount" to finalAmount,
+                "discountReason" to discountReason,
+                "discountCode" to discountCode,
+                "appliedBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment late fee application
+     */
+    fun logPaymentLateFeeApplication(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        lateFeeAmount: Double,
+        lateFeeReason: String,
+        daysLate: Int
+    ) {
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = "Late fee applied: $invoiceNumber - $lateFeeAmount",
+            beforePayment = mapOf("lateFeeAmount" to 0.0),
+            afterPayment = mapOf(
+                "lateFeeAmount" to lateFeeAmount,
+                "lateFeeAppliedAt" to System.currentTimeMillis()
+            ),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "lateFeeAmount" to lateFeeAmount,
+                "lateFeeReason" to lateFeeReason,
+                "daysLate" to daysLate,
+                "appliedBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment partial payment
+     */
+    fun logPaymentPartialPayment(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        partialAmount: Double,
+        totalAmount: Double,
+        paymentMethod: String
+    ) {
+        val remainingAmount = totalAmount - partialAmount
+        val description = "Partial payment: $invoiceNumber - $partialAmount of $totalAmount"
+        
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.PAYMENT,
+            description = description,
+            beforePayment = mapOf(
+                "paidAmount" to 0.0,
+                "remainingAmount" to totalAmount
+            ),
+            afterPayment = mapOf(
+                "paidAmount" to partialAmount,
+                "remainingAmount" to remainingAmount,
+                "partialPaymentAt" to System.currentTimeMillis()
+            ),
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "partialAmount" to partialAmount,
+                "totalAmount" to totalAmount,
+                "remainingAmount" to remainingAmount,
+                "paymentMethod" to paymentMethod,
+                "paidBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment view/access
+     */
+    fun logPaymentView(
+        userId: String,
+        paymentId: String,
+        invoiceNumber: String,
+        accessType: String
+    ) {
+        val description = "Payment accessed: $invoiceNumber - $accessType"
+        
+        auditSystem?.logPaymentOperation(
+            userId = userId,
+            paymentId = paymentId,
+            operation = AuditOperation.VIEW,
+            description = description,
+            beforePayment = null,
+            afterPayment = null,
+            metadata = mapOf(
+                "invoiceNumber" to invoiceNumber,
+                "accessType" to accessType,
+                "viewTimestamp" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    /**
+     * Log payment export
+     */
+    fun logPaymentExport(
+        userId: String,
+        exportType: String,
+        dateRange: String,
+        recordCount: Int,
+        exportFormat: String
+    ) {
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "PAYMENT_EXPORT",
+            entityId = "export_${System.currentTimeMillis()}",
+            operation = AuditOperation.VIEW,
+            description = "Payment export: $exportType - $recordCount records",
+            beforeData = null,
+            afterData = mapOf(
+                "exportType" to exportType,
+                "recordCount" to recordCount,
+                "exportFormat" to exportFormat,
+                "exportedAt" to System.currentTimeMillis()
+            ),
+            metadata = mapOf(
+                "exportType" to exportType,
+                "dateRange" to dateRange,
+                "recordCount" to recordCount,
+                "exportFormat" to exportFormat,
+                "exportedBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Log payment reconciliation
+     */
+    fun logPaymentReconciliation(
+        userId: String,
+        reconciliationDate: String,
+        totalPayments: Int,
+        reconciledAmount: Double,
+        discrepancies: List<Map<String, Any>>
+    ) {
+        val description = "Payment reconciliation: $totalPayments payments - $reconciledAmount"
+        
+        auditSystem?.logOperation(
+            userId = userId,
+            entityType = "PAYMENT_RECONCILIATION",
+            entityId = "reconciliation_${System.currentTimeMillis()}",
+            operation = AuditOperation.VIEW,
+            description = description,
+            beforeData = null,
+            afterData = mapOf(
+                "totalPayments" to totalPayments,
+                "reconciledAmount" to reconciledAmount,
+                "discrepancies" to discrepancies.size,
+                "reconciledAt" to System.currentTimeMillis()
+            ),
+            metadata = mapOf(
+                "reconciliationDate" to reconciliationDate,
+                "totalPayments" to totalPayments,
+                "reconciledAmount" to reconciledAmount,
+                "discrepancies" to discrepancies,
+                "reconciledBy" to userId
+            )
+        )
+    }
+    
+    /**
+     * Get payment audit history
+     */
+    fun getPaymentAuditHistory(paymentId: String): List<Map<String, Any>> {
+        return runBlocking {
+            auditSystem?.getEntityAuditHistory("PAYMENT", paymentId)?.map { log ->
+                mapOf(
+                    "id" to log.id,
+                    "userId" to log.userId,
+                    "operation" to log.operation.name,
+                    "description" to log.description,
+                    "timestamp" to log.timestamp,
+                    "beforeData" to log.beforeData,
+                    "afterData" to log.afterData,
+                    "metadata" to log.metadata,
+                    "ipAddress" to log.ipAddress
+                )
+            } ?: emptyList()
+        }
+    }
+    
+    /**
+     * Get payment statistics
+     */
+    fun getPaymentStatistics(): Map<String, Any> {
+        return runBlocking {
+            val allLogs = auditSystem?.getAuditLogs(
+                entityType = "PAYMENT",
+                limit = 10000
+            ) ?: emptyList()
+            
+            val totalOperations = allLogs.size
+            val operationsByType = allLogs.groupBy { it.operation }.mapValues { it.value.size }
+            val recentActivity = allLogs.filter { 
+                System.currentTimeMillis() - it.timestamp < 24 * 60 * 60 * 1000L 
+            }.size
+            
+            val successfulPayments = allLogs.filter { log ->
+                log.metadata?.get("processingResult") == true
+            }.size
+            
+            val failedPayments = allLogs.filter { log ->
+                log.metadata?.get("processingResult") == false
+            }.size
+            
+            val totalAmount = allLogs.sumOf { log ->
+                (log.afterData?.get("amount") as? Double) ?: 0.0
+            }
+            
+            mapOf(
+                "totalOperations" to totalOperations,
+                "operationsByType" to operationsByType,
+                "recentActivity24h" to recentActivity,
+                "successfulPayments" to successfulPayments,
+                "failedPayments" to failedPayments,
+                "totalProcessedAmount" to totalAmount,
+                "successRate" to if (successfulPayments + failedPayments > 0) {
+                    (successfulPayments.toDouble() / (successfulPayments + failedPayments)) * 100
+                } else 0.0
+            )
+        }
+    }
+}

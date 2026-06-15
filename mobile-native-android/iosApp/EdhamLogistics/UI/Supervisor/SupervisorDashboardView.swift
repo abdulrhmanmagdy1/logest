@@ -19,6 +19,22 @@ struct SupervisorDashboardView: View {
                             summaryCard(title: "تنبيهات", value: "\(viewModel.data?.totalAlerts ?? 0)", color: AppColors.edRust)
                         }
 
+                        // Analytics Navigation Button
+                        NavigationLink(destination: SupervisorAnalyticsView()) {
+                            HStack {
+                                Image(systemName: "chart.pie.fill")
+                                Text("عرض التقارير والتحليلات المتقدمة")
+                                    .bold()
+                                Spacer()
+                                Image(systemName: "chevron.left")
+                            }
+                            .padding()
+                            .background(AppColors.cockpitBlue.opacity(0.1))
+                            .foregroundColor(AppColors.cockpitBlue)
+                            .cornerRadius(12)
+                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppColors.cockpitBlue.opacity(0.3), lineWidth: 1))
+                        }
+
                         fleetListSection
 
                         Spacer()
@@ -27,7 +43,7 @@ struct SupervisorDashboardView: View {
                 }
             }
             .navigationTitle("لوحة إشراف إدهام")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarHidden(true)
         }
     }
 

@@ -1,0 +1,541 @@
+package com.edham.logistics.core.ui
+
+import android.content.Context
+import android.view.View
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * UX State Manager - Manages loading states, empty states, and UI transitions
+ * Provides consistent UX patterns across the application
+ */
+@Singleton
+class UXStateManager @Inject constructor(
+    private val context: Context,
+    private val skeletonManager: SkeletonManager,
+    private val emptyStateManager: EmptyStateManager,
+    private val navigationManager: NavigationManager,
+    private val dialogManager: DialogManager,
+    private val formValidationManager: FormValidationManager
+) {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    
+    // UI State tracking
+    private val uiStates = ConcurrentHashMap<String, UIState>()
+    private val loadingStates = ConcurrentHashMap<String, LoadingState>()
+    private val emptyStates = ConcurrentHashMap<String, EmptyState>()
+    
+    // State flows
+    private val _globalUIState = MutableStateFlow<UIState>(UIState.IDLE)
+    val globalUIState: StateFlow<UIState> = _globalUIState.asStateFlow()
+    
+    // Metrics
+    private val stateTransitions = ConcurrentHashMap<String, Int>()
+    private val loadingTimes = ConcurrentHashMap<String, Long>()
+    private val userInteractions = ConcurrentHashMap<String, Int>()
+
+    /**
+     * Initialize UX state for a screen
+     */
+    fun initializeScreen(
+        screenId: String,
+        lifecycleOwner: LifecycleOwner,
+        config: UXConfig = UXConfig()
+    ) {
+        uiStates[screenId] = UIState.IDLE
+        loadingStates[screenId] = LoadingState.IDLE
+        emptyStates[screenId] = EmptyState.HIDDEN
+        
+        // Setup lifecycle observers
+        setupLifecycleObservers(screenId, lifecycleOwner, config)
+        
+        // Initialize components
+        skeletonManager.initialize(screenId, config.skeletonConfig)
+        emptyStateManager.initialize(screenId, config.emptyStateConfig)
+        navigationManager.initialize(screenId, config.navigationConfig)
+        dialogManager.initialize(screenId, config.dialogConfig)
+        formValidationManager.initialize(screenId, config.formValidationConfig)
+    }
+
+    /**
+     * Show loading state with skeleton
+     */
+    fun showLoading(
+        screenId: String,
+        loadingType: LoadingType = LoadingType.SKELETON,
+        message: String? = null
+    ) {
+        val startTime = System.currentTimeMillis()
+        
+        when (loadingType) {
+            LoadingType.SKELETON -> {
+                skeletonManager.showSkeleton(screenId)
+            }
+            LoadingType.PROGRESS -> {
+                showProgressIndicator(screenId, message)
+            }
+            LoadingType.OVERLAY -> {
+                showLoadingOverlay(screenId, message)
+            }
+        }
+        
+        loadingStates[screenId] = LoadingState.LOADING
+        uiStates[screenId] = UIState.LOADING
+        _globalUIState.value = UIState.LOADING
+        
+        recordStateTransition(screenId, "SHOW_LOADING")
+        loadingTimes[screenId] = startTime
+    }
+
+    /**
+     * Hide loading state
+     */
+    fun hideLoading(screenId: String) {
+        val loadingTime = loadingTimes[screenId]?.let { startTime ->
+            System.currentTimeMillis() - startTime
+        }
+        
+        skeletonManager.hideSkeleton(screenId)
+        hideProgressIndicator(screenId)
+        hideLoadingOverlay(screenId)
+        
+        loadingStates[screenId] = LoadingState.IDLE
+        uiStates[screenId] = UIState.CONTENT
+        
+        recordStateTransition(screenId, "HIDE_LOADING")
+        recordLoadingTime(screenId, loadingTime)
+    }
+
+    /**
+     * Show empty state
+     */
+    fun showEmptyState(
+        screenId: String,
+        emptyType: EmptyType,
+        title: String,
+        description: String,
+        actionText: String? = null,
+        action: (() -> Unit)? = null
+    ) {
+        emptyStateManager.showEmptyState(
+            screenId,
+            emptyType,
+            title,
+            description,
+            actionText,
+            action
+        )
+        
+        emptyStates[screenId] = EmptyState.VISIBLE
+        uiStates[screenId] = UIState.EMPTY
+        
+        recordStateTransition(screenId, "SHOW_EMPTY")
+    }
+
+    /**
+     * Hide empty state
+     */
+    fun hideEmptyState(screenId: String) {
+        emptyStateManager.hideEmptyState(screenId)
+        emptyStates[screenId] = EmptyState.HIDDEN
+        uiStates[screenId] = UIState.CONTENT
+        
+        recordStateTransition(screenId, "HIDE_EMPTY")
+    }
+
+    /**
+     * Show error state
+     */
+    fun showErrorState(
+        screenId: String,
+        errorType: ErrorType,
+        title: String,
+        description: String,
+        actionText: String? = null,
+        action: (() -> Unit)? = null
+    ) {
+        emptyStateManager.showErrorState(
+            screenId,
+            errorType,
+            title,
+            description,
+            actionText,
+            action
+        )
+        
+        uiStates[screenId] = UIState.ERROR
+        
+        recordStateTransition(screenId, "SHOW_ERROR")
+    }
+
+    /**
+     * Show content state
+     */
+    fun showContent(screenId: String) {
+        hideLoading(screenId)
+        hideEmptyState(screenId)
+        uiStates[screenId] = UIState.CONTENT
+        
+        recordStateTransition(screenId, "SHOW_CONTENT")
+    }
+
+    /**
+     * Handle navigation with transitions
+     */
+    fun navigateWithTransition(
+        fromScreen: String,
+        toScreen: String,
+        transitionType: NavigationTransition = NavigationTransition.SLIDE,
+        data: Map<String, Any>? = null
+    ) {
+        navigationManager.navigate(
+            fromScreen,
+            toScreen,
+            transitionType,
+            data
+        )
+        
+        recordUserInteraction(fromScreen, "NAVIGATE")
+        recordStateTransition(fromScreen, "NAVIGATE_TO_$toScreen")
+    }
+
+    /**
+     * Show confirmation dialog
+     */
+    fun showConfirmationDialog(
+        screenId: String,
+        title: String,
+        message: String,
+        confirmText: String = "تأكيد",
+        cancelText: String = "إلغاء",
+        onConfirm: () -> Unit,
+        onCancel: (() -> Unit)? = null,
+        dialogType: DialogType = DialogType.CONFIRMATION
+    ) {
+        dialogManager.showDialog(
+            screenId,
+            dialogType,
+            title,
+            message,
+            confirmText,
+            cancelText,
+            onConfirm,
+            onCancel
+        )
+        
+        recordUserInteraction(screenId, "SHOW_CONFIRMATION_DIALOG")
+    }
+
+    /**
+     * Show validation messages
+     */
+    fun showValidationMessages(
+        screenId: String,
+        validationResults: List<ValidationResult>
+    ) {
+        formValidationManager.showValidationMessages(screenId, validationResults)
+        recordUserInteraction(screenId, "SHOW_VALIDATION_MESSAGES")
+    }
+
+    /**
+     * Validate form and show messages
+     */
+    fun validateAndShowMessages(
+        screenId: String,
+        formData: Map<String, Any>,
+        validationRules: List<ValidationRule>
+    ): Boolean {
+        val results = formValidationManager.validate(formData, validationRules)
+        showValidationMessages(screenId, results)
+        
+        return results.all { it.isValid }
+    }
+
+    /**
+     * Get current UI state
+     */
+    fun getUIState(screenId: String): UIState {
+        return uiStates[screenId] ?: UIState.IDLE
+    }
+
+    /**
+     * Get loading state
+     */
+    fun getLoadingState(screenId: String): LoadingState {
+        return loadingStates[screenId] ?: LoadingState.IDLE
+    }
+
+    /**
+     * Get empty state
+     */
+    fun getEmptyState(screenId: String): EmptyState {
+        return emptyStates[screenId] ?: EmptyState.HIDDEN
+    }
+
+    /**
+     * Get UX metrics
+     */
+    fun getUXMetrics(): UXMetrics {
+        return UXMetrics(
+            stateTransitions = stateTransitions.toMap(),
+            loadingTimes = loadingTimes.toMap(),
+            userInteractions = userInteractions.toMap(),
+            averageLoadingTime = loadingTimes.values.average(),
+            totalInteractions = userInteractions.values.sum(),
+            mostActiveScreen = userInteractions.maxByOrNull { it.value }?.key
+        )
+    }
+
+    /**
+     * Cleanup screen state
+     */
+    fun cleanupScreen(screenId: String) {
+        skeletonManager.cleanup(screenId)
+        emptyStateManager.cleanup(screenId)
+        navigationManager.cleanup(screenId)
+        dialogManager.cleanup(screenId)
+        formValidationManager.cleanup(screenId)
+        
+        uiStates.remove(screenId)
+        loadingStates.remove(screenId)
+        emptyStates.remove(screenId)
+        stateTransitions.remove(screenId)
+        loadingTimes.remove(screenId)
+        userInteractions.remove(screenId)
+    }
+
+    /**
+     * Setup lifecycle observers
+     */
+    private fun setupLifecycleObservers(
+        screenId: String,
+        lifecycleOwner: LifecycleOwner,
+        config: UXConfig
+    ) {
+        lifecycleOwner.lifecycle.addObserver(object : Lifecycle.EventObserver {
+            override fun onStateChanged(source: LifecycleOwner, event: Lifecycle.Event) {
+                when (event) {
+                    Lifecycle.Event.ON_PAUSE -> {
+                        // Pause any ongoing animations or processes
+                        pauseScreen(screenId)
+                    }
+                    Lifecycle.Event.ON_RESUME -> {
+                        // Resume animations and processes
+                        resumeScreen(screenId)
+                    }
+                    Lifecycle.Event.ON_DESTROY -> {
+                        // Cleanup screen state
+                        cleanupScreen(screenId)
+                    }
+                    else -> {}
+                }
+            }
+        })
+    }
+
+    /**
+     * Show progress indicator
+     */
+    private fun showProgressIndicator(screenId: String, message: String?) {
+        // Implementation for showing progress indicator
+    }
+
+    /**
+     * Hide progress indicator
+     */
+    private fun hideProgressIndicator(screenId: String) {
+        // Implementation for hiding progress indicator
+    }
+
+    /**
+     * Show loading overlay
+     */
+    private fun showLoadingOverlay(screenId: String, message: String?) {
+        // Implementation for showing loading overlay
+    }
+
+    /**
+     * Hide loading overlay
+     */
+    private fun hideLoadingOverlay(screenId: String) {
+        // Implementation for hiding loading overlay
+    }
+
+    /**
+     * Pause screen
+     */
+    private fun pauseScreen(screenId: String) {
+        skeletonManager.pause(screenId)
+        // Pause other UI elements
+    }
+
+    /**
+     * Resume screen
+     */
+    private fun resumeScreen(screenId: String) {
+        skeletonManager.resume(screenId)
+        // Resume other UI elements
+    }
+
+    /**
+     * Record state transition
+     */
+    private fun recordStateTransition(screenId: String, transition: String) {
+        stateTransitions[screenId] = stateTransitions.getOrDefault(screenId, 0) + 1
+    }
+
+    /**
+     * Record loading time
+     */
+    private fun recordLoadingTime(screenId: String, time: Long?) {
+        time?.let {
+            loadingTimes[screenId] = it
+        }
+    }
+
+    /**
+     * Record user interaction
+     */
+    private fun recordUserInteraction(screenId: String, interaction: String) {
+        userInteractions[screenId] = userInteractions.getOrDefault(screenId, 0) + 1
+    }
+
+    /**
+     * Cleanup all states
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+        uiStates.clear()
+        loadingStates.clear()
+        emptyStates.clear()
+        stateTransitions.clear()
+        loadingTimes.clear()
+        userInteractions.clear()
+        
+        skeletonManager.cleanup()
+        emptyStateManager.cleanup()
+        navigationManager.cleanup()
+        dialogManager.cleanup()
+        formValidationManager.cleanup()
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class UXConfig(
+    val skeletonConfig: SkeletonConfig = SkeletonConfig(),
+    val emptyStateConfig: EmptyStateConfig = EmptyStateConfig(),
+    val navigationConfig: NavigationConfig = NavigationConfig(),
+    val dialogConfig: DialogConfig = DialogConfig(),
+    val formValidationConfig: FormValidationConfig = FormValidationConfig()
+)
+
+data class SkeletonConfig(
+    val enableSkeleton: Boolean = true,
+    val shimmerDuration: Long = 1000,
+    val shimmerColor: Int = 0x44CCCCCC.toInt(),
+    val cornerRadius: Float = 8f
+)
+
+data class EmptyStateConfig(
+    val enableEmptyStates: Boolean = true,
+    val showIcons: Boolean = true,
+    val enableActions: Boolean = true,
+    val animationDuration: Long = 300
+)
+
+data class NavigationConfig(
+    val enableTransitions: Boolean = true,
+    val defaultTransition: NavigationTransition = NavigationTransition.SLIDE,
+    val transitionDuration: Long = 300,
+    val enableBackStack: Boolean = true
+)
+
+data class DialogConfig(
+    val enableDialogs: Boolean = true,
+    val defaultDialogType: DialogType = DialogType.CONFIRMATION,
+    val enableBackdrop: Boolean = true,
+    val enableAnimations: Boolean = true
+)
+
+data class FormValidationConfig(
+    val enableValidation: Boolean = true,
+    val showRealtimeValidation: Boolean = true,
+    val showErrorIcons: Boolean = true,
+    val enableHapticFeedback: Boolean = true
+)
+
+data class UXMetrics(
+    val stateTransitions: Map<String, Int>,
+    val loadingTimes: Map<String, Long>,
+    val userInteractions: Map<String, Int>,
+    val averageLoadingTime: Double,
+    val totalInteractions: Int,
+    val mostActiveScreen: String?
+)
+
+enum class UIState {
+    IDLE, LOADING, CONTENT, EMPTY, ERROR
+}
+
+enum class LoadingState {
+    IDLE, LOADING, SUCCESS, ERROR
+}
+
+enum class EmptyState {
+    HIDDEN, VISIBLE
+}
+
+enum class LoadingType {
+    SKELETON, PROGRESS, OVERLAY
+}
+
+enum class EmptyType {
+    NO_DATA, NO_RESULTS, NO_NETWORK, ERROR, LOADING_ERROR
+}
+
+enum class ErrorType {
+    NETWORK_ERROR, SERVER_ERROR, VALIDATION_ERROR, UNKNOWN_ERROR
+}
+
+enum class NavigationTransition {
+    SLIDE, FADE, NONE, CUSTOM
+}
+
+enum class DialogType {
+    CONFIRMATION, WARNING, INFO, ERROR, CUSTOM
+}
+
+data class ValidationResult(
+    val field: String,
+    val isValid: Boolean,
+    val message: String,
+    val severity: ValidationSeverity = ValidationSeverity.ERROR
+)
+
+data class ValidationRule(
+    val field: String,
+    val type: ValidationType,
+    val required: Boolean = false,
+    val minLength: Int? = null,
+    val maxLength: Int? = null,
+    val pattern: String? = null,
+    val customValidator: ((String) -> Boolean)? = null
+)
+
+enum class ValidationSeverity {
+    ERROR, WARNING, INFO
+}
+
+enum class ValidationType {
+    REQUIRED, EMAIL, PHONE, PASSWORD, MIN_LENGTH, MAX_LENGTH, PATTERN, CUSTOM
+}

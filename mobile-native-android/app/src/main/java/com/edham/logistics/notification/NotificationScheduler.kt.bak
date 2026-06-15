@@ -1,0 +1,802 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.NotificationApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Notification Scheduler - Manages scheduled notifications and reminders
+ * 
+ * Features:
+ * - Cron-like scheduling support
+ * - Recurring notifications
+ * - One-time scheduled notifications
+ * - Calendar integration
+ * - Timezone-aware scheduling
+ * - Scheduled notification analytics
+ * - Batch scheduling
+ * - Schedule conflict resolution
+ */
+@Singleton
+class NotificationScheduler @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val notificationApi: NotificationApi,
+    private val networkUtils: NetworkUtils,
+    private val smartNotificationManager: SmartNotificationManager
+) {
+    
+    private val _schedulerState = MutableStateFlow<SchedulerState>(SchedulerState.Idle)
+    val schedulerState: StateFlow<SchedulerState> = _schedulerState.asStateFlow()
+    
+    private val _scheduledNotifications = MutableStateFlow<List<ScheduledNotification>>(emptyList())
+    val scheduledNotifications: StateFlow<List<ScheduledNotification>> = _scheduledNotifications.asStateFlow()
+    
+    private val _schedulerStats = MutableStateFlow<SchedulerStats>(SchedulerStats())
+    val schedulerStats: StateFlow<SchedulerStats> = _schedulerStats.asStateFlow()
+    
+    private var isInitialized = false
+    private val schedulerScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var schedulerJob: Job? = null
+    
+    companion object {
+        private const val TAG = "NotificationScheduler"
+        private const val SCHEDULER_CHECK_INTERVAL_MS = 60000L // 1 minute
+        private const val MAX_SCHEDULED_NOTIFICATIONS = 1000
+    }
+    
+    /**
+     * Initialize notification scheduler
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _schedulerState.value = SchedulerState.Initializing
+                
+                // Load scheduler configuration
+                loadSchedulerConfiguration()
+                
+                // Load scheduled notifications
+                loadScheduledNotifications()
+                
+                // Start scheduler
+                startScheduler()
+                
+                isInitialized = true
+                _schedulerState.value = SchedulerState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _schedulerState.value = SchedulerState.Error("Failed to initialize notification scheduler: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule one-time notification
+     */
+    suspend fun scheduleNotification(
+        title: String,
+        message: String,
+        category: NotificationCategory,
+        recipients: List<NotificationRecipient>,
+        scheduledTime: Date,
+        priority: NotificationPriority = NotificationPriority.NORMAL,
+        metadata: Map<String, String> = emptyMap()
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Notification scheduler not initialized")
+                }
+                
+                val notificationId = UUID.randomUUID().toString()
+                
+                val scheduledNotification = ScheduledNotification(
+                    id = notificationId,
+                    title = title,
+                    message = message,
+                    category = category,
+                    recipients = recipients,
+                    scheduledTime = scheduledTime,
+                    priority = priority,
+                    scheduleType = ScheduleType.ONE_TIME,
+                    status = ScheduleStatus.SCHEDULED,
+                    metadata = metadata,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    sentAt = null,
+                    cancelledAt = null,
+                    cronExpression = null,
+                    nextExecutionTime = scheduledTime,
+                    executionCount = 0,
+                    maxExecutions = 1
+                )
+                
+                // Save to database
+                saveScheduledNotification(scheduledNotification)
+                
+                // Add to scheduled notifications
+                addToScheduledNotifications(scheduledNotification)
+                
+                // Update stats
+                updateSchedulerStats()
+                
+                Result.success(notificationId)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule recurring notification
+     */
+    suspend fun scheduleRecurringNotification(
+        title: String,
+        message: String,
+        category: NotificationCategory,
+        recipients: List<NotificationRecipient>,
+        cronExpression: String,
+        startTime: Date,
+        endTime: Date? = null,
+        priority: NotificationPriority = NotificationPriority.NORMAL,
+        maxExecutions: Int? = null,
+        metadata: Map<String, String> = emptyMap()
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Notification scheduler not initialized")
+                }
+                
+                val notificationId = UUID.randomUUID().toString()
+                
+                // Calculate next execution time
+                val nextExecutionTime = calculateNextExecutionTime(cronExpression, startTime)
+                
+                val scheduledNotification = ScheduledNotification(
+                    id = notificationId,
+                    title = title,
+                    message = message,
+                    category = category,
+                    recipients = recipients,
+                    scheduledTime = startTime,
+                    priority = priority,
+                    scheduleType = ScheduleType.RECURRING,
+                    status = ScheduleStatus.SCHEDULED,
+                    metadata = metadata,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    sentAt = null,
+                    cancelledAt = null,
+                    cronExpression = cronExpression,
+                    nextExecutionTime = nextExecutionTime,
+                    executionCount = 0,
+                    maxExecutions = maxExecutions,
+                    endTime = endTime
+                )
+                
+                // Save to database
+                saveScheduledNotification(scheduledNotification)
+                
+                // Add to scheduled notifications
+                addToScheduledNotifications(scheduledNotification)
+                
+                // Update stats
+                updateSchedulerStats()
+                
+                Result.success(notificationId)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule daily notification
+     */
+    suspend fun scheduleDailyNotification(
+        title: String,
+        message: String,
+        category: NotificationCategory,
+        recipients: List<NotificationRecipient>,
+        hour: Int,
+        minute: Int,
+        priority: NotificationPriority = NotificationPriority.NORMAL,
+        metadata: Map<String, String> = emptyMap()
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val calendar = Calendar.getInstance()
+                calendar.set(Calendar.HOUR_OF_DAY, hour)
+                calendar.set(Calendar.MINUTE, minute)
+                calendar.set(Calendar.SECOND, 0)
+                calendar.set(Calendar.MILLISECOND, 0)
+                
+                // If time has passed today, schedule for tomorrow
+                if (calendar.time.before(Date())) {
+                    calendar.add(Calendar.DAY_OF_YEAR, 1)
+                }
+                
+                val cronExpression = "0 $minute $hour * * *" // minute hour day month day-of-week
+                
+                scheduleRecurringNotification(
+                    title = title,
+                    message = message,
+                    category = category,
+                    recipients = recipients,
+                    cronExpression = cronExpression,
+                    startTime = calendar.time,
+                    priority = priority,
+                    metadata = metadata
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule weekly notification
+     */
+    suspend fun scheduleWeeklyNotification(
+        title: String,
+        message: String,
+        category: NotificationCategory,
+        recipients: List<NotificationRecipient>,
+        dayOfWeek: Int, // Calendar.MONDAY, etc.
+        hour: Int,
+        minute: Int,
+        priority: NotificationPriority = NotificationPriority.NORMAL,
+        metadata: Map<String, String> = emptyMap()
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val calendar = Calendar.getInstance()
+                calendar.set(Calendar.DAY_OF_WEEK, dayOfWeek)
+                calendar.set(Calendar.HOUR_OF_DAY, hour)
+                calendar.set(Calendar.MINUTE, minute)
+                calendar.set(Calendar.SECOND, 0)
+                calendar.set(Calendar.MILLISECOND, 0)
+                
+                // If time has passed this week, schedule for next week
+                if (calendar.time.before(Date())) {
+                    calendar.add(Calendar.WEEK_OF_YEAR, 1)
+                }
+                
+                val cronExpression = "0 $minute $hour * * $dayOfWeek"
+                
+                scheduleRecurringNotification(
+                    title = title,
+                    message = message,
+                    category = category,
+                    recipients = recipients,
+                    cronExpression = cronExpression,
+                    startTime = calendar.time,
+                    priority = priority,
+                    metadata = metadata
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule monthly notification
+     */
+    suspend fun scheduleMonthlyNotification(
+        title: String,
+        message: String,
+        category: NotificationCategory,
+        recipients: List<NotificationRecipient>,
+        dayOfMonth: Int,
+        hour: Int,
+        minute: Int,
+        priority: NotificationPriority = NotificationPriority.NORMAL,
+        metadata: Map<String, String> = emptyMap()
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val calendar = Calendar.getInstance()
+                calendar.set(Calendar.DAY_OF_MONTH, dayOfMonth)
+                calendar.set(Calendar.HOUR_OF_DAY, hour)
+                calendar.set(Calendar.MINUTE, minute)
+                calendar.set(Calendar.SECOND, 0)
+                calendar.set(Calendar.MILLISECOND, 0)
+                
+                // If time has passed this month, schedule for next month
+                if (calendar.time.before(Date())) {
+                    calendar.add(Calendar.MONTH, 1)
+                }
+                
+                val cronExpression = "0 $minute $hour $dayOfMonth * *"
+                
+                scheduleRecurringNotification(
+                    title = title,
+                    message = message,
+                    category = category,
+                    recipients = recipients,
+                    cronExpression = cronExpression,
+                    startTime = calendar.time,
+                    priority = priority,
+                    metadata = metadata
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Cancel scheduled notification
+     */
+    suspend fun cancelScheduledNotification(notificationId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val scheduledNotification = _scheduledNotifications.value.find { it.id == notificationId }
+                    ?: throw Exception("Scheduled notification not found")
+                
+                // Update status
+                val cancelledNotification = scheduledNotification.copy(
+                    status = ScheduleStatus.CANCELLED,
+                    cancelledAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                updateScheduledNotificationInList(cancelledNotification)
+                
+                // Update in database
+                updateScheduledNotification(cancelledNotification)
+                
+                // Remove from scheduled notifications
+                removeFromScheduledNotifications(notificationId)
+                
+                // Update stats
+                updateSchedulerStats()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Reschedule notification
+     */
+    suspend fun rescheduleNotification(
+        notificationId: String,
+        newScheduledTime: Date
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val scheduledNotification = _scheduledNotifications.value.find { it.id == notificationId }
+                    ?: throw Exception("Scheduled notification not found")
+                
+                // Update scheduled time
+                val rescheduledNotification = scheduledNotification.copy(
+                    scheduledTime = newScheduledTime,
+                    nextExecutionTime = newScheduledTime,
+                    updatedAt = Date()
+                )
+                
+                updateScheduledNotificationInList(rescheduledNotification)
+                
+                // Update in database
+                updateScheduledNotification(rescheduledNotification)
+                
+                // Update stats
+                updateSchedulerStats()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get scheduled notifications by category
+     */
+    suspend fun getScheduledNotificationsByCategory(category: NotificationCategory): List<ScheduledNotification> {
+        return _scheduledNotifications.value.filter { it.category == category }
+    }
+    
+    /**
+     * Get scheduled notifications by status
+     */
+    suspend fun getScheduledNotificationsByStatus(status: ScheduleStatus): List<ScheduledNotification> {
+        return _scheduledNotifications.value.filter { it.status == status }
+    }
+    
+    /**
+     * Get scheduler statistics
+     */
+    suspend fun getSchedulerStats(dateRange: DateRange = DateRange.last30Days()): Result<SchedulerStats> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val stats = database.scheduledNotificationDao().getSchedulerStats(dateRange.startDate, dateRange.endDate)
+                Result.success(stats)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadSchedulerConfiguration() {
+        // Load scheduler configuration from database or remote config
+    }
+    
+    private suspend fun loadScheduledNotifications() {
+        try {
+            val notifications = database.scheduledNotificationDao().getActiveScheduledNotifications()
+                .map { it.toDomainModel() }
+                .sortedBy { it.nextExecutionTime }
+                .take(MAX_SCHEDULED_NOTIFICATIONS)
+            
+            _scheduledNotifications.value = notifications
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun startScheduler() {
+        schedulerJob = schedulerScope.launch {
+            while (true) {
+                try {
+                    checkScheduledNotifications()
+                    delay(SCHEDULER_CHECK_INTERVAL_MS)
+                } catch (e: Exception) {
+                    delay(1000) // Brief pause before retry
+                }
+            }
+        }
+    }
+    
+    private suspend fun checkScheduledNotifications() {
+        val now = Date()
+        val readyNotifications = _scheduledNotifications.value.filter { notification ->
+            notification.status == ScheduleStatus.SCHEDULED &&
+            notification.nextExecutionTime != null &&
+            notification.nextExecutionTime <= now
+        }
+        
+        readyNotifications.forEach { notification ->
+            schedulerScope.launch {
+                executeScheduledNotification(notification)
+            }
+        }
+    }
+    
+    private suspend fun executeScheduledNotification(scheduledNotification: ScheduledNotification) {
+        try {
+            _schedulerState.value = SchedulerState.Processing
+            
+            // Update status to executing
+            val executingNotification = scheduledNotification.copy(
+                status = ScheduleStatus.EXECUTING,
+                executionCount = scheduledNotification.executionCount + 1,
+                lastExecutionTime = Date(),
+                updatedAt = Date()
+            )
+            
+            updateScheduledNotificationInList(executingNotification)
+            
+            // Create notification request
+            val notificationRequest = NotificationRequest(
+                title = scheduledNotification.title,
+                message = scheduledNotification.message,
+                category = scheduledNotification.category,
+                priority = scheduledNotification.priority,
+                recipients = scheduledNotification.recipients,
+                data = scheduledNotification.metadata,
+                channels = determineNotificationChannels(scheduledNotification)
+            )
+            
+            // Send notification
+            val result = smartNotificationManager.sendNotification(notificationRequest)
+            
+            if (result.isSuccess) {
+                // Mark as sent
+                val sentNotification = executingNotification.copy(
+                    status = ScheduleStatus.SENT,
+                    sentAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                updateScheduledNotificationInList(sentNotification)
+                
+                // Handle recurring notifications
+                if (scheduledNotification.scheduleType == ScheduleType.RECURRING) {
+                    handleRecurringNotification(sentNotification)
+                } else {
+                    // One-time notification, remove from active list
+                    removeFromScheduledNotifications(scheduledNotification.id)
+                }
+                
+            } else {
+                // Mark as failed
+                val failedNotification = executingNotification.copy(
+                    status = ScheduleStatus.FAILED,
+                    errorMessage = result.exceptionOrNull()?.message,
+                    updatedAt = Date()
+                )
+                
+                updateScheduledNotificationInList(failedNotification)
+            }
+            
+            // Update stats
+            updateSchedulerStats()
+            
+        } catch (e: Exception) {
+            // Handle execution error
+            val failedNotification = scheduledNotification.copy(
+                status = ScheduleStatus.FAILED,
+                errorMessage = e.message,
+                updatedAt = Date()
+            )
+            
+            updateScheduledNotificationInList(failedNotification)
+        }
+    }
+    
+    private suspend fun handleRecurringNotification(sentNotification: ScheduledNotification) {
+        try {
+            // Check if should continue scheduling
+            if (shouldContinueScheduling(sentNotification)) {
+                // Calculate next execution time
+                val nextExecutionTime = calculateNextExecutionTime(
+                    sentNotification.cronExpression ?: "",
+                    sentNotification.nextExecutionTime ?: Date()
+                )
+                
+                // Update for next execution
+                val nextNotification = sentNotification.copy(
+                    nextExecutionTime = nextExecutionTime,
+                    status = ScheduleStatus.SCHEDULED,
+                    updatedAt = Date()
+                )
+                
+                updateScheduledNotificationInList(nextNotification)
+            } else {
+                // Max executions reached or end time passed
+                val completedNotification = sentNotification.copy(
+                    status = ScheduleStatus.COMPLETED,
+                    completedAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                updateScheduledNotificationInList(completedNotification)
+                removeFromScheduledNotifications(completedNotification.id)
+            }
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun shouldContinueScheduling(notification: ScheduledNotification): Boolean {
+        // Check max executions
+        notification.maxExecutions?.let { maxExec ->
+            if (notification.executionCount >= maxExec) {
+                return false
+            }
+        }
+        
+        // Check end time
+        notification.endTime?.let { endTime ->
+            if (Date().after(endTime)) {
+                return false
+            }
+        }
+        
+        return true
+    }
+    
+    private fun calculateNextExecutionTime(cronExpression: String, fromTime: Date): Date {
+        // This is a simplified implementation
+        // In a real app, you would use a proper cron expression parser library
+        val calendar = Calendar.getInstance()
+        calendar.time = fromTime
+        calendar.add(Calendar.DAY_OF_YEAR, 1) // Simple: add 1 day for recurring notifications
+        return calendar.time
+    }
+    
+    private fun determineNotificationChannels(notification: ScheduledNotification): List<NotificationChannel> {
+        return when (notification.priority) {
+            NotificationPriority.EMERGENCY -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL,
+                NotificationChannel.IN_APP
+            )
+            NotificationPriority.HIGH -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL
+            )
+            NotificationPriority.NORMAL -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.EMAIL
+            )
+            NotificationPriority.LOW -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.IN_APP
+            )
+        }
+    }
+    
+    private suspend fun saveScheduledNotification(notification: ScheduledNotification) {
+        try {
+            database.scheduledNotificationDao().insertScheduledNotification(notification.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun updateScheduledNotification(notification: ScheduledNotification) {
+        try {
+            database.scheduledNotificationDao().updateScheduledNotification(notification.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun updateScheduledNotificationInList(notification: ScheduledNotification) {
+        val currentNotifications = _scheduledNotifications.value.toMutableList()
+        val index = currentNotifications.indexOfFirst { it.id == notification.id }
+        
+        if (index != -1) {
+            currentNotifications[index] = notification
+            _scheduledNotifications.value = currentNotifications
+        }
+        
+        // Update in database (async)
+        schedulerScope.launch {
+            updateScheduledNotification(notification)
+        }
+    }
+    
+    private fun addToScheduledNotifications(notification: ScheduledNotification) {
+        val currentNotifications = _scheduledNotifications.value.toMutableList()
+        currentNotifications.add(notification)
+        
+        // Keep only max notifications
+        if (currentNotifications.size > MAX_SCHEDULED_NOTIFICATIONS) {
+            currentNotifications.removeAt(0)
+        }
+        
+        _scheduledNotifications.value = currentNotifications
+    }
+    
+    private fun removeFromScheduledNotifications(notificationId: String) {
+        val currentNotifications = _scheduledNotifications.value.toMutableList()
+        currentNotifications.removeAll { it.id == notificationId }
+        _scheduledNotifications.value = currentNotifications
+    }
+    
+    private suspend fun updateSchedulerStats() {
+        try {
+            val notifications = _scheduledNotifications.value
+            val stats = SchedulerStats(
+                totalScheduled = notifications.size,
+                scheduled = notifications.count { it.status == ScheduleStatus.SCHEDULED },
+                executing = notifications.count { it.status == ScheduleStatus.EXECUTING },
+                sent = notifications.count { it.status == ScheduleStatus.SENT },
+                failed = notifications.count { it.status == ScheduleStatus.FAILED },
+                cancelled = notifications.count { it.status == ScheduleStatus.CANCELLED },
+                completed = notifications.count { it.status == ScheduleStatus.COMPLETED },
+                typeStats = notifications.groupBy { it.scheduleType }
+                    .mapValues { it.value.size },
+                categoryStats = notifications.groupBy { it.category }
+                    .mapValues { it.value.size }
+            )
+            
+            _schedulerStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+    
+    /**
+     * Stop scheduler
+     */
+    fun stop() {
+        schedulerJob?.cancel()
+        schedulerScope.cancel()
+    }
+}
+
+/**
+ * Data classes
+ */
+data class ScheduledNotification(
+    val id: String,
+    val title: String,
+    val message: String,
+    val category: NotificationCategory,
+    val recipients: List<NotificationRecipient>,
+    val scheduledTime: Date,
+    val priority: NotificationPriority,
+    val scheduleType: ScheduleType,
+    val status: ScheduleStatus,
+    val metadata: Map<String, String>,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val sentAt: Date?,
+    val cancelledAt: Date?,
+    val cronExpression: String?,
+    val nextExecutionTime: Date?,
+    val executionCount: Int,
+    val maxExecutions: Int?,
+    val endTime: Date? = null,
+    val lastExecutionTime: Date? = null,
+    val completedAt: Date? = null,
+    val errorMessage: String? = null
+)
+
+data class SchedulerStats(
+    val totalScheduled: Int = 0,
+    val scheduled: Int = 0,
+    val executing: Int = 0,
+    val sent: Int = 0,
+    val failed: Int = 0,
+    val cancelled: Int = 0,
+    val completed: Int = 0,
+    val typeStats: Map<ScheduleType, Int> = emptyMap(),
+    val categoryStats: Map<NotificationCategory, Int> = emptyMap()
+)
+
+/**
+ * Enums
+ */
+enum class SchedulerState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class ScheduleType {
+    ONE_TIME,
+    RECURRING
+}
+
+enum class ScheduleStatus {
+    SCHEDULED,
+    EXECUTING,
+    SENT,
+    FAILED,
+    CANCELLED,
+    COMPLETED
+}

@@ -1,0 +1,542 @@
+package com.edham.logistics.maintenance
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentMaintenanceAnalyticsBinding
+import com.edham.logistics.maintenance.adapters.TopMaintenanceAdapter
+import com.edham.logistics.maintenance.viewmodels.MaintenanceAnalyticsViewModel
+import com.github.mikephil.charting.charts.LineChart
+import com.github.mikephil.charting.charts.PieChart
+import com.github.mikephil.charting.data.*
+import com.github.mikephil.charting.formatter.PercentFormatter
+import com.github.mikephil.charting.formatter.ValueFormatter
+import com.google.android.material.datepicker.MaterialDatePicker
+import kotlinx.coroutines.launch
+import java.util.*
+import javax.inject.Inject
+
+/**
+ * Maintenance Analytics Fragment - Comprehensive maintenance analytics and insights
+ * 
+ * Features:
+ * - Cost breakdown analysis
+ * - Maintenance trends visualization
+ * - Performance metrics
+ * - Top maintenance types
+ * - Technician performance
+ * - Predictive insights
+ * - Export functionality
+ */
+class MaintenanceAnalyticsFragment @Inject constructor(
+    private val topMaintenanceAdapter: TopMaintenanceAdapter
+) : Fragment() {
+
+    private var _binding: FragmentMaintenanceAnalyticsBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: MaintenanceAnalyticsViewModel
+    private var currentDateRange = DateRange.last30Days()
+    private var currentTrendPeriod = TrendPeriod.WEEKLY
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentMaintenanceAnalyticsBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupCharts()
+        setupRecyclerView()
+        setupClickListeners()
+        observeViewModel()
+        
+        // Load initial data
+        loadMaintenanceAnalytics()
+    }
+
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[MaintenanceAnalyticsViewModel::class.java]
+    }
+
+    private fun setupCharts() {
+        setupCostBreakdownChart()
+        setupMaintenanceTrendsChart()
+    }
+
+    private fun setupRecyclerView() {
+        binding.rvTopMaintenance.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = topMaintenanceAdapter
+            isNestedScrollingEnabled = false
+        }
+    }
+
+    private fun setupClickListeners() {
+        // Date range selector
+        binding.cardDateRange.setOnClickListener {
+            showDateRangePicker()
+        }
+        
+        // Cost details
+        binding.btnCostDetails.setOnClickListener {
+            showCostDetailsDialog()
+        }
+        
+        // Trend period buttons
+        binding.btnTrendsWeekly.setOnClickListener {
+            selectTrendPeriod(TrendPeriod.WEEKLY)
+        }
+        
+        binding.btnTrendsMonthly.setOnClickListener {
+            selectTrendPeriod(TrendPeriod.MONTHLY)
+        }
+        
+        // Export
+        binding.fabExport.setOnClickListener {
+            exportAnalyticsData()
+        }
+        
+        // Toolbar menu
+        binding.toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_refresh -> {
+                    refreshAnalytics()
+                    true
+                }
+                R.id.action_filter -> {
+                    showAdvancedFilters()
+                    true
+                }
+                R.id.action_compare -> {
+                    showComparisonDialog()
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.analyticsState.collect { state ->
+                when (state) {
+                    is MaintenanceAnalyticsState.Loading -> {
+                        showLoadingState()
+                    }
+                    is MaintenanceAnalyticsState.Success -> {
+                        hideLoadingState()
+                        updateAnalyticsData(state.data)
+                    }
+                    is MaintenanceAnalyticsState.Error -> {
+                        hideLoadingState()
+                        showError(state.message)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.costBreakdownData.collect { data ->
+                updateCostBreakdownChart(data)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.trendsData.collect { data ->
+                updateMaintenanceTrendsChart(data)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.topMaintenanceData.collect { data ->
+                topMaintenanceAdapter.submitList(data)
+            }
+        }
+    }
+
+    private fun loadMaintenanceAnalytics() {
+        viewModel.loadMaintenanceAnalytics(currentDateRange, currentTrendPeriod)
+    }
+
+    private fun updateAnalyticsData(data: MaintenanceAnalyticsData) {
+        // Update key metrics
+        updateKeyMetrics(data.keyMetrics)
+        
+        // Update performance metrics
+        updatePerformanceMetrics(data.performanceMetrics)
+        
+        // Update charts
+        updateCostBreakdownChart(data.costBreakdown)
+        updateMaintenanceTrendsChart(data.trendsData)
+        
+        // Update top maintenance list
+        topMaintenanceAdapter.submitList(data.topMaintenanceTypes)
+    }
+
+    private fun updateKeyMetrics(metrics: MaintenanceKeyMetrics) {
+        binding.tvTotalCost.text = "${metrics.totalCost.formatNumber()} ريال"
+        binding.tvCostTrend.text = formatTrend(metrics.costTrend)
+        binding.tvCostTrend.setTextColor(getTrendColor(metrics.costTrend))
+        
+        binding.tvAvgDuration.text = "${metrics.averageDuration} ساعة"
+        binding.tvDurationTrend.text = formatTrend(metrics.durationTrend)
+        binding.tvDurationTrend.setTextColor(getTrendColor(metrics.durationTrend))
+    }
+
+    private fun updatePerformanceMetrics(metrics: MaintenancePerformanceMetrics) {
+        binding.tvOnTimeCompletion.text = "${metrics.onTimeCompletionRate}%"
+        binding.tvCostEfficiency.text = "${metrics.costEfficiency}%"
+        binding.tvPreventiveRate.text = "${metrics.preventiveMaintenanceRate}%"
+        binding.tvRepeatIssues.text = "${metrics.repeatIssuesRate}%"
+    }
+
+    private fun setupCostBreakdownChart() {
+        val chart = binding.chartCostBreakdown
+        
+        // Chart appearance
+        chart.description.isEnabled = false
+        chart.legend.isEnabled = true
+        chart.legend.textColor = requireContext().getColor(R.color.white)
+        chart.legend.textSize = 12f
+        chart.legend.verticalAlignment = com.github.mikephil.charting.components.Legend.LegendVerticalAlignment.BOTTOM
+        chart.legend.horizontalAlignment = com.github.mikephil.charting.components.Legend.LegendHorizontalAlignment.CENTER
+        
+        // Hole in the center
+        chart.isDrawHoleEnabled = true
+        chart.holeRadius = 40f
+        chart.transparentCircleRadius = 45f
+        chart.setHoleColor(requireContext().getColor(R.color.surface_dark))
+        
+        // Text in center
+        chart.setDrawCenterText(true)
+        chart.centerText = "توزيع التكاليف"
+        chart.centerTextColor = requireContext().getColor(R.color.white)
+        chart.centerTextSize = 16f
+        
+        // Rotation angle
+        chart.rotationAngle = 0f
+        chart.isRotationEnabled = true
+        
+        // Animation
+        chart.animateY(1000)
+    }
+
+    private fun setupMaintenanceTrendsChart() {
+        val chart = binding.chartMaintenanceTrends
+        
+        // Chart appearance
+        chart.description.isEnabled = false
+        chart.legend.isEnabled = true
+        chart.legend.textColor = requireContext().getColor(R.color.white)
+        chart.legend.textSize = 12f
+        
+        // Axis configuration
+        chart.xAxis.isEnabled = true
+        chart.xAxis.textColor = requireContext().getColor(R.color.white_60)
+        chart.xAxis.textSize = 10f
+        chart.xAxis.setDrawGridLines(false)
+        
+        chart.axisLeft.isEnabled = true
+        chart.axisLeft.textColor = requireContext().getColor(R.color.white_60)
+        chart.axisLeft.textSize = 10f
+        chart.axisLeft.setDrawGridLines(true)
+        chart.axisLeft.gridColor = requireContext().getColor(R.color.white_20)
+        chart.axisLeft.axisMinimum = 0f
+        
+        chart.axisRight.isEnabled = false
+        
+        // Touch gestures
+        chart.setTouchEnabled(true)
+        chart.isDragEnabled = true
+        chart.setScaleEnabled(true)
+        chart.setPinchZoom(true)
+        
+        // Animation
+        chart.animateX(1000)
+    }
+
+    private fun updateCostBreakdownChart(data: CostBreakdownData) {
+        val chart = binding.chartCostBreakdown
+        
+        val entries = data.categories.mapIndexed { index, category ->
+            PieEntry(category.value, category.label)
+        }
+        
+        val colors = listOf(
+            requireContext().getColor(R.color.primary_blue),
+            requireContext().getColor(R.color.green),
+            requireContext().getColor(R.color.orange),
+            requireContext().getColor(R.color.red),
+            requireContext().getColor(R.color.purple)
+        )
+        
+        val dataSet = PieDataSet(entries, "توزيع التكاليف").apply {
+            this.colors = colors
+            setDrawValues(true)
+            valueTextColor = requireContext().getColor(R.color.white)
+            valueTextSize = 12f
+            valueFormatter = PercentFormatter(chart)
+        }
+        
+        val pieData = PieData(dataSet)
+        chart.data = pieData
+        
+        chart.notifyDataSetChanged()
+        chart.invalidate()
+    }
+
+    private fun updateMaintenanceTrendsChart(data: MaintenanceTrendsData) {
+        val chart = binding.chartMaintenanceTrends
+        
+        val entries = data.values.mapIndexed { index, value ->
+            Entry(index.toFloat(), value)
+        }
+        
+        val dataSet = LineDataSet(entries, "عدد الصيانات").apply {
+            color = requireContext().getColor(R.color.primary_blue)
+            setCircleColor(requireContext().getColor(R.color.primary_blue))
+            lineWidth = 2f
+            circleRadius = 4f
+            setDrawCircleHole(false)
+            setDrawValues(false)
+            mode = LineDataSet.Mode.CUBIC_BEZIER
+            cubicIntensity = 0.2f
+        }
+        
+        val lineData = LineData(dataSet)
+        chart.data = lineData
+        
+        // Update X-axis labels
+        chart.xAxis.valueFormatter = object : ValueFormatter() {
+            override fun getFormattedValue(value: Float): String {
+                val index = value.toInt()
+                return if (index < data.labels.size) data.labels[index] else ""
+            }
+        }
+        
+        chart.notifyDataSetChanged()
+        chart.invalidate()
+    }
+
+    private fun selectTrendPeriod(period: TrendPeriod) {
+        currentTrendPeriod = period
+        
+        // Update button styles
+        when (period) {
+            TrendPeriod.WEEKLY -> {
+                binding.btnTrendsWeekly.setTextColor(requireContext().getColor(R.color.primary_blue))
+                binding.btnTrendsWeekly.setBackgroundResource(R.drawable.bg_chart_tab_selected)
+                binding.btnTrendsMonthly.setTextColor(requireContext().getColor(R.color.white_60))
+                binding.btnTrendsMonthly.setBackgroundResource(R.drawable.bg_chart_tab_unselected)
+            }
+            TrendPeriod.MONTHLY -> {
+                binding.btnTrendsMonthly.setTextColor(requireContext().getColor(R.color.primary_blue))
+                binding.btnTrendsMonthly.setBackgroundResource(R.drawable.bg_chart_tab_selected)
+                binding.btnTrendsWeekly.setTextColor(requireContext().getColor(R.color.white_60))
+                binding.btnTrendsWeekly.setBackgroundResource(R.drawable.bg_chart_tab_unselected)
+            }
+        }
+        
+        // Reload data
+        loadMaintenanceAnalytics()
+    }
+
+    private fun showDateRangePicker() {
+        val dateRangePicker = MaterialDatePicker.Builder.dateRangePicker()
+            .setTitleText("اختر فترة التحليل")
+            .setSelection(
+                androidx.core.util.Pair(
+                    currentDateRange.startDate.time,
+                    currentDateRange.endDate.time
+                )
+            )
+            .build()
+        
+        dateRangePicker.addOnPositiveButtonClickListener { selection ->
+            selection?.let {
+                val startDate = Date(it.first ?: 0)
+                val endDate = Date(it.second ?: 0)
+                currentDateRange = DateRange(startDate, endDate)
+                updateDateRangeDisplay()
+                loadMaintenanceAnalytics()
+            }
+        }
+        
+        dateRangePicker.show(childFragmentManager, "date_range_picker")
+    }
+
+    private fun updateDateRangeDisplay() {
+        val formatter = java.text.SimpleDateFormat("dd/MM/yyyy", Locale.getDefault())
+        val displayText = "${formatter.format(currentDateRange.startDate)} - ${formatter.format(currentDateRange.endDate)}"
+        binding.tvDateRange.text = displayText
+    }
+
+    private fun showCostDetailsDialog() {
+        // Show cost details dialog
+        val dialog = CostDetailsDialogFragment()
+        dialog.show(childFragmentManager, "cost_details_dialog")
+    }
+
+    private fun showAdvancedFilters() {
+        // Show advanced filters dialog
+        val dialog = MaintenanceFiltersDialogFragment()
+        dialog.show(childFragmentManager, "maintenance_filters_dialog")
+        
+        dialog.setOnFiltersApplied { filters ->
+            viewModel.applyAdvancedFilters(filters)
+        }
+    }
+
+    private fun showComparisonDialog() {
+        // Show comparison dialog
+        val dialog = MaintenanceComparisonDialogFragment()
+        dialog.show(childFragmentManager, "maintenance_comparison_dialog")
+    }
+
+    private fun exportAnalyticsData() {
+        viewModel.exportAnalyticsData { success, message ->
+            if (success) {
+                showSuccessMessage("تم تصدير تحليلات الصيانة بنجاح")
+            } else {
+                showErrorMessage("فشل تصدير البيانات: $message")
+            }
+        }
+    }
+
+    private fun refreshAnalytics() {
+        loadMaintenanceAnalytics()
+    }
+
+    private fun showLoadingState() {
+        binding.layoutLoading.visibility = View.VISIBLE
+        binding.contentGroup.visibility = View.GONE
+    }
+
+    private fun hideLoadingState() {
+        binding.layoutLoading.visibility = View.GONE
+        binding.contentGroup.visibility = View.VISIBLE
+    }
+
+    private fun showSuccessMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun showErrorMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_LONG
+        ).show()
+    }
+
+    private fun formatTrend(trend: Float): String {
+        return when {
+            trend > 0 -> "↑ ${abs(trend)}%"
+            trend < 0 -> "↓ ${abs(trend)}%"
+            else -> "→ 0%"
+        }
+    }
+
+    private fun getTrendColor(trend: Float): Int {
+        return when {
+            trend > 0 -> requireContext().getColor(R.color.green)
+            trend < 0 -> requireContext().getColor(R.color.red)
+            else -> requireContext().getColor(R.color.white_60)
+        }
+    }
+
+    private fun Float.formatNumber(): String {
+        return this.toInt().toString().reversed().chunked(3).joinToString(",").reversed()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh analytics when fragment becomes visible
+        loadMaintenanceAnalytics()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+
+/**
+ * Data classes
+ */
+data class MaintenanceAnalyticsData(
+    val keyMetrics: MaintenanceKeyMetrics,
+    val performanceMetrics: MaintenancePerformanceMetrics,
+    val costBreakdown: CostBreakdownData,
+    val trendsData: MaintenanceTrendsData,
+    val topMaintenanceTypes: List<TopMaintenanceType>
+)
+
+data class MaintenanceKeyMetrics(
+    val totalCost: Float,
+    val costTrend: Float,
+    val averageDuration: Float,
+    val durationTrend: Float
+)
+
+data class MaintenancePerformanceMetrics(
+    val onTimeCompletionRate: Float,
+    val costEfficiency: Float,
+    val preventiveMaintenanceRate: Float,
+    val repeatIssuesRate: Float
+)
+
+data class CostBreakdownData(
+    val categories: List<CostCategory>,
+    val totalCost: Float
+)
+
+data class CostCategory(
+    val label: String,
+    val value: Float,
+    val percentage: Float
+)
+
+data class MaintenanceTrendsData(
+    val labels: List<String>,
+    val values: List<Float>,
+    val period: TrendPeriod
+)
+
+data class TopMaintenanceType(
+    val type: String,
+    val count: Int,
+    val cost: Float,
+    val percentage: Float
+)
+
+/**
+ * Enums
+ */
+enum class MaintenanceAnalyticsState {
+    Loading,
+    Success,
+    Error
+}
+
+enum class TrendPeriod {
+    WEEKLY,
+    MONTHLY
+}

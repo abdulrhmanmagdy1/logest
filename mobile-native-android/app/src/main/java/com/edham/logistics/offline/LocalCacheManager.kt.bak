@@ -1,0 +1,499 @@
+package com.edham.logistics.offline
+
+import android.content.Context
+import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Local Cache Manager
+ * Manages offline data storage using Room database
+ */
+@Database(
+    entities = [
+        CachedShipment::class,
+        CachedDriver::class,
+        CachedVehicle::class,
+        CachedUser::class,
+        OfflineAction::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(Converters::class)
+abstract class LocalCacheDatabase : RoomDatabase() {
+    abstract fun shipmentDao(): CachedShipmentDao
+    abstract fun driverDao(): CachedDriverDao
+    abstract fun vehicleDao(): CachedVehicleDao
+    abstract fun userDao(): CachedUserDao
+    abstract fun offlineActionDao(): OfflineActionDao
+}
+
+/**
+ * Local Cache Manager
+ */
+class LocalCacheManager private constructor(context: Context) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: LocalCacheManager? = null
+        
+        fun getInstance(context: Context): LocalCacheManager {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: LocalCacheManager(context).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val database = Room.databaseBuilder(
+        context.applicationContext,
+        LocalCacheDatabase::class.java,
+        "edham_offline_cache"
+    ).fallbackToDestructiveMigration()
+     .build()
+    
+    private val _isConnected = MutableStateFlow(true)
+    val isConnected = _isConnected.asStateFlow()
+    
+    private val _syncStatus = MutableStateFlow<SyncStatus>(SyncStatus.IDLE)
+    val syncStatus = _syncStatus.asStateFlow()
+    
+    private val cacheStats = ConcurrentHashMap<String, CacheStats>()
+    
+    /**
+     * Update connection status
+     */
+    fun updateConnectionStatus(isConnected: Boolean) {
+        _isConnected.value = isConnected
+        if (isConnected) {
+            // Trigger sync when connection is restored
+            triggerSync()
+        }
+    }
+    
+    /**
+     * Cache shipment data
+     */
+    suspend fun cacheShipment(shipment: CachedShipment) {
+        database.shipmentDao().insertOrUpdate(shipment)
+        updateCacheStats("shipments", "insert")
+    }
+    
+    /**
+     * Get cached shipments
+     */
+    suspend fun getCachedShipments(): List<CachedShipment> {
+        return database.shipmentDao().getAll()
+    }
+    
+    /**
+     * Get cached shipment by ID
+     */
+    suspend fun getCachedShipment(id: String): CachedShipment? {
+        return database.shipmentDao().getById(id)
+    }
+    
+    /**
+     * Cache driver data
+     */
+    suspend fun cacheDriver(driver: CachedDriver) {
+        database.driverDao().insertOrUpdate(driver)
+        updateCacheStats("drivers", "insert")
+    }
+    
+    /**
+     * Get cached drivers
+     */
+    suspend fun getCachedDrivers(): List<CachedDriver> {
+        return database.driverDao().getAll()
+    }
+    
+    /**
+     * Cache vehicle data
+     */
+    suspend fun cacheVehicle(vehicle: CachedVehicle) {
+        database.vehicleDao().insertOrUpdate(vehicle)
+        updateCacheStats("vehicles", "insert")
+    }
+    
+    /**
+     * Get cached vehicles
+     */
+    suspend fun getCachedVehicles(): List<CachedVehicle> {
+        return database.vehicleDao().getAll()
+    }
+    
+    /**
+     * Cache user data
+     */
+    suspend fun cacheUser(user: CachedUser) {
+        database.userDao().insertOrUpdate(user)
+        updateCacheStats("users", "insert")
+    }
+    
+    /**
+     * Get cached user
+     */
+    suspend fun getCachedUser(id: String): CachedUser? {
+        return database.userDao().getById(id)
+    }
+    
+    /**
+     * Queue offline action
+     */
+    suspend fun queueOfflineAction(action: OfflineAction) {
+        database.offlineActionDao().insert(action)
+        updateCacheStats("actions", "queue")
+    }
+    
+    /**
+     * Get pending offline actions
+     */
+    suspend fun getPendingActions(): List<OfflineAction> {
+        return database.offlineActionDao().getPending()
+    }
+    
+    /**
+     * Mark action as synced
+     */
+    suspend fun markActionSynced(actionId: String) {
+        database.offlineActionDao().markSynced(actionId)
+        updateCacheStats("actions", "sync")
+    }
+    
+    /**
+     * Get cache statistics
+     */
+    suspend fun getCacheStatistics(): CacheStatistics {
+        val shipmentsCount = database.shipmentDao().getCount()
+        val driversCount = database.driverDao().getCount()
+        val vehiclesCount = database.vehicleDao().getCount()
+        val usersCount = database.userDao().getCount()
+        val pendingActionsCount = database.offlineActionDao().getPendingCount()
+        
+        return CacheStatistics(
+            shipmentsCount = shipmentsCount,
+            driversCount = driversCount,
+            vehiclesCount = vehiclesCount,
+            usersCount = usersCount,
+            pendingActionsCount = pendingActionsCount,
+            totalCacheSize = calculateTotalCacheSize()
+        )
+    }
+    
+    /**
+     * Clear old cache data
+     */
+    suspend fun clearOldCache(maxAgeMs: Long = 7 * 24 * 60 * 60 * 1000L) { // 7 days
+        val cutoffTime = System.currentTimeMillis() - maxAgeMs
+        
+        database.shipmentDao().deleteOlderThan(cutoffTime)
+        database.driverDao().deleteOlderThan(cutoffTime)
+        database.vehicleDao().deleteOlderThan(cutoffTime)
+        database.userDao().deleteOlderThan(cutoffTime)
+        database.offlineActionDao().deleteOlderThan(cutoffTime)
+        
+        updateCacheStats("cache", "cleanup")
+    }
+    
+    /**
+     * Clear all cache
+     */
+    suspend fun clearAllCache() {
+        database.shipmentDao().clear()
+        database.driverDao().clear()
+        database.vehicleDao().clear()
+        database.userDao().clear()
+        database.offlineActionDao().clear()
+        
+        updateCacheStats("cache", "clear")
+    }
+    
+    /**
+     * Trigger sync process
+     */
+    private fun triggerSync() {
+        if (_isConnected.value) {
+            _syncStatus.value = SyncStatus.SYNCING
+            // This would trigger the sync service
+        }
+    }
+    
+    /**
+     * Update sync status
+     */
+    fun updateSyncStatus(status: SyncStatus) {
+        _syncStatus.value = status
+    }
+    
+    /**
+     * Update cache statistics
+     */
+    private fun updateCacheStats(type: String, operation: String) {
+        val stats = cacheStats.getOrPut(type) { CacheStats() }
+        stats.operationCount++
+        stats.lastOperation = operation
+        stats.lastUpdated = System.currentTimeMillis()
+    }
+    
+    /**
+     * Calculate total cache size
+     */
+    private suspend fun calculateTotalCacheSize(): Long {
+        // This would calculate the actual database size
+        // For now, return estimated size
+        return database.shipmentDao().getCount() * 1000L + // ~1KB per shipment
+               database.driverDao().getCount() * 500L + // ~500B per driver
+               database.vehicleDao().getCount() * 500L + // ~500B per vehicle
+               database.userDao().getCount() * 300L + // ~300B per user
+               database.offlineActionDao().getPendingCount() * 200L // ~200B per action
+    }
+}
+
+/**
+ * Data Access Objects
+ */
+@Dao
+interface CachedShipmentDao {
+    @Query("SELECT * FROM cached_shipments ORDER BY lastUpdated DESC")
+    suspend fun getAll(): List<CachedShipment>
+    
+    @Query("SELECT * FROM cached_shipments WHERE id = :id")
+    suspend fun getById(id: String): CachedShipment?
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdate(shipment: CachedShipment)
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdateAll(shipments: List<CachedShipment>)
+    
+    @Query("SELECT COUNT(*) FROM cached_shipments")
+    suspend fun getCount(): Int
+    
+    @Query("DELETE FROM cached_shipments WHERE lastUpdated < :cutoffTime")
+    suspend fun deleteOlderThan(cutoffTime: Long)
+    
+    @Query("DELETE FROM cached_shipments")
+    suspend fun clear()
+}
+
+@Dao
+interface CachedDriverDao {
+    @Query("SELECT * FROM cached_drivers ORDER BY lastUpdated DESC")
+    suspend fun getAll(): List<CachedDriver>
+    
+    @Query("SELECT * FROM cached_drivers WHERE id = :id")
+    suspend fun getById(id: String): CachedDriver?
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdate(driver: CachedDriver)
+    
+    @Query("SELECT COUNT(*) FROM cached_drivers")
+    suspend fun getCount(): Int
+    
+    @Query("DELETE FROM cached_drivers WHERE lastUpdated < :cutoffTime")
+    suspend fun deleteOlderThan(cutoffTime: Long)
+    
+    @Query("DELETE FROM cached_drivers")
+    suspend fun clear()
+}
+
+@Dao
+interface CachedVehicleDao {
+    @Query("SELECT * FROM cached_vehicles ORDER BY lastUpdated DESC")
+    suspend fun getAll(): List<CachedVehicle>
+    
+    @Query("SELECT * FROM cached_vehicles WHERE id = :id")
+    suspend fun getById(id: String): CachedVehicle?
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdate(vehicle: CachedVehicle)
+    
+    @Query("SELECT COUNT(*) FROM cached_vehicles")
+    suspend fun getCount(): Int
+    
+    @Query("DELETE FROM cached_vehicles WHERE lastUpdated < :cutoffTime")
+    suspend fun deleteOlderThan(cutoffTime: Long)
+    
+    @Query("DELETE FROM cached_vehicles")
+    suspend fun clear()
+}
+
+@Dao
+interface CachedUserDao {
+    @Query("SELECT * FROM cached_users WHERE id = :id")
+    suspend fun getById(id: String): CachedUser?
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdate(user: CachedUser)
+    
+    @Query("SELECT COUNT(*) FROM cached_users")
+    suspend fun getCount(): Int
+    
+    @Query("DELETE FROM cached_users WHERE lastUpdated < :cutoffTime")
+    suspend fun deleteOlderThan(cutoffTime: Long)
+    
+    @Query("DELETE FROM cached_users")
+    suspend fun clear()
+}
+
+@Dao
+interface OfflineActionDao {
+    @Query("SELECT * FROM offline_actions WHERE synced = 0 ORDER BY timestamp ASC")
+    suspend fun getPending(): List<OfflineAction>
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(action: OfflineAction)
+    
+    @Query("UPDATE offline_actions SET synced = 1, syncedAt = :syncedAt WHERE id = :id")
+    suspend fun markSynced(id: String, syncedAt: Long = System.currentTimeMillis())
+    
+    @Query("SELECT COUNT(*) FROM offline_actions WHERE synced = 0")
+    suspend fun getPendingCount(): Int
+    
+    @Query("DELETE FROM offline_actions WHERE timestamp < :cutoffTime")
+    suspend fun deleteOlderThan(cutoffTime: Long)
+    
+    @Query("DELETE FROM offline_actions")
+    suspend fun clear()
+}
+
+/**
+ * Type converters for Room
+ */
+class Converters {
+    @TypeConverter
+    fun fromStringList(value: List<String>): String {
+        return value.joinToString(",")
+    }
+    
+    @TypeConverter
+    fun toStringList(value: String): List<String> {
+        return if (value.isEmpty()) emptyList() else value.split(",")
+    }
+    
+    @TypeConverter
+    fun fromMapString(value: Map<String, String>): String {
+        return value.entries.joinToString(";") { "${it.key}=${it.value}" }
+    }
+    
+    @TypeConverter
+    fun toMapString(value: String): Map<String, String> {
+        return if (value.isEmpty()) emptyMap() else 
+            value.split(";").associate { 
+                val parts = it.split("=", limit = 2)
+                parts[0] to (parts.getOrNull(1) ?: "")
+            }
+    }
+}
+
+/**
+ * Data classes
+ */
+@Entity(tableName = "cached_shipments")
+data class CachedShipment(
+    @PrimaryKey val id: String,
+    val trackingNumber: String,
+    val origin: String,
+    val destination: String,
+    val status: String,
+    val estimatedDelivery: Long,
+    val actualDelivery: Long?,
+    val weight: Double,
+    val dimensions: String,
+    val specialInstructions: String?,
+    val customerId: String,
+    val driverId: String?,
+    val vehicleId: String?,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val lastUpdated: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "cached_drivers")
+data class CachedDriver(
+    @PrimaryKey val id: String,
+    val name: String,
+    val email: String,
+    val phone: String,
+    val licenseNumber: String,
+    val status: String,
+    val currentLocation: String?,
+    val currentShipmentId: String?,
+    val totalDeliveries: Int,
+    val rating: Double,
+    val vehicleId: String?,
+    val lastUpdated: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "cached_vehicles")
+data class CachedVehicle(
+    @PrimaryKey val id: String,
+    val plateNumber: String,
+    val make: String,
+    val model: String,
+    val year: Int,
+    val type: String,
+    val capacity: Double,
+    val status: String,
+    val currentDriverId: String?,
+    val location: String?,
+    val fuelLevel: Double,
+    val mileage: Long,
+    val lastUpdated: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "cached_users")
+data class CachedUser(
+    @PrimaryKey val id: String,
+    val name: String,
+    val email: String,
+    val phone: String,
+    val role: String,
+    val profilePicture: String?,
+    val preferences: Map<String, String>,
+    val lastUpdated: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "offline_actions")
+data class OfflineAction(
+    @PrimaryKey val id: String,
+    val type: String, // CREATE_UPDATE, DELETE, etc.
+    val entityType: String, // SHIPMENT, DRIVER, etc.
+    val entityId: String,
+    val data: String, // JSON data
+    val timestamp: Long = System.currentTimeMillis(),
+    val synced: Boolean = false,
+    val syncedAt: Long?,
+    val retryCount: Int = 0,
+    val errorMessage: String?
+)
+
+/**
+ * Status classes
+ */
+data class CacheStatistics(
+    val shipmentsCount: Int,
+    val driversCount: Int,
+    val vehiclesCount: Int,
+    val usersCount: Int,
+    val pendingActionsCount: Int,
+    val totalCacheSize: Long
+)
+
+data class CacheStats(
+    var operationCount: Int = 0,
+    var lastOperation: String = "",
+    var lastUpdated: Long = System.currentTimeMillis()
+)
+
+enum class SyncStatus {
+    IDLE,
+    SYNCING,
+    SUCCESS,
+    ERROR
+}

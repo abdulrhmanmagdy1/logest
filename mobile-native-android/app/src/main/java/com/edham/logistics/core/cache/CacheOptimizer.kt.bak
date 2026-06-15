@@ -1,0 +1,623 @@
+package com.edham.logistics.core.cache
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.room.Room
+import com.edham.logistics.core.database.AppDatabase
+import com.edham.logistics.core.utils.DeviceInfo
+import com.edham.logistics.core.utils.NetworkUtils
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Advanced caching system for production optimization
+ */
+@Singleton
+class CacheOptimizer @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val database: AppDatabase,
+    private val deviceInfo: DeviceInfo,
+    private val networkUtils: NetworkUtils
+) {
+    
+    companion object {
+        private const val MEMORY_CACHE_SIZE = 100
+        private const val DISK_CACHE_SIZE = 50 * 1024 * 1024L // 50MB
+        private const val DEFAULT_CACHE_TTL = 5 * 60 * 1000L // 5 minutes
+        private const val PREFETCH_THRESHOLD = 0.8 // Prefetch when 80% of TTL passed
+        private const val CLEANUP_INTERVAL = 10 * 60 * 1000L // 10 minutes
+        private const val MAX_CONCURRENT_PREFETCH = 3
+    }
+    
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val memoryCache = ConcurrentHashMap<String, CacheEntry>()
+    private val cacheMutex = Mutex()
+    private val sharedPreferences: SharedPreferences = context.getSharedPreferences("cache_optimizer", Context.MODE_PRIVATE)
+    
+    private val _cacheStats = MutableStateFlow(CacheStats())
+    val cacheStats: StateFlow<CacheStats> = _cacheStats.asStateFlow()
+    
+    private val _prefetchQueue = MutableStateFlow<List<PrefetchTask>>(emptyList())
+    val prefetchQueue: StateFlow<List<PrefetchTask>> = _prefetchQueue.asStateFlow()
+    
+    private val prefetchTasks = mutableSetOf<String>()
+    private val prefetchMutex = Mutex()
+    
+    init {
+        startCleanupScheduler()
+        loadCacheStats()
+    }
+    
+    /**
+     * Get cached data or fetch if not available
+     */
+    suspend fun <T> getOrFetch(
+        key: String,
+        fetcher: suspend () -> T,
+        ttl: Long = DEFAULT_CACHE_TTL,
+        cacheStrategy: CacheStrategy = CacheStrategy.MEMORY_FIRST
+    ): Result<T> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try memory cache first
+                val memoryEntry = memoryCache[key]
+                if (memoryEntry != null && !memoryEntry.isExpired()) {
+                    updateCacheStats(hit = true, miss = false)
+                    return@withContext Result.Success(memoryEntry.data as T)
+                }
+                
+                // Try disk cache based on strategy
+                when (cacheStrategy) {
+                    CacheStrategy.MEMORY_FIRST -> {
+                        val diskResult = getFromDiskCache<T>(key)
+                        if (diskResult is Result.Success && !diskResult.data.isExpired()) {
+                            // Update memory cache
+                            memoryCache[key] = diskResult.data
+                            updateCacheStats(hit = true, miss = false)
+                            schedulePrefetch(key, fetcher, ttl)
+                            return@withContext Result.Success(diskResult.data.data as T)
+                        }
+                    }
+                    CacheStrategy.DISK_FIRST -> {
+                        val diskResult = getFromDiskCache<T>(key)
+                        if (diskResult is Result.Success && !diskResult.data.isExpired()) {
+                            memoryCache[key] = diskResult.data
+                            updateCacheStats(hit = true, miss = false)
+                            schedulePrefetch(key, fetcher, ttl)
+                            return@withContext Result.Success(diskResult.data.data as T)
+                        }
+                    }
+                    CacheStrategy.NETWORK_FIRST -> {
+                        // Fetch from network first
+                        val networkResult = fetchAndCache(key, fetcher, ttl)
+                        if (networkResult is Result.Success) {
+                            return@withContext networkResult
+                        }
+                        
+                        // Fallback to cache
+                        val diskResult = getFromDiskCache<T>(key)
+                        if (diskResult is Result.Success && !diskResult.data.isExpired()) {
+                            memoryCache[key] = diskResult.data
+                            updateCacheStats(hit = true, miss = false)
+                            return@withContext Result.Success(diskResult.data.data as T)
+                        }
+                    }
+                }
+                
+                // Cache miss - fetch from network
+                updateCacheStats(hit = false, miss = true)
+                fetchAndCache(key, fetcher, ttl)
+                
+            } catch (e: Exception) {
+                Result.Error(e)
+            }
+        }
+    }
+    
+    /**
+     * Get from disk cache
+     */
+    private suspend fun <T> getFromDiskCache(key: String): Result<CacheEntry> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val cachedData = database.cacheDao().getCacheEntry(key)
+                if (cachedData != null && !cachedData.isExpired()) {
+                    Result.Success(cachedData)
+                } else {
+                    Result.Error(Exception("Cache miss or expired"))
+                }
+            } catch (e: Exception) {
+                Result.Error(e)
+            }
+        }
+    }
+    
+    /**
+     * Fetch and cache data
+     */
+    private suspend fun <T> fetchAndCache(
+        key: String,
+        fetcher: suspend () -> T,
+        ttl: Long
+    ): Result<T> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val data = fetcher()
+                val entry = CacheEntry(
+                    key = key,
+                    data = data,
+                    timestamp = System.currentTimeMillis(),
+                    ttl = ttl
+                )
+                
+                // Update memory cache
+                memoryCache[key] = entry
+                
+                // Update disk cache
+                database.cacheDao().insertCacheEntry(entry)
+                
+                // Update stats
+                updateCacheStats(
+                    memorySize = memoryCache.size.toLong(),
+                    diskSize = getDiskCacheSize()
+                )
+                
+                Result.Success(data)
+            } catch (e: Exception) {
+                Result.Error(e)
+            }
+        }
+    }
+    
+    /**
+     * Invalidate cache entry
+     */
+    suspend fun invalidate(key: String) {
+        withContext(Dispatchers.IO) {
+            try {
+                memoryCache.remove(key)
+                database.cacheDao().deleteCacheEntry(key)
+                
+                updateCacheStats(
+                    memorySize = memoryCache.size.toLong(),
+                    diskSize = getDiskCacheSize()
+                )
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Invalidate multiple cache entries
+     */
+    suspend fun invalidate(keys: List<String>) {
+        withContext(Dispatchers.IO) {
+            try {
+                keys.forEach { key ->
+                    memoryCache.remove(key)
+                }
+                
+                database.cacheDao().deleteCacheEntries(keys)
+                
+                updateCacheStats(
+                    memorySize = memoryCache.size.toLong(),
+                    diskSize = getDiskCacheSize()
+                )
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Clear all cache
+     */
+    suspend fun clearCache() {
+        withContext(Dispatchers.IO) {
+            try {
+                memoryCache.clear()
+                database.cacheDao().clearCache()
+                
+                updateCacheStats(
+                    memorySize = 0,
+                    diskSize = 0
+                )
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Prefetch data
+     */
+    suspend fun <T> prefetch(
+        key: String,
+        fetcher: suspend () -> T,
+        ttl: Long = DEFAULT_CACHE_TTL
+    ) {
+        withContext(Dispatchers.IO) {
+            try {
+                // Check if already being prefetched
+                prefetchMutex.withLock {
+                    if (prefetchTasks.contains(key)) {
+                        return@withContext
+                    }
+                    prefetchTasks.add(key)
+                }
+                
+                // Check if cache is still valid
+                val memoryEntry = memoryCache[key]
+                if (memoryEntry != null && !memoryEntry.isExpired()) {
+                    return@withContext
+                }
+                
+                // Fetch and cache
+                fetchAndCache(key, fetcher, ttl)
+                
+            } catch (e: Exception) {
+                // Log error but don't crash
+            } finally {
+                prefetchMutex.withLock {
+                    prefetchTasks.remove(key)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Schedule prefetch
+     */
+    private fun schedulePrefetch(
+        key: String,
+        fetcher: suspend () -> Any,
+        ttl: Long
+    ) {
+        scope.launch {
+            delay((ttl * PREFETCH_THRESHOLD).toLong())
+            
+            prefetchMutex.withLock {
+                if (prefetchTasks.size < MAX_CONCURRENT_PREFETCH) {
+                    prefetch(key, fetcher, ttl)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Batch prefetch
+     */
+    suspend fun batchPrefetch(
+        tasks: List<PrefetchTask>,
+        concurrency: Int = MAX_CONCURRENT_PREFETCH
+    ) {
+        withContext(Dispatchers.IO) {
+            tasks.chunked(concurrency).forEach { batch ->
+                batch.map { task ->
+                    async {
+                        prefetch(task.key, task.fetcher, task.ttl)
+                    }
+                }.awaitAll()
+            }
+        }
+    }
+    
+    /**
+     * Get cache statistics
+     */
+    fun getCacheStatistics(): CacheStatistics {
+        val memorySize = memoryCache.size
+        val diskSize = getDiskCacheSize()
+        val hitRate = calculateHitRate()
+        
+        return CacheStatistics(
+            memorySize = memorySize,
+            diskSize = diskSize,
+            hitRate = hitRate,
+            totalRequests = _cacheStats.value.totalRequests,
+            cacheHits = _cacheStats.value.cacheHits,
+            cacheMisses = _cacheStats.value.cacheMisses
+        )
+    }
+    
+    /**
+     * Optimize cache based on usage patterns
+     */
+    suspend fun optimizeCache() {
+        withContext(Dispatchers.IO) {
+            try {
+                // Remove expired entries
+                cleanupExpiredEntries()
+                
+                // Remove least recently used entries if cache is full
+                if (memoryCache.size > MEMORY_CACHE_SIZE) {
+                    cleanupLRUEntries()
+                }
+                
+                // Optimize disk cache
+                optimizeDiskCache()
+                
+                updateCacheStats(
+                    memorySize = memoryCache.size.toLong(),
+                    diskSize = getDiskCacheSize()
+                )
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Cleanup expired entries
+     */
+    private suspend fun cleanupExpiredEntries() {
+        withContext(Dispatchers.IO) {
+            try {
+                // Remove expired memory entries
+                memoryCache.values.removeAll { it.isExpired() }
+                
+                // Remove expired disk entries
+                database.cacheDao().deleteExpiredEntries()
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Cleanup LRU entries
+     */
+    private suspend fun cleanupLRUEntries() {
+        withContext(Dispatchers.IO) {
+            try {
+                val entriesToRemove = memoryCache.entries
+                    .sortedBy { it.value.timestamp }
+                    .take(memoryCache.size - MEMORY_CACHE_SIZE)
+                
+                entriesToRemove.forEach { (key, _) ->
+                    memoryCache.remove(key)
+                }
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Optimize disk cache
+     */
+    private suspend fun optimizeDiskCache() {
+        withContext(Dispatchers.IO) {
+            try {
+                val currentSize = getDiskCacheSize()
+                if (currentSize > DISK_CACHE_SIZE) {
+                    // Remove oldest entries
+                    val entriesToRemove = database.cacheDao()
+                        .getAllEntries()
+                        .sortedBy { it.timestamp }
+                        .take((currentSize - DISK_CACHE_SIZE).toInt() / 1024) // Approximate
+                    
+                    entriesToRemove.forEach { entry ->
+                        database.cacheDao().deleteCacheEntry(entry.key)
+                    }
+                }
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Get disk cache size
+     */
+    private suspend fun getDiskCacheSize(): Long {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.cacheDao().getCacheSize()
+            } catch (e: Exception) {
+                0L
+            }
+        }
+    }
+    
+    /**
+     * Calculate hit rate
+     */
+    private fun calculateHitRate(): Float {
+        val stats = _cacheStats.value
+        return if (stats.totalRequests > 0) {
+            (stats.cacheHits.toFloat() / stats.totalRequests) * 100
+        } else 0f
+    }
+    
+    /**
+     * Update cache statistics
+     */
+    private fun updateCacheStats(
+        hit: Boolean = false,
+        miss: Boolean = false,
+        memorySize: Long = 0,
+        diskSize: Long = 0
+    ) {
+        val currentStats = _cacheStats.value
+        val newStats = currentStats.copy(
+            totalRequests = currentStats.totalRequests + if (hit || miss) 1 else 0,
+            cacheHits = currentStats.cacheHits + if (hit) 1 else 0,
+            cacheMisses = currentStats.cacheMisses + if (miss) 1 else 0,
+            memorySize = if (memorySize > 0) memorySize else currentStats.memorySize,
+            diskSize = if (diskSize > 0) diskSize else currentStats.diskSize,
+            lastUpdated = System.currentTimeMillis()
+        )
+        
+        _cacheStats.value = newStats
+        saveCacheStats(newStats)
+    }
+    
+    /**
+     * Load cache statistics
+     */
+    private fun loadCacheStats() {
+        scope.launch {
+            try {
+                val totalRequests = sharedPreferences.getLong("total_requests", 0)
+                val cacheHits = sharedPreferences.getLong("cache_hits", 0)
+                val cacheMisses = sharedPreferences.getLong("cache_misses", 0)
+                val lastUpdated = sharedPreferences.getLong("last_updated", 0)
+                
+                val stats = CacheStats(
+                    totalRequests = totalRequests,
+                    cacheHits = cacheHits,
+                    cacheMisses = cacheMisses,
+                    memorySize = memoryCache.size.toLong(),
+                    diskSize = getDiskCacheSize(),
+                    lastUpdated = lastUpdated
+                )
+                
+                _cacheStats.value = stats
+            } catch (e: Exception) {
+                // Use default stats
+            }
+        }
+    }
+    
+    /**
+     * Save cache statistics
+     */
+    private fun saveCacheStats(stats: CacheStats) {
+        scope.launch {
+            try {
+                sharedPreferences.edit()
+                    .putLong("total_requests", stats.totalRequests)
+                    .putLong("cache_hits", stats.cacheHits)
+                    .putLong("cache_misses", stats.cacheMisses)
+                    .putLong("last_updated", stats.lastUpdated)
+                    .apply()
+            } catch (e: Exception) {
+                // Log error but don't crash
+            }
+        }
+    }
+    
+    /**
+     * Start cleanup scheduler
+     */
+    private fun startCleanupScheduler() {
+        scope.launch {
+            while (true) {
+                delay(CLEANUP_INTERVAL)
+                optimizeCache()
+            }
+        }
+    }
+    
+    /**
+     * Get cache entry with Flow
+     */
+    fun <T> getCacheFlow(key: String): Flow<Result<T>> = flow {
+        try {
+            val memoryEntry = memoryCache[key]
+            if (memoryEntry != null && !memoryEntry.isExpired()) {
+                emit(Result.Success(memoryEntry.data as T))
+                return@flow
+            }
+            
+            val diskResult = getFromDiskCache<T>(key)
+            if (diskResult is Result.Success && !diskResult.data.isExpired()) {
+                memoryCache[key] = diskResult.data
+                emit(Result.Success(diskResult.data.data as T))
+            } else {
+                emit(Result.Error(Exception("Cache miss")))
+            }
+        } catch (e: Exception) {
+            emit(Result.Error(e))
+        }
+    }.catch { e ->
+        emit(Result.Error(e))
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        scope.launch {
+            clearCache()
+        }
+    }
+}
+
+/**
+ * Cache entry data class
+ */
+data class CacheEntry(
+    val key: String,
+    val data: Any,
+    val timestamp: Long,
+    val ttl: Long
+) {
+    fun isExpired(): Boolean {
+        return System.currentTimeMillis() > (timestamp + ttl)
+    }
+}
+
+/**
+ * Cache strategy enum
+ */
+enum class CacheStrategy {
+    MEMORY_FIRST,
+    DISK_FIRST,
+    NETWORK_FIRST
+}
+
+/**
+ * Cache statistics data class
+ */
+data class CacheStats(
+    val totalRequests: Long = 0,
+    val cacheHits: Long = 0,
+    val cacheMisses: Long = 0,
+    val memorySize: Long = 0,
+    val diskSize: Long = 0,
+    val lastUpdated: Long = 0
+)
+
+/**
+ * Cache statistics summary
+ */
+data class CacheStatistics(
+    val memorySize: Int,
+    val diskSize: Long,
+    val hitRate: Float,
+    val totalRequests: Long,
+    val cacheHits: Long,
+    val cacheMisses: Long
+)
+
+/**
+ * Prefetch task data class
+ */
+data class PrefetchTask(
+    val key: String,
+    val fetcher: suspend () -> Any,
+    val ttl: Long,
+    val priority: Int = 0
+)

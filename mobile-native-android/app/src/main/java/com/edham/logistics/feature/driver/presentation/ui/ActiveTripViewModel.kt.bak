@@ -1,0 +1,180 @@
+package com.edham.logistics.feature.driver.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.driver.domain.usecase.*
+import com.edham.logistics.feature.driver.domain.model.*
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class ActiveTripViewModel @Inject constructor(
+    private val updateTripStatusUseCase: UpdateTripStatusUseCase,
+    private val uploadDeliveryProofUseCase: UploadDeliveryProofUseCase
+) : BaseViewModel<ActiveTripViewModel.ActiveTripUiState>() {
+
+    private val _uiState = MutableStateFlow(ActiveTripUiState())
+    val uiState: StateFlow<ActiveTripUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): ActiveTripUiState = ActiveTripUiState()
+
+    private var currentTripId: String = ""
+
+    fun initialize(tripId: String) {
+        this.currentTripId = tripId
+        // In real app, we would load trip details here
+        // For now, we'll use mock data
+        loadMockTripData()
+    }
+
+    private fun loadMockTripData() {
+        val mockTrip = DriverTrip(
+            id = currentTripId,
+            trackingNumber = "EDHAM-2024-001",
+            customerName = "محمد أحمد",
+            customerPhone = "+966501234567",
+            pickupLocation = LocationPoint(
+                latitude = 24.7136,
+                longitude = 46.6753,
+                address = "الرياض، شارع الملك، بناية 123",
+                city = "الرياض",
+                timestamp = null
+            ),
+            deliveryLocation = LocationPoint(
+                latitude = 21.4225,
+                longitude = 39.8262,
+                address = "جدة، شارع الأمير، بناية 456",
+                city = "جدة",
+                timestamp = null
+            ),
+            cargoType = "general",
+            weight = 15.5,
+            priority = "normal",
+            specialInstructions = "العميل يفضل التسليم في المساء",
+            estimatedDuration = 180,
+            estimatedDistance = 950.0,
+            price = 250.0,
+            status = TripStatus.STARTED,
+            assignedAt = "2024-01-18T08:00:00Z",
+            acceptedAt = "2024-01-18T08:30:00Z",
+            startedAt = "2024-01-18T09:00:00Z",
+            completedAt = null,
+            deliveryProof = null,
+            currentLocation = LocationPoint(
+                latitude = 24.7136,
+                longitude = 46.6753,
+                address = "الرياض، شارع الملك",
+                city = "الرياض",
+                timestamp = "2024-01-18T09:30:00Z"
+            ),
+            route = null
+        )
+        
+        updateUiState { copy(trip = mockTrip) }
+    }
+
+    fun updateStatus(status: TripStatus, location: LocationPoint? = null, notes: String? = null) {
+        viewModelScope.launch {
+            when (val result = updateTripStatusUseCase(currentTripId, status, location, notes)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        actionSuccess = "تم تحديث الحالة بنجاح",
+                        error = null
+                    )}
+                    // Update local trip status
+                    updateUiState { state ->
+                        state.trip?.let { trip ->
+                            copy(trip = trip.copy(status = status))
+                        } ?: state
+                    }
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحديث الحالة") }
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun markLoaded(location: LocationPoint) {
+        updateStatus(TripStatus.IN_TRANSIT, location, "تم تحميل البضائع")
+    }
+
+    fun markInTransit(location: LocationPoint) {
+        updateStatus(TripStatus.IN_TRANSIT, location, "الرحلة قيد التنفيذ")
+    }
+
+    fun markArrived(location: LocationPoint) {
+        updateStatus(TripStatus.ARRIVED, location, "وصلت إلى موقع التسليم")
+    }
+
+    fun uploadDeliveryProof(
+        photoBase64: String? = null,
+        signatureBase64: String? = null,
+        recipientName: String,
+        recipientPhone: String,
+        notes: String? = null,
+        location: LocationPoint
+    ) {
+        viewModelScope.launch {
+            when (val result = uploadDeliveryProofUseCase(
+                currentTripId, photoBase64, signatureBase64, recipientName, recipientPhone, notes, location
+            )) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        actionSuccess = "تم رفع دليل التسليم بنجاح",
+                        error = null,
+                        showDeliveryProofDialog = false
+                    )}
+                    // Update trip status to delivered
+                    updateStatus(TripStatus.DELIVERED, location, "تم التسليم بنجاح")
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل رفع دليل التسليم") }
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun showDeliveryProofDialog() {
+        updateUiState { copy(showDeliveryProofDialog = true) }
+    }
+
+    fun hideDeliveryProofDialog() {
+        updateUiState { copy(showDeliveryProofDialog = false) }
+    }
+
+    fun clearError() {
+        updateUiState { copy(error = null) }
+    }
+
+    fun clearSuccess() {
+        updateUiState { copy(actionSuccess = null) }
+    }
+
+    fun refreshTrip() {
+        loadMockTripData()
+    }
+
+    data class ActiveTripUiState(
+        val isLoading: Boolean = false,
+        val trip: DriverTrip? = null,
+        val error: String? = null,
+        val actionSuccess: String? = null,
+        val showDeliveryProofDialog: Boolean = false
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = copy(actionSuccess = message)
+    }
+}

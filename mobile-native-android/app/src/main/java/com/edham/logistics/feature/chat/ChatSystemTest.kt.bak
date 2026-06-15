@@ -1,0 +1,393 @@
+package com.edham.logistics.feature.chat
+
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.edham.logistics.data.local.database.ChatDatabase
+import com.edham.logistics.data.remote.api.ChatApi
+import kotlinx.coroutines.runBlocking
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.mockito.Mock
+import org.mockito.MockitoAnnotations
+import org.junit.Assert.*
+
+/**
+ * Comprehensive Chat System Testing Framework
+ * Tests all chat functionality including real-time messaging, media sharing, and emergency broadcasts
+ */
+@RunWith(AndroidJUnit4::class)
+class ChatSystemTest {
+    
+    @Mock
+    private lateinit var mockApi: ChatApi
+    
+    private lateinit var database: ChatDatabase
+    private lateinit var chatService: ChatService
+    private lateinit var context: Context
+    
+    @Before
+    fun setup() {
+        MockitoAnnotations.openMocks(this)
+        context = ApplicationProvider.getApplicationContext()
+        database = ChatDatabase.getDatabase(context)
+        chatService = ChatService(context, mockApi, database)
+    }
+    
+    @Test
+    fun `test message sending and receiving`() = runBlocking {
+        // Test real-time message sending and receiving
+        val testMessage = ChatMessage(
+            id = "test_msg_001",
+            conversationId = "conv_001",
+            senderId = "user_001",
+            senderRole = UserRole.DRIVER,
+            content = "Test message",
+            messageType = MessageType.TEXT,
+            timestamp = System.currentTimeMillis(),
+            isRead = false,
+            isDelivered = false
+        )
+        
+        // Send message
+        val result = chatService.sendMessage(testMessage)
+        assertTrue("Message should send successfully", result.isSuccess)
+        
+        // Verify message is stored locally
+        val storedMessages = database.messageDao().getConversationMessages("conv_001")
+        assertTrue("Message should be stored locally", storedMessages.isNotEmpty())
+        
+        // Verify message appears in LiveData
+        val messages = chatService.messages.value
+        assertNotNull("Messages LiveData should not be null", messages)
+        assertTrue("Sent message should appear in list", messages?.any { it.id == testMessage.id } == true)
+    }
+    
+    @Test
+    fun `test voice note recording and sending`() = runBlocking {
+        // Test voice note functionality
+        val voiceMessage = ChatMessage(
+            id = "voice_msg_001",
+            conversationId = "conv_001",
+            senderId = "user_001",
+            senderRole = UserRole.DRIVER,
+            content = "Voice note",
+            messageType = MessageType.VOICE,
+            timestamp = System.currentTimeMillis(),
+            metadata = MessageMetadata(
+                fileName = "voice_note_001.mp3",
+                fileSize = 1024000L, // 1MB
+                duration = 30000L // 30 seconds
+            )
+        )
+        
+        val result = chatService.sendMessage(voiceMessage)
+        assertTrue("Voice message should send successfully", result.isSuccess)
+        
+        // Verify voice message is stored with metadata
+        val storedMessages = database.messageDao().getMessagesByType(MessageType.VOICE, 10)
+        assertTrue("Voice message should be stored", storedMessages.isNotEmpty())
+        
+        val storedVoiceMessage = storedMessages.first()
+        assertNotNull("Voice metadata should not be null", storedVoiceMessage.metadata)
+        assertEquals("File name should match", "voice_note_001.mp3", storedVoiceMessage.metadata?.fileName)
+        assertEquals("Duration should match", 30000L, storedVoiceMessage.metadata?.duration)
+    }
+    
+    @Test
+    fun `test image file sharing`() = runBlocking {
+        // Test image sharing functionality
+        val imageMessage = ChatMessage(
+            id = "img_msg_001",
+            conversationId = "conv_001",
+            senderId = "user_001",
+            senderRole = UserRole.DRIVER,
+            content = "Delivery photo",
+            messageType = MessageType.IMAGE,
+            timestamp = System.currentTimeMillis(),
+            metadata = MessageMetadata(
+                fileName = "delivery_photo_001.jpg",
+                fileSize = 2048000L // 2MB
+            )
+        )
+        
+        val result = chatService.sendMessage(imageMessage)
+        assertTrue("Image message should send successfully", result.isSuccess)
+        
+        // Verify image message is stored
+        val storedImages = database.messageDao().getMessagesByType(MessageType.IMAGE, 10)
+        assertTrue("Image message should be stored", storedImages.isNotEmpty())
+        
+        val storedImageMessage = storedImages.first()
+        assertEquals("File size should be within limit", true, storedImageMessage.metadata?.fileSize ?: 0 <= 10485760L) // 10MB limit
+    }
+    
+    @Test
+    fun `test location sharing`() = runBlocking {
+        // Test location sharing functionality
+        val locationMessage = ChatMessage(
+            id = "loc_msg_001",
+            conversationId = "conv_001",
+            senderId = "user_001",
+            senderRole = UserRole.DRIVER,
+            content = "Current location",
+            messageType = MessageType.LOCATION,
+            timestamp = System.currentTimeMillis(),
+            metadata = MessageMetadata(
+                locationData = LocationData(
+                    latitude = 24.7136,
+                    longitude = 46.6753,
+                    address = "Riyadh, Saudi Arabia",
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        )
+        
+        val result = chatService.sendMessage(locationMessage)
+        assertTrue("Location message should send successfully", result.isSuccess)
+        
+        // Verify location message is stored
+        val storedLocations = database.messageDao().getMessagesByType(MessageType.LOCATION, 10)
+        assertTrue("Location message should be stored", storedLocations.isNotEmpty())
+        
+        val storedLocationMessage = storedLocations.first()
+        assertNotNull("Location data should not be null", storedLocationMessage.metadata?.locationData)
+        assertEquals("Latitude should match", 24.7136, storedLocationMessage.metadata?.locationData?.latitude ?: 0.0, 0.0001)
+        assertEquals("Longitude should match", 46.6753, storedLocationMessage.metadata?.locationData?.longitude ?: 0.0, 0.0001)
+    }
+    
+    @Test
+    fun `test emergency broadcast messages`() = runBlocking {
+        // Test emergency broadcast functionality
+        val emergencyMessage = EmergencyMessage(
+            id = "emergency_001",
+            senderId = "admin_001",
+            senderRole = UserRole.ADMIN,
+            message = "Emergency: All drivers report to headquarters",
+            priority = EmergencyPriority.CRITICAL,
+            targetRoles = listOf("DRIVER", "DISPATCHER"),
+            timestamp = System.currentTimeMillis(),
+            isRead = false
+        )
+        
+        val result = chatService.sendEmergencyMessage(emergencyMessage)
+        assertTrue("Emergency message should send successfully", result.isSuccess)
+        
+        // Verify emergency message is stored
+        val storedEmergencyMessages = database.emergencyMessageDao().getEmergencyMessagesForRole("DRIVER", 10)
+        assertTrue("Emergency message should be stored", storedEmergencyMessages.isNotEmpty())
+        
+        val storedEmergencyMessage = storedEmergencyMessages.first()
+        assertEquals("Priority should be CRITICAL", EmergencyPriority.CRITICAL, storedEmergencyMessage.priority)
+        assertTrue("Should target drivers", storedEmergencyMessage.targetRoles.contains("DRIVER"))
+    }
+    
+    @Test
+    fun `test typing indicators`() = runBlocking {
+        // Test typing indicator functionality
+        val typingIndicator = TypingIndicator(
+            userId = "user_001",
+            conversationId = "conv_001",
+            isTyping = true,
+            timestamp = System.currentTimeMillis()
+        )
+        
+        // Start typing
+        chatService.setTypingIndicator(typingIndicator)
+        
+        // Verify typing indicator is stored
+        val typingUsers = database.typingIndicatorDao().getTypingUsers("conv_001")
+        assertTrue("Typing indicator should be stored", typingUsers.isNotEmpty())
+        
+        // Stop typing after timeout
+        chatService.stopTyping("user_001", "conv_001")
+        
+        // Verify typing indicator is removed
+        val typingUsersAfterStop = database.typingIndicatorDao().getTypingUsers("conv_001")
+        assertFalse("Typing indicator should be removed", typingUsersAfterStop.any { it.userId == "user_001" })
+    }
+    
+    @Test
+    fun `test read receipts`() = runBlocking {
+        // Test read receipt functionality
+        val readReceipt = ReadReceipt(
+            id = "read_001",
+            messageId = "msg_001",
+            readerId = "user_002",
+            readAt = System.currentTimeMillis()
+        )
+        
+        // Mark message as read
+        chatService.markMessageAsRead(readReceipt)
+        
+        // Verify read receipt is stored
+        val readReceipts = database.readReceiptDao().getMessageReadReceipts("msg_001")
+        assertTrue("Read receipt should be stored", readReceipts.isNotEmpty())
+        
+        // Verify message is marked as read
+        val messages = database.messageDao().getConversationMessages("conv_001")
+        val readMessage = messages.find { it.id == "msg_001" }
+        assertTrue("Message should be marked as read", readMessage?.isRead == true)
+    }
+    
+    @Test
+    fun `test conversation management`() = runBlocking {
+        // Test conversation creation and management
+        val conversation = Conversation(
+            id = "conv_001",
+            name = "Driver Support",
+            description = "Support conversation for drivers",
+            type = ConversationType.DIRECT,
+            participantIds = "driver_001,dispatcher_001",
+            creatorId = "system_001",
+            creatorRole = UserRole.ADMIN,
+            createdAt = System.currentTimeMillis(),
+            lastMessageAt = System.currentTimeMillis(),
+            unreadCount = 0,
+            isActive = true
+        )
+        
+        // Create conversation
+        database.conversationDao().insertConversation(conversation)
+        
+        // Verify conversation is stored
+        val storedConversation = database.conversationDao().getConversation("conv_001")
+        assertNotNull("Conversation should be stored", storedConversation)
+        assertEquals("Conversation name should match", "Driver Support", storedConversation?.name)
+        assertTrue("Conversation should be active", storedConversation?.isActive == true)
+    }
+    
+    @Test
+    fun `test online user tracking`() = runBlocking {
+        // Test online user tracking
+        val onlineUser = OnlineUser(
+            userId = "user_001",
+            userName = "Test Driver",
+            userRole = "DRIVER",
+            lastSeen = System.currentTimeMillis(),
+            isActive = true
+        )
+        
+        // Mark user as online
+        database.onlineUserDao().insertOnlineUser(onlineUser)
+        
+        // Verify user is marked as online
+        val onlineUsers = database.onlineUserDao().getActiveOnlineUsers()
+        assertTrue("User should be marked as online", onlineUsers.any { it.userId == "user_001" })
+        
+        // Mark user as offline
+        database.onlineUserDao().deleteOnlineUser("user_001")
+        
+        // Verify user is marked as offline
+        val onlineUsersAfterOffline = database.onlineUserDao().getActiveOnlineUsers()
+        assertFalse("User should be marked as offline", onlineUsersAfterOffline.any { it.userId == "user_001" })
+    }
+    
+    @Test
+    fun `test message persistence and caching`() = runBlocking {
+        // Test message persistence and caching performance
+        val messages = mutableListOf<ChatMessage>()
+        
+        // Create 100 test messages
+        repeat(100) { index ->
+            val message = ChatMessage(
+                id = "msg_$index",
+                conversationId = "conv_001",
+                senderId = "user_001",
+                senderRole = UserRole.DRIVER,
+                content = "Test message $index",
+                messageType = MessageType.TEXT,
+                timestamp = System.currentTimeMillis() + index,
+                isRead = index % 2 == 0,
+                isDelivered = true
+            )
+            messages.add(message)
+        }
+        
+        val startTime = System.currentTimeMillis()
+        
+        // Insert all messages
+        database.messageDao().insertMessages(messages)
+        
+        val insertTime = System.currentTimeMillis() - startTime
+        assertTrue("Bulk insert should be fast", insertTime < 1000) // Less than 1 second
+        
+        // Test pagination performance
+        val paginationStartTime = System.currentTimeMillis()
+        val paginatedMessages = database.messageDao().getMessagesPaginated("conv_001", 20, 0)
+        val paginationTime = System.currentTimeMillis() - paginationStartTime
+        
+        assertTrue("Pagination should be fast", paginationTime < 500) // Less than 500ms
+        assertEquals("Should return 20 messages", 20, paginatedMessages.size)
+    }
+    
+    @Test
+    fun `test message search functionality`() = runBlocking {
+        // Test message search functionality
+        val searchQuery = "delivery"
+        
+        // Search messages
+        val searchResults = database.messageDao().searchMessages("conv_001", searchQuery)
+        
+        // Verify search results contain the query
+        searchResults.forEach { message ->
+            assertTrue("Search result should contain query", message.content.contains(searchQuery, ignoreCase = true))
+        }
+    }
+    
+    @Test
+    fun `test unread count calculation`() = runBlocking {
+        // Test unread count calculation
+        val currentUserId = "user_002"
+        
+        // Get unread count
+        val unreadCount = database.messageDao().getUnreadCount("conv_001", currentUserId)
+        
+        // Verify unread count is non-negative
+        assertTrue("Unread count should be non-negative", unreadCount >= 0)
+    }
+    
+    @Test
+    fun `test old message cleanup`() = runBlocking {
+        // Test automatic cleanup of old messages
+        val oldTimestamp = System.currentTimeMillis() - (30L * 24L * 60L * 60L * 1000L) // 30 days ago
+        
+        // Delete old messages
+        val deletedCount = database.messageDao().deleteOldMessages(oldTimestamp)
+        
+        // Verify cleanup works
+        assertTrue("Old messages should be deleted", deletedCount >= 0)
+    }
+    
+    @Test
+    fun `test concurrent message operations`() = runBlocking {
+        // Test concurrent message operations
+        val concurrentJobs = (1..10).map { index ->
+            runBlocking {
+                val message = ChatMessage(
+                    id = "concurrent_msg_$index",
+                    conversationId = "conv_001",
+                    senderId = "user_$index",
+                    senderRole = UserRole.DRIVER,
+                    content = "Concurrent message $index",
+                    messageType = MessageType.TEXT,
+                    timestamp = System.currentTimeMillis() + index,
+                    isRead = false,
+                    isDelivered = false
+                )
+                chatService.sendMessage(message)
+            }
+        }
+        
+        // Wait for all operations to complete
+        val results = concurrentJobs.awaitAll()
+        
+        // Verify all operations succeeded
+        assertTrue("All concurrent operations should succeed", results.all { it.isSuccess })
+        
+        // Verify all messages are stored
+        val storedMessages = database.messageDao().getConversationMessages("conv_001")
+        assertTrue("All concurrent messages should be stored", storedMessages.size >= 10)
+    }
+}

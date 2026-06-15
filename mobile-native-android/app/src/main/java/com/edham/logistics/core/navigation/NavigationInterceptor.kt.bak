@@ -1,0 +1,144 @@
+package com.edham.logistics.core.navigation
+
+import androidx.fragment.app.Fragment
+import androidx.navigation.NavController
+import androidx.navigation.fragment.NavHostFragment
+import timber.log.Timber
+
+/**
+ * Navigation Interceptor - Relaxed enforcement
+ * Only intercepts sensitive navigation operations, allows simple fragment-to-fragment navigation
+ */
+class NavigationInterceptor {
+    
+    companion object {
+        private var appNavigationController: AppNavigationController? = null
+        private var isStrictMode = false // Default to relaxed mode
+        
+        /**
+         * Initialize the interceptor with the app navigation controller
+         */
+        fun initialize(appNavigationController: AppNavigationController, strictMode: Boolean = false) {
+            this.appNavigationController = appNavigationController
+            this.isStrictMode = strictMode
+            Timber.d("NavigationInterceptor initialized (strictMode: $strictMode)")
+        }
+        
+        /**
+         * Intercept navigation for sensitive operations only
+         * Use for financial, admin, or critical operations
+         */
+        fun navigateToSensitiveFragment(
+            fragment: Fragment,
+            destinationId: Int,
+            args: android.os.Bundle? = null,
+            isModal: Boolean = false
+        ) {
+            val controller = appNavigationController
+            if (controller == null) {
+                Timber.e("AppNavigationController not initialized for sensitive navigation.")
+                return
+            }
+            
+            // Log sensitive navigation attempt
+            Timber.d("Sensitive navigation intercepted: ${fragment.javaClass.simpleName} -> destination: $destinationId")
+            
+            // Perform navigation through centralized controller
+            controller.navigateToFragment(destinationId, args, isModal)
+        }
+        
+        /**
+         * Check if navigation should be intercepted (sensitive operations only)
+         */
+        fun shouldInterceptNavigation(destinationId: Int): Boolean {
+            if (!isStrictMode) {
+                // Only intercept sensitive destinations in relaxed mode
+                return isSensitiveDestination(destinationId)
+            }
+            
+            // In strict mode, intercept all navigation
+            return true
+        }
+        
+        /**
+         * Check if destination is sensitive (requires role-based access)
+         */
+        private fun isSensitiveDestination(destinationId: Int): Boolean {
+            return try {
+                val destination = NavigationDestination.fromFragmentId(destinationId)
+                when (destination) {
+                    NavigationDestination.ADMIN_DASHBOARD,
+                    NavigationDestination.ACCOUNTANT_DASHBOARD,
+                    NavigationDestination.INVOICES,
+                    NavigationDestination.PAYMENTS,
+                    NavigationDestination.FINANCIAL_REPORTS,
+                    NavigationDestination.MANAGE_USERS,
+                    NavigationDestination.MANAGE_SYSTEM -> true
+                    else -> false
+                }
+            } catch (e: IllegalArgumentException) {
+                false
+            }
+        }
+        
+        /**
+         * Get the app navigation controller
+         */
+        fun getAppNavigationController(): AppNavigationController? {
+            return appNavigationController
+        }
+        
+        /**
+         * Check if navigation is allowed for a specific fragment (sensitive only)
+         */
+        fun canNavigateToSensitive(fragment: Fragment, destinationId: Int): Boolean {
+            if (!shouldInterceptNavigation(destinationId)) {
+                return true // Allow non-sensitive navigation
+            }
+            
+            val controller = appNavigationController ?: return false
+            
+            return try {
+                val destination = NavigationDestination.fromFragmentId(destinationId)
+                controller.canAccessDestination(destination)
+            } catch (e: IllegalArgumentException) {
+                Timber.w("Invalid destination ID: $destinationId")
+                false
+            }
+        }
+        
+        /**
+         * Enable/disable strict mode
+         */
+        fun setStrictMode(enabled: Boolean) {
+            isStrictMode = enabled
+            Timber.d("NavigationInterceptor strict mode: $enabled")
+        }
+    }
+}
+
+/**
+ * Extension function for sensitive navigation only
+ * Use for financial, admin, or critical operations
+ */
+fun Fragment.navigateToSensitive(
+    destination: NavigationDestination,
+    args: android.os.Bundle? = null,
+    isModal: Boolean = false
+) {
+    NavigationInterceptor.navigateToSensitiveFragment(this, destination.fragmentId, args, isModal)
+}
+
+/**
+ * Extension function for navigating back (use AppNavigationController for sensitive operations)
+ */
+fun Fragment.navigateBackSensitive(): Boolean {
+    return NavigationInterceptor.getAppNavigationController()?.navigateBack() ?: false
+}
+
+/**
+ * Extension function to check if sensitive navigation is possible
+ */
+fun Fragment.canNavigateToSensitive(destination: NavigationDestination): Boolean {
+    return NavigationInterceptor.canNavigateToSensitive(this, destination.fragmentId)
+}

@@ -1,0 +1,657 @@
+package com.edham.logistics.tracking
+
+import android.location.Location
+import com.edham.logistics.data.local.entity.RouteEntity
+import com.edham.logistics.data.local.entity.RouteStopEntity
+import com.edham.logistics.data.remote.api.TrafficApi
+import com.google.android.gms.maps.model.LatLng
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import kotlin.math.*
+
+/**
+ * ETA Calculator - Advanced Estimated Time of Arrival calculation
+ * 
+ * Features:
+ * - Real-time ETA calculation
+ * - Traffic-aware predictions
+ * - Historical data analysis
+ * - Weather considerations
+ * - Route-specific factors
+ * - Confidence scoring
+ */
+class ETACalculator(
+    private val trafficApi: TrafficApi,
+    private val weatherService: WeatherService
+) {
+    
+    private val _etaState = MutableStateFlow<ETAState>(ETAState.Initial)
+    val etaState: StateFlow<ETAState> = _etaState.asStateFlow()
+    
+    private val _currentETA = MutableStateFlow<ETAInfo?>(null)
+    val currentETA: StateFlow<ETAInfo?> = _currentETA.asStateFlow()
+    
+    private var currentRoute: RouteEntity? = null
+    private var routeStops: List<RouteStopEntity> = emptyList()
+    private var trafficData: TrafficData? = null
+    private var weatherData: WeatherData? = null
+    private var historicalData: HistoricalData? = null
+    
+    companion object {
+        private const val TAG = "ETACalculator"
+        private const val DEFAULT_SPEED = 50.0 // km/h
+        private const val URBAN_SPEED = 30.0 // km/h
+        private const val HIGHWAY_SPEED = 80.0 // km/h
+        private const val TRAFFIC_IMPACT_FACTOR = 0.3
+        private const val WEATHER_IMPACT_FACTOR = 0.1
+        private const val TIME_OF_DAY_FACTOR = 0.15
+        private const val DAY_OF_WEEK_FACTOR = 0.1
+    }
+    
+    /**
+     * Initialize ETA calculator with route
+     */
+    fun initializeRoute(route: RouteEntity) {
+        currentRoute = route
+        routeStops = route.stops
+        _etaState.value = ETAState.Initialized
+    }
+    
+    /**
+     * Calculate ETA for current location
+     */
+    suspend fun calculateETA(currentLocation: Location, route: RouteEntity): Date {
+        return withContext(Dispatchers.Default) {
+            try {
+                _etaState.value = ETAState.Calculating
+                
+                // Get current traffic data
+                trafficData = getTrafficData(currentLocation, route)
+                
+                // Get current weather data
+                // weatherData = weatherService.getCurrentWeather(currentLocation)
+                
+                // Get historical data
+                historicalData = getHistoricalData(currentLocation, route)
+                
+                // Calculate remaining distance
+                val remainingDistance = calculateRemainingDistance(currentLocation, route)
+                
+                // Calculate average speed considering all factors
+                val averageSpeed = calculateAverageSpeed(currentLocation, route)
+                
+                // Calculate base travel time
+                val baseTravelTime = (remainingDistance / averageSpeed * 1000).toLong()
+                
+                // Apply adjustments
+                val adjustedTravelTime = applyTimeAdjustments(baseTravelTime, currentLocation, route)
+                
+                // Calculate ETA
+                val eta = Date(System.currentTimeMillis() + adjustedTravelTime)
+                
+                // Create ETA info
+                val etaInfo = ETAInfo(
+                    eta = eta,
+                    remainingDistance = remainingDistance,
+                    estimatedDuration = adjustedTravelTime,
+                    confidence = calculateConfidence(),
+                    factors = getInfluencingFactors(),
+                    alternativeETAs = calculateAlternativeETAs(currentLocation, route)
+                )
+                
+                _currentETA.value = etaInfo
+                _etaState.value = ETAState.Calculated
+                
+                eta
+                
+            } catch (e: Exception) {
+                _etaState.value = ETAState.Error(e.message ?: "ETA calculation failed")
+                Date(System.currentTimeMillis() + 3600000) // Default 1 hour
+            }
+        }
+    }
+    
+    /**
+     * Calculate ETA for specific destination
+     */
+    suspend fun calculateETAToDestination(
+        currentLocation: Location,
+        destination: LatLng,
+        route: RouteEntity
+    ): ETAInfo {
+        return withContext(Dispatchers.Default) {
+            try {
+                // Calculate distance to destination
+                val distance = calculateDistance(currentLocation, destination)
+                
+                // Get route-specific factors
+                val routeFactors = getRouteFactors(currentLocation, destination, route)
+                
+                // Calculate average speed
+                val averageSpeed = calculateAverageSpeedForSegment(currentLocation, destination, routeFactors)
+                
+                // Calculate travel time
+                val travelTime = (distance / averageSpeed * 1000).toLong()
+                
+                // Apply adjustments
+                val adjustedTravelTime = applyTimeAdjustments(travelTime, currentLocation, route)
+                
+                // Calculate ETA
+                val eta = Date(System.currentTimeMillis() + adjustedTravelTime)
+                
+                ETAInfo(
+                    eta = eta,
+                    remainingDistance = distance,
+                    estimatedDuration = adjustedTravelTime,
+                    confidence = calculateConfidence(),
+                    factors = getInfluencingFactors(),
+                    alternativeETAs = emptyList()
+                )
+                
+            } catch (e: Exception) {
+                throw ETACalculationException("Failed to calculate ETA: ${e.message}")
+            }
+        }
+    }
+    
+    /**
+     * Update ETA based on new location
+     */
+    suspend fun updateETA(currentLocation: Location, route: RouteEntity) {
+        calculateETA(currentLocation, route)
+    }
+    
+    /**
+     * Get ETA predictions for multiple stops
+     */
+    suspend fun getMultiStopETA(
+        currentLocation: Location,
+        stops: List<RouteStopEntity>,
+        route: RouteEntity
+    ): List<StopETA> {
+        return withContext(Dispatchers.Default) {
+            val stopETAs = mutableListOf<StopETA>()
+            var cumulativeTime = 0L
+            var previousLocation = currentLocation
+            
+            stops.forEach { stop ->
+                val stopLocation = Location("").apply {
+                    latitude = stop.latitude
+                    longitude = stop.longitude
+                }
+                
+                val distance = calculateDistance(previousLocation, stopLocation)
+                val averageSpeed = calculateAverageSpeedForSegment(previousLocation, stopLocation, emptyMap())
+                val travelTime = (distance / averageSpeed * 1000).toLong()
+                
+                cumulativeTime += travelTime
+                
+                val eta = Date(System.currentTimeMillis() + cumulativeTime)
+                
+                stopETAs.add(
+                    StopETA(
+                        stop = stop,
+                        eta = eta,
+                        estimatedDuration = travelTime,
+                        distance = distance,
+                        confidence = calculateStopConfidence(stop)
+                    )
+                )
+                
+                previousLocation = stopLocation
+            }
+            
+            stopETAs
+        }
+    }
+    
+    /**
+     * Calculate remaining distance
+     */
+    private fun calculateRemainingDistance(currentLocation: Location, route: RouteEntity): Double {
+        var remainingDistance = 0.0
+        val currentLatLng = LatLng(currentLocation.latitude, currentLocation.longitude)
+        
+        // Find current position in route
+        val currentStopIndex = findCurrentStopIndex(currentLocation, route)
+        
+        // Calculate distance from current position to end
+        if (currentStopIndex < route.stops.size - 1) {
+            // Distance from current position to next stop
+            val nextStop = route.stops[currentStopIndex + 1]
+            remainingDistance += calculateDistance(
+                currentLatLng,
+                LatLng(nextStop.latitude, nextStop.longitude)
+            )
+            
+            // Distance from next stop to end
+            for (i in currentStopIndex + 1 until route.stops.size - 1) {
+                val stop = route.stops[i]
+                val nextStop = route.stops[i + 1]
+                remainingDistance += calculateDistance(
+                    LatLng(stop.latitude, stop.longitude),
+                    LatLng(nextStop.latitude, nextStop.longitude)
+                )
+            }
+        }
+        
+        return remainingDistance
+    }
+    
+    /**
+     * Calculate average speed considering all factors
+     */
+    private fun calculateAverageSpeed(currentLocation: Location, route: RouteEntity): Double {
+        val baseSpeed = getBaseSpeed(
+            try {
+                RouteType.valueOf(route.routeType)
+            } catch (_: IllegalArgumentException) {
+                RouteType.HIGHWAY
+            }
+        )
+        
+        // Apply traffic factor
+        val trafficFactor = getTrafficFactor()
+        
+        // Apply weather factor
+        val weatherFactor = getWeatherFactor()
+        
+        // Apply time of day factor
+        val timeOfDayFactor = getTimeOfDayFactor()
+        
+        // Apply day of week factor
+        val dayOfWeekFactor = getDayOfWeekFactor()
+        
+        // Apply historical factor
+        val historicalFactor = getHistoricalFactor()
+        
+        val adjustedSpeed = baseSpeed *
+                trafficFactor *
+                weatherFactor *
+                timeOfDayFactor *
+                dayOfWeekFactor *
+                historicalFactor
+        
+        return maxOf(adjustedSpeed, 5.0) // Minimum 5 km/h
+    }
+    
+    /**
+     * Calculate average speed for specific segment
+     */
+    private fun calculateAverageSpeedForSegment(
+        startLocation: Location,
+        endLocation: LatLng,
+        routeFactors: Map<String, Double>
+    ): Double {
+        val baseSpeed = DEFAULT_SPEED
+        
+        // Apply route-specific factors
+        val roadTypeFactor = routeFactors["roadType"] ?: 1.0
+        val trafficFactor = routeFactors["traffic"] ?: 1.0
+        val weatherFactor = routeFactors["weather"] ?: 1.0
+        
+        return baseSpeed * roadTypeFactor * trafficFactor * weatherFactor
+    }
+    
+    /**
+     * Apply time adjustments to travel time
+     */
+    private fun applyTimeAdjustments(baseTime: Long, currentLocation: Location, route: RouteEntity): Long {
+        var adjustedTime = baseTime
+        
+        // Add buffer for uncertainty
+        val uncertaintyBuffer = (baseTime * 0.1).toLong()
+        adjustedTime += uncertaintyBuffer
+        
+        // Add stops duration
+        val stopsDuration = calculateStopsDuration(route)
+        adjustedTime += stopsDuration
+        
+        // Add rest breaks if needed
+        val restBreaks = calculateRestBreaks(baseTime)
+        adjustedTime += restBreaks
+        
+        return adjustedTime
+    }
+    
+    /**
+     * Calculate confidence score
+     */
+    private fun calculateConfidence(): Double {
+        var confidence = 1.0
+        
+        // Reduce confidence based on data quality
+        if (trafficData == null) confidence -= 0.2
+        if (weatherData == null) confidence -= 0.1
+        if (historicalData == null) confidence -= 0.1
+        
+        // Reduce confidence based on traffic conditions
+        trafficData?.let { traffic ->
+            if (traffic.congestionLevel > 0.7) confidence -= 0.15
+        }
+        
+        // Reduce confidence based on weather
+        weatherData?.let { weather ->
+            if (weather.severity > 0.6) confidence -= 0.1
+        }
+        
+        return maxOf(confidence, 0.3) // Minimum 30% confidence
+    }
+    
+    /**
+     * Calculate confidence for specific stop
+     */
+    private fun calculateStopConfidence(stop: RouteStopEntity): Double {
+        var confidence = 0.9
+        
+        // Adjust based on stop location type
+        if (stop.locationType == LocationType.URBAN) {
+            confidence -= 0.1 // Urban areas have more uncertainty
+        }
+        
+        // Adjust based on time windows
+        if (stop.timeWindow != null) {
+            confidence += 0.05 // Time windows improve accuracy
+        }
+        
+        return maxOf(confidence, 0.3)
+    }
+    
+    /**
+     * Get influencing factors
+     */
+    private fun getInfluencingFactors(): List<InfluencingFactor> {
+        val factors = mutableListOf<InfluencingFactor>()
+        
+        // Traffic factor
+        trafficData?.let { traffic ->
+            factors.add(
+                InfluencingFactor(
+                    type = FactorType.TRAFFIC,
+                    impact = abs(traffic.congestionLevel - 0.5) * 2,
+                    description = "Traffic congestion: ${(traffic.congestionLevel * 100).toInt()}%"
+                )
+            )
+        }
+        
+        // Weather factor
+        weatherData?.let { weather ->
+            factors.add(
+                InfluencingFactor(
+                    type = FactorType.WEATHER,
+                    impact = weather.severity,
+                    description = "Weather conditions: ${weather.condition}"
+                )
+            )
+        }
+        
+        // Time of day factor
+        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        val timeImpact = when (hour) {
+            in 7..9, in 17..19 -> 0.3 // Rush hours
+            in 22..6 -> -0.1 // Night time (faster)
+            else -> 0.0 // Normal
+        }
+        
+        factors.add(
+            InfluencingFactor(
+                type = FactorType.TIME_OF_DAY,
+                impact = timeImpact,
+                description = "Time of day: ${hour}:00"
+            )
+        )
+        
+        return factors
+    }
+    
+    /**
+     * Calculate alternative ETAs
+     */
+    private fun calculateAlternativeETAs(
+        currentLocation: Location,
+        route: RouteEntity
+    ): List<AlternativeETA> {
+        val alternatives = mutableListOf<AlternativeETA>()
+        
+        // Fast route (optimistic)
+        val fastETA = calculateOptimisticETA(currentLocation, route)
+        alternatives.add(
+            AlternativeETA(
+                type = AlternativeType.FAST,
+                eta = fastETA,
+                confidence = 0.6,
+                description = "Best case scenario"
+            )
+        )
+        
+        // Slow route (pessimistic)
+        val slowETA = calculatePessimisticETA(currentLocation, route)
+        alternatives.add(
+            AlternativeETA(
+                type = AlternativeType.SLOW,
+                eta = slowETA,
+                confidence = 0.6,
+                description = "Worst case scenario"
+            )
+        )
+        
+        return alternatives
+    }
+    
+    /**
+     * Helper functions
+     */
+    private fun getTrafficData(currentLocation: Location, route: RouteEntity): TrafficData? {
+        return try {
+            // Implementation would fetch traffic data from API
+            TrafficData(
+                congestionLevel = 0.3,
+                averageSpeed = 45.0,
+                incidents = emptyList()
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun getHistoricalData(currentLocation: Location, route: RouteEntity): HistoricalData? {
+        return try {
+            // Implementation would fetch historical data
+            HistoricalData(
+                averageSpeed = 50.0,
+                typicalDelay = 300000, // 5 minutes
+                reliability = 0.85
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun calculateDistance(location: Location, destination: LatLng): Double {
+        val results = FloatArray(1)
+        Location.distanceBetween(
+            location.latitude, location.longitude,
+            destination.latitude, destination.longitude,
+            results
+        )
+        return results[0].toDouble()
+    }
+    
+    private fun calculateDistance(point1: LatLng, point2: LatLng): Double {
+        val results = FloatArray(1)
+        Location.distanceBetween(
+            point1.latitude, point1.longitude,
+            point2.latitude, point2.longitude,
+            results
+        )
+        return results[0].toDouble()
+    }
+    
+    private fun findCurrentStopIndex(currentLocation: Location, route: RouteEntity): Int {
+        // Implementation would find current stop index based on location
+        return 0 // Placeholder
+    }
+    
+    private fun getBaseSpeed(routeType: RouteType): Double {
+        return when (routeType) {
+            RouteType.URBAN -> URBAN_SPEED
+            RouteType.HIGHWAY -> HIGHWAY_SPEED
+            RouteType.MIXED -> DEFAULT_SPEED
+            RouteType.OFF_ROAD -> DEFAULT_SPEED * 0.7
+        }
+    }
+    
+    private fun getTrafficFactor(): Double {
+        return trafficData?.let { traffic ->
+            1.0 - (traffic.congestionLevel * TRAFFIC_IMPACT_FACTOR)
+        } ?: 1.0
+    }
+    
+    private fun getWeatherFactor(): Double {
+        return weatherData?.let { weather ->
+            1.0 - (weather.severity * WEATHER_IMPACT_FACTOR)
+        } ?: 1.0
+    }
+    
+    private fun getTimeOfDayFactor(): Double {
+        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        return when (hour) {
+            in 7..9, in 17..19 -> 1.0 - TIME_OF_DAY_FACTOR // Rush hours
+            in 22..6 -> 1.0 + 0.05 // Night time (slightly faster)
+            else -> 1.0
+        }
+    }
+    
+    private fun getDayOfWeekFactor(): Double {
+        val day = Calendar.getInstance().get(Calendar.DAY_OF_WEEK)
+        return when (day) {
+            Calendar.SATURDAY, Calendar.SUNDAY -> 1.0 - DAY_OF_WEEK_FACTOR // Weekends
+            else -> 1.0
+        }
+    }
+    
+    private fun getHistoricalFactor(): Double {
+        return historicalData?.let { historical ->
+            historical.averageSpeed / DEFAULT_SPEED
+        } ?: 1.0
+    }
+    
+    private fun getRouteFactors(
+        startLocation: Location,
+        endLocation: LatLng,
+        route: RouteEntity
+    ): Map<String, Double> {
+        return mapOf(
+            "roadType" to 1.0,
+            "traffic" to getTrafficFactor(),
+            "weather" to getWeatherFactor()
+        )
+    }
+    
+    private fun calculateStopsDuration(route: RouteEntity): Long {
+        return route.stops.sumOf { stop ->
+            (stop.averageStopDuration ?: 300000L) // Default 5 minutes
+        }
+    }
+    
+    private fun calculateRestBreaks(travelTime: Long): Long {
+        // Add 15 minutes rest every 4 hours
+        val hours = travelTime / (1000 * 60 * 60)
+        return (hours / 4) * 15 * 60 * 1000L
+    }
+    
+    private fun calculateOptimisticETA(currentLocation: Location, route: RouteEntity): Date {
+        val optimisticTime = (System.currentTimeMillis() + 1800000) // 30 minutes optimistic
+        return Date(optimisticTime)
+    }
+    
+    private fun calculatePessimisticETA(currentLocation: Location, route: RouteEntity): Date {
+        val pessimisticTime = (System.currentTimeMillis() + 7200000) // 2 hours pessimistic
+        return Date(pessimisticTime)
+    }
+}
+
+/**
+ * Data classes
+ */
+data class ETAInfo(
+    val eta: Date,
+    val remainingDistance: Double,
+    val estimatedDuration: Long,
+    val confidence: Double,
+    val factors: List<InfluencingFactor>,
+    val alternativeETAs: List<AlternativeETA>
+)
+
+data class StopETA(
+    val stop: RouteStopEntity,
+    val eta: Date,
+    val estimatedDuration: Long,
+    val distance: Double,
+    val confidence: Double
+)
+
+data class AlternativeETA(
+    val type: AlternativeType,
+    val eta: Date,
+    val confidence: Double,
+    val description: String
+)
+
+data class InfluencingFactor(
+    val type: FactorType,
+    val impact: Double,
+    val description: String
+)
+
+data class TrafficData(
+    val congestionLevel: Double,
+    val averageSpeed: Double,
+    val incidents: List<String>
+)
+
+data class WeatherData(
+    val condition: String,
+    val severity: Double,
+    val visibility: Double,
+    val temperature: Double
+)
+
+data class HistoricalData(
+    val averageSpeed: Double,
+    val typicalDelay: Long,
+    val reliability: Double
+)
+
+/**
+ * Enums and sealed classes
+ */
+sealed class ETAState {
+    object Initial : ETAState()
+    object Initialized : ETAState()
+    object Calculating : ETAState()
+    object Calculated : ETAState()
+    data class Error(val message: String) : ETAState()
+}
+
+enum class RouteType {
+    URBAN, HIGHWAY, MIXED, OFF_ROAD
+}
+
+enum class LocationType {
+    URBAN, RURAL, HIGHWAY, OFF_ROAD
+}
+
+enum class AlternativeType {
+    FAST, SLOW, ALTERNATIVE_ROUTE
+}
+
+enum class FactorType {
+    TRAFFIC, WEATHER, TIME_OF_DAY, DAY_OF_WEEK, HISTORICAL
+}
+
+class ETACalculationException(message: String) : Exception(message)

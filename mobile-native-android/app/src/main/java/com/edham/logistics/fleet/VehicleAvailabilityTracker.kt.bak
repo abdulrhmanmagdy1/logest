@@ -1,0 +1,959 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.FleetAssignmentEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Vehicle Availability Tracker - Advanced vehicle availability tracking and management system
+ * 
+ * Features:
+ * - Real-time availability monitoring
+ * - Availability prediction
+ * - Scheduling optimization
+ * - Resource allocation
+ * - Conflict detection
+ * - Availability analytics
+ * - Maintenance scheduling
+ * - Demand forecasting
+ */
+@Singleton
+class VehicleAvailabilityTracker @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _availabilityState = MutableStateFlow<AvailabilityState>(AvailabilityState.Idle)
+    val availabilityState: StateFlow<AvailabilityState> = _availabilityState.asStateFlow()
+    
+    private val _vehicleAvailability = MutableStateFlow<Map<Long, VehicleAvailability>>(emptyMap())
+    val vehicleAvailability: StateFlow<Map<Long, VehicleAvailability>> = _vehicleAvailability.asStateFlow()
+    
+    private val _availabilityPredictions = MutableStateFlow<Map<Long, AvailabilityPrediction>>(emptyMap())
+    val availabilityPredictions: StateFlow<Map<Long, AvailabilityPrediction>> = _availabilityAvailabilityPredictions.asStateFlow()
+    
+    private val _availabilityConflicts = MutableStateFlow<List<AvailabilityConflict>>(emptyList())
+    val availabilityConflicts: StateFlow<List<AvailabilityConflict>> = _availabilityAvailabilityConflicts.asStateFlow()
+    
+    private val _availabilityAnalytics = MutableStateFlow<AvailabilityAnalytics?>(null)
+    val availabilityAnalytics: StateFlow<AvailabilityAnalytics?> = _availabilityAvailabilityAnalytics.asStateFlow()
+    
+    private val _demandForecast = MutableStateFlow<DemandForecast?>(null)
+    val demandForecast: StateFlow<DemandForecast?> = _demandForecast.asStateFlow()
+    
+    private var isTracking = false
+    private val availabilityListeners = mutableListOf<AvailabilityTrackingListener>()
+    
+    companion object {
+        private const val TAG = "VehicleAvailabilityTracker"
+        private const val MONITORING_INTERVAL = 30000L // 30 seconds
+        private const val PREDICTION_HORIZON_DAYS = 30
+        private const val AVAILABILITY_BUFFER_HOURS = 2
+        private const val HIGH_DEMAND_THRESHOLD = 0.8f
+    }
+    
+    /**
+     * Initialize availability tracking system
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _availabilityState.value = AvailabilityState.Initializing
+                
+                // Load current availability
+                loadVehicleAvailability()
+                
+                // Generate availability predictions
+                generateAvailabilityPredictions()
+                
+                // Check for conflicts
+                checkAvailabilityConflicts()
+                
+                // Start monitoring
+                startAvailabilityMonitoring()
+                
+                // Generate demand forecast
+                generateDemandForecast()
+                
+                _availabilityState.value = AvailabilityState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _availabilityState.value = AvailabilityState.Error("Failed to initialize availability tracking: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get vehicle availability
+     */
+    suspend fun getVehicleAvailability(vehicleId: Long): Result<VehicleAvailability> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val currentAssignment = database.fleetAssignmentDao().getActiveAssignmentByVehicle(vehicleId)
+                val upcomingAssignments = database.fleetAssignmentDao()
+                    .getUpcomingAssignmentsByVehicle(vehicleId, Date())
+                
+                val availability = calculateVehicleAvailability(vehicle, currentAssignment, upcomingAssignments)
+                
+                Result.success(availability)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get available vehicles for time range
+     */
+    suspend fun getAvailableVehicles(
+        startTime: Date,
+        endTime: Date,
+        vehicleType: VehicleType? = null,
+        requiredCapacity: Float? = null
+    ): Result<List<AvailableVehicle>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val allVehicles = database.vehicleDao().getAllVehicles()
+                val allAssignments = database.fleetAssignmentDao().getAllAssignments()
+                
+                val availableVehicles = mutableListOf<AvailableVehicle>()
+                
+                allVehicles.forEach { vehicle ->
+                    // Filter by vehicle type if specified
+                    if (vehicleType != null && vehicle.vehicleType != vehicleType) {
+                        return@forEach
+                    }
+                    
+                    // Filter by capacity if specified
+                    if (requiredCapacity != null && vehicle.capacity < requiredCapacity) {
+                        return@forEach
+                    }
+                    
+                    // Check if vehicle is available for the time range
+                    val isAvailable = isVehicleAvailable(vehicle.id, startTime, endTime, allAssignments)
+                    
+                    if (isAvailable) {
+                        val nextAvailableTime = getNextAvailableTime(vehicle.id, startTime, allAssignments)
+                        val availabilityScore = calculateAvailabilityScore(vehicle, allAssignments)
+                        
+                        availableVehicles.add(AvailableVehicle(
+                            vehicleId = vehicle.id,
+                            vehicleIdString = vehicle.vehicleId,
+                            make = vehicle.make,
+                            model = vehicle.model,
+                            vehicleType = vehicle.vehicleType,
+                            capacity = vehicle.capacity,
+                            currentLocation = vehicle.currentLocation,
+                            nextAvailableTime = nextAvailableTime,
+                            availabilityScore = availabilityScore,
+                            estimatedCost = calculateEstimatedCost(vehicle.id, startTime, endTime),
+                            features = vehicle.features
+                        ))
+                    }
+                }
+                
+                // Sort by availability score (best first)
+                val sortedVehicles = availableVehicles.sortedByDescending { it.availabilityScore }
+                
+                Result.success(sortedVehicles)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Check vehicle availability for time range
+     */
+    suspend fun checkVehicleAvailability(
+        vehicleId: Long,
+        startTime: Date,
+        endTime: Date
+    ): Result<AvailabilityCheck> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val assignments = database.fleetAssignmentDao().getAllAssignments()
+                val conflictingAssignments = getConflictingAssignments(vehicleId, startTime, endTime, assignments)
+                
+                val isAvailable = conflictingAssignments.isEmpty()
+                val availabilityWindow = if (isAvailable) {
+                    calculateAvailabilityWindow(vehicleId, startTime, endTime, assignments)
+                } else null
+                
+                val check = AvailabilityCheck(
+                    vehicleId = vehicleId,
+                    vehicleIdString = vehicle.vehicleId,
+                    isAvailable = isAvailable,
+                    conflictingAssignments = conflictingAssignments,
+                    availabilityWindow = availabilityWindow,
+                    alternativeVehicles = if (!isAvailable) {
+                        findAlternativeVehicles(vehicleId, startTime, endTime, assignments)
+                    } else emptyList(),
+                    recommendations = generateAvailabilityRecommendations(isAvailable, conflictingAssignments, vehicle)
+                )
+                
+                Result.success(check)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Predict vehicle availability
+     */
+    suspend fun predictAvailability(vehicleId: Long, daysAhead: Int = PREDICTION_HORIZON_DAYS): Result<AvailabilityPrediction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val assignments = database.fleetAssignmentDao().getAllAssignments()
+                val historicalAssignments = assignments.filter { 
+                    it.assignedAt.after(Date(System.currentTimeMillis() - 90L * 24 * 60 * 60 * 1000))
+                }
+                
+                val prediction = generateAvailabilityPrediction(vehicle, historicalAssignments, daysAhead)
+                
+                Result.success(prediction)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Optimize vehicle allocation
+     */
+    suspend fun optimizeVehicleAllocation(
+        requests: List<VehicleRequest>,
+        optimizationStrategy: OptimizationStrategy = OptimizationStrategy.COST_EFFICIENT
+    ): Result<AllocationOptimization> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicles = database.vehicleDao().getAllVehicles()
+                val assignments = database.fleetAssignmentDao().getAllAssignments()
+                
+                val optimization = AllocationOptimizer.optimize(
+                    vehicles = vehicles,
+                    assignments = assignments,
+                    requests = requests,
+                    strategy = optimizationStrategy
+                )
+                
+                Result.success(optimization)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get availability analytics
+     */
+    suspend fun getAvailabilityAnalytics(dateRange: DateRange = DateRange.last30Days()): AvailabilityAnalytics {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicles = database.vehicleDao().getAllVehicles()
+                val assignments = database.fleetAssignmentDao().getAllAssignments()
+                
+                val totalVehicles = vehicles.size
+                val availableVehicles = vehicles.count { it.status == VehicleStatus.AVAILABLE }
+                val assignedVehicles = vehicles.count { it.status == VehicleStatus.IN_USE }
+                val maintenanceVehicles = vehicles.count { it.status == VehicleStatus.MAINTENANCE }
+                
+                val availabilityRate = if (totalVehicles > 0) {
+                    availableVehicles.toFloat() / totalVehicles * 100f
+                } else 0f
+                
+                val utilizationRate = if (totalVehicles > 0) {
+                    assignedVehicles.toFloat() / totalVehicles * 100f
+                } else 0f
+                
+                val averageDowntime = calculateAverageDowntime(vehicles, assignments, dateRange)
+                val peakDemandPeriods = identifyPeakDemandPeriods(assignments, dateRange)
+                val availabilityByType = calculateAvailabilityByType(vehicles, assignments, dateRange)
+                val demandTrends = calculateDemandTrends(assignments, dateRange)
+                
+                AvailabilityAnalytics(
+                    totalVehicles = totalVehicles,
+                    availableVehicles = availableVehicles,
+                    assignedVehicles = assignedVehicles,
+                    maintenanceVehicles = maintenanceVehicles,
+                    availabilityRate = availabilityRate,
+                    utilizationRate = utilizationRate,
+                    averageDowntime = averageDowntime,
+                    peakDemandPeriods = peakDemandPeriods,
+                    availabilityByType = availabilityByType,
+                    demandTrends = demandTrends,
+                    dateRange = dateRange
+                )
+                
+            } catch (e: Exception) {
+                AvailabilityAnalytics()
+            }
+        }
+    }
+    
+    /**
+     * Add availability tracking listener
+     */
+    fun addAvailabilityTrackingListener(listener: AvailabilityTrackingListener) {
+        availabilityListeners.add(listener)
+    }
+    
+    /**
+     * Remove availability tracking listener
+     */
+    fun removeAvailabilityTrackingListener(listener: AvailabilityTrackingListener) {
+        availabilityListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadVehicleAvailability() {
+        val vehicles = database.vehicleDao().getAllVehicles()
+        val assignments = database.fleetAssignmentDao().getAllAssignments()
+        
+        val availabilityMap = vehicles.associate { vehicle ->
+            val currentAssignment = assignments.find { it.vehicleId == vehicle.id && it.status == AssignmentStatus.ACTIVE }
+            val upcomingAssignments = assignments.filter { 
+                it.vehicleId == vehicle.id && it.status == AssignmentStatus.SCHEDULED && 
+                it.assignedAt.after(Date())
+            }
+            
+            vehicle.id to calculateVehicleAvailability(vehicle, currentAssignment, upcomingAssignments)
+        }
+        
+        _vehicleAvailability.value = availabilityMap
+    }
+    
+    private suspend fun generateAvailabilityPredictions() {
+        val vehicles = database.vehicleDao().getAllVehicles()
+        val predictions = mutableMapOf<Long, AvailabilityPrediction>()
+        
+        vehicles.forEach { vehicle ->
+            val prediction = predictAvailability(vehicle.id, PREDICTION_HORIZON_DAYS)
+                .getOrNull()
+            if (prediction != null) {
+                predictions[vehicle.id] = prediction
+            }
+        }
+        
+        _availabilityPredictions.value = predictions
+    }
+    
+    private suspend fun checkAvailabilityConflicts() {
+        val assignments = database.fleetAssignmentDao().getAllAssignments()
+        val conflicts = mutableListOf<AvailabilityConflict>()
+        
+        // Check for double bookings
+        val vehicleAssignments = assignments.groupBy { it.vehicleId }
+        vehicleAssignments.forEach { (vehicleId, vehicleAssignments) ->
+            val overlappingAssignments = findOverlappingAssignments(vehicleAssignments)
+            overlappingAssignments.forEach { overlapping ->
+                conflicts.add(AvailabilityConflict(
+                    id = 0,
+                    vehicleId = vehicleId,
+                    conflictType = ConflictType.DOUBLE_BOOKING,
+                    assignments = overlapping,
+                    severity = ConflictSeverity.HIGH,
+                    description = "Vehicle has overlapping assignments",
+                    detectedAt = Date(),
+                    resolved = false
+                ))
+            }
+        }
+        
+        _availabilityConflicts.value = conflicts
+    }
+    
+    private fun startAvailabilityMonitoring() {
+        isTracking = true
+        // Implementation would start periodic availability monitoring
+    }
+    
+    private suspend fun generateDemandForecast() {
+        val assignments = database.fleetAssignmentDao().getAllAssignments()
+        val forecast = DemandForecastGenerator.generate(assignments)
+        _demandForecast.value = forecast
+    }
+    
+    private fun calculateVehicleAvailability(
+        vehicle: VehicleEntity,
+        currentAssignment: FleetAssignmentEntity?,
+        upcomingAssignments: List<FleetAssignmentEntity>
+    ): VehicleAvailability {
+        val currentStatus = when {
+            currentAssignment != null -> AvailabilityStatus.ASSIGNED
+            vehicle.status == VehicleStatus.MAINTENANCE -> AvailabilityStatus.MAINTENANCE
+            vehicle.status == VehicleStatus.OUT_OF_SERVICE -> AvailabilityStatus.OUT_OF_SERVICE
+            else -> AvailabilityStatus.AVAILABLE
+        }
+        
+        val nextAvailableTime = if (currentStatus != AvailabilityStatus.AVAILABLE) {
+            calculateNextAvailableTime(vehicle.id, Date(), upcomingAssignments)
+        } else null
+        
+        val availabilityScore = calculateAvailabilityScore(vehicle, listOfNotNull(currentAssignment))
+        
+        return VehicleAvailability(
+            vehicleId = vehicle.id,
+            vehicleIdString = vehicle.vehicleId,
+            currentStatus = currentStatus,
+            nextAvailableTime = nextAvailableTime,
+            availabilityScore = availabilityScore,
+            currentAssignment = currentAssignment,
+            upcomingAssignments = upcomingAssignments,
+            totalAssignments = upcomingAssignments.size + if (currentAssignment != null) 1 else 0,
+            averageAssignmentDuration = calculateAverageAssignmentDuration(vehicle.id),
+            utilizationRate = calculateVehicleUtilizationRate(vehicle.id)
+        )
+    }
+    
+    private fun isVehicleAvailable(
+        vehicleId: Long,
+        startTime: Date,
+        endTime: Date,
+        assignments: List<FleetAssignmentEntity>
+    ): Boolean {
+        val vehicleAssignments = assignments.filter { it.vehicleId == vehicleId }
+        
+        return vehicleAssignments.none { assignment ->
+            assignment.status == AssignmentStatus.ACTIVE ||
+            (assignment.status == AssignmentStatus.SCHEDULED &&
+             isTimeOverlapping(startTime, endTime, assignment.assignedAt, assignment.endedAt))
+        }
+    }
+    
+    private fun isTimeOverlapping(
+        startTime1: Date, endTime1: Date,
+        startTime2: Date, endTime2: Date?
+    ): Boolean {
+        val end2 = endTime2 ?: Date(startTime2.time + 24 * 60 * 60 * 1000) // Default 24 hours if no end time
+        
+        return startTime1.before(end2) && endTime1.after(startTime2)
+    }
+    
+    private fun getNextAvailableTime(
+        vehicleId: Long,
+        afterTime: Date,
+        assignments: List<FleetAssignmentEntity>
+    ): Date? {
+        val vehicleAssignments = assignments.filter { it.vehicleId == vehicleId }
+            .filter { it.status == AssignmentStatus.ACTIVE || it.status == AssignmentStatus.SCHEDULED }
+            .sortedBy { it.assignedAt }
+        
+        return vehicleAssignments.firstOrNull { assignment ->
+            assignment.endedAt?.after(afterTime) == true
+        }?.endedAt
+    }
+    
+    private fun calculateAvailabilityScore(vehicle: VehicleEntity, assignments: List<FleetAssignmentEntity>): Float {
+        var score = 100f
+        
+        // Deduct for current assignments
+        score -= assignments.size * 10f
+        
+        // Deduct for maintenance
+        if (vehicle.status == VehicleStatus.MAINTENANCE) {
+            score -= 30f
+        }
+        
+        // Deduct for out of service
+        if (vehicle.status == VehicleStatus.OUT_OF_SERVICE) {
+            score -= 50f
+        }
+        
+        // Add for good condition
+        if (vehicle.mileage < 50000f) {
+            score += 10f
+        }
+        
+        return maxOf(0f, score)
+    }
+    
+    private fun calculateEstimatedCost(vehicleId: Long, startTime: Date, endTime: Date): Float {
+        // Implementation would calculate estimated cost based on duration, vehicle type, etc.
+        return 500f // Placeholder
+    }
+    
+    private fun getConflictingAssignments(
+        vehicleId: Long,
+        startTime: Date,
+        endTime: Date,
+        assignments: List<FleetAssignmentEntity>
+    ): List<FleetAssignmentEntity> {
+        return assignments.filter { assignment ->
+            assignment.vehicleId == vehicleId &&
+            (assignment.status == AssignmentStatus.ACTIVE ||
+             (assignment.status == AssignmentStatus.SCHEDULED &&
+              isTimeOverlapping(startTime, endTime, assignment.assignedAt, assignment.endedAt)))
+        }
+    }
+    
+    private fun calculateAvailabilityWindow(
+        vehicleId: Long,
+        startTime: Date,
+        endTime: Date,
+        assignments: List<FleetAssignmentEntity>
+    ): AvailabilityWindow {
+        val conflictingAssignments = getConflictingAssignments(vehicleId, startTime, endTime, assignments)
+        
+        val availableSlots = mutableListOf<TimeSlot>()
+        var currentTime = startTime
+        
+        conflictingAssignments.sortedBy { it.assignedAt }.forEach { assignment ->
+            if (currentTime.before(assignment.assignedAt)) {
+                availableSlots.add(TimeSlot(
+                    startTime = currentTime,
+                    endTime = assignment.assignedAt
+                ))
+            }
+            currentTime = assignment.endedAt ?: assignment.assignedAt
+        }
+        
+        if (currentTime.before(endTime)) {
+            availableSlots.add(TimeSlot(
+                startTime = currentTime,
+                endTime = endTime
+            ))
+        }
+        
+        return AvailabilityWindow(
+            requestedStartTime = startTime,
+            requestedEndTime = endTime,
+            availableSlots = availableSlots,
+            totalAvailableHours = availableSlots.sumOf { 
+                (it.endTime.time - it.startTime.time) / (1000 * 60 * 60).toFloat()
+            }
+        )
+    }
+    
+    private fun findAlternativeVehicles(
+        excludedVehicleId: Long,
+        startTime: Date,
+        endTime: Date,
+        assignments: List<FleetAssignmentEntity>
+    ): List<VehicleEntity> {
+        val allVehicles = database.vehicleDao().getAllVehicles()
+        
+        return allVehicles.filter { vehicle ->
+            vehicle.id != excludedVehicleId &&
+            vehicle.status == VehicleStatus.AVAILABLE &&
+            isVehicleAvailable(vehicle.id, startTime, endTime, assignments)
+        }.take(5) // Return top 5 alternatives
+    }
+    
+    private fun generateAvailabilityRecommendations(
+        isAvailable: Boolean,
+        conflictingAssignments: List<FleetAssignmentEntity>,
+        vehicle: VehicleEntity
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (!isAvailable) {
+            recommendations.add("Consider rescheduling conflicting assignments")
+            recommendations.add("Check alternative vehicles in the fleet")
+            
+            if (conflictingAssignments.isNotEmpty()) {
+                recommendations.add("Review assignment priorities for ${vehicle.vehicleId}")
+            }
+        } else {
+            recommendations.add("Vehicle is available for requested time")
+        }
+        
+        return recommendations
+    }
+    
+    private fun generateAvailabilityPrediction(
+        vehicle: VehicleEntity,
+        historicalAssignments: List<FleetAssignmentEntity>,
+        daysAhead: Int
+    ): AvailabilityPrediction {
+        val dailyAvailability = calculateDailyAvailability(historicalAssignments)
+        val predictedAvailability = predictDailyAvailability(dailyAvailability, daysAhead)
+        
+        return AvailabilityPrediction(
+            vehicleId = vehicle.id,
+            vehicleIdString = vehicle.vehicleId,
+            predictionDate = Date(System.currentTimeMillis() + daysAhead * 24L * 60 * 60 * 1000),
+            availabilityProbability = predictedAvailability,
+            confidence = calculatePredictionConfidence(historicalAssignments.size),
+            factors = listOf("Historical patterns", "Seasonal trends", "Maintenance schedule"),
+            recommendations = generatePredictionRecommendations(predictedAvailability)
+        )
+    }
+    
+    private fun calculateDailyAvailability(assignments: List<FleetAssignmentEntity>): Map<Int, Float> {
+        // Implementation would calculate daily availability from historical data
+        return mapOf(
+            1 to 0.8f,
+            2 to 0.7f,
+            3 to 0.9f,
+            4 to 0.6f,
+            5 to 0.8f
+        ) // Placeholder
+    }
+    
+    private fun predictDailyAvailability(historicalAvailability: Map<Int, Float>, daysAhead: Int): Float {
+        // Implementation would use time series forecasting
+        return historicalAvailability.values.average() * 0.9f // Placeholder
+    }
+    
+    private fun calculatePredictionConfidence(dataPoints: Int): Float {
+        return when {
+            dataPoints >= 100 -> 0.9f
+            dataPoints >= 50 -> 0.8f
+            dataPoints >= 20 -> 0.7f
+            dataPoints >= 10 -> 0.6f
+            else -> 0.5f
+        }
+    }
+    
+    private fun generatePredictionRecommendations(availabilityProbability: Float): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (availabilityProbability < 0.5f) {
+            recommendations.add("Consider backup vehicle arrangements")
+            recommendations.add("Review maintenance schedule")
+        } else if (availabilityProbability > 0.8f) {
+            recommendations.add("High availability expected")
+        }
+        
+        return recommendations
+    }
+    
+    private fun findOverlappingAssignments(assignments: List<FleetAssignmentEntity>): List<List<FleetAssignmentEntity>> {
+        val overlapping = mutableListOf<List<FleetAssignmentEntity>>()
+        
+        for (i in assignments.indices) {
+            for (j in i + 1 until assignments.size) {
+                val assignment1 = assignments[i]
+                val assignment2 = assignments[j]
+                
+                if (isTimeOverlapping(
+                    assignment1.assignedAt,
+                    assignment1.endedAt ?: Date(assignment1.assignedAt.time + 24 * 60 * 60 * 1000),
+                    assignment2.assignedAt,
+                    assignment2.endedAt
+                )) {
+                    overlapping.add(listOf(assignment1, assignment2))
+                }
+            }
+        }
+        
+        return overlapping
+    }
+    
+    private fun calculateAverageDowntime(
+        vehicles: List<VehicleEntity>,
+        assignments: List<FleetAssignmentEntity>,
+        dateRange: DateRange
+    ): Float {
+        // Implementation would calculate average downtime from maintenance records
+        return 2.5f // Hours per day
+    }
+    
+    private fun identifyPeakDemandPeriods(assignments: List<FleetAssignmentEntity>, dateRange: DateRange): List<PeakDemandPeriod> {
+        // Implementation would identify peak demand periods
+        return listOf(
+            PeakDemandPeriod(
+                startTime = Date(dateRange.startDate.time + 8 * 60 * 60 * 1000), // 8 AM
+                endTime = Date(dateRange.startDate.time + 10 * 60 * 60 * 1000), // 10 AM
+                demandLevel = DemandLevel.HIGH
+            ),
+            PeakDemandPeriod(
+                startTime = Date(dateRange.startDate.time + 14 * 60 * 60 * 1000), // 2 PM
+                endTime = Date(dateRange.startDate.time + 16 * 60 * 60 * 1000), // 4 PM
+                demandLevel = DemandLevel.HIGH
+            )
+        )
+    }
+    
+    private fun calculateAvailabilityByType(
+        vehicles: List<VehicleEntity>,
+        assignments: List<FleetAssignmentEntity>,
+        dateRange: DateRange
+    ): Map<VehicleType, Float> {
+        return vehicles.groupBy { it.vehicleType }
+            .mapValues { vehicleList ->
+                val availableCount = vehicleList.count { it.status == VehicleStatus.AVAILABLE }
+                availableCount.toFloat() / vehicleList.size * 100f
+            }
+    }
+    
+    private fun calculateDemandTrends(assignments: List<FleetAssignmentEntity>, dateRange: DateRange): DemandTrends {
+        // Implementation would calculate demand trends
+        return DemandTrends(
+            overallTrend = TrendDirection.INCREASING,
+            peakHours = listOf(8, 9, 14, 15, 16),
+            lowDemandHours = listOf(0, 1, 2, 3, 4, 5, 22, 23),
+            weeklyPattern = mapOf(
+                "Monday" to DemandLevel.MEDIUM,
+                "Tuesday" to DemandLevel.MEDIUM,
+                "Wednesday" to DemandLevel.HIGH,
+                "Thursday" to DemandLevel.HIGH,
+                "Friday" to DemandLevel.HIGH,
+                "Saturday" to DemandLevel.LOW,
+                "Sunday" to DemandLevel.LOW
+            )
+        )
+    }
+    
+    private fun calculateAverageAssignmentDuration(vehicleId: Long): Float {
+        // Implementation would calculate average assignment duration
+        return 4.5f // Hours
+    }
+    
+    private fun calculateVehicleUtilizationRate(vehicleId: Long): Float {
+        // Implementation would calculate utilization rate
+        return 75f // Percentage
+    }
+    
+    private suspend fun updateVehicleAvailability() {
+        loadVehicleAvailability()
+    }
+    
+    private fun notifyAvailabilityChanged(vehicleId: Long, availability: VehicleAvailability) {
+        availabilityListeners.forEach { listener ->
+            listener.onAvailabilityChanged(vehicleId, availability)
+        }
+    }
+    
+    /**
+     * Get tracking status
+     */
+    fun isTracking(): Boolean = isTracking
+}
+
+/**
+ * Data classes
+ */
+data class VehicleAvailability(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val currentStatus: AvailabilityStatus,
+    val nextAvailableTime: Date?,
+    val availabilityScore: Float,
+    val currentAssignment: FleetAssignmentEntity?,
+    val upcomingAssignments: List<FleetAssignmentEntity>,
+    val totalAssignments: Int,
+    val averageAssignmentDuration: Float,
+    val utilizationRate: Float
+)
+
+data class AvailableVehicle(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val make: String,
+    val model: String,
+    val vehicleType: VehicleType,
+    val capacity: Float,
+    val currentLocation: String,
+    val nextAvailableTime: Date?,
+    val availabilityScore: Float,
+    val estimatedCost: Float,
+    val features: List<String>
+)
+
+data class AvailabilityCheck(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val isAvailable: Boolean,
+    val conflictingAssignments: List<FleetAssignmentEntity>,
+    val availabilityWindow: AvailabilityWindow?,
+    val alternativeVehicles: List<VehicleEntity>,
+    val recommendations: List<String>
+)
+
+data class AvailabilityWindow(
+    val requestedStartTime: Date,
+    val requestedEndTime: Date,
+    val availableSlots: List<TimeSlot>,
+    val totalAvailableHours: Float
+)
+
+data class TimeSlot(
+    val startTime: Date,
+    val endTime: Date
+)
+
+data class AvailabilityPrediction(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val predictionDate: Date,
+    val availabilityProbability: Float,
+    val confidence: Float,
+    val factors: List<String>,
+    val recommendations: List<String>
+)
+
+data class VehicleRequest(
+    val id: String,
+    val vehicleType: VehicleType,
+    val requiredCapacity: Float,
+    val startTime: Date,
+    val endTime: Date,
+    val priority: RequestPriority,
+    val specialRequirements: List<String>
+)
+
+data class AllocationOptimization(
+    val totalRequests: Int,
+    val satisfiedRequests: Int,
+    val unsatisfiedRequests: List<VehicleRequest>,
+    val allocation: Map<String, Long>, // Request ID to Vehicle ID
+    val totalCost: Float,
+    val optimizationScore: Float,
+    val alternativeSolutions: List<AlternativeSolution>
+)
+
+data class AvailabilityAnalytics(
+    val totalVehicles: Int = 0,
+    val availableVehicles: Int = 0,
+    val assignedVehicles: Int = 0,
+    val maintenanceVehicles: Int = 0,
+    val availabilityRate: Float = 0f,
+    val utilizationRate: Float = 0f,
+    val averageDowntime: Float = 0f,
+    val peakDemandPeriods: List<PeakDemandPeriod> = emptyList(),
+    val availabilityByType: Map<VehicleType, Float> = emptyMap(),
+    val demandTrends: DemandTrends = DemandTrends(),
+    val dateRange: DateRange = DateRange()
+)
+
+data class PeakDemandPeriod(
+    val startTime: Date,
+    val endTime: Date,
+    val demandLevel: DemandLevel
+)
+
+data class DemandTrends(
+    val overallTrend: TrendDirection,
+    val peakHours: List<Int>,
+    val lowDemandHours: List<Int>,
+    val weeklyPattern: Map<String, DemandLevel>
+)
+
+data class DemandForecast(
+    val forecastPeriod: DateRange,
+    val dailyDemand: Map<String, Int>,
+    val peakDemandDays: List<String>,
+    val demandTrend: TrendDirection,
+    val confidence: Float
+)
+
+data class AlternativeSolution(
+    val requestId: String,
+    val suggestedVehicleId: Long,
+    val adjustments: List<String>,
+    val impact: String
+)
+
+data class AvailabilityConflict(
+    val id: Long,
+    val vehicleId: Long,
+    val conflictType: ConflictType,
+    val assignments: List<FleetAssignmentEntity>,
+    val severity: ConflictSeverity,
+    val description: String,
+    val detectedAt: Date,
+    val resolved: Boolean
+)
+
+/**
+ * Interfaces
+ */
+interface AvailabilityTrackingListener {
+    fun onAvailabilityChanged(vehicleId: Long, availability: VehicleAvailability)
+    fun onConflictDetected(conflict: AvailabilityConflict)
+    fun onDemandChanged(demandLevel: DemandLevel)
+    fun onPredictionUpdated(vehicleId: Long, prediction: AvailabilityPrediction)
+}
+
+/**
+ * Enums
+ */
+enum class AvailabilityState {
+    Idle,
+    Initializing,
+    Ready,
+    Checking,
+    Predicting,
+    Optimizing,
+    Error
+}
+
+enum class AvailabilityStatus {
+    AVAILABLE,
+    ASSIGNED,
+    MAINTENANCE,
+    OUT_OF_SERVICE,
+    RESERVED
+}
+
+enum class OptimizationStrategy {
+    COST_EFFICIENT,
+    FASTEST_RESPONSE,
+    HIGHEST_UTILIZATION,
+    BALANCED
+}
+
+enum class RequestPriority {
+    LOW,
+    NORMAL,
+    HIGH,
+    URGENT
+}
+
+enum class ConflictType {
+    DOUBLE_BOOKING,
+    MAINTENANCE_CONFLICT,
+    CAPACITY_MISMATCH,
+    LICENSE_RESTRICTION,
+    LOCATION_CONFLICT
+}
+
+enum class ConflictSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class DemandLevel {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

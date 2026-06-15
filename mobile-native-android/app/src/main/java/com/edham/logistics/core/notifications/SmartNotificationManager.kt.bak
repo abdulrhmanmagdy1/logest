@@ -1,0 +1,652 @@
+package com.edham.logistics.core.notifications
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Smart Notification Manager - Intelligent notification system
+ * Provides smart triggers based on events, grouping, and user preferences
+ */
+@Singleton
+class SmartNotificationManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // Notification channels
+    private val SHIPMENT_CHANNEL = "shipment_notifications"
+    private val PAYMENT_CHANNEL = "payment_notifications"
+    private val DELAY_CHANNEL = "delay_notifications"
+    private val TEMPERATURE_CHANNEL = "temperature_notifications"
+    private val SYSTEM_CHANNEL = "system_notifications"
+    
+    // Notification state
+    private val _notificationHistory = MutableStateFlow<List<SmartNotification>>(emptyList())
+    val notificationHistory: StateFlow<List<SmartNotification>> = _notificationHistory.asStateFlow()
+    
+    // Event triggers
+    private val eventTriggers = ConcurrentHashMap<NotificationEvent, NotificationTrigger>()
+    
+    // User preferences
+    private var userPreferences = NotificationPreferences()
+    
+    // Notification grouping
+    private val notificationGroups = ConcurrentHashMap<String, MutableList<SmartNotification>>()
+
+    /**
+     * Initialize notification manager
+     */
+    fun initialize() {
+        createNotificationChannels()
+        setupEventTriggers()
+        loadUserPreferences()
+    }
+
+    /**
+     * Show smart notification
+     */
+    suspend fun showSmartNotification(
+        event: NotificationEvent,
+        data: Map<String, Any> = emptyMap(),
+        priority: NotificationPriority = NotificationPriority.NORMAL
+    ) {
+        withContext(Dispatchers.IO) {
+            try {
+                // Check if notification is enabled for this event
+                if (!isNotificationEnabled(event)) {
+                    return@withContext
+                }
+                
+                // Get trigger for event
+                val trigger = eventTriggers[event] ?: return@withContext
+                
+                // Check trigger conditions
+                if (!trigger.shouldTrigger(data)) {
+                    return@withContext
+                }
+                
+                // Create notification
+                val notification = createNotification(event, data, priority)
+                
+                // Group notification
+                groupNotification(notification)
+                
+                // Show notification
+                showNotification(notification)
+                
+                // Add to history
+                addToHistory(notification)
+                
+                // Handle smart actions
+                handleSmartActions(notification, data)
+                
+            } catch (e: Exception) {
+                // Handle notification error
+            }
+        }
+    }
+
+    /**
+     * Show delay detection notification
+     */
+    suspend fun showDelayNotification(
+        shipmentId: String,
+        delayMinutes: Int,
+        estimatedDelivery: Date
+    ) {
+        val data = mapOf(
+            "shipmentId" to shipmentId,
+            "delayMinutes" to delayMinutes,
+            "estimatedDelivery" to estimatedDelivery.time
+        )
+        
+        showSmartNotification(
+            event = NotificationEvent.SHIPMENT_DELAYED,
+            data = data,
+            priority = if (delayMinutes > 60) NotificationPriority.HIGH else NotificationPriority.NORMAL
+        )
+    }
+
+    /**
+     * Show temperature issue notification
+     */
+    suspend fun showTemperatureNotification(
+        shipmentId: String,
+        currentTemp: Double,
+        minTemp: Double,
+        maxTemp: Double,
+        location: String
+    ) {
+        val data = mapOf(
+            "shipmentId" to shipmentId,
+            "currentTemp" to currentTemp,
+            "minTemp" to minTemp,
+            "maxTemp" to maxTemp,
+            "location" to location
+        )
+        
+        val priority = when {
+            currentTemp < minTemp - 5 || currentTemp > maxTemp + 5 -> NotificationPriority.CRITICAL
+            currentTemp < minTemp || currentTemp > maxTemp -> NotificationPriority.HIGH
+            else -> NotificationPriority.NORMAL
+        }
+        
+        showSmartNotification(
+            event = NotificationEvent.TEMPERATURE_ISSUE,
+            data = data,
+            priority = priority
+        )
+    }
+
+    /**
+     * Show payment overdue notification
+     */
+    suspend fun showPaymentOverdueNotification(
+        invoiceId: String,
+        amount: Double,
+        dueDate: Date,
+        daysOverdue: Int
+    ) {
+        val data = mapOf(
+            "invoiceId" to invoiceId,
+            "amount" to amount,
+            "dueDate" to dueDate.time,
+            "daysOverdue" to daysOverdue
+        )
+        
+        val priority = when {
+            daysOverdue > 30 -> NotificationPriority.CRITICAL
+            daysOverdue > 14 -> NotificationPriority.HIGH
+            else -> NotificationPriority.NORMAL
+        }
+        
+        showSmartNotification(
+            event = NotificationEvent.PAYMENT_OVERDUE,
+            data = data,
+            priority = priority
+        )
+    }
+
+    /**
+     * Update user preferences
+     */
+    fun updateUserPreferences(preferences: NotificationPreferences) {
+        this.userPreferences = preferences
+        saveUserPreferences()
+    }
+
+    /**
+     * Get notification statistics
+     */
+    fun getNotificationStatistics(): NotificationStatistics {
+        val history = _notificationHistory.value
+        val now = System.currentTimeMillis()
+        val last24Hours = history.filter { now - it.timestamp < 24 * 60 * 60 * 1000 }
+        val last7Days = history.filter { now - it.timestamp < 7 * 24 * 60 * 60 * 1000 }
+        
+        return NotificationStatistics(
+            totalNotifications = history.size,
+            last24Hours = last24Hours.size,
+            last7Days = last7Days.size,
+            byType = history.groupBy { it.event },
+            byPriority = history.groupBy { it.priority },
+            averageResponseTime = calculateAverageResponseTime(history)
+        )
+    }
+
+    /**
+     * Get notification groups
+     */
+    fun getNotificationGroups(): Map<String, List<SmartNotification>> {
+        return notificationGroups.mapValues { it.value.toList() }
+    }
+
+    /**
+     * Clear notification history
+     */
+    fun clearNotificationHistory() {
+        _notificationHistory.value = emptyList()
+        notificationGroups.clear()
+    }
+
+    /**
+     * Create notification channels
+     */
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            
+            // Shipment channel
+            val shipmentChannel = NotificationChannel(
+                SHIPMENT_CHANNEL,
+                "شحنات",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "إشعارات حالة الشحنات وتحديثاتها"
+                enableLights(true)
+                enableVibration(true)
+            }
+            
+            // Payment channel
+            val paymentChannel = NotificationChannel(
+                PAYMENT_CHANNEL,
+                "مدفوعات",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "إشعارات الدفعات والفواتير"
+                enableLights(true)
+                enableVibration(true)
+            }
+            
+            // Delay channel
+            val delayChannel = NotificationChannel(
+                DELAY_CHANNEL,
+                "تأخيرات",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "إشعارات تأخير الشحنات"
+                enableLights(true)
+                enableVibration(true)
+            }
+            
+            // Temperature channel
+            val temperatureChannel = NotificationChannel(
+                TEMPERATURE_CHANNEL,
+                "درجة الحرارة",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "إشعارات مشاكل درجة الحرارة"
+                enableLights(true)
+                enableVibration(true)
+            }
+            
+            // System channel
+            val systemChannel = NotificationChannel(
+                SYSTEM_CHANNEL,
+                "نظام",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "إشعارات النظام والتحديثات"
+                enableLights(false)
+                enableVibration(false)
+            }
+            
+            notificationManager.createNotificationChannels(
+                listOf(shipmentChannel, paymentChannel, delayChannel, temperatureChannel, systemChannel)
+            )
+        }
+    }
+
+    /**
+     * Setup event triggers
+     */
+    private fun setupEventTriggers() {
+        // Shipment delay trigger
+        eventTriggers[NotificationEvent.SHIPMENT_DELAYED] = object : NotificationTrigger {
+            override fun shouldTrigger(data: Map<String, Any>): Boolean {
+                val delayMinutes = data["delayMinutes"] as? Int ?: 0
+                return delayMinutes >= userPreferences.minDelayMinutes
+            }
+        }
+        
+        // Temperature issue trigger
+        eventTriggers[NotificationEvent.TEMPERATURE_ISSUE] = object : NotificationTrigger {
+            override fun shouldTrigger(data: Map<String, Any>): Boolean {
+                if (!userPreferences.temperatureAlerts) return false
+                
+                val currentTemp = data["currentTemp"] as? Double ?: return false
+                val minTemp = data["minTemp"] as? Double ?: return false
+                val maxTemp = data["maxTemp"] as? Double ?: return false
+                
+                return currentTemp < minTemp || currentTemp > maxTemp
+            }
+        }
+        
+        // Payment overdue trigger
+        eventTriggers[NotificationEvent.PAYMENT_OVERDUE] = object : NotificationTrigger {
+            override fun shouldTrigger(data: Map<String, Any>): Boolean {
+                if (!userPreferences.paymentAlerts) return false
+                
+                val daysOverdue = data["daysOverdue"] as? Int ?: return false
+                return daysOverdue >= userPreferences.minPaymentOverdueDays
+            }
+        }
+    }
+
+    /**
+     * Create notification
+     */
+    private fun createNotification(
+        event: NotificationEvent,
+        data: Map<String, Any>,
+        priority: NotificationPriority
+    ): SmartNotification {
+        val id = UUID.randomUUID().toString()
+        val timestamp = System.currentTimeMillis()
+        
+        val (title, message) = generateNotificationContent(event, data)
+        val channelId = getChannelForEvent(event)
+        
+        return SmartNotification(
+            id = id,
+            event = event,
+            title = title,
+            message = message,
+            priority = priority,
+            channelId = channelId,
+            timestamp = timestamp,
+            data = data,
+            isRead = false
+        )
+    }
+
+    /**
+     * Generate notification content
+     */
+    private fun generateNotificationContent(
+        event: NotificationEvent,
+        data: Map<String, Any>
+    ): Pair<String, String> {
+        return when (event) {
+            NotificationEvent.SHIPMENT_DELAYED -> {
+                val delayMinutes = data["delayMinutes"] as? Int ?: 0
+                val shipmentId = data["shipmentId"] as? String ?: ""
+                "تأخير في الشحنة" to "الشحنة $shipmentId متأخرة $delayMinutes دقيقة"
+            }
+            
+            NotificationEvent.TEMPERATURE_ISSUE -> {
+                val currentTemp = data["currentTemp"] as? Double ?: 0.0
+                val location = data["location"] as? String ?: ""
+                "مشكلة في درجة الحرارة" to "درجة الحرارة الحالية $currentTemp°C في $location خارج النطاق المسموح"
+            }
+            
+            NotificationEvent.PAYMENT_OVERDUE -> {
+                val amount = data["amount"] as? Double ?: 0.0
+                val daysOverdue = data["daysOverdue"] as? Int ?: 0
+                "دفع متأخر" to "دفع بقيمة $amount ريال متأخر $daysOverdue يوم"
+            }
+            
+            else -> {
+                "إشعار" to "لديك إشعار جديد"
+            }
+        }
+    }
+
+    /**
+     * Get channel for event
+     */
+    private fun getChannelForEvent(event: NotificationEvent): String {
+        return when (event) {
+            NotificationEvent.SHIPMENT_DELAYED,
+            NotificationEvent.SHIPMENT_DELIVERED,
+            NotificationEvent.SHIPMENT_PICKED_UP -> SHIPMENT_CHANNEL
+            
+            NotificationEvent.PAYMENT_OVERDUE,
+            NotificationEvent.PAYMENT_RECEIVED -> PAYMENT_CHANNEL
+            
+            NotificationEvent.TEMPERATURE_ISSUE -> TEMPERATURE_CHANNEL
+            
+            else -> SYSTEM_CHANNEL
+        }
+    }
+
+    /**
+     * Group notification
+     */
+    private fun groupNotification(notification: SmartNotification) {
+        val groupKey = notification.event.name
+        
+        val group = notificationGroups.getOrPut(groupKey) { mutableListOf() }
+        group.add(notification)
+        
+        // Keep only last 10 notifications per group
+        if (group.size > 10) {
+            group.removeAt(0)
+        }
+    }
+
+    /**
+     * Show notification
+     */
+    private fun showNotification(notification: SmartNotification) {
+        val notificationManager = NotificationManagerCompat.from(context)
+        
+        // Create intent for notification tap
+        val intent = createNotificationIntent(notification)
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            notification.id.hashCode(),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        
+        // Build notification
+        val builder = NotificationCompat.Builder(context, notification.channelId)
+            .setSmallIcon(getNotificationIcon(notification.event))
+            .setContentTitle(notification.title)
+            .setContentText(notification.message)
+            .setPriority(getAndroidPriority(notification.priority))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setGroup(notification.event.name)
+            .setGroupSummary(true)
+        
+        // Show notification
+        notificationManager.notify(notification.id.hashCode(), builder.build())
+    }
+
+    /**
+     * Create notification intent
+     */
+    private fun createNotificationIntent(notification: SmartNotification): Intent {
+        return when (notification.event) {
+            NotificationEvent.SHIPMENT_DELAYED,
+            NotificationEvent.SHIPMENT_DELIVERED -> {
+                Intent(context, ShipmentDetailActivity::class.java).apply {
+                    putExtra("shipmentId", notification.data["shipmentId"])
+                }
+            }
+            
+            NotificationEvent.PAYMENT_OVERDUE -> {
+                Intent(context, InvoiceDetailActivity::class.java).apply {
+                    putExtra("invoiceId", notification.data["invoiceId"])
+                }
+            }
+            
+            else -> {
+                Intent(context, MainActivity::class.java)
+            }
+        }
+    }
+
+    /**
+     * Get notification icon
+     */
+    private fun getNotificationIcon(event: NotificationEvent): Int {
+        return when (event) {
+            NotificationEvent.SHIPMENT_DELAYED -> android.R.drawable.stat_notify_error
+            NotificationEvent.SHIPMENT_DELIVERED -> android.R.drawable.stat_notify_sync
+            NotificationEvent.TEMPERATURE_ISSUE -> android.R.drawable.stat_notify_error
+            NotificationEvent.PAYMENT_OVERDUE -> android.R.drawable.stat_notify_error
+            else -> android.R.drawable.stat_notify_more
+        }
+    }
+
+    /**
+     * Get Android priority
+     */
+    private fun getAndroidPriority(priority: NotificationPriority): Int {
+        return when (priority) {
+            NotificationPriority.CRITICAL -> NotificationCompat.PRIORITY_MAX
+            NotificationPriority.HIGH -> NotificationCompat.PRIORITY_HIGH
+            NotificationPriority.NORMAL -> NotificationCompat.PRIORITY_DEFAULT
+            NotificationPriority.LOW -> NotificationCompat.PRIORITY_LOW
+        }
+    }
+
+    /**
+     * Handle smart actions
+     */
+    private suspend fun handleSmartActions(notification: SmartNotification, data: Map<String, Any>) {
+        when (notification.event) {
+            NotificationEvent.SHIPMENT_DELAYED -> {
+                // Auto-reschedule delivery if possible
+                if (userPreferences.autoReschedule) {
+                    // Implementation for auto-rescheduling
+                }
+            }
+            
+            NotificationEvent.TEMPERATURE_ISSUE -> {
+                // Alert driver if temperature is critical
+                val currentTemp = data["currentTemp"] as? Double ?: 0.0
+                if (currentTemp > 50 || currentTemp < -10) {
+                    // Send critical alert to driver
+                }
+            }
+            
+            NotificationEvent.PAYMENT_OVERDUE -> {
+                // Send reminder to customer
+                if (userPreferences.paymentReminders) {
+                    // Send payment reminder
+                }
+            }
+        }
+    }
+
+    /**
+     * Check if notification is enabled
+     */
+    private fun isNotificationEnabled(event: NotificationEvent): Boolean {
+        return when (event) {
+            NotificationEvent.SHIPMENT_DELAYED -> userPreferences.shipmentAlerts
+            NotificationEvent.TEMPERATURE_ISSUE -> userPreferences.temperatureAlerts
+            NotificationEvent.PAYMENT_OVERDUE -> userPreferences.paymentAlerts
+            else -> true
+        }
+    }
+
+    /**
+     * Add to history
+     */
+    private fun addToHistory(notification: SmartNotification) {
+        val currentHistory = _notificationHistory.value.toMutableList()
+        currentHistory.add(0, notification)
+        
+        // Keep only last 1000 notifications
+        if (currentHistory.size > 1000) {
+            currentHistory.removeAt(currentHistory.size - 1)
+        }
+        
+        _notificationHistory.value = currentHistory
+    }
+
+    /**
+     * Calculate average response time
+     */
+    private fun calculateAverageResponseTime(notifications: List<SmartNotification>): Long {
+        val readNotifications = notifications.filter { it.isRead }
+        if (readNotifications.isEmpty()) return 0L
+        
+        val totalResponseTime = readNotifications.sumOf { 
+            (it.readTimestamp ?: it.timestamp) - it.timestamp 
+        }
+        
+        return totalResponseTime / readNotifications.size
+    }
+
+    /**
+     * Load user preferences
+     */
+    private fun loadUserPreferences() {
+        // Implementation for loading user preferences
+    }
+
+    /**
+     * Save user preferences
+     */
+    private fun saveUserPreferences() {
+        // Implementation for saving user preferences
+    }
+
+    /**
+     * Cleanup
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Data classes and interfaces
+ */
+data class SmartNotification(
+    val id: String,
+    val event: NotificationEvent,
+    val title: String,
+    val message: String,
+    val priority: NotificationPriority,
+    val channelId: String,
+    val timestamp: Long,
+    val data: Map<String, Any>,
+    var isRead: Boolean,
+    var readTimestamp: Long? = null
+)
+
+data class NotificationPreferences(
+    val shipmentAlerts: Boolean = true,
+    val paymentAlerts: Boolean = true,
+    val temperatureAlerts: Boolean = true,
+    val minDelayMinutes: Int = 30,
+    val minPaymentOverdueDays: Int = 7,
+    val autoReschedule: Boolean = false,
+    val paymentReminders: Boolean = true,
+    val quietHours: Boolean = true,
+    val quietStartHour: Int = 22,
+    val quietEndHour: Int = 8,
+    val groupSimilar: Boolean = true,
+    val maxNotificationsPerHour: Int = 10
+)
+
+data class NotificationStatistics(
+    val totalNotifications: Int,
+    val last24Hours: Int,
+    val last7Days: Int,
+    val byType: Map<NotificationEvent, List<SmartNotification>>,
+    val byPriority: Map<NotificationPriority, List<SmartNotification>>,
+    val averageResponseTime: Long
+)
+
+enum class NotificationEvent {
+    SHIPMENT_DELAYED,
+    SHIPMENT_DELIVERED,
+    SHIPMENT_PICKED_UP,
+    TEMPERATURE_ISSUE,
+    PAYMENT_OVERDUE,
+    PAYMENT_RECEIVED,
+    SYSTEM_UPDATE,
+    MAINTENANCE_SCHEDULED
+}
+
+enum class NotificationPriority {
+    CRITICAL,
+    HIGH,
+    NORMAL,
+    LOW
+}
+
+interface NotificationTrigger {
+    fun shouldTrigger(data: Map<String, Any>): Boolean
+}

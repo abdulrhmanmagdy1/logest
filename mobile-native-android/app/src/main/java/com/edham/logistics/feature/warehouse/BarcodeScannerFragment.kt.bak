@@ -1,0 +1,481 @@
+package com.edham.logistics.feature.warehouse
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentBarcodeScannerBinding
+import com.edham.logistics.utils.VoiceAlertManager
+import com.google.zxing.integration.android.IntentIntegrator
+import com.google.zxing.integration.android.IntentResult
+import timber.log.Timber
+
+class BarcodeScannerFragment : Fragment() {
+    
+    private var _binding: FragmentBarcodeScannerBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var warehouseService: WarehouseManagementService
+    private lateinit var voiceAlertManager: VoiceAlertManager
+    private var lastScannedCode: String? = null
+    private var scanCount = 0
+    
+    // Permission launcher for camera
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            startBarcodeScanner()
+        } else {
+            Toast.makeText(requireContext(), "Camera permission required for scanning", Toast.LENGTH_LONG).show()
+        }
+    }
+    
+    // Barcode scanner launcher
+    private val barcodeLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val scanResult = IntentIntegrator.parseActivityResult(IntentIntegrator.RESULT_CODE, result.data)
+        
+        if (scanResult != null && scanResult.contents != null) {
+            handleScanResult(scanResult.contents, ScanType.BARCODE)
+        } else {
+            Toast.makeText(requireContext(), "Scan cancelled", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    override fun onCreateView(
+        inflater: android.view.LayoutInflater,
+        container: android.view.ViewGroup?,
+        savedInstanceState: Bundle?
+    ): android.view.View {
+        _binding = FragmentBarcodeScannerBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: android.view.View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Initialize services
+        warehouseService = WarehouseManagementService(
+            requireContext(),
+            // api instance,
+            // database instance
+        )
+        
+        voiceAlertManager = VoiceAlertManager(requireContext())
+        
+        setupUI()
+        setupClickListeners()
+        
+        // Check camera permission and start scanner
+        checkCameraPermissionAndStart()
+    }
+    
+    private fun setupUI() {
+        // Large touch targets for one-hand usage
+        binding.btnScanBarcode.minimumHeight = 88.dp
+        binding.btnScanBarcode.minimumWidth = 160.dp
+        
+        binding.btnScanQR.minimumHeight = 72.dp
+        binding.btnScanQR.minimumWidth = 120.dp
+        
+        binding.btnManualEntry.minimumHeight = 72.dp
+        binding.btnManualEntry.minimumWidth = 120.dp
+        
+        binding.btnViewHistory.minimumHeight = 72.dp
+        binding.btnViewHistory.minimumWidth = 120.dp
+        
+        // Dark mode optimized colors
+        binding.cardScanner.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        binding.cardScanResult.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        // High visibility status colors
+        updateScanStatusUI(ScanStatus.READY)
+    }
+    
+    private fun setupClickListeners() {
+        binding.btnScanBarcode.setOnClickListener {
+            startBarcodeScanner()
+        }
+        
+        binding.btnScanQR.setOnClickListener {
+            startQRScanner()
+        }
+        
+        binding.btnManualEntry.setOnClickListener {
+            openManualEntryDialog()
+        }
+        
+        binding.btnViewHistory.setOnClickListener {
+            viewScanHistory()
+        }
+        
+        binding.btnClearResult.setOnClickListener {
+            clearScanResult()
+        }
+        
+        binding.btnProcessItem.setOnClickListener {
+            processScannedItem()
+        }
+        
+        binding.etManualCode.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_DONE) {
+                processManualEntry()
+                true
+            } else {
+                false
+            }
+        }
+    }
+    
+    private fun checkCameraPermissionAndStart() {
+        when {
+            ContextCompat.checkSelfPermission(
+                requireContext(),
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED -> {
+                startBarcodeScanner()
+            }
+            else -> {
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+        }
+    }
+    
+    private fun startBarcodeScanner() {
+        try {
+            updateScanStatusUI(ScanStatus.SCANNING)
+            
+            val integrator = IntentIntegrator.forSupportFragment(this)
+            integrator.setDesiredBarcodeFormats(IntentIntegrator.ALL_CODE_TYPES)
+            integrator.setPrompt("Scan a barcode")
+            integrator.setCameraId(0) // Use back camera
+            integrator.setBeepEnabled(true)
+            integrator.setBarcodeImageEnabled(true)
+            integrator.setOrientationLocked(false)
+            
+            barcodeLauncher.launch(integrator.createScanIntent())
+            
+            voiceAlertManager.speak("Barcode scanner started")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error starting barcode scanner")
+            updateScanStatusUI(ScanStatus.ERROR)
+            Toast.makeText(requireContext(), "Error starting scanner", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    private fun startQRScanner() {
+        try {
+            updateScanStatusUI(ScanStatus.SCANNING)
+            
+            val integrator = IntentIntegrator.forSupportFragment(this)
+            integrator.setDesiredBarcodeFormats(IntentIntegrator.QR_CODE_TYPES)
+            integrator.setPrompt("Scan a QR code")
+            integrator.setCameraId(0) // Use back camera
+            integrator.setBeepEnabled(true)
+            integrator.setBarcodeImageEnabled(true)
+            integrator.setOrientationLocked(false)
+            
+            barcodeLauncher.launch(integrator.createScanIntent())
+            
+            voiceAlertManager.speak("QR code scanner started")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error starting QR scanner")
+            updateScanStatusUI(ScanStatus.ERROR)
+            Toast.makeText(requireContext(), "Error starting scanner", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    private fun handleScanResult(code: String, scanType: ScanType) {
+        try {
+            lastScannedCode = code
+            scanCount++
+            
+            // Update UI
+            binding.tvScannedCode.text = code
+            binding.tvScanType.text = scanType.name
+            binding.tvScanCount.text = "Scan #$scanCount"
+            binding.tvScanTime.text = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+                .format(java.util.Date())
+            
+            // Show result card
+            binding.cardScanResult.visibility = android.view.View.VISIBLE
+            
+            // Process the scan
+            processScanResult(code, scanType)
+            
+            updateScanStatusUI(ScanStatus.SUCCESS)
+            
+            voiceAlertManager.speak("Scan successful: ${code.takeLast(8)}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error handling scan result")
+            updateScanStatusUI(ScanStatus.ERROR)
+            Toast.makeText(requireContext(), "Error processing scan", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    private suspend fun processScanResult(code: String, scanType: ScanType) {
+        try {
+            val result = warehouseService.scanCode(code, scanType)
+            
+            when (result) {
+                ScanResult.SUCCESS -> {
+                    // Find item in inventory
+                    findItemByCode(code)
+                }
+                ScanResult.NOT_FOUND -> {
+                    binding.tvItemInfo.text = "Item not found in inventory"
+                    binding.btnProcessItem.text = "Add New Item"
+                }
+                ScanResult.INVALID_FORMAT -> {
+                    binding.tvItemInfo.text = "Invalid barcode/QR code format"
+                    binding.btnProcessItem.text = "Retry Scan"
+                }
+                ScanResult.ERROR -> {
+                    binding.tvItemInfo.text = "Error processing scan"
+                    binding.btnProcessItem.text = "Retry"
+                }
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error processing scan result")
+            binding.tvItemInfo.text = "Error: ${e.message}"
+        }
+    }
+    
+    private fun findItemByCode(code: String) {
+        // Search for item in inventory
+        warehouseService.searchInventory(code) { items ->
+            if (items.isNotEmpty()) {
+                val item = items.first()
+                displayItemInfo(item)
+                binding.btnProcessItem.text = "View Item Details"
+            } else {
+                binding.tvItemInfo.text = "No item found with code: $code"
+                binding.btnProcessItem.text = "Add New Item"
+            }
+        }
+    }
+    
+    private fun displayItemInfo(item: com.edham.logistics.data.local.entity.InventoryItem) {
+        val info = """
+            SKU: ${item.sku}
+            Name: ${item.name}
+            Quantity: ${item.quantity}
+            Location: ${item.location}
+            Category: ${item.category}
+            Price: $${item.unitPrice}
+        """.trimIndent()
+        
+        binding.tvItemInfo.text = info
+        
+        // Update item status color based on stock level
+        val statusColor = when {
+            item.quantity == 0 -> requireContext().getColor(R.color.status_error)
+            item.quantity <= item.minStockLevel -> requireContext().getColor(R.color.status_warning)
+            else -> requireContext().getColor(R.color.status_completed)
+        }
+        
+        binding.viewItemStatus.setBackgroundColor(statusColor)
+    }
+    
+    private fun openManualEntryDialog() {
+        voiceAlertManager.speak("Manual code entry")
+        
+        // Show manual entry dialog
+        binding.layoutManualEntry.visibility = android.view.View.VISIBLE
+        binding.etManualCode.requestFocus()
+        
+        // Show keyboard
+        binding.etManualCode.post {
+            val imm = requireContext().getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            imm.showSoftInput(binding.etManualCode, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        }
+    }
+    
+    private fun processManualEntry() {
+        val code = binding.etManualCode.text.toString().trim()
+        
+        if (code.isBlank()) {
+            Toast.makeText(requireContext(), "Please enter a code", Toast.LENGTH_SHORT).show()
+            return
+        }
+        
+        // Hide manual entry
+        binding.layoutManualEntry.visibility = android.view.View.GONE
+        binding.etManualCode.text.clear()
+        
+        // Process as barcode scan
+        handleScanResult(code, ScanType.BARCODE)
+    }
+    
+    private fun viewScanHistory() {
+        voiceAlertManager.speak("Viewing scan history")
+        
+        // Show scan history
+        val history = """
+            Last scan: $lastScannedCode
+            Total scans: $scanCount
+            Session started: ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}
+        """.trimIndent()
+        
+        binding.tvItemInfo.text = history
+        binding.cardScanResult.visibility = android.view.View.VISIBLE
+    }
+    
+    private fun clearScanResult() {
+        lastScannedCode = null
+        binding.tvScannedCode.text = ""
+        binding.tvScanType.text = ""
+        binding.tvScanCount.text = ""
+        binding.tvScanTime.text = ""
+        binding.tvItemInfo.text = ""
+        binding.cardScanResult.visibility = android.view.View.GONE
+        
+        updateScanStatusUI(ScanStatus.READY)
+        
+        voiceAlertManager.speak("Scan result cleared")
+    }
+    
+    private fun processScannedItem() {
+        val code = binding.tvScannedCode.text.toString()
+        
+        if (code.isBlank()) {
+            Toast.makeText(requireContext(), "No code to process", Toast.LENGTH_SHORT).show()
+            return
+        }
+        
+        when (binding.btnProcessItem.text.toString()) {
+            "View Item Details" -> {
+                // Navigate to item details
+                voiceAlertManager.speak("Viewing item details")
+                // Implementation would navigate to item details screen
+            }
+            "Add New Item" -> {
+                // Navigate to add new item screen
+                voiceAlertManager.speak("Adding new item")
+                // Implementation would navigate to add item screen
+            }
+            "Retry Scan" -> {
+                // Retry scanning
+                startBarcodeScanner()
+            }
+            "Retry" -> {
+                // Retry processing
+                processScanResult(code, ScanType.BARCODE)
+            }
+        }
+    }
+    
+    private fun updateScanStatusUI(status: ScanStatus) {
+        val (statusText, color, icon) = when (status) {
+            ScanStatus.READY -> Triple("Ready to scan", R.color.status_idle, R.drawable.ic_scanner)
+            ScanStatus.SCANNING -> Triple("Scanning...", R.color.status_active, R.drawable.ic_scanner_active)
+            ScanStatus.SUCCESS -> Triple("Scan successful", R.color.status_completed, R.drawable.ic_check_circle)
+            ScanStatus.ERROR -> Triple("Scan error", R.color.status_error, R.drawable.ic_error)
+        }
+        
+        binding.tvScanStatus.text = statusText
+        binding.viewScanIndicator.setBackgroundColor(requireContext().getColor(color))
+        binding.ivScanStatusIcon.setImageResource(icon)
+        
+        // Enable/disable scan buttons
+        val isScanning = status == ScanStatus.SCANNING
+        binding.btnScanBarcode.isEnabled = !isScanning
+        binding.btnScanQR.isEnabled = !isScanning
+        binding.btnManualEntry.isEnabled = !isScanning
+    }
+    
+    private fun toggleFlash() {
+        // Toggle flash for better scanning in low light
+        // Implementation would toggle camera flash
+        voiceAlertManager.speak("Toggling flash")
+    }
+    
+    private fun switchCamera() {
+        // Switch between front and back camera
+        // Implementation would switch camera
+        voiceAlertManager.speak("Switching camera")
+    }
+    
+    private fun configureScanner() {
+        // Open scanner configuration dialog
+        voiceAlertManager.speak("Scanner configuration")
+        
+        // Implementation would show configuration options:
+        // - Barcode formats to scan
+        // - Camera settings
+        // - Sound/vibration settings
+        // - Auto-focus settings
+    }
+    
+    private fun exportScanSession() {
+        voiceAlertManager.speak("Exporting scan session")
+        
+        // Export scan session data
+        val sessionData = """
+            Scan Session Report
+            ===================
+            Date: ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}
+            Total Scans: $scanCount
+            Last Scanned: $lastScannedCode
+            
+            Scan History:
+            ${generateScanHistory()}
+        """.trimIndent()
+        
+        // Implementation would export to file or share
+        Toast.makeText(requireContext(), "Scan session exported", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun generateScanHistory(): String {
+        // Implementation would generate detailed scan history
+        return "• Scan #1: $lastScannedCode at ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}"
+    }
+    
+    override fun onResume() {
+        super.onResume()
+        
+        // Check camera permission
+        checkCameraPermissionAndStart()
+    }
+    
+    override fun onPause() {
+        super.onPause()
+        
+        // Hide keyboard if showing
+        val imm = requireContext().getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+        imm.hideSoftInputFromWindow(binding.etManualCode.windowToken, 0)
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        
+        // Cleanup resources
+        warehouseService.cleanup()
+        voiceAlertManager.cleanup()
+        _binding = null
+    }
+    
+    // Extension for dp to pixels
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+}
+
+// Enums
+enum class ScanStatus {
+    READY, SCANNING, SUCCESS, ERROR
+}

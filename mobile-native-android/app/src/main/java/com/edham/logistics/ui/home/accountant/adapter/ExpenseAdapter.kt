@@ -11,7 +11,8 @@ import com.edham.logistics.core.network.api.DriverExpense
 class ExpenseAdapter(
     private var items: List<DriverExpense>,
     private val onApprove: (DriverExpense) -> Unit,
-    private val onReject: (DriverExpense) -> Unit
+    private val onReject: (DriverExpense) -> Unit,
+    private val onImageClick: (String) -> Unit
 ) : RecyclerView.Adapter<ExpenseAdapter.ViewHolder>() {
 
     fun updateData(newItems: List<DriverExpense>) {
@@ -36,6 +37,7 @@ class ExpenseAdapter(
         val amount: TextView = view.findViewById(R.id.tvAmount)
         val attachmentStatus: TextView = view.findViewById(R.id.tvAttachmentStatus)
         val icon: TextView = view.findViewById(R.id.tvIcon)
+        val iconContainer: View = view.findViewById(R.id.iconContainer)
         val btnApprove: View = view.findViewById(R.id.btnApprove)
         val btnReject: View = view.findViewById(R.id.btnReject)
         val actionGroup: View = view.findViewById(R.id.actionGroup)
@@ -53,15 +55,20 @@ class ExpenseAdapter(
             if (item.imageUrl.isNullOrEmpty()) {
                 attachmentStatus.text = "لا يوجد مرفق"
                 attachmentStatus.setTextColor(itemView.context.getColor(R.color.ed_rust))
+                iconContainer.isClickable = false
             } else {
                 attachmentStatus.text = "صورة المرفق متاحة ✓"
                 attachmentStatus.setTextColor(itemView.context.getColor(R.color.ed_success))
+                iconContainer.setOnClickListener { onImageClick(item.imageUrl) }
             }
 
             actionGroup.visibility = if (item.status == "PENDING") View.VISIBLE else View.GONE
             
             btnApprove.setOnClickListener { onApprove(item) }
             btnReject.setOnClickListener { onReject(item) }
+
+            // Visual indicator if already reviewed
+            itemView.alpha = if (item.status != "PENDING") 0.6f else 1.0f
         }
     }
 }

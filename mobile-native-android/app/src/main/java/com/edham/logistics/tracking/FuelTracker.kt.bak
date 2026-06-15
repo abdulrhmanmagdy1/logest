@@ -1,0 +1,786 @@
+package com.edham.logistics.tracking
+
+import android.content.Context
+import android.location.Location
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.FuelConsumptionEntity
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.remote.api.FuelMonitoringApi
+import com.edham.logistics.utils.BatteryOptimizer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Fuel Tracker - Advanced fuel consumption monitoring and analytics
+ * 
+ * Features:
+ * - Real-time fuel consumption tracking
+ * - Fuel efficiency analysis
+ * - Cost calculation
+ * - Refueling tracking
+ * - Fuel theft detection
+ * - Predictive analytics
+ */
+@Singleton
+class FuelTracker @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fuelMonitoringApi: FuelMonitoringApi,
+    private val batteryOptimizer: BatteryOptimizer
+) {
+    
+    private val _trackingState = MutableStateFlow<FuelTrackingState>(FuelTrackingState.Stopped)
+    val trackingState: StateFlow<FuelTrackingState> = _trackingState.asStateFlow()
+    
+    private val _currentFuelLevel = MutableStateFlow<FuelLevelInfo?>(null)
+    val currentFuelLevel: StateFlow<FuelLevelInfo?> = _currentFuelLevel.asStateFlow()
+    
+    private val _fuelConsumption = MutableStateFlow<FuelConsumptionInfo?>(null)
+    val fuelConsumption: StateFlow<FuelConsumptionInfo?> = _fuelConsumption.asStateFlow()
+    
+    private val _fuelAnalytics = MutableStateFlow<FuelAnalytics?>(null)
+    val fuelAnalytics: StateFlow<FuelAnalytics?> = _fuelAnalytics.asStateFlow()
+    
+    private val _fuelAlerts = MutableStateFlow<List<FuelAlert>>(emptyList())
+    val fuelAlerts: StateFlow<List<FuelAlert>> = _fuelAlerts.asStateFlow()
+    
+    private var currentVehicleId: String? = null
+    private var isTracking = false
+    private var currentFuelLevelPercent: Float = 0f
+    private var totalFuelConsumed: Double = 0.0
+    private var lastRefuelTime: Long = 0L
+    private var fuelReadings: MutableList<FuelReading> = mutableListOf()
+    private var refuelingEvents: MutableList<RefuelingEvent> = mutableListOf()
+    private var lastLocation: Location? = null
+    private var lastUpdateTime: Long = 0L
+    
+    private val trackingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    companion object {
+        private const val TAG = "FuelTracker"
+        private const val FUEL_UPDATE_INTERVAL = 30000L // 30 seconds
+        private const val FUEL_TANK_CAPACITY = 200.0 // Liters
+        private const val FUEL_CONSUMPTION_RATE = 0.08 // Liters per km
+        private const val LOW_FUEL_THRESHOLD = 20f // 20%
+        private const val CRITICAL_FUEL_THRESHOLD = 10f // 10%
+        private const val FUEL_THEFT_THRESHOLD = 5f // 5% sudden drop
+        private const val MAX_FUEL_READINGS = 1000
+        private const val REFUELING_DETECTION_THRESHOLD = 2f // 2% increase
+    }
+    
+    /**
+     * Initialize fuel tracking for vehicle
+     */
+    fun initialize(vehicleId: String) {
+        try {
+            _trackingState.value = FuelTrackingState.Initializing
+            
+            currentVehicleId = vehicleId
+            fuelReadings.clear()
+            refuelingEvents.clear()
+            totalFuelConsumed = 0.0
+            
+            // Load vehicle information
+            trackingScope.launch {
+                loadVehicleInfo(vehicleId)
+            }
+            
+            // Load current fuel level
+            trackingScope.launch {
+                loadCurrentFuelLevel()
+            }
+            
+            _trackingState.value = FuelTrackingState.Ready
+            
+        } catch (e: Exception) {
+            _trackingState.value = FuelTrackingState.Error("Failed to initialize: ${e.message}")
+        }
+    }
+    
+    /**
+     * Start fuel tracking
+     */
+    fun startTracking() {
+        if (isTracking) return
+        
+        try {
+            _trackingState.value = FuelTrackingState.Starting
+            
+            isTracking = true
+            lastUpdateTime = System.currentTimeMillis()
+            
+            _trackingState.value = FuelTrackingState.Tracking
+            
+        } catch (e: Exception) {
+            _trackingState.value = FuelTrackingState.Error("Failed to start tracking: ${e.message}")
+        }
+    }
+    
+    /**
+     * Stop fuel tracking
+     */
+    fun stopTracking() {
+        if (!isTracking) return
+        
+        try {
+            _trackingState.value = FuelTrackingState.Stopping
+            
+            isTracking = false
+            
+            // Save final data
+            trackingScope.launch {
+                saveFuelData()
+            }
+            
+            _trackingState.value = FuelTrackingState.Stopped
+            
+        } catch (e: Exception) {
+            _trackingState.value = FuelTrackingState.Error("Failed to stop tracking: ${e.message}")
+        }
+    }
+    
+    /**
+     * Update fuel consumption based on distance traveled
+     */
+    fun updateConsumption(distance: Double, speed: Float) {
+        if (!isTracking) return
+        
+        try {
+            val currentTime = System.currentTimeMillis()
+            
+            // Calculate fuel consumption for this segment
+            val segmentConsumption = calculateSegmentFuelConsumption(distance, speed)
+            totalFuelConsumed += segmentConsumption
+            
+            // Update current fuel level
+            currentFuelLevelPercent = maxOf(0f, currentFuelLevelPercent - (segmentConsumption / FUEL_TANK_CAPACITY * 100).toFloat())
+            
+            // Create fuel level info
+            val fuelLevelInfo = FuelLevelInfo(
+                currentLevel = currentFuelLevelPercent,
+                currentLiters = currentFuelLevelPercent / 100f * FUEL_TANK_CAPACITY,
+                totalConsumed = totalFuelConsumed,
+                estimatedRange = calculateEstimatedRange(),
+                timestamp = currentTime,
+                batteryLevel = batteryOptimizer.getBatteryLevel()
+            )
+            
+            _currentFuelLevel.value = fuelLevelInfo
+            
+            // Add fuel reading
+            addFuelReading(fuelLevelInfo)
+            
+            // Check for fuel alerts
+            checkFuelAlerts(fuelLevelInfo)
+            
+            // Update consumption info
+            updateConsumptionInfo()
+            
+            // Update analytics
+            updateFuelAnalytics()
+            
+            lastUpdateTime = currentTime
+            
+        } catch (e: Exception) {
+            _trackingState.value = FuelTrackingState.Error("Failed to update consumption: ${e.message}")
+        }
+    }
+    
+    /**
+     * Update fuel level (from sensor or manual input)
+     */
+    fun updateFuelLevel(fuelLevelPercent: Float, isRefueling: Boolean = false) {
+        if (!isTracking) return
+        
+        try {
+            val currentTime = System.currentTimeMillis()
+            val previousLevel = currentFuelLevelPercent
+            
+            // Check for refueling
+            if (fuelLevelPercent > previousLevel + REFUELING_DETECTION_THRESHOLD && !isRefueling) {
+                handleRefuelingEvent(previousLevel, fuelLevelPercent, currentTime)
+            }
+            
+            // Check for fuel theft
+            if (fuelLevelPercent < previousLevel - FUEL_THEFT_THRESHOLD && !isRefueling) {
+                handleFuelTheftEvent(previousLevel, fuelLevelPercent, currentTime)
+            }
+            
+            currentFuelLevelPercent = fuelLevelPercent
+            
+            // Update fuel level info
+            val fuelLevelInfo = FuelLevelInfo(
+                currentLevel = currentFuelLevelPercent,
+                currentLiters = currentFuelLevelPercent / 100f * FUEL_TANK_CAPACITY,
+                totalConsumed = totalFuelConsumed,
+                estimatedRange = calculateEstimatedRange(),
+                timestamp = currentTime,
+                batteryLevel = batteryOptimizer.getBatteryLevel()
+            )
+            
+            _currentFuelLevel.value = fuelLevelInfo
+            
+            // Add fuel reading
+            addFuelReading(fuelLevelInfo)
+            
+            // Check for fuel alerts
+            checkFuelAlerts(fuelLevelInfo)
+            
+        } catch (e: Exception) {
+            _trackingState.value = FuelTrackingState.Error("Failed to update fuel level: ${e.message}")
+        }
+    }
+    
+    /**
+     * Get total consumption
+     */
+    fun getTotalConsumption(): Double = totalFuelConsumed
+    
+    /**
+     * Get current fuel level
+     */
+    fun getCurrentFuelLevel(): Float = currentFuelLevelPercent
+    
+    /**
+     * Get fuel efficiency
+     */
+    fun getFuelEfficiency(): Double {
+        val readings = fuelReadings.toList()
+        if (readings.size < 2) return 0.0
+        
+        val totalDistance = calculateTotalDistance(readings)
+        val totalFuel = totalFuelConsumed
+        
+        return if (totalFuel > 0) totalDistance / totalFuel else 0.0
+    }
+    
+    /**
+     * Get fuel statistics
+     */
+    fun getFuelStatistics(): FuelStatistics {
+        val readings = fuelReadings.toList()
+        
+        return FuelStatistics(
+            currentLevel = currentFuelLevelPercent,
+            totalConsumed = totalFuelConsumed,
+            averageConsumptionRate = calculateAverageConsumptionRate(readings),
+            fuelEfficiency = getFuelEfficiency(),
+            estimatedRange = calculateEstimatedRange(),
+            refuelingCount = refuelingEvents.size,
+            lastRefuelTime = lastRefuelTime,
+            costPerKm = calculateCostPerKm(),
+            co2Emissions = totalFuelConsumed * 2.31 // CO2 factor for diesel
+        )
+    }
+    
+    /**
+     * Load vehicle information
+     */
+    private suspend fun loadVehicleInfo(vehicleId: String) {
+        // Implementation would load vehicle info from database
+    }
+    
+    /**
+     * Load current fuel level
+     */
+    private suspend fun loadCurrentFuelLevel() {
+        // Implementation would load current fuel level from sensor or database
+        currentFuelLevelPercent = 75f // Default 75%
+    }
+    
+    /**
+     * Calculate segment fuel consumption
+     */
+    private fun calculateSegmentFuelConsumption(distance: Double, speed: Float): Double {
+        // Base consumption rate adjusted for speed
+        val speedFactor = when {
+            speed < 30 -> 1.2 // Low speed: higher consumption
+            speed < 60 -> 1.0 // Normal speed: standard consumption
+            speed < 90 -> 1.1 // High speed: slightly higher consumption
+            else -> 1.3 // Very high speed: much higher consumption
+        }
+        
+        return distance * FUEL_CONSUMPTION_RATE * speedFactor
+    }
+    
+    /**
+     * Calculate estimated range
+     */
+    private fun calculateEstimatedRange(): Double {
+        val averageConsumptionRate = calculateAverageConsumptionRate(fuelReadings.toList())
+        val currentLiters = currentFuelLevelPercent / 100f * FUEL_TANK_CAPACITY
+        
+        return if (averageConsumptionRate > 0) currentLiters / averageConsumptionRate else 0.0
+    }
+    
+    /**
+     * Add fuel reading
+     */
+    private fun addFuelReading(fuelLevelInfo: FuelLevelInfo) {
+        val reading = FuelReading(
+            fuelLevel = fuelLevelInfo.currentLevel,
+            timestamp = fuelLevelInfo.timestamp,
+            location = lastLocation,
+            batteryLevel = fuelLevelInfo.batteryLevel
+        )
+        
+        fuelReadings.add(reading)
+        
+        // Limit readings to prevent memory issues
+        if (fuelReadings.size > MAX_FUEL_READINGS) {
+            fuelReadings.removeAt(0)
+        }
+    }
+    
+    /**
+     * Handle refueling event
+     */
+    private fun handleRefuelingEvent(previousLevel: Float, newLevel: Float, timestamp: Long) {
+        val refuelAmount = (newLevel - previousLevel) / 100f * FUEL_TANK_CAPACITY
+        
+        val refuelingEvent = RefuelingEvent(
+            id = 0,
+            timestamp = Date(timestamp),
+            previousLevel = previousLevel,
+            newLevel = newLevel,
+            refuelAmount = refuelAmount,
+            location = lastLocation,
+            cost = refuelAmount * 1.5, // Assuming 1.5 per liter
+            isCompleted = true
+        )
+        
+        refuelingEvents.add(refuelingEvent)
+        lastRefuelTime = timestamp
+        
+        // Reset consumption tracking after refuel
+        totalFuelConsumed = 0.0
+        
+        // Create refuel alert
+        createFuelAlert(FuelAlertType.REFUELING_COMPLETED, "Refueling completed: ${refuelAmount.toInt()} liters")
+    }
+    
+    /**
+     * Handle fuel theft event
+     */
+    private fun handleFuelTheftEvent(previousLevel: Float, newLevel: Float, timestamp: Long) {
+        val stolenAmount = (previousLevel - newLevel) / 100f * FUEL_TANK_CAPACITY
+        
+        // Create fuel theft alert
+        createFuelAlert(
+            FuelAlertType.FUEL_THEFT_DETECTED,
+            "Fuel theft detected: ${stolenAmount.toInt()} liters",
+            FuelAlertSeverity.HIGH
+        )
+    }
+    
+    /**
+     * Check for fuel alerts
+     */
+    private fun checkFuelAlerts(fuelLevelInfo: FuelLevelInfo) {
+        // Low fuel alert
+        if (fuelLevelInfo.currentLevel <= CRITICAL_FUEL_THRESHOLD) {
+            createFuelAlert(
+                FuelAlertType.CRITICAL_FUEL_LEVEL,
+                "Critical fuel level: ${fuelLevelInfo.currentLevel.toInt()}%",
+                FuelAlertSeverity.HIGH
+            )
+        } else if (fuelLevelInfo.currentLevel <= LOW_FUEL_THRESHOLD) {
+            createFuelAlert(
+                FuelAlertType.LOW_FUEL_LEVEL,
+                "Low fuel level: ${fuelLevelInfo.currentLevel.toInt()}%",
+                FuelAlertSeverity.MEDIUM
+            )
+        }
+        
+        // Estimated range alert
+        if (fuelLevelInfo.estimatedRange < 50) { // Less than 50 km
+            createFuelAlert(
+                FuelAlertType.LOW_ESTIMATED_RANGE,
+                "Low estimated range: ${fuelLevelInfo.estimatedRange.toInt()} km",
+                FuelAlertSeverity.MEDIUM
+            )
+        }
+    }
+    
+    /**
+     * Create fuel alert
+     */
+    private fun createFuelAlert(type: FuelAlertType, message: String, severity: FuelAlertSeverity = FuelAlertSeverity.LOW) {
+        val alert = FuelAlert(
+            type = type,
+            severity = severity,
+            message = message,
+            timestamp = System.currentTimeMillis(),
+            location = lastLocation,
+            data = mapOf(
+                "fuelLevel" to currentFuelLevelPercent,
+                "totalConsumed" to totalFuelConsumed,
+                "estimatedRange" to calculateEstimatedRange()
+            )
+        )
+        
+        val currentAlerts = _fuelAlerts.value.toMutableList()
+        currentAlerts.add(alert)
+        _fuelAlerts.value = currentAlerts
+    }
+    
+    /**
+     * Update consumption info
+     */
+    private fun updateConsumptionInfo() {
+        val readings = fuelReadings.toList()
+        if (readings.isEmpty()) return
+        
+        val consumptionInfo = FuelConsumptionInfo(
+            currentRate = calculateCurrentConsumptionRate(readings),
+            averageRate = calculateAverageConsumptionRate(readings),
+            totalConsumed = totalFuelConsumed,
+            efficiency = getFuelEfficiency(),
+            costPerKm = calculateCostPerKm(),
+            projectedDailyConsumption = calculateProjectedDailyConsumption(readings)
+        )
+        
+        _fuelConsumption.value = consumptionInfo
+    }
+    
+    /**
+     * Update fuel analytics
+     */
+    private fun updateFuelAnalytics() {
+        val readings = fuelReadings.toList()
+        if (readings.isEmpty()) return
+        
+        val analytics = FuelAnalytics(
+            averageConsumptionRate = calculateAverageConsumptionRate(readings),
+            consumptionTrend = calculateConsumptionTrend(readings),
+            fuelEfficiencyTrend = calculateEfficiencyTrend(readings),
+            refuelingPattern = analyzeRefuelingPattern(),
+            costAnalysis = calculateCostAnalysis(),
+            predictions = generateFuelPredictions(readings)
+        )
+        
+        _fuelAnalytics.value = analytics
+    }
+    
+    /**
+     * Calculate average consumption rate
+     */
+    private fun calculateAverageConsumptionRate(readings: List<FuelReading>): Double {
+        if (readings.size < 2) return FUEL_CONSUMPTION_RATE
+        
+        val totalDistance = calculateTotalDistance(readings)
+        val totalFuel = totalFuelConsumed
+        
+        return if (totalFuel > 0) totalFuel / totalDistance else FUEL_CONSUMPTION_RATE
+    }
+    
+    /**
+     * Calculate current consumption rate
+     */
+    private fun calculateCurrentConsumptionRate(readings: List<FuelReading>): Double {
+        val recentReadings = readings.takeLast(10)
+        return calculateAverageConsumptionRate(recentReadings)
+    }
+    
+    /**
+     * Calculate total distance from readings
+     */
+    private fun calculateTotalDistance(readings: List<FuelReading>): Double {
+        var totalDistance = 0.0
+        
+        for (i in 0 until readings.size - 1) {
+            val reading1 = readings[i]
+            val reading2 = readings[i + 1]
+            
+            if (reading1.location != null && reading2.location != null) {
+                val distance = calculateDistance(reading1.location!!, reading2.location!!)
+                totalDistance += distance
+            }
+        }
+        
+        return totalDistance
+    }
+    
+    /**
+     * Calculate distance between two locations
+     */
+    private fun calculateDistance(location1: Location, location2: Location): Double {
+        val results = FloatArray(1)
+        Location.distanceBetween(
+            location1.latitude, location1.longitude,
+            location2.latitude, location2.longitude,
+            results
+        )
+        return results[0].toDouble()
+    }
+    
+    /**
+     * Calculate cost per km
+     */
+    private fun calculateCostPerKm(): Double {
+        val efficiency = getFuelEfficiency()
+        return if (efficiency > 0) (1.5 / efficiency) else 0.0 // Assuming 1.5 per liter
+    }
+    
+    /**
+     * Calculate projected daily consumption
+     */
+    private fun calculateProjectedDailyConsumption(readings: List<FuelReading>): Double {
+        val currentRate = calculateCurrentConsumptionRate(readings)
+        val averageDailyDistance = 400.0 // Average 400 km per day
+        
+        return currentRate * averageDailyDistance
+    }
+    
+    /**
+     * Calculate consumption trend
+     */
+    private fun calculateConsumptionTrend(readings: List<FuelReading>): FuelTrend {
+        if (readings.size < 20) return FuelTrend.STABLE
+        
+        val recentReadings = readings.takeLast(10)
+        val olderReadings = readings.dropLast(10).takeLast(10)
+        
+        val recentRate = calculateAverageConsumptionRate(recentReadings)
+        val olderRate = calculateAverageConsumptionRate(olderReadings)
+        
+        return when {
+            recentRate > olderRate * 1.1 -> FuelTrend.INCREASING
+            recentRate < olderRate * 0.9 -> FuelTrend.DECREASING
+            else -> FuelTrend.STABLE
+        }
+    }
+    
+    /**
+     * Calculate efficiency trend
+     */
+    private fun calculateEfficiencyTrend(readings: List<FuelReading>): FuelTrend {
+        if (readings.size < 20) return FuelTrend.STABLE
+        
+        val recentEfficiency = getFuelEfficiency()
+        // Implementation would compare recent efficiency with historical average
+        
+        return FuelTrend.STABLE // Placeholder
+    }
+    
+    /**
+     * Analyze refueling pattern
+     */
+    private fun analyzeRefuelingPattern(): RefuelingPattern {
+        if (refuelingEvents.isEmpty()) {
+            return RefuelingPattern()
+        }
+        
+        val averageInterval = if (refuelingEvents.size > 1) {
+            val intervals = mutableListOf<Long>()
+            for (i in 1 until refuelingEvents.size) {
+                val interval = refuelingEvents[i].timestamp.time - refuelingEvents[i - 1].timestamp.time
+                intervals.add(interval)
+            }
+            intervals.average()
+        } else 0L
+        
+        val averageAmount = refuelingEvents.map { it.refuelAmount }.average()
+        
+        return RefuelingPattern(
+            averageInterval = averageInterval,
+            averageAmount = averageAmount,
+            totalRefuels = refuelingEvents.size,
+            lastRefuelTime = lastRefuelTime
+        )
+    }
+    
+    /**
+     * Calculate cost analysis
+     */
+    private fun calculateCostAnalysis(): CostAnalysis {
+        val totalCost = totalFuelConsumed * 1.5 // Assuming 1.5 per liter
+        val costPerKm = calculateCostPerKm()
+        val projectedMonthlyCost = costPerKm * 12000 // Assuming 12000 km per month
+        
+        return CostAnalysis(
+            totalCost = totalCost,
+            costPerKm = costPerKm,
+            projectedMonthlyCost = projectedMonthlyCost,
+            projectedAnnualCost = projectedMonthlyCost * 12
+        )
+    }
+    
+    /**
+     * Generate fuel predictions
+     */
+    private fun generateFuelPredictions(readings: List<FuelReading>): FuelPredictions {
+        val currentRate = calculateCurrentConsumptionRate(readings)
+        val currentLevel = currentFuelLevelPercent
+        
+        val estimatedEmptyTime = if (currentRate > 0) {
+            val currentLiters = currentLevel / 100f * FUEL_TANK_CAPACITY
+            (currentLiters / currentRate) * 3600000 // Convert to milliseconds
+        } else 0L
+        
+        return FuelPredictions(
+            estimatedEmptyTime = estimatedEmptyTime,
+            projectedRange = calculateEstimatedRange(),
+            recommendedRefuelTime = estimatedEmptyTime * 0.8, // Refuel at 80%
+            nextRefuelCost = (FUEL_TANK_CAPACITY * 0.25) * 1.5 // 25% tank
+        )
+    }
+    
+    /**
+     * Save fuel data
+     */
+    private suspend fun saveFuelData() {
+        // Implementation would save fuel data to database
+    }
+    
+    /**
+     * Clear fuel data
+     */
+    fun clearFuelData() {
+        fuelReadings.clear()
+        refuelingEvents.clear()
+        totalFuelConsumed = 0.0
+        _currentFuelLevel.value = null
+        _fuelConsumption.value = null
+        _fuelAnalytics.value = null
+        _fuelAlerts.value = emptyList()
+    }
+    
+    /**
+     * Get tracking status
+     */
+    fun isTracking(): Boolean = isTracking
+}
+
+/**
+ * Data classes
+ */
+data class FuelLevelInfo(
+    val currentLevel: Float,
+    val currentLiters: Double,
+    val totalConsumed: Double,
+    val estimatedRange: Double,
+    val timestamp: Long,
+    val batteryLevel: Int
+)
+
+data class FuelConsumptionInfo(
+    val currentRate: Double,
+    val averageRate: Double,
+    val totalConsumed: Double,
+    val efficiency: Double,
+    val costPerKm: Double,
+    val projectedDailyConsumption: Double
+)
+
+data class FuelReading(
+    val fuelLevel: Float,
+    val timestamp: Long,
+    val location: Location?,
+    val batteryLevel: Int
+)
+
+data class RefuelingEvent(
+    val id: Long,
+    val timestamp: Date,
+    val previousLevel: Float,
+    val newLevel: Float,
+    val refuelAmount: Double,
+    val location: Location?,
+    val cost: Double,
+    val isCompleted: Boolean
+)
+
+data class FuelStatistics(
+    val currentLevel: Float,
+    val totalConsumed: Double,
+    val averageConsumptionRate: Double,
+    val fuelEfficiency: Double,
+    val estimatedRange: Double,
+    val refuelingCount: Int,
+    val lastRefuelTime: Long,
+    val costPerKm: Double,
+    val co2Emissions: Double
+)
+
+data class FuelAnalytics(
+    val averageConsumptionRate: Double,
+    val consumptionTrend: FuelTrend,
+    val fuelEfficiencyTrend: FuelTrend,
+    val refuelingPattern: RefuelingPattern,
+    val costAnalysis: CostAnalysis,
+    val predictions: FuelPredictions
+)
+
+data class RefuelingPattern(
+    val averageInterval: Double = 0.0,
+    val averageAmount: Double = 0.0,
+    val totalRefuels: Int = 0,
+    val lastRefuelTime: Long = 0L
+)
+
+data class CostAnalysis(
+    val totalCost: Double,
+    val costPerKm: Double,
+    val projectedMonthlyCost: Double,
+    val projectedAnnualCost: Double
+)
+
+data class FuelPredictions(
+    val estimatedEmptyTime: Long,
+    val projectedRange: Double,
+    val recommendedRefuelTime: Long,
+    val nextRefuelCost: Double
+)
+
+data class FuelAlert(
+    val type: FuelAlertType,
+    val severity: FuelAlertSeverity,
+    val message: String,
+    val timestamp: Long,
+    val location: Location?,
+    val data: Map<String, Any>
+)
+
+/**
+ * Enums
+ */
+enum class FuelTrackingState {
+    Stopped,
+    Initializing,
+    Ready,
+    Starting,
+    Tracking,
+    Stopping,
+    Error
+}
+
+enum class FuelAlertType {
+    LOW_FUEL_LEVEL,
+    CRITICAL_FUEL_LEVEL,
+    LOW_ESTIMATED_RANGE,
+    REFUELING_COMPLETED,
+    FUEL_THEFT_DETECTED,
+    UNUSUAL_CONSUMPTION
+}
+
+enum class FuelAlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH
+}
+
+enum class FuelTrend {
+    INCREASING,
+    DECREASING,
+    STABLE
+}

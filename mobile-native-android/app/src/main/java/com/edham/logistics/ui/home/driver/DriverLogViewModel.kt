@@ -25,7 +25,7 @@ class DriverLogViewModel @Inject constructor(
         viewModelScope.launch {
             _isLoading.value = true
             try {
-                val res = api.getTripHistory(driverId)
+                val res = api.getTrips(driverId, status = "completed")
                 if (res.isSuccessful) {
                     _logs.value = res.body()?.data ?: emptyList()
                 }

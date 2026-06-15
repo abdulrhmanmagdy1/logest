@@ -14,7 +14,9 @@ data class Trip(
     @SerializedName("origin") val origin: String,
     @SerializedName("destination") val destination: String,
     @SerializedName("dest_lat") val destLat: Double,
-    @SerializedName("dest_lng") val destLng: Double
+    @SerializedName("dest_lng") val destLng: Double,
+    @SerializedName("plate_number") val plateNumber: String? = null,
+    @SerializedName("temperature") val temperature: Double? = null
 )
 
 data class Waypoint(
@@ -62,7 +64,10 @@ data class DeliveryProof(
     @SerializedName("images") val images: List<String>, // base64
     @SerializedName("signature") val signature: String, // base64
     @SerializedName("rating") val rating: Int,
-    @SerializedName("notes") val notes: String
+    @SerializedName("notes") val notes: String,
+    @SerializedName("temp_verified") val tempVerified: Boolean = true,
+    @SerializedName("seals_verified") val sealsVerified: Boolean = true,
+    @SerializedName("qty_verified") val qtyVerified: Boolean = true
 )
 
 data class LocationUpdate(

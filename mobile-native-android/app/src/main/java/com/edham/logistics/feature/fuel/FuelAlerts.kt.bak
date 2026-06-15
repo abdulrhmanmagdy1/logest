@@ -1,0 +1,926 @@
+package com.edham.logistics.feature.fuel
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+/**
+ * Comprehensive Fuel Alerts System
+ * 
+ * Provides intelligent fuel monitoring and alerting including:
+ * - Low fuel level alerts with customizable thresholds
+ * - Fuel consumption anomaly detection
+ * - Fuel theft and unauthorized usage alerts
+ * - Maintenance reminders based on fuel patterns
+ * - Cost optimization alerts and recommendations
+ * - Real-time fuel status monitoring
+ */
+class FuelAlerts {
+    
+    companion object {
+        private const val TAG = "FuelAlerts"
+        private const val DEFAULT_LOW_FUEL_THRESHOLD = 15.0 // 15% threshold
+        private const val DEFAULT_CRITICAL_FUEL_THRESHOLD = 10.0 // 10% threshold
+        private const val DEFAULT_THEFT_DETECTION_THRESHOLD = 5.0 // 5% sudden drop
+        private const val DEFAULT_CONSUMPTION_ANOMALY_THRESHOLD = 25.0 // 25% increase
+    }
+    
+    private val activeAlerts = mutableMapOf<String, MutableList<FuelAlert>>()
+    private val alertHistory = mutableMapOf<String, MutableList<FuelAlert>>()
+    private val alertPreferences = mutableMapOf<String, AlertPreferences>()
+    private val fuelMonitors = mutableMapOf<String, FuelMonitor>()
+    
+    /**
+     * Creates a comprehensive fuel monitoring system for a vehicle
+     */
+    suspend fun createFuelMonitor(
+        vehicleId: String,
+        preferences: AlertPreferences = AlertPreferences()
+    ): Result<FuelMonitor> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Creating fuel monitor for vehicle: $vehicleId")
+            
+            val monitor = FuelMonitor(
+                vehicleId = vehicleId,
+                preferences = preferences,
+                createdAt = LocalDateTime.now(),
+                isActive = true,
+                lastFuelCheck = LocalDateTime.now(),
+                currentFuelLevel = 100.0,
+                averageConsumptionRate = 0.0,
+                alertCount = 0,
+                status = MonitorStatus.ACTIVE
+            )
+            
+            fuelMonitors[vehicleId] = monitor
+            alertPreferences[vehicleId] = preferences
+            
+            // Initialize alert lists
+            activeAlerts.getOrPut(vehicleId) { mutableListOf() }
+            alertHistory.getOrPut(vehicleId) { mutableListOf() }
+            
+            Log.d(TAG, "Fuel monitor created successfully for: $vehicleId")
+            Result.success(monitor)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating fuel monitor for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Monitors fuel levels and generates appropriate alerts
+     */
+    suspend fun monitorFuelLevels(
+        vehicleId: String,
+        currentFuelLevel: Double,
+        odometerReading: Double,
+        location: LocationData? = null,
+        timestamp: LocalDateTime = LocalDateTime.now()
+    ): Result<List<FuelAlert>> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Monitoring fuel levels for vehicle: $vehicleId")
+            
+            val monitor = fuelMonitors[vehicleId]
+                ?: return@withContext Result.failure(
+                    IllegalArgumentException("No fuel monitor found for vehicle: $vehicleId")
+                )
+            
+            val preferences = alertPreferences[vehicleId] ?: AlertPreferences()
+            val generatedAlerts = mutableListOf<FuelAlert>()
+            
+            // Check for low fuel alerts
+            val lowFuelAlert = checkLowFuelAlert(vehicleId, currentFuelLevel, preferences, timestamp)
+            if (lowFuelAlert != null) {
+                generatedAlerts.add(lowFuelAlert)
+            }
+            
+            // Check for critical fuel alerts
+            val criticalFuelAlert = checkCriticalFuelAlert(vehicleId, currentFuelLevel, preferences, timestamp)
+            if (criticalFuelAlert != null) {
+                generatedAlerts.add(criticalFuelAlert)
+            }
+            
+            // Check for fuel theft detection
+            val theftAlert = checkFuelTheftAlert(vehicleId, monitor.currentFuelLevel, currentFuelLevel, preferences, timestamp)
+            if (theftAlert != null) {
+                generatedAlerts.add(theftAlert)
+            }
+            
+            // Check for consumption anomalies
+            val consumptionAlert = checkConsumptionAnomaly(vehicleId, monitor, currentFuelLevel, odometerReading, preferences, timestamp)
+            if (consumptionAlert != null) {
+                generatedAlerts.add(consumptionAlert)
+            }
+            
+            // Update monitor state
+            updateFuelMonitor(vehicleId, currentFuelLevel, odometerReading, timestamp)
+            
+            // Store alerts
+            if (generatedAlerts.isNotEmpty()) {
+                storeAlerts(vehicleId, generatedAlerts)
+            }
+            
+            Log.d(TAG, "Generated ${generatedAlerts.size} fuel alerts for: $vehicleId")
+            Result.success(generatedAlerts)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error monitoring fuel levels for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Generates fuel efficiency alerts based on consumption patterns
+     */
+    suspend fun generateEfficiencyAlerts(
+        vehicleId: String,
+        consumptionData: List<ConsumptionData>,
+        timeWindow: TimeWindow = TimeWindow.LAST_7_DAYS
+    ): Result<List<FuelAlert>> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Generating efficiency alerts for vehicle: $vehicleId")
+            
+            val preferences = alertPreferences[vehicleId] ?: AlertPreferences()
+            val generatedAlerts = mutableListOf<FuelAlert>()
+            
+            if (consumptionData.size < 2) {
+                return@withContext Result.success(generatedAlerts)
+            }
+            
+            // Calculate average consumption
+            val averageConsumption = consumptionData.map { it.consumptionRate }.average()
+            val recentConsumption = consumptionData.takeLast(5).map { it.consumptionRate }.average()
+            
+            // Check for poor efficiency
+            if (averageConsumption > preferences.poorEfficiencyThreshold) {
+                val alert = FuelAlert(
+                    id = generateAlertId(),
+                    vehicleId = vehicleId,
+                    type = AlertType.POOR_EFFICIENCY,
+                    severity = AlertSeverity.MEDIUM,
+                    title = "Poor Fuel Efficiency Detected",
+                    message = "Average fuel consumption is ${String.format("%.1f", averageConsumption)} L/100km, which exceeds the threshold of ${preferences.poorEfficiencyThreshold} L/100km",
+                    timestamp = LocalDateTime.now(),
+                    location = null,
+                    fuelLevel = consumptionData.lastOrNull()?.fuelLevel,
+                    recommendations = generateEfficiencyRecommendations(averageConsumption),
+                    isAcknowledged = false,
+                    isResolved = false
+                )
+                generatedAlerts.add(alert)
+            }
+            
+            // Check for declining efficiency trend
+            val efficiencyTrend = calculateEfficiencyTrend(consumptionData)
+            if (efficiencyTrend < -10.0) { // 10% decline
+                val alert = FuelAlert(
+                    id = generateAlertId(),
+                    vehicleId = vehicleId,
+                    type = AlertType.EFFICIENCY_DECLINE,
+                    severity = AlertSeverity.LOW,
+                    title = "Fuel Efficiency Declining",
+                    message = "Fuel efficiency has declined by ${String.format("%.1f", Math.abs(efficiencyTrend))}% over the past week",
+                    timestamp = LocalDateTime.now(),
+                    location = null,
+                    fuelLevel = consumptionData.lastOrNull()?.fuelLevel,
+                    recommendations = listOf(
+                        "Check tire pressure",
+                        "Review driving habits",
+                        "Schedule vehicle maintenance"
+                    ),
+                    isAcknowledged = false,
+                    isResolved = false
+                )
+                generatedAlerts.add(alert)
+            }
+            
+            // Store alerts
+            if (generatedAlerts.isNotEmpty()) {
+                storeAlerts(vehicleId, generatedAlerts)
+            }
+            
+            Log.d(TAG, "Generated ${generatedAlerts.size} efficiency alerts for: $vehicleId")
+            Result.success(generatedAlerts)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error generating efficiency alerts for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Generates cost optimization alerts based on fuel spending patterns
+     */
+    suspend fun generateCostAlerts(
+        vehicleId: String,
+        fuelExpenses: List<FuelExpense>,
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS
+    ): Result<List<FuelAlert>> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Generating cost alerts for vehicle: $vehicleId")
+            
+            val preferences = alertPreferences[vehicleId] ?: AlertPreferences()
+            val generatedAlerts = mutableListOf<FuelAlert>()
+            
+            if (fuelExpenses.isEmpty()) {
+                return@withContext Result.success(generatedAlerts)
+            }
+            
+            // Calculate total spending
+            val totalSpending = fuelExpenses.sumOf { it.amount }
+            val averagePricePerLiter = fuelExpenses.map { it.pricePerLiter }.average()
+            
+            // Check for overspending alert
+            if (totalSpending > preferences.monthlyBudgetLimit) {
+                val alert = FuelAlert(
+                    id = generateAlertId(),
+                    vehicleId = vehicleId,
+                    type = AlertType.OVERSPENDING,
+                    severity = AlertSeverity.HIGH,
+                    title = "Fuel Budget Exceeded",
+                    message = "Monthly fuel spending of ${CURRENCY_SYMBOL}${String.format("%.2f", totalSpending)} exceeds the budget limit of ${CURRENCY_SYMBOL}${String.format("%.2f", preferences.monthlyBudgetLimit)}",
+                    timestamp = LocalDateTime.now(),
+                    location = null,
+                    fuelLevel = null,
+                    recommendations = listOf(
+                        "Review route optimization",
+                        "Consider fuel-efficient driving practices",
+                        "Evaluate alternative fuel stations"
+                    ),
+                    isAcknowledged = false,
+                    isResolved = false
+                )
+                generatedAlerts.add(alert)
+            }
+            
+            // Check for high fuel price alert
+            val marketAveragePrice = getMarketAverageFuelPrice()
+            if (averagePricePerLiter > marketAveragePrice * 1.15) { // 15% above market average
+                val alert = FuelAlert(
+                    id = generateAlertId(),
+                    vehicleId = vehicleId,
+                    type = AlertType.HIGH_FUEL_PRICE,
+                    severity = AlertSeverity.LOW,
+                    title = "High Fuel Price Detected",
+                    message = "Average fuel price of ${CURRENCY_SYMBOL}${String.format("%.3f", averagePricePerLiter)}/L is 15% above market average",
+                    timestamp = LocalDateTime.now(),
+                    location = null,
+                    fuelLevel = null,
+                    recommendations = listOf(
+                        "Consider alternative fuel stations",
+                        "Look for fuel discounts and loyalty programs",
+                        "Plan refueling at cheaper locations"
+                    ),
+                    isAcknowledged = false,
+                    isResolved = false
+                )
+                generatedAlerts.add(alert)
+            }
+            
+            // Store alerts
+            if (generatedAlerts.isNotEmpty()) {
+                storeAlerts(vehicleId, generatedAlerts)
+            }
+            
+            Log.d(TAG, "Generated ${generatedAlerts.size} cost alerts for: $vehicleId")
+            Result.success(generatedAlerts)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error generating cost alerts for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Generates maintenance alerts based on fuel patterns and vehicle usage
+     */
+    suspend fun generateMaintenanceAlerts(
+        vehicleId: String,
+        fuelData: List<FuelData>,
+        odometerReading: Double
+    ): Result<List<FuelAlert>> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Generating maintenance alerts for vehicle: $vehicleId")
+            
+            val preferences = alertPreferences[vehicleId] ?: AlertPreferences()
+            val generatedAlerts = mutableListOf<FuelAlert>()
+            
+            if (fuelData.isEmpty()) {
+                return@withContext Result.success(generatedAlerts)
+            }
+            
+            // Check for maintenance based on fuel consumption
+            val totalFuelConsumed = fuelData.sumOf { it.fuelConsumed }
+            val lastMaintenanceOdometer = preferences.lastMaintenanceOdometer
+            
+            if (odometerReading - lastMaintenanceOdometer > preferences.maintenanceIntervalKm) {
+                val alert = FuelAlert(
+                    id = generateAlertId(),
+                    vehicleId = vehicleId,
+                    type = AlertType.MAINTENANCE_DUE,
+                    severity = AlertSeverity.MEDIUM,
+                    title = "Maintenance Required",
+                    message = "Vehicle has traveled ${String.format("%.0f", odometerReading - lastMaintenanceOdometer)} km since last maintenance",
+                    timestamp = LocalDateTime.now(),
+                    location = null,
+                    fuelLevel = fuelData.lastOrNull()?.fuelLevel,
+                    recommendations = listOf(
+                        "Schedule routine maintenance",
+                        "Check fuel filter and injectors",
+                        "Inspect fuel system components"
+                    ),
+                    isAcknowledged = false,
+                    isResolved = false
+                )
+                generatedAlerts.add(alert)
+            }
+            
+            // Check for unusual fuel consumption patterns that may indicate maintenance needs
+            val recentConsumptionPattern = analyzeConsumptionPattern(fuelData.takeLast(10))
+            if (recentConsumptionPattern == ConsumptionPattern.IRREGULAR) {
+                val alert = FuelAlert(
+                    id = generateAlertId(),
+                    vehicleId = vehicleId,
+                    type = AlertType.CONSUMPTION_PATTERN_ANOMALY,
+                    severity = AlertSeverity.LOW,
+                    title = "Irregular Fuel Consumption Pattern",
+                    message = "Fuel consumption pattern appears irregular, which may indicate maintenance needs",
+                    timestamp = LocalDateTime.now(),
+                    location = null,
+                    fuelLevel = fuelData.lastOrNull()?.fuelLevel,
+                    recommendations = listOf(
+                        "Check for fuel leaks",
+                        "Inspect fuel injectors",
+                        "Review vehicle maintenance history"
+                    ),
+                    isAcknowledged = false,
+                    isResolved = false
+                )
+                generatedAlerts.add(alert)
+            }
+            
+            // Store alerts
+            if (generatedAlerts.isNotEmpty()) {
+                storeAlerts(vehicleId, generatedAlerts)
+            }
+            
+            Log.d(TAG, "Generated ${generatedAlerts.size} maintenance alerts for: $vehicleId")
+            Result.success(generatedAlerts)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error generating maintenance alerts for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets all active alerts for a vehicle
+     */
+    suspend fun getActiveAlerts(vehicleId: String): Result<List<FuelAlert>> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting active alerts for vehicle: $vehicleId")
+            
+            val alerts = activeAlerts[vehicleId]?.filter { !it.isAcknowledged && !it.isResolved } ?: emptyList()
+            
+            Log.d(TAG, "Found ${alerts.size} active alerts for: $vehicleId")
+            Result.success(alerts)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting active alerts for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets alert history for a vehicle
+     */
+    suspend fun getAlertHistory(
+        vehicleId: String,
+        alertType: AlertType? = null,
+        timeWindow: TimeWindow? = null,
+        limit: Int = 100
+    ): Result<List<FuelAlert>> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting alert history for vehicle: $vehicleId")
+            
+            var alerts = alertHistory[vehicleId] ?: emptyList()
+            
+            // Filter by alert type
+            if (alertType != null) {
+                alerts = alerts.filter { it.type == alertType }
+            }
+            
+            // Filter by time window
+            if (timeWindow != null) {
+                val cutoffTime = LocalDateTime.now().minus(timeWindow.duration)
+                alerts = alerts.filter { it.timestamp.isAfter(cutoffTime) }
+            }
+            
+            // Sort by timestamp (most recent first) and limit
+            alerts = alerts.sortedByDescending { it.timestamp }.take(limit)
+            
+            Log.d(TAG, "Found ${alerts.size} historical alerts for: $vehicleId")
+            Result.success(alerts)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting alert history for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Acknowledges an alert
+     */
+    suspend fun acknowledgeAlert(
+        vehicleId: String,
+        alertId: String,
+        acknowledgedBy: String,
+        notes: String? = null
+    ): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Acknowledging alert: $alertId for vehicle: $vehicleId")
+            
+            val alert = findAlert(vehicleId, alertId)
+                ?: return@withContext Result.failure(
+                    IllegalArgumentException("Alert not found: $alertId")
+                )
+            
+            alert.isAcknowledged = true
+            alert.acknowledgedAt = LocalDateTime.now()
+            alert.acknowledgedBy = acknowledgedBy
+            alert.acknowledgmentNotes = notes
+            
+            Log.d(TAG, "Alert acknowledged successfully: $alertId")
+            Result.success(true)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error acknowledging alert: $alertId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Resolves an alert
+     */
+    suspend fun resolveAlert(
+        vehicleId: String,
+        alertId: String,
+        resolvedBy: String,
+        resolutionNotes: String? = null
+    ): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Resolving alert: $alertId for vehicle: $vehicleId")
+            
+            val alert = findAlert(vehicleId, alertId)
+                ?: return@withContext Result.failure(
+                    IllegalArgumentException("Alert not found: $alertId")
+                )
+            
+            alert.isResolved = true
+            alert.resolvedAt = LocalDateTime.now()
+            alert.resolvedBy = resolvedBy
+            alert.resolutionNotes = resolutionNotes
+            
+            // Move from active to history if it was active
+            val activeAlertsList = activeAlerts[vehicleId]
+            if (activeAlertsList != null) {
+                activeAlertsList.remove(alert)
+                alertHistory.getOrPut(vehicleId) { mutableListOf() }.add(alert)
+            }
+            
+            Log.d(TAG, "Alert resolved successfully: $alertId")
+            Result.success(true)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resolving alert: $alertId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Updates alert preferences for a vehicle
+     */
+    suspend fun updateAlertPreferences(
+        vehicleId: String,
+        preferences: AlertPreferences
+    ): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Updating alert preferences for vehicle: $vehicleId")
+            
+            alertPreferences[vehicleId] = preferences
+            
+            // Update existing monitor if it exists
+            fuelMonitors[vehicleId]?.let { monitor ->
+                fuelMonitors[vehicleId] = monitor.copy(preferences = preferences)
+            }
+            
+            Log.d(TAG, "Alert preferences updated successfully for: $vehicleId")
+            Result.success(true)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating alert preferences for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Gets alert statistics for a vehicle
+     */
+    suspend fun getAlertStatistics(
+        vehicleId: String,
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS
+    ): Result<AlertStatistics> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting alert statistics for vehicle: $vehicleId")
+            
+            val cutoffTime = LocalDateTime.now().minus(timeWindow.duration)
+            val allAlerts = (activeAlerts[vehicleId] ?: emptyList()) + (alertHistory[vehicleId] ?: emptyList())
+            val filteredAlerts = allAlerts.filter { it.timestamp.isAfter(cutoffTime) }
+            
+            val stats = AlertStatistics(
+                totalAlerts = filteredAlerts.size,
+                activeAlerts = filteredAlerts.count { !it.isResolved },
+                acknowledgedAlerts = filteredAlerts.count { it.isAcknowledged },
+                resolvedAlerts = filteredAlerts.count { it.isResolved },
+                alertsByType = filteredAlerts.groupingBy { it.type }.eachCount(),
+                alertsBySeverity = filteredAlerts.groupingBy { it.severity }.eachCount(),
+                averageResolutionTime = calculateAverageResolutionTime(filteredAlerts),
+                mostCommonAlertType = filteredAlerts.groupingBy { it.type }.eachCount().maxByOrNull { it.value }?.key,
+                lastAlertTime = filteredAlerts.maxOfOrNull { it.timestamp }
+            )
+            
+            Log.d(TAG, "Alert statistics calculated for: $vehicleId")
+            Result.success(stats)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting alert statistics for: $vehicleId", e)
+            Result.failure(e)
+        }
+    }
+    
+    // Private helper methods
+    
+    private fun checkLowFuelAlert(
+        vehicleId: String,
+        fuelLevel: Double,
+        preferences: AlertPreferences,
+        timestamp: LocalDateTime
+    ): FuelAlert? {
+        if (fuelLevel <= preferences.lowFuelThreshold && fuelLevel > preferences.criticalFuelThreshold) {
+            return FuelAlert(
+                id = generateAlertId(),
+                vehicleId = vehicleId,
+                type = AlertType.LOW_FUEL,
+                severity = AlertSeverity.MEDIUM,
+                title = "Low Fuel Level",
+                message = "Fuel level is at ${String.format("%.1f", fuelLevel)}%, consider refueling soon",
+                timestamp = timestamp,
+                location = null,
+                fuelLevel = fuelLevel,
+                recommendations = listOf(
+                    "Refuel at nearest station",
+                    "Plan route to include fuel stop",
+                    "Check for fuel discounts"
+                ),
+                isAcknowledged = false,
+                isResolved = false
+            )
+        }
+        return null
+    }
+    
+    private fun checkCriticalFuelAlert(
+        vehicleId: String,
+        fuelLevel: Double,
+        preferences: AlertPreferences,
+        timestamp: LocalDateTime
+    ): FuelAlert? {
+        if (fuelLevel <= preferences.criticalFuelThreshold) {
+            return FuelAlert(
+                id = generateAlertId(),
+                vehicleId = vehicleId,
+                type = AlertType.CRITICAL_FUEL,
+                severity = AlertSeverity.CRITICAL,
+                title = "Critical Fuel Level",
+                message = "Fuel level is critically low at ${String.format("%.1f", fuelLevel)}%, refuel immediately",
+                timestamp = timestamp,
+                location = null,
+                fuelLevel = fuelLevel,
+                recommendations = listOf(
+                    "Refuel immediately",
+                    "Find nearest fuel station",
+                    "Consider emergency fuel service"
+                ),
+                isAcknowledged = false,
+                isResolved = false
+            )
+        }
+        return null
+    }
+    
+    private fun checkFuelTheftAlert(
+        vehicleId: String,
+        previousFuelLevel: Double,
+        currentFuelLevel: Double,
+        preferences: AlertPreferences,
+        timestamp: LocalDateTime
+    ): FuelAlert? {
+        val fuelDrop = previousFuelLevel - currentFuelLevel
+        if (fuelDrop >= preferences.theftDetectionThreshold) {
+            return FuelAlert(
+                id = generateAlertId(),
+                vehicleId = vehicleId,
+                type = AlertType.FUEL_THEFT,
+                severity = AlertSeverity.HIGH,
+                title = "Potential Fuel Theft Detected",
+                message = "Sudden fuel level drop of ${String.format("%.1f", fuelDrop)}% detected",
+                timestamp = timestamp,
+                location = null,
+                fuelLevel = currentFuelLevel,
+                recommendations = listOf(
+                    "Verify fuel level manually",
+                    "Check for unauthorized vehicle usage",
+                    "Review vehicle location history"
+                ),
+                isAcknowledged = false,
+                isResolved = false
+            )
+        }
+        return null
+    }
+    
+    private fun checkConsumptionAnomaly(
+        vehicleId: String,
+        monitor: FuelMonitor,
+        currentFuelLevel: Double,
+        odometerReading: Double,
+        preferences: AlertPreferences,
+        timestamp: LocalDateTime
+    ): FuelAlert? {
+        if (monitor.averageConsumptionRate > 0) {
+            val distanceTraveled = odometerReading - (monitor.lastOdometerReading ?: odometerReading)
+            val fuelConsumed = monitor.currentFuelLevel - currentFuelLevel
+            val currentConsumptionRate = if (distanceTraveled > 0) (fuelConsumed / distanceTraveled) * 100 else 0.0
+            
+            val consumptionIncrease = ((currentConsumptionRate - monitor.averageConsumptionRate) / monitor.averageConsumptionRate) * 100
+            
+            if (consumptionIncrease >= preferences.consumptionAnomalyThreshold) {
+                return FuelAlert(
+                    id = generateAlertId(),
+                    vehicleId = vehicleId,
+                    type = AlertType.CONSUMPTION_ANOMALY,
+                    severity = AlertSeverity.MEDIUM,
+                    title = "Unusual Fuel Consumption",
+                    message = "Fuel consumption increased by ${String.format("%.1f", consumptionIncrease)}% compared to average",
+                    timestamp = timestamp,
+                    location = null,
+                    fuelLevel = currentFuelLevel,
+                    recommendations = listOf(
+                        "Check for fuel leaks",
+                        "Review driving conditions",
+                        "Inspect vehicle maintenance status"
+                    ),
+                    isAcknowledged = false,
+                    isResolved = false
+                )
+            }
+        }
+        return null
+    }
+    
+    private fun updateFuelMonitor(
+        vehicleId: String,
+        currentFuelLevel: Double,
+        odometerReading: Double,
+        timestamp: LocalDateTime
+    ) {
+        val monitor = fuelMonitors[vehicleId] ?: return
+        
+        val distanceTraveled = odometerReading - (monitor.lastOdometerReading ?: odometerReading)
+        val fuelConsumed = monitor.currentFuelLevel - currentFuelLevel
+        
+        val newConsumptionRate = if (distanceTraveled > 0) (fuelConsumed / distanceTraveled) * 100 else monitor.averageConsumptionRate
+        val updatedAverageRate = (monitor.averageConsumptionRate + newConsumptionRate) / 2
+        
+        fuelMonitors[vehicleId] = monitor.copy(
+            currentFuelLevel = currentFuelLevel,
+            lastOdometerReading = odometerReading,
+            averageConsumptionRate = updatedAverageRate,
+            lastFuelCheck = timestamp,
+            alertCount = monitor.alertCount + 1
+        )
+    }
+    
+    private fun storeAlerts(vehicleId: String, alerts: List<FuelAlert>) {
+        val activeList = activeAlerts.getOrPut(vehicleId) { mutableListOf() }
+        val historyList = alertHistory.getOrPut(vehicleId) { mutableListOf() }
+        
+        alerts.forEach { alert ->
+            activeList.add(alert)
+            historyList.add(alert)
+            
+            // Update monitor alert count
+            fuelMonitors[vehicleId]?.let { monitor ->
+                fuelMonitors[vehicleId] = monitor.copy(alertCount = monitor.alertCount + 1)
+            }
+        }
+    }
+    
+    private fun findAlert(vehicleId: String, alertId: String): FuelAlert? {
+        val activeList = activeAlerts[vehicleId]
+        val historyList = alertHistory[vehicleId]
+        
+        return activeList?.find { it.id == alertId }
+            ?: historyList?.find { it.id == alertId }
+    }
+    
+    private fun generateEfficiencyRecommendations(averageConsumption: Double): List<String> {
+        return listOf(
+            "Maintain steady speeds to improve efficiency",
+            "Check tire pressure regularly",
+            "Reduce excessive idling",
+            "Plan routes to avoid traffic congestion",
+            "Schedule regular vehicle maintenance"
+        )
+    }
+    
+    private fun calculateEfficiencyTrend(consumptionData: List<ConsumptionData>): Double {
+        if (consumptionData.size < 2) return 0.0
+        
+        val firstHalf = consumptionData.take(consumptionData.size / 2)
+        val secondHalf = consumptionData.drop(consumptionData.size / 2)
+        
+        val firstAvg = firstHalf.map { it.consumptionRate }.average()
+        val secondAvg = secondHalf.map { it.consumptionRate }.average()
+        
+        return ((secondAvg - firstAvg) / firstAvg) * 100
+    }
+    
+    private fun analyzeConsumptionPattern(fuelData: List<FuelData>): ConsumptionPattern {
+        if (fuelData.size < 3) return ConsumptionPattern.NORMAL
+        
+        val consumptions = fuelData.map { it.fuelConsumed }
+        val variance = calculateVariance(consumptions)
+        val mean = consumptions.average()
+        
+        return when {
+            variance > mean * 0.5 -> ConsumptionPattern.IRREGULAR
+            variance > mean * 0.2 -> ConsumptionPattern.VARIABLE
+            else -> ConsumptionPattern.NORMAL
+        }
+    }
+    
+    private fun calculateVariance(values: List<Double>): Double {
+        val mean = values.average()
+        return values.map { (it - mean) * (it - mean) }.average()
+    }
+    
+    private fun calculateAverageResolutionTime(alerts: List<FuelAlert>): Double {
+        val resolvedAlerts = alerts.filter { it.isResolved && it.resolvedAt != null }
+        if (resolvedAlerts.isEmpty()) return 0.0
+        
+        val totalMinutes = resolvedAlerts.sumOf { alert ->
+            java.time.Duration.between(alert.timestamp, alert.resolvedAt!!).toMinutes()
+        }
+        
+        return totalMinutes.toDouble() / resolvedAlerts.size
+    }
+    
+    private fun getMarketAverageFuelPrice(): Double {
+        // This would typically fetch from an external API or database
+        return 1.85 // Default market price
+    }
+    
+    private fun generateAlertId(): String = "ALT_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    
+    // Data classes and enums
+    
+    data class FuelAlert(
+        val id: String,
+        val vehicleId: String,
+        val type: AlertType,
+        val severity: AlertSeverity,
+        val title: String,
+        val message: String,
+        val timestamp: LocalDateTime,
+        val location: LocationData?,
+        val fuelLevel: Double?,
+        val recommendations: List<String>,
+        var isAcknowledged: Boolean,
+        var isResolved: Boolean,
+        var acknowledgedAt: LocalDateTime? = null,
+        var acknowledgedBy: String? = null,
+        var acknowledgmentNotes: String? = null,
+        var resolvedAt: LocalDateTime? = null,
+        var resolvedBy: String? = null,
+        var resolutionNotes: String? = null
+    )
+    
+    data class FuelMonitor(
+        val vehicleId: String,
+        val preferences: AlertPreferences,
+        val createdAt: LocalDateTime,
+        var isActive: Boolean,
+        var lastFuelCheck: LocalDateTime,
+        var currentFuelLevel: Double,
+        var averageConsumptionRate: Double,
+        var alertCount: Int,
+        var status: MonitorStatus,
+        var lastOdometerReading: Double? = null
+    )
+    
+    data class AlertPreferences(
+        val lowFuelThreshold: Double = DEFAULT_LOW_FUEL_THRESHOLD,
+        val criticalFuelThreshold: Double = DEFAULT_CRITICAL_FUEL_THRESHOLD,
+        val theftDetectionThreshold: Double = DEFAULT_THEFT_DETECTION_THRESHOLD,
+        val consumptionAnomalyThreshold: Double = DEFAULT_CONSUMPTION_ANOMALY_THRESHOLD,
+        val poorEfficiencyThreshold: Double = 15.0, // L/100km
+        val monthlyBudgetLimit: Double = 500.0,
+        val maintenanceIntervalKm: Double = 10000.0,
+        val lastMaintenanceOdometer: Double = 0.0,
+        val enableLowFuelAlerts: Boolean = true,
+        val enableTheftAlerts: Boolean = true,
+        val enableEfficiencyAlerts: Boolean = true,
+        val enableCostAlerts: Boolean = true,
+        val enableMaintenanceAlerts: Boolean = true
+    )
+    
+    data class AlertStatistics(
+        val totalAlerts: Int,
+        val activeAlerts: Int,
+        val acknowledgedAlerts: Int,
+        val resolvedAlerts: Int,
+        val alertsByType: Map<AlertType, Int>,
+        val alertsBySeverity: Map<AlertSeverity, Int>,
+        val averageResolutionTime: Double,
+        val mostCommonAlertType: AlertType?,
+        val lastAlertTime: LocalDateTime?
+    )
+    
+    data class ConsumptionData(
+        val timestamp: LocalDateTime,
+        val fuelLevel: Double,
+        val odometerReading: Double,
+        val consumptionRate: Double
+    )
+    
+    data class FuelData(
+        val timestamp: LocalDateTime,
+        val fuelConsumed: Double,
+        val fuelLevel: Double,
+        val odometerReading: Double
+    )
+    
+    data class FuelExpense(
+        val timestamp: LocalDateTime,
+        val amount: Double,
+        val pricePerLiter: Double,
+        val liters: Double,
+        val location: String?
+    )
+    
+    data class LocationData(
+        val latitude: Double,
+        val longitude: Double,
+        val address: String? = null
+    )
+    
+    enum class AlertType {
+        LOW_FUEL,
+        CRITICAL_FUEL,
+        FUEL_THEFT,
+        CONSUMPTION_ANOMALY,
+        POOR_EFFICIENCY,
+        EFFICIENCY_DECLINE,
+        OVERSPENDING,
+        HIGH_FUEL_PRICE,
+        MAINTENANCE_DUE,
+        CONSUMPTION_PATTERN_ANOMALY
+    }
+    
+    enum class AlertSeverity {
+        LOW, MEDIUM, HIGH, CRITICAL
+    }
+    
+    enum class MonitorStatus {
+        ACTIVE, INACTIVE, SUSPENDED, ERROR
+    }
+    
+    enum class ConsumptionPattern {
+        NORMAL, VARIABLE, IRREGULAR
+    }
+    
+    enum class TimeWindow(val duration: java.time.Duration) {
+        LAST_24_HOURS(java.time.Duration.ofHours(24)),
+        LAST_7_DAYS(java.time.Duration.ofDays(7)),
+        LAST_30_DAYS(java.time.Duration.ofDays(30)),
+        LAST_90_DAYS(java.time.Duration.ofDays(90))
+    }
+    
+    companion object {
+        private const val CURRENCY_SYMBOL = "$"
+    }
+}

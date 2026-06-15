@@ -1,0 +1,577 @@
+package com.edham.logistics.core.performance
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Lazy Load Manager - Efficient lazy loading for heavy screens with placeholders and progressive loading
+ */
+@Singleton
+class LazyLoadManager @Inject constructor() {
+
+    private var config: LazyLoadConfig = LazyLoadConfig()
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // Lazy loading registry
+    private val lazyLoads = ConcurrentHashMap<String, LazyLoadState<*>>()
+    
+    // Loading queue
+    private val loadingQueue = Channel<LoadTask>(capacity = Channel.UNLIMITED)
+    private val loadingExecutor = Executors.newFixedThreadPool(3) as ExecutorService
+    
+    // Metrics
+    private val totalLazyLoads = AtomicInteger(0)
+    private val preloadedItems = AtomicInteger(0)
+    private val cancelledLoads = AtomicInteger(0)
+
+    /**
+     * Configure the lazy load manager
+     */
+    fun configure(config: LazyLoadConfig) {
+        this.config = config
+        
+        if (config.enableLazyLoading) {
+            startLoadingProcessor()
+        }
+    }
+
+    /**
+     * Create lazy load result
+     */
+    fun <T> createLazyLoad(
+        loader: suspend () -> T,
+        placeholder: (() -> T)? = null,
+        priority: LoadPriority = LoadPriority.NORMAL,
+        deviceCapability: DeviceCapability = DeviceCapability.MEDIUM
+    ): LazyLoadResult<T> {
+        totalLazyLoads.incrementAndGet()
+        
+        val stateKey = generateStateKey(loader)
+        val state = getOrCreateState(stateKey, loader, placeholder, priority, deviceCapability)
+        
+        return LazyLoadResult(
+            data = state.data,
+            isLoading = state.isLoading,
+            isLoaded = state.isLoaded,
+            load = { state.load() },
+            preload = { state.preload() },
+            cancel = { state.cancel() },
+            refresh = { state.refresh() }
+        )
+    }
+
+    /**
+     * Create progressive lazy load for complex screens
+     */
+    suspend fun <T> createProgressiveLazyLoad(
+        stages: List<LazyLoadStage<T>>,
+        deviceCapability: DeviceCapability = DeviceCapability.MEDIUM
+    ): ProgressiveLazyLoadResult<T> {
+        val state = ProgressiveLazyLoadState(
+            stages = stages,
+            deviceCapability = deviceCapability,
+            coroutineScope = coroutineScope,
+            loadingQueue = loadingQueue,
+            onStageCompleted = { preloadedItems.incrementAndGet() }
+        )
+        
+        return ProgressiveLazyLoadResult(
+            data = state.data,
+            currentStage = state.currentStage,
+            isLoading = state.isLoading,
+            isFullyLoaded = state.isFullyLoaded,
+            loadNextStage = { state.loadNextStage() },
+            loadStage = { stageIndex -> state.loadStage(stageIndex) },
+            refresh = { state.refresh() }
+        )
+    }
+
+    /**
+     * Create lazy load for images with progressive loading
+     */
+    fun createImageLazyLoad(
+        imageLoader: suspend (quality: ImageQuality) -> ByteArray,
+        placeholder: ByteArray? = null,
+        deviceCapability: DeviceCapability = DeviceCapability.MEDIUM
+    ): ImageLazyLoadResult {
+        val quality = determineOptimalImageQuality(deviceCapability)
+        
+        return createLazyLoad(
+            loader = { imageLoader(quality) },
+            placeholder = { placeholder },
+            priority = LoadPriority.NORMAL,
+            deviceCapability = deviceCapability
+        ).let { lazyResult ->
+            ImageLazyLoadResult(
+                data = lazyResult.data,
+                isLoading = lazyResult.isLoading,
+                isLoaded = lazyResult.isLoaded,
+                load = lazyResult.load,
+                quality = quality,
+                loadWithQuality = { newQuality ->
+                    createLazyLoad(
+                        loader = { imageLoader(newQuality) },
+                        placeholder = placeholder,
+                        priority = LoadPriority.NORMAL,
+                        deviceCapability = deviceCapability
+                    )
+                }
+            )
+        }
+    }
+
+    /**
+     * Create lazy load for lists with progressive loading
+     */
+    suspend fun <T> createListLazyLoad(
+        itemLoader: suspend (index: Int) -> T,
+        itemCount: Int,
+        batchSize: Int = 10,
+        deviceCapability: DeviceCapability = DeviceCapability.MEDIUM
+    ): ListLazyLoadResult<T> {
+        val state = ListLazyLoadState(
+            itemLoader = itemLoader,
+            itemCount = itemCount,
+            batchSize = calculateOptimalBatchSize(batchSize, deviceCapability),
+            deviceCapability = deviceCapability,
+            coroutineScope = coroutineScope
+        )
+        
+        return ListLazyLoadResult(
+            items = state.items,
+            loadedCount = state.loadedCount,
+            isLoading = state.isLoading,
+            isFullyLoaded = state.isFullyLoaded,
+            loadItem = { index -> state.loadItem(index) },
+            loadBatch = { startIndex, size -> state.loadBatch(startIndex, size) },
+            loadRemaining = { state.loadRemaining() },
+            refresh = { state.refresh() }
+        )
+    }
+
+    /**
+     * Get lazy load metrics
+     */
+    fun getMetrics(): LazyLoadMetrics {
+        return LazyLoadMetrics(
+            totalLazyLoads = totalLazyLoads.get(),
+            preloadedItems = preloadedItems.get(),
+            cancelledLoads = cancelledLoads.get(),
+            averageLoadDelay = config.loadDelayMs,
+            preloadDistance = config.preloadDistance,
+            enablePlaceholders = config.enablePlaceholders,
+            enableLazyLoading = config.enableLazyLoading
+        )
+    }
+
+    /**
+     * Clear all lazy loads
+     */
+    fun clearAll() {
+        lazyLoads.values.forEach { state ->
+            state.cancel()
+        }
+        lazyLoads.clear()
+        totalLazyLoads.set(0)
+        preloadedItems.set(0)
+        cancelledLoads.set(0)
+    }
+
+    /**
+     * Clear specific lazy load
+     */
+    fun clear(key: String) {
+        lazyLoads.remove(key)?.cancel()
+    }
+
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        coroutineScope.cancel()
+        loadingExecutor.shutdown()
+        loadingQueue.close()
+        clearAll()
+    }
+
+    /**
+     * Get or create lazy load state
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> getOrCreateState(
+        key: String,
+        loader: suspend () -> T,
+        placeholder: (() -> T)?,
+        priority: LoadPriority,
+        deviceCapability: DeviceCapability
+    ): LazyLoadState<T> {
+        return lazyLoads.getOrPut(key) {
+            LazyLoadState(
+                loader = loader,
+                placeholder = placeholder,
+                priority = priority,
+                deviceCapability = deviceCapability,
+                coroutineScope = coroutineScope,
+                loadingQueue = loadingQueue,
+                config = config
+            ) as LazyLoadState<*>
+        } as LazyLoadState<T>
+    }
+
+    /**
+     * Generate state key from loader
+     */
+    private fun <T> generateStateKey(loader: suspend () -> T): String {
+        return loader.hashCode().toString()
+    }
+
+    /**
+     * Start loading processor
+     */
+    private fun startLoadingProcessor() {
+        coroutineScope.launch {
+            for (task in loadingQueue) {
+                try {
+                    withContext(Dispatchers.IO) {
+                        task.execute()
+                    }
+                } catch (e: Exception) {
+                    // Log error but continue
+                }
+            }
+        }
+    }
+
+    /**
+     * Determine optimal image quality based on device capability
+     */
+    private fun determineOptimalImageQuality(deviceCapability: DeviceCapability): ImageQuality {
+        return when (deviceCapability) {
+            DeviceCapability.HIGH -> ImageQuality.HIGH
+            DeviceCapability.MEDIUM -> ImageQuality.MEDIUM
+            DeviceCapability.LOW -> ImageQuality.LOW
+            DeviceCapability.VERY_LOW -> ImageQuality.VERY_LOW
+        }
+    }
+
+    /**
+     * Calculate optimal batch size based on device capability
+     */
+    private fun calculateOptimalBatchSize(baseBatchSize: Int, deviceCapability: DeviceCapability): Int {
+        return when (deviceCapability) {
+            DeviceCapability.HIGH -> baseBatchSize
+            DeviceCapability.MEDIUM -> baseBatchSize / 2
+            DeviceCapability.LOW -> baseBatchSize / 4
+            DeviceCapability.VERY_LOW -> maxOf(baseBatchSize / 8, 1)
+        }
+    }
+}
+
+/**
+ * Lazy load state implementation
+ */
+class LazyLoadState<T>(
+    private val loader: suspend () -> T,
+    private val placeholder: (() -> T)?,
+    private val priority: LoadPriority,
+    private val deviceCapability: DeviceCapability,
+    private val coroutineScope: CoroutineScope,
+    private val loadingQueue: Channel<LoadTask>,
+    private val config: LazyLoadConfig
+) {
+    private val _data = MutableStateFlow<T?>(placeholder?.invoke())
+    val data: StateFlow<T?> = _data.asStateFlow()
+    
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+    
+    private val _isLoaded = MutableStateFlow(false)
+    val isLoaded: StateFlow<Boolean> = _isLoaded.asStateFlow()
+    
+    private val loadJob = AtomicReference<Job?>(null)
+    private val isCancelled = AtomicBoolean(false)
+    
+    suspend fun load(): T? {
+        if (_isLoaded.value) return _data.value
+        
+        val job = coroutineScope.launch {
+            _isLoading.value = true
+            
+            try {
+                // Add delay for low-end devices
+                if (deviceCapability == DeviceCapability.VERY_LOW || deviceCapability == DeviceCapability.LOW) {
+                    delay(config.loadDelayMs)
+                }
+                
+                val result = loader()
+                _data.value = result
+                _isLoaded.value = true
+            } catch (e: Exception) {
+                // Handle error
+                if (placeholder != null) {
+                    _data.value = placeholder()
+                }
+            } finally {
+                _isLoading.value = false
+            }
+        }
+        
+        loadJob.set(job)
+        job.join()
+        
+        return _data.value
+    }
+    
+    suspend fun preload() {
+        if (!_isLoaded.value && !isCancelled.get()) {
+            val task = LoadTask(
+                priority = priority,
+                execute = { load() }
+            )
+            
+            try {
+                loadingQueue.trySend(task)
+            } catch (e: Exception) {
+                // Queue is full, load directly
+                load()
+            }
+        }
+    }
+    
+    fun cancel() {
+        isCancelled.set(true)
+        loadJob.get()?.cancel()
+        _isLoading.value = false
+    }
+    
+    suspend fun refresh() {
+        cancel()
+        isCancelled.set(false)
+        _isLoaded.value = false
+        load()
+    }
+}
+
+/**
+ * Progressive lazy load state implementation
+ */
+class ProgressiveLazyLoadState<T>(
+    private val stages: List<LazyLoadStage<T>>,
+    private val deviceCapability: DeviceCapability,
+    private val coroutineScope: CoroutineScope,
+    private val loadingQueue: Channel<LoadTask>,
+    private val onStageCompleted: () -> Unit
+) {
+    private val _data = MutableStateFlow<T?>(null)
+    val data: StateFlow<T?> = _data.asStateFlow()
+    
+    private val _currentStage = MutableStateFlow(0)
+    val currentStage: StateFlow<Int> = _currentStage.asStateFlow()
+    
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+    
+    private val _isFullyLoaded = MutableStateFlow(false)
+    val isFullyLoaded: StateFlow<Boolean> = _isFullyLoaded.asStateFlow()
+    
+    private var currentStageIndex = 0
+    
+    suspend fun loadNextStage(): Boolean {
+        if (currentStageIndex < stages.size - 1) {
+            return loadStage(currentStageIndex + 1)
+        }
+        return false
+    }
+    
+    suspend fun loadStage(stageIndex: Int): Boolean {
+        if (stageIndex < 0 || stageIndex >= stages.size) return false
+        
+        _isLoading.value = true
+        currentStageIndex = stageIndex
+        _currentStage.value = stageIndex
+        
+        try {
+            val stage = stages[stageIndex]
+            val result = stage.loader()
+            _data.value = result
+            onStageCompleted()
+            
+            if (stageIndex == stages.size - 1) {
+                _isFullyLoaded.value = true
+            }
+            
+            return true
+        } catch (e: Exception) {
+            return false
+        } finally {
+            _isLoading.value = false
+        }
+    }
+    
+    suspend fun refresh() {
+        currentStageIndex = 0
+        _data.value = null
+        _isFullyLoaded.value = false
+        loadStage(0)
+    }
+}
+
+/**
+ * List lazy load state implementation
+ */
+class ListLazyLoadState<T>(
+    private val itemLoader: suspend (Int) -> T,
+    private val itemCount: Int,
+    private val batchSize: Int,
+    private val deviceCapability: DeviceCapability,
+    private val coroutineScope: CoroutineScope
+) {
+    private val _items = MutableStateFlow<List<T?>>(List(itemCount) { null })
+    val items: StateFlow<List<T?>> = _items.asStateFlow()
+    
+    private val _loadedCount = MutableStateFlow(0)
+    val loadedCount: StateFlow<Int> = _loadedCount.asStateFlow()
+    
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+    
+    private val _isFullyLoaded = MutableStateFlow(false)
+    val isFullyLoaded: StateFlow<Boolean> = _isFullyLoaded.asStateFlow()
+    
+    private val loadedItems = ConcurrentHashMap<Int, T>()
+    
+    suspend fun loadItem(index: Int): T? {
+        if (index < 0 || index >= itemCount) return null
+        
+        loadedItems[index]?.let { return it }
+        
+        _isLoading.value = true
+        
+        try {
+            val item = itemLoader(index)
+            loadedItems[index] = item
+            
+            val currentItems = _items.value.toMutableList()
+            currentItems[index] = item
+            _items.value = currentItems
+            
+            _loadedCount.value = loadedItems.size
+            _isFullyLoaded.value = loadedItems.size == itemCount
+            
+            return item
+        } catch (e: Exception) {
+            return null
+        } finally {
+            _isLoading.value = false
+        }
+    }
+    
+    suspend fun loadBatch(startIndex: Int, size: Int): List<T> {
+        val endIndex = minOf(startIndex + size, itemCount)
+        val results = mutableListOf<T>()
+        
+        _isLoading.value = true
+        
+        try {
+            for (i in startIndex until endIndex) {
+                val item = loadItem(i)
+                if (item != null) {
+                    results.add(item)
+                }
+            }
+            
+            return results
+        } catch (e: Exception) {
+            return results
+        } finally {
+            _isLoading.value = false
+        }
+    }
+    
+    suspend fun loadRemaining(): List<T> {
+        return loadBatch(0, itemCount)
+    }
+    
+    suspend fun refresh() {
+        loadedItems.clear()
+        _items.value = List(itemCount) { null }
+        _loadedCount.value = 0
+        _isFullyLoaded.value = false
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class LazyLoadResult<T>(
+    val data: StateFlow<T?>,
+    val isLoading: StateFlow<Boolean>,
+    val isLoaded: StateFlow<Boolean>,
+    val load: suspend () -> T?,
+    val preload: suspend () -> Unit,
+    val cancel: () -> Unit,
+    val refresh: suspend () -> Unit
+)
+
+data class ProgressiveLazyLoadResult<T>(
+    val data: StateFlow<T?>,
+    val currentStage: StateFlow<Int>,
+    val isLoading: StateFlow<Boolean>,
+    val isFullyLoaded: StateFlow<Boolean>,
+    val loadNextStage: suspend () -> Boolean,
+    val loadStage: suspend (Int) -> Boolean,
+    val refresh: suspend () -> Unit
+)
+
+data class ImageLazyLoadResult(
+    val data: StateFlow<ByteArray?>,
+    val isLoading: StateFlow<Boolean>,
+    val isLoaded: StateFlow<Boolean>,
+    val load: suspend () -> ByteArray?,
+    val quality: ImageQuality,
+    val loadWithQuality: () -> ImageLazyLoadResult
+)
+
+data class ListLazyLoadResult<T>(
+    val items: StateFlow<List<T?>>,
+    val loadedCount: StateFlow<Int>,
+    val isLoading: StateFlow<Boolean>,
+    val isFullyLoaded: StateFlow<Boolean>,
+    val loadItem: suspend (Int) -> T?,
+    val loadBatch: suspend (Int, Int) -> List<T>,
+    val loadRemaining: suspend () -> List<T>,
+    val refresh: suspend () -> Unit
+)
+
+data class LazyLoadStage<T>(
+    val name: String,
+    val priority: LoadPriority,
+    val loader: suspend () -> T
+)
+
+data class LoadTask(
+    val priority: LoadPriority,
+    val execute: suspend () -> Any?
+)
+
+data class LazyLoadMetrics(
+    val totalLazyLoads: Int,
+    val preloadedItems: Int,
+    val cancelledLoads: Int,
+    val averageLoadDelay: Long,
+    val preloadDistance: Int,
+    val enablePlaceholders: Boolean,
+    val enableLazyLoading: Boolean
+)
+
+enum class LoadPriority {
+    LOW, NORMAL, HIGH, CRITICAL
+}
+
+enum class ImageQuality {
+    VERY_LOW, LOW, MEDIUM, HIGH
+}

@@ -1,0 +1,214 @@
+package com.edham.logistics.feature.notifications.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.databinding.FragmentNotificationBinding
+import com.edham.logistics.feature.notifications.presentation.ui.NotificationViewModel
+import com.edham.logistics.feature.notifications.presentation.adapter.NotificationAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class NotificationFragment : Fragment() {
+
+    private var _binding: FragmentNotificationBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: NotificationViewModel by viewModels()
+    
+    @Inject
+    lateinit var notificationAdapter: NotificationAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentNotificationBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerView()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize with user data (in real app, this would come from user session)
+        viewModel.initialize("user_123", com.edham.logistics.feature.notifications.domain.model.UserRole.CUSTOMER)
+    }
+
+    private fun setupRecyclerView() {
+        notificationAdapter = NotificationAdapter { notification, action ->
+            when (action) {
+                "mark_read" -> viewModel.markAsRead(notification.id)
+                "delete" -> viewModel.deleteNotification(notification.id)
+                "view" -> navigateToNotificationDetails(notification.id)
+            }
+        }
+        
+        binding.recyclerViewNotifications.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = notificationAdapter
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refresh()
+        }
+        
+        binding.buttonMarkAllRead.setOnClickListener {
+            viewModel.markAllAsRead()
+        }
+        
+        binding.buttonClearFilters.setOnClickListener {
+            clearFilters()
+        }
+        
+        binding.spinnerNotificationType.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val type = when (parent?.getItemAtPosition(position).toString()) {
+                    "Shipment" -> com.edham.logistics.feature.notifications.domain.model.NotificationType.SHIPMENT_CREATED
+                    "Driver" -> com.edham.logistics.feature.notifications.domain.model.NotificationType.DRIVER_ASSIGNED
+                    "Temperature" -> com.edham.logistics.feature.notifications.domain.model.NotificationType.TEMPERATURE_ALERT
+                    "Payment" -> com.edham.logistics.feature.notifications.domain.model.NotificationType.PAYMENT_RECEIVED
+                    "System" -> com.edham.logistics.feature.notifications.domain.model.NotificationType.SYSTEM_ALERT
+                    "All" -> null
+                    else -> null
+                }
+                viewModel.filterByType(type)
+            }
+            
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        
+        binding.spinnerNotificationCategory.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val category = when (parent?.getItemAtPosition(position).toString()) {
+                    "Shipment" -> com.edham.logistics.feature.notifications.domain.model.NotificationCategory.SHIPMENT
+                    "Driver" -> com.edham.logistics.feature.notifications.domain.model.NotificationCategory.DRIVER
+                    "Temperature" -> com.edham.logistics.feature.notifications.domain.model.NotificationCategory.TEMPERATURE
+                    "Payment" -> com.edham.logistics.feature.notifications.domain.model.NotificationCategory.PAYMENT
+                    "System" -> com.edham.logistics.feature.notifications.domain.model.NotificationCategory.SYSTEM
+                    "All" -> null
+                    else -> null
+                }
+                viewModel.filterByCategory(category)
+            }
+            
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+    }
+
+    private fun updateUI(uiState: NotificationViewModel.NotificationUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.contentLayout.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refresh()
+        }
+    }
+
+    private fun showContent(uiState: NotificationViewModel.NotificationUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        
+        // Update notifications list
+        notificationAdapter.submitList(uiState.notifications)
+        
+        // Update unread count
+        updateUnreadCount(uiState.unreadCount)
+        
+        // Update empty state
+        if (uiState.notifications.isEmpty()) {
+            showEmptyState()
+        } else {
+            hideEmptyState()
+        }
+    }
+
+    private fun updateUnreadCount(unreadCount: Int) {
+        binding.textUnreadCount.text = unreadCount.toString()
+        
+        if (unreadCount > 0) {
+            binding.badgeUnread.visible()
+            binding.buttonMarkAllRead.visible()
+        } else {
+            binding.badgeUnread.gone()
+            binding.buttonMarkAllRead.gone()
+        }
+    }
+
+    private fun showEmptyState() {
+        binding.layoutEmptyState.visible()
+        binding.recyclerViewNotifications.gone()
+    }
+
+    private fun hideEmptyState() {
+        binding.layoutEmptyState.gone()
+        binding.recyclerViewNotifications.visible()
+    }
+
+    private fun clearFilters() {
+        binding.spinnerNotificationType.setSelection(0)
+        binding.spinnerNotificationCategory.setSelection(0)
+        viewModel.filterByType(null)
+        viewModel.filterByCategory(null)
+    }
+
+    private fun navigateToNotificationDetails(notificationId: String) {
+        // Navigate to notification details based on notification type
+        // This would integrate with navigation component
+        showSnackbar("فتح تفاصيل الإشعار: $notificationId")
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

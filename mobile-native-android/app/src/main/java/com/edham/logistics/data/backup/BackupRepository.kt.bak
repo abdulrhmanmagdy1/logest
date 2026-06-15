@@ -1,0 +1,395 @@
+package com.edham.logistics.data.backup
+
+import com.edham.logistics.core.backup.*
+import com.edham.logistics.domain.backup.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.flow
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Backup Repository - Data layer for backup operations
+ * Provides data access and persistence for backup functionality
+ */
+@Singleton
+class BackupRepository @Inject constructor(
+    private val backupManager: BackupManager,
+    private val databaseBackupService: DatabaseBackupService,
+    private val fileBackupService: FileBackupService
+) {
+
+    /**
+     * Get all backups
+     */
+    fun getAllBackups(): Flow<List<BackupInfo>> {
+        return backupManager.backupHistory.map { backups ->
+            backups.sortedByDescending { it.timestamp }
+        }
+    }
+
+    /**
+     * Get backup by ID
+     */
+    fun getBackupById(backupId: String): Flow<BackupInfo?> {
+        return backupManager.backupHistory.map { backups ->
+            backups.find { it.id == backupId }
+        }
+    }
+
+    /**
+     * Get backups by type
+     */
+    fun getBackupsByType(type: BackupType): Flow<List<BackupInfo>> {
+        return backupManager.backupHistory.map { backups ->
+            backups.filter { it.type == type }
+                .sortedByDescending { it.timestamp }
+        }
+    }
+
+    /**
+     * Get recent backups (last 30 days)
+     */
+    fun getRecentBackups(days: Int = 30): Flow<List<BackupInfo>> {
+        return backupManager.backupHistory.map { backups ->
+            val cutoffTime = System.currentTimeMillis() - (days * 24 * 60 * 60 * 1000L)
+            backups.filter { it.timestamp >= cutoffTime }
+                .sortedByDescending { it.timestamp }
+        }
+    }
+
+    /**
+     * Get backup statistics
+     */
+    fun getBackupStatistics(): Flow<BackupStatistics> {
+        return flow {
+            emit(backupManager.getBackupStatistics())
+        }
+    }
+
+    /**
+     * Create manual backup
+     */
+    suspend fun createManualBackup(
+        name: String? = null,
+        includeFiles: Boolean = true,
+        includeDatabase: Boolean = true,
+        encryptionEnabled: Boolean = true
+    ): Result<BackupInfo> {
+        return backupManager.createManualBackup(
+            name = name,
+            includeFiles = includeFiles,
+            includeDatabase = includeDatabase,
+            encryptionEnabled = encryptionEnabled
+        )
+    }
+
+    /**
+     * Create automatic backup
+     */
+    suspend fun createAutoBackup(): Result<BackupInfo> {
+        return backupManager.createAutoBackup()
+    }
+
+    /**
+     * Restore backup
+     */
+    suspend fun restoreBackup(
+        backupId: String,
+        restoreOptions: RestoreOptions = RestoreOptions()
+    ): Result<RestoreResult> {
+        return backupManager.restoreBackup(backupId, restoreOptions)
+    }
+
+    /**
+     * Delete backup
+     */
+    suspend fun deleteBackup(backupId: String): Result<Boolean> {
+        return backupManager.deleteBackup(backupId)
+    }
+
+    /**
+     * Export system data
+     */
+    suspend fun exportSystemData(
+        exportType: ExportType,
+        dateRange: DateRange? = null,
+        includeFiles: Boolean = true
+    ): Result<ExportResult> {
+        return backupManager.exportSystemData(exportType, dateRange, includeFiles)
+    }
+
+    /**
+     * Get database statistics
+     */
+    suspend fun getDatabaseStatistics(): DatabaseStatistics {
+        return databaseBackupService.getDatabaseStatistics()
+    }
+
+    /**
+     * Get file statistics
+     */
+    suspend fun getFileStatistics(): FileStatistics {
+        return fileBackupService.getFileStatistics()
+    }
+
+    /**
+     * Verify database integrity
+     */
+    suspend fun verifyDatabaseIntegrity(): DatabaseIntegrityResult {
+        return databaseBackupService.verifyDatabaseIntegrity()
+    }
+
+    /**
+     * Optimize database
+     */
+    suspend fun optimizeDatabase(): Boolean {
+        return databaseBackupService.optimizeDatabase()
+    }
+
+    /**
+     * Get backup history with pagination
+     */
+    fun getBackupHistoryPaged(
+        page: Int = 0,
+        pageSize: Int = 20
+    ): Flow<PagedResult<BackupInfo>> {
+        return backupManager.backupHistory.map { backups ->
+            val sortedBackups = backups.sortedByDescending { it.timestamp }
+            val startIndex = page * pageSize
+            val endIndex = minOf(startIndex + pageSize, sortedBackups.size)
+            
+            val items = if (startIndex < sortedBackups.size) {
+                sortedBackups.subList(startIndex, endIndex)
+            } else {
+                emptyList()
+            }
+            
+            PagedResult(
+                items = items,
+                page = page,
+                pageSize = pageSize,
+                totalCount = sortedBackups.size,
+                hasNext = endIndex < sortedBackups.size
+            )
+        }
+    }
+
+    /**
+     * Search backups by name
+     */
+    fun searchBackups(query: String): Flow<List<BackupInfo>> {
+        return backupManager.backupHistory.map { backups ->
+            if (query.isBlank()) {
+                backups.sortedByDescending { it.timestamp }
+            } else {
+                backups.filter { 
+                    it.name.contains(query, ignoreCase = true) ||
+                    it.description?.contains(query, ignoreCase = true) == true
+                }.sortedByDescending { it.timestamp }
+            }
+        }
+    }
+
+    /**
+     * Get backup size distribution
+     */
+    fun getBackupSizeDistribution(): Flow<BackupSizeDistribution> {
+        return backupManager.backupHistory.map { backups ->
+            val successfulBackups = backups.filter { it.status == BackupStatus.COMPLETED }
+            
+            val sizeRanges = mapOf(
+                "Small (< 10MB)" to successfulBackups.filter { it.size < 10 * 1024 * 1024 }.size,
+                "Medium (10-50MB)" to successfulBackups.filter { 
+                    it.size >= 10 * 1024 * 1024 && it.size < 50 * 1024 * 1024 
+                }.size,
+                "Large (50-100MB)" to successfulBackups.filter { 
+                    it.size >= 50 * 1024 * 1024 && it.size < 100 * 1024 * 1024 
+                }.size,
+                "Very Large (> 100MB)" to successfulBackups.filter { it.size >= 100 * 1024 * 1024 }.size
+            )
+            
+            BackupSizeDistribution(
+                totalBackups = successfulBackups.size,
+                sizeRanges = sizeRanges,
+                totalSize = successfulBackups.sumOf { it.size },
+                averageSize = if (successfulBackups.isNotEmpty()) {
+                    successfulBackups.sumOf { it.size } / successfulBackups.size
+                } else 0L,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+    }
+
+    /**
+     * Get backup trends
+     */
+    fun getBackupTrends(days: Int = 30): Flow<BackupTrends> {
+        return backupManager.backupHistory.map { backups ->
+            val cutoffTime = System.currentTimeMillis() - (days * 24 * 60 * 60 * 1000L)
+            val recentBackups = backups.filter { it.timestamp >= cutoffTime }
+            
+            // Group by day
+            val dailyBackups = recentBackups.groupBy { backup ->
+                val calendar = java.util.Calendar.getInstance()
+                calendar.timeInMillis = backup.timestamp
+                calendar.get(java.util.Calendar.YEAR) * 1000 + calendar.get(java.util.Calendar.DAY_OF_YEAR)
+            }
+            
+            val trendData = dailyBackups.map { (dayKey, dayBackups) ->
+                DayBackupData(
+                    date = dayKey,
+                    backupCount = dayBackups.size,
+                    totalSize = dayBackups.sumOf { it.size },
+                    successfulCount = dayBackups.count { it.status == BackupStatus.COMPLETED },
+                    failedCount = dayBackups.count { it.status == BackupStatus.FAILED }
+                )
+            }.sortedBy { it.date }
+            
+            BackupTrends(
+                period = days,
+                totalBackups = recentBackups.size,
+                successfulBackups = recentBackups.count { it.status == BackupStatus.COMPLETED },
+                failedBackups = recentBackups.count { it.status == BackupStatus.FAILED },
+                averageDailyBackups = if (trendData.isNotEmpty()) {
+                    trendData.map { it.backupCount }.average()
+                } else 0.0,
+                dailyData = trendData,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+    }
+
+    /**
+     * Clean up old backups
+     */
+    suspend fun cleanupOldBackups(retentionDays: Int = 30): Result<Int> {
+        return try {
+            val history = backupManager.backupHistory.value
+            val cutoffTime = System.currentTimeMillis() - (retentionDays * 24 * 60 * 60 * 1000L)
+            
+            val oldBackups = history.filter { it.timestamp < cutoffTime }
+            var deletedCount = 0
+            
+            oldBackups.forEach { backup ->
+                val result = backupManager.deleteBackup(backup.id)
+                if (result.isSuccess && result.getOrNull() == true) {
+                    deletedCount++
+                }
+            }
+            
+            Result.success(deletedCount)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Get backup storage usage
+     */
+    fun getBackupStorageUsage(): Flow<BackupStorageUsage> {
+        return backupManager.backupHistory.map { backups ->
+            val successfulBackups = backups.filter { it.status == BackupStatus.COMPLETED }
+            
+            val totalSize = successfulBackups.sumOf { it.size }
+            val encryptedSize = successfulBackups.filter { it.encrypted }.sumOf { it.size }
+            val unencryptedSize = totalSize - encryptedSize
+            
+            BackupStorageUsage(
+                totalBackups = successfulBackups.size,
+                totalSize = totalSize,
+                encryptedSize = encryptedSize,
+                unencryptedSize = unencryptedSize,
+                averageSize = if (successfulBackups.isNotEmpty()) {
+                    totalSize / successfulBackups.size
+                } else 0L,
+                oldestBackup = successfulBackups.minByOrNull { it.timestamp }?.timestamp,
+                newestBackup = successfulBackups.maxByOrNull { it.timestamp }?.timestamp,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+    }
+
+    /**
+     * Validate backup before restore
+     */
+    suspend fun validateBackupForRestore(backupId: String): Result<BackupValidationResult> {
+        val backupInfo = backupManager.getBackupInfo(backupId)
+            ?: return Result.failure(Exception("Backup not found"))
+
+        return try {
+            // Validate backup integrity
+            val isValid = validateBackupIntegrity(backupInfo)
+            
+            Result.success(
+                BackupValidationResult(
+                    backupId = backupId,
+                    isValid = isValid,
+                    validationErrors = if (!isValid) listOf("Backup integrity check failed") else emptyList(),
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Validate backup integrity
+     */
+    private suspend fun validateBackupIntegrity(backupInfo: BackupInfo): Boolean {
+        return try {
+            backupInfo.status == BackupStatus.COMPLETED && backupInfo.size > 0
+        } catch (e: Exception) {
+            false
+        }
+    }
+}
+
+/**
+ * Data classes for repository
+ */
+data class PagedResult<T>(
+    val items: List<T>,
+    val page: Int,
+    val pageSize: Int,
+    val totalCount: Int,
+    val hasNext: Boolean
+)
+
+data class BackupSizeDistribution(
+    val totalBackups: Int,
+    val sizeRanges: Map<String, Int>,
+    val totalSize: Long,
+    val averageSize: Long,
+    val timestamp: Long
+)
+
+data class DayBackupData(
+    val date: Int,
+    val backupCount: Int,
+    val totalSize: Long,
+    val successfulCount: Int,
+    val failedCount: Int
+)
+
+data class BackupTrends(
+    val period: Int,
+    val totalBackups: Int,
+    val successfulBackups: Int,
+    val failedBackups: Int,
+    val averageDailyBackups: Double,
+    val dailyData: List<DayBackupData>,
+    val timestamp: Long
+)
+
+data class BackupStorageUsage(
+    val totalBackups: Int,
+    val totalSize: Long,
+    val encryptedSize: Long,
+    val unencryptedSize: Long,
+    val averageSize: Long,
+    val oldestBackup: Long?,
+    val newestBackup: Long?,
+    val timestamp: Long
+)

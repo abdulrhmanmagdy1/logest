@@ -19,9 +19,11 @@ class CargoFinalReviewFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         
-        view.findViewById<TextView>(R.id.tvPickupSummary).text = viewModel.pickupAddress.value ?: "غير محدد"
-        view.findViewById<TextView>(R.id.tvDeliverySummary).text = viewModel.deliveryAddress.value ?: "غير محدد"
-        view.findViewById<TextView>(R.id.tvCargoSummary).text = viewModel.cargoType.value ?: "غير محدد"
-        view.findViewById<TextView>(R.id.tvVehicleSummary).text = viewModel.vehicleType.value ?: "غير محدد"
+        view.findViewById<TextView>(R.id.tvPickupSummary).text = viewModel.pickupAddress.value ?: "---"
+        view.findViewById<TextView>(R.id.tvDeliverySummary).text = viewModel.deliveryAddress.value ?: "---"
+        view.findViewById<TextView>(R.id.tvCargoSummary).text = viewModel.cargoType.value ?: "---"
+        view.findViewById<TextView>(R.id.tvWeightSummary).text = getString(R.string.weight_kg, viewModel.weight.value ?: "0")
+        view.findViewById<TextView>(R.id.tvVehicleSummary).text = viewModel.vehicleType.value ?: "---"
+        view.findViewById<TextView>(R.id.tvScheduleSummary).text = if (viewModel.isImmediate.value == true) "فوري" else "مجدول"
     }
 }

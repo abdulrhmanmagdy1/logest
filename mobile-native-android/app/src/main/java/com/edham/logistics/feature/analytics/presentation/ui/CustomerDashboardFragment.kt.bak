@@ -1,0 +1,246 @@
+package com.edham.logistics.feature.analytics.presentation.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.databinding.FragmentCustomerDashboardBinding
+import com.edham.logistics.feature.analytics.presentation.adapter.ShipmentAnalyticsAdapter
+import com.edham.logistics.feature.analytics.presentation.adapter.ShipmentHistoryAdapter
+import com.edham.logistics.feature.analytics.presentation.adapter.MonthlySpendingAdapter
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class CustomerDashboardFragment : Fragment() {
+
+    private var _binding: FragmentCustomerDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: CustomerDashboardViewModel by viewModels()
+    
+    @Inject
+    lateinit var shipmentAnalyticsAdapter: ShipmentAnalyticsAdapter
+    
+    @Inject
+    lateinit var shipmentHistoryAdapter: ShipmentHistoryAdapter
+    
+    @Inject
+    lateinit var monthlySpendingAdapter: MonthlySpendingAdapter
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentCustomerDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerViews()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize with user data (in real app, this would come from user session)
+        viewModel.initialize("customer_123")
+    }
+
+    private fun setupRecyclerViews() {
+        shipmentAnalyticsAdapter = ShipmentAnalyticsAdapter { shipment ->
+            navigateToShipmentDetails(shipment.shipmentId)
+        }
+        
+        shipmentHistoryAdapter = ShipmentHistoryAdapter { shipment ->
+            navigateToShipmentDetails(shipment.shipmentId)
+        }
+        
+        monthlySpendingAdapter = MonthlySpendingAdapter()
+        
+        binding.recyclerViewActiveShipments.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = shipmentAnalyticsAdapter
+        }
+        
+        binding.recyclerViewShipmentHistory.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = shipmentHistoryAdapter
+        }
+        
+        binding.recyclerViewMonthlySpending.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = monthlySpendingAdapter
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refresh()
+        }
+        
+        binding.cardActiveShipments.setOnClickListener {
+            navigateToActiveShipments()
+        }
+        
+        binding.cardTotalShipments.setOnClickListener {
+            navigateToShipmentHistory()
+        }
+        
+        binding.cardLoyaltyPoints.setOnClickListener {
+            navigateToLoyaltyProgram()
+        }
+    }
+
+    private fun updateUI(uiState: CustomerDashboardViewModel.CustomerDashboardUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.contentLayout.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refresh()
+        }
+    }
+
+    private fun showContent(uiState: CustomerDashboardViewModel.CustomerDashboardUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        
+        uiState.dashboardData?.let { data ->
+            updateMetricCards(data)
+            updateCharts(data)
+            updateLists(data)
+        }
+    }
+
+    private fun updateMetricCards(data: CustomerDashboardData) {
+        binding.apply {
+            // Active Shipments
+            textActiveShipments.text = data.activeShipments.toString()
+            
+            // Total Shipments
+            textTotalShipments.text = data.totalShipments.toString()
+            
+            // Total Spent
+            textTotalSpent.text = formatCurrency(data.totalSpent)
+            
+            // Average Delivery Time
+            textAverageDeliveryTime.text = "${data.averageDeliveryTime.toInt()} دقيقة"
+            
+            // On-time Delivery Rate
+            textOnTimeDeliveryRate.text = "${(data.onTimeDeliveryRate * 100).toInt()}%"
+            
+            // Customer Rating
+            textCustomerRating.text = data.customerRating.toString()
+            
+            // Loyalty Points
+            textLoyaltyPoints.text = data.loyaltyPoints.toString()
+        }
+    }
+
+    private fun updateCharts(data: CustomerDashboardData) {
+        // Monthly Spending Chart
+        updateMonthlySpendingChart(data.monthlySpending)
+        
+        // Service Usage Chart
+        updateServiceUsageChart(data.serviceUsage)
+    }
+
+    private fun updateMonthlySpendingChart(monthlySpending: List<MonthlySpending>) {
+        // In a real implementation, you would use a charting library like MPAndroidChart
+        // For now, we'll just display a summary
+        val totalSpending = monthlySpending.sumOf { it.amount }
+        val averageSpending = if (monthlySpending.isNotEmpty()) totalSpending / monthlySpending.size else 0.0
+        
+        binding.textMonthlySpendingSummary.text = "متوسط الإنفاق الشهري: ${formatCurrency(averageSpending)}"
+    }
+
+    private fun updateServiceUsageChart(serviceUsage: Map<String, Long>) {
+        // In a real implementation, you would use a charting library
+        val totalUsage = serviceUsage.values.sum()
+        val mostUsedService = serviceUsage.maxByOrNull { it.value }?.key ?: "N/A"
+        
+        binding.textServiceUsageSummary.text = "الخدمة الأكثر استخداماً: $mostUsedService"
+    }
+
+    private fun updateLists(data: CustomerDashboardData) {
+        // Recent Shipments
+        shipmentAnalyticsAdapter.submitList(data.recentShipments)
+        
+        // Shipment History
+        shipmentHistoryAdapter.submitList(data.shipmentHistory)
+        
+        // Monthly Spending
+        monthlySpendingAdapter.submitList(data.monthlySpending)
+    }
+
+    private fun formatCurrency(amount: Double): String {
+        return String.format("%,.0f ر.س", amount)
+    }
+
+    private fun navigateToShipmentDetails(shipmentId: String) {
+        // Navigate to shipment details
+        showSnackbar("فتح تفاصيل الشحنة: $shipmentId")
+    }
+
+    private fun navigateToActiveShipments() {
+        // Navigate to active shipments
+        showSnackbar("فتح الشحنات النشطة")
+    }
+
+    private fun navigateToShipmentHistory() {
+        // Navigate to shipment history
+        showSnackbar("فتح سجل الشحنات")
+    }
+
+    private fun navigateToLoyaltyProgram() {
+        // Navigate to loyalty program
+        showSnackbar("فتح برنامج الولاء")
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

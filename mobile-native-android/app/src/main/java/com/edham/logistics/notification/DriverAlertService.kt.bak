@@ -1,0 +1,982 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.DriverApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Driver Alert Service - Specialized service for driver-related alerts
+ * 
+ * Features:
+ * - Driver behavior alerts
+ * - Driver location alerts
+ * - Driver performance alerts
+ * - Driver compliance alerts
+ * - Driver emergency alerts
+ * - Driver fatigue alerts
+ * - Driver speeding alerts
+ * - Driver route deviation alerts
+ */
+@Singleton
+class DriverAlertService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val driverApi: DriverApi,
+    private val networkUtils: NetworkUtils,
+    private val smartNotificationManager: SmartNotificationManager
+) {
+    
+    private val _driverAlertState = MutableStateFlow<DriverAlertState>(DriverAlertState.Idle)
+    val driverAlertState: StateFlow<DriverAlertState> = _driverAlertState.asStateFlow()
+    
+    private val _activeDriverAlerts = MutableStateFlow<List<DriverAlert>>(emptyList())
+    val activeDriverAlerts: StateFlow<List<DriverAlert>> = _activeDriverAlerts.asStateFlow()
+    
+    private val _driverAnalytics = MutableStateFlow<DriverAnalytics>(DriverAnalytics())
+    val driverAnalytics: StateFlow<DriverAnalytics> = _driverAnalytics.asStateFlow()
+    
+    private var isInitialized = false
+    private val driverAlertListeners = mutableListOf<DriverAlertListener>()
+    
+    companion object {
+        private const val TAG = "DriverAlertService"
+        private const val SPEEDING_THRESHOLD_KMH = 120
+        private const val HARSH_BRAKING_THRESHOLD = 5
+        private const val RAPID_ACCELERATION_THRESHOLD = 4
+        private const val IDLING_THRESHOLD_MINUTES = 10
+        private const val FATIGUE_DRIVING_HOURS = 8
+        private const val ROUTE_DEVIATION_THRESHOLD_KM = 5
+        private const val MAX_ACTIVE_DRIVER_ALERTS = 50
+    }
+    
+    /**
+     * Initialize driver alert service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _driverAlertState.value = DriverAlertState.Initializing
+                
+                // Load driver alert configuration
+                loadDriverAlertConfiguration()
+                
+                // Initialize driver rules
+                initializeDriverRules()
+                
+                // Load active driver alerts
+                loadActiveDriverAlerts()
+                
+                // Start driver monitoring
+                startDriverMonitoring()
+                
+                isInitialized = true
+                _driverAlertState.value = DriverAlertState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _driverAlertState.value = DriverAlertState.Error("Failed to initialize driver alert service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create driver alert
+     */
+    suspend fun createDriverAlert(
+        driverId: String,
+        alertData: DriverAlertData
+    ): Result<DriverAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Driver alert service not initialized")
+                }
+                
+                // Validate alert data
+                validateDriverAlertData(driverId, alertData)
+                
+                // Determine alert severity
+                val severity = determineDriverSeverity(alertData)
+                
+                // Check for duplicate alerts
+                if (isDuplicateDriverAlert(driverId, alertData.alertType, severity)) {
+                    throw Exception("Duplicate driver alert detected")
+                }
+                
+                // Create alert
+                val alert = DriverAlert(
+                    id = UUID.randomUUID().toString(),
+                    driverId = driverId,
+                    alertType = alertData.alertType,
+                    severity = severity,
+                    title = generateAlertTitle(alertData),
+                    message = generateAlertMessage(alertData),
+                    location = alertData.location,
+                    vehicleId = alertData.vehicleId,
+                    currentSpeed = alertData.currentSpeed,
+                    speedLimit = alertData.speedLimit,
+                    drivingHours = alertData.drivingHours,
+                    recipients = determineDriverRecipients(driverId, severity, alertData),
+                    metadata = alertData.toMetadata(),
+                    status = DriverAlertStatus.ACTIVE,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    acknowledgedAt = null,
+                    acknowledgedBy = null,
+                    resolvedAt = null,
+                    resolvedBy = null,
+                    resolution = null
+                )
+                
+                // Save alert to database
+                database.driverAlertDao().insertAlert(alert.toEntity())
+                
+                // Add to active alerts
+                addToActiveDriverAlerts(alert)
+                
+                // Process alert
+                processDriverAlert(alert)
+                
+                // Update analytics
+                updateDriverAnalytics()
+                
+                // Notify listeners
+                notifyDriverAlertCreated(alert)
+                
+                Result.success(alert)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle speeding alert
+     */
+    suspend fun handleSpeedingAlert(
+        driverId: String,
+        currentSpeed: Float,
+        speedLimit: Float,
+        location: String,
+        vehicleId: String
+    ): Result<DriverAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get driver details
+                val driver = database.driverDao().getDriverById(driverId.toLong())
+                    ?: throw Exception("Driver not found")
+                
+                // Create speeding alert data
+                val alertData = DriverAlertData(
+                    alertType = DriverAlertType.SPEEDING,
+                    currentSpeed = currentSpeed,
+                    speedLimit = speedLimit,
+                    location = location,
+                    vehicleId = vehicleId,
+                    speedViolation = currentSpeed - speedLimit,
+                    urgency = determineSpeedingUrgency(currentSpeed, speedLimit),
+                    metadata = mapOf(
+                        "driverName" to driver.name,
+                        "vehicleId" to vehicleId,
+                        "speedingPercentage" to ((currentSpeed / speedLimit) * 100).toString()
+                    )
+                )
+                
+                createDriverAlert(driverId, alertData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle harsh braking alert
+     */
+    suspend fun handleHarshBrakingAlert(
+        driverId: String,
+        brakingForce: Float,
+        location: String,
+        vehicleId: String
+    ): Result<DriverAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get driver details
+                val driver = database.driverDao().getDriverById(driverId.toLong())
+                    ?: throw Exception("Driver not found")
+                
+                // Create harsh braking alert data
+                val alertData = DriverAlertData(
+                    alertType = DriverAlertType.HARSH_BRAKING,
+                    location = location,
+                    vehicleId = vehicleId,
+                    brakingForce = brakingForce,
+                    urgency = determineBrakingUrgency(brakingForce),
+                    metadata = mapOf(
+                        "driverName" to driver.name,
+                        "vehicleId" to vehicleId,
+                        "brakingForce" to brakingForce.toString()
+                    )
+                )
+                
+                createDriverAlert(driverId, alertData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle rapid acceleration alert
+     */
+    suspend fun handleRapidAccelerationAlert(
+        driverId: String,
+        accelerationForce: Float,
+        location: String,
+        vehicleId: String
+    ): Result<DriverAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get driver details
+                val driver = database.driverDao().getDriverById(driverId.toLong())
+                    ?: throw Exception("Driver not found")
+                
+                // Create rapid acceleration alert data
+                val alertData = DriverAlertData(
+                    alertType = DriverAlertType.RAPID_ACCELERATION,
+                    location = location,
+                    vehicleId = vehicleId,
+                    accelerationForce = accelerationForce,
+                    urgency = determineAccelerationUrgency(accelerationForce),
+                    metadata = mapOf(
+                        "driverName" to driver.name,
+                        "vehicleId" to vehicleId,
+                        "accelerationForce" to accelerationForce.toString()
+                    )
+                )
+                
+                createDriverAlert(driverId, alertData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle driver fatigue alert
+     */
+    suspend fun handleDriverFatigueAlert(
+        driverId: String,
+        drivingHours: Float,
+        lastRestTime: Date,
+        location: String,
+        vehicleId: String
+    ): Result<DriverAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get driver details
+                val driver = database.driverDao().getDriverById(driverId.toLong())
+                    ?: throw Exception("Driver not found")
+                
+                // Calculate hours since last rest
+                val hoursSinceRest = ((Date().time - lastRestTime.time) / (1000 * 60 * 60)).toFloat()
+                
+                // Create driver fatigue alert data
+                val alertData = DriverAlertData(
+                    alertType = DriverAlertType.DRIVER_FATIGUE,
+                    drivingHours = drivingHours,
+                    lastRestTime = lastRestTime,
+                    hoursSinceRest = hoursSinceRest,
+                    location = location,
+                    vehicleId = vehicleId,
+                    urgency = determineFatigueUrgency(drivingHours, hoursSinceRest),
+                    metadata = mapOf(
+                        "driverName" to driver.name,
+                        "vehicleId" to vehicleId,
+                        "drivingHours" to drivingHours.toString(),
+                        "hoursSinceRest" to hoursSinceRest.toString()
+                    )
+                )
+                
+                createDriverAlert(driverId, alertData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle idling alert
+     */
+    suspend fun handleIdlingAlert(
+        driverId: String,
+        idlingDuration: Int,
+        location: String,
+        vehicleId: String
+    ): Result<DriverAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get driver details
+                val driver = database.driverDao().getDriverById(driverId.toLong())
+                    ?: throw Exception("Driver not found")
+                
+                // Create idling alert data
+                val alertData = DriverAlertData(
+                    alertType = DriverAlertType.IDLING,
+                    idlingDuration = idlingDuration,
+                    location = location,
+                    vehicleId = vehicleId,
+                    urgency = determineIdlingUrgency(idlingDuration),
+                    metadata = mapOf(
+                        "driverName" to driver.name,
+                        "vehicleId" to vehicleId,
+                        "idlingDuration" to idlingDuration.toString()
+                    )
+                )
+                
+                createDriverAlert(driverId, alertData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle route deviation alert
+     */
+    suspend fun handleRouteDeviationAlert(
+        driverId: String,
+        currentLocation: String,
+        plannedRoute: String,
+        deviationDistance: Float,
+        vehicleId: String
+    ): Result<DriverAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get driver details
+                val driver = database.driverDao().getDriverById(driverId.toLong())
+                    ?: throw Exception("Driver not found")
+                
+                // Create route deviation alert data
+                val alertData = DriverAlertData(
+                    alertType = DriverAlertType.ROUTE_DEVIATION,
+                    currentLocation = currentLocation,
+                    plannedRoute = plannedRoute,
+                    deviationDistance = deviationDistance,
+                    location = currentLocation,
+                    vehicleId = vehicleId,
+                    urgency = determineRouteDeviationUrgency(deviationDistance),
+                    metadata = mapOf(
+                        "driverName" to driver.name,
+                        "vehicleId" to vehicleId,
+                        "deviationDistance" to deviationDistance.toString()
+                    )
+                )
+                
+                createDriverAlert(driverId, alertData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Handle emergency alert
+     */
+    suspend fun handleEmergencyAlert(
+        driverId: String,
+        emergencyType: String,
+        description: String,
+        location: String,
+        vehicleId: String
+    ): Result<DriverAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get driver details
+                val driver = database.driverDao().getDriverById(driverId.toLong())
+                    ?: throw Exception("Driver not found")
+                
+                // Create emergency alert data
+                val alertData = DriverAlertData(
+                    alertType = DriverAlertType.EMERGENCY,
+                    emergencyType = emergencyType,
+                    description = description,
+                    location = location,
+                    vehicleId = vehicleId,
+                    urgency = DriverUrgency.EMERGENCY,
+                    metadata = mapOf(
+                        "driverName" to driver.name,
+                        "vehicleId" to vehicleId,
+                        "emergencyType" to emergencyType
+                    )
+                )
+                
+                createDriverAlert(driverId, alertData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Resolve driver alert
+     */
+    suspend fun resolveDriverAlert(
+        alertId: String,
+        resolvedBy: String,
+        resolution: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activeDriverAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Driver alert not found")
+                
+                // Update alert status
+                val resolvedAlert = alert.copy(
+                    status = DriverAlertStatus.RESOLVED,
+                    resolvedAt = Date(),
+                    resolvedBy = resolvedBy,
+                    resolution = resolution,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.driverAlertDao().updateAlert(resolvedAlert.toEntity())
+                
+                // Remove from active alerts
+                removeFromActiveDriverAlerts(alertId)
+                
+                // Update analytics
+                updateDriverAnalytics()
+                
+                // Notify listeners
+                notifyDriverAlertResolved(resolvedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get driver alerts by severity
+     */
+    suspend fun getDriverAlertsBySeverity(severity: DriverSeverity): List<DriverAlert> {
+        return _activeDriverAlerts.value.filter { it.severity == severity }
+    }
+    
+    /**
+     * Get driver alerts by driver
+     */
+    suspend fun getDriverAlertsByDriver(driverId: String): List<DriverAlert> {
+        return _activeDriverAlerts.value.filter { it.driverId == driverId }
+    }
+    
+    /**
+     * Get active driver alerts
+     */
+    suspend fun getActiveDriverAlerts(): List<DriverAlert> {
+        return _activeDriverAlerts.value.filter { it.status == DriverAlertStatus.ACTIVE }
+    }
+    
+    /**
+     * Get driver analytics
+     */
+    suspend fun getDriverAnalytics(dateRange: DateRange = DateRange.last30Days()): Result<DriverAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val analytics = database.driverAlertDao().getDriverAnalytics(dateRange.startDate, dateRange.endDate)
+                Result.success(analytics)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add driver alert listener
+     */
+    fun addDriverAlertListener(listener: DriverAlertListener) {
+        driverAlertListeners.add(listener)
+    }
+    
+    /**
+     * Remove driver alert listener
+     */
+    fun removeDriverAlertListener(listener: DriverAlertListener) {
+        driverAlertListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadDriverAlertConfiguration() {
+        // Load driver alert configuration
+    }
+    
+    private suspend fun initializeDriverRules() {
+        // Initialize driver rules
+    }
+    
+    private suspend fun loadActiveDriverAlerts() {
+        try {
+            val alerts = database.driverAlertDao().getActiveAlerts()
+                .map { it.toDomainModel() }
+                .sortedByDescending { it.createdAt }
+                .take(MAX_ACTIVE_DRIVER_ALERTS)
+            
+            _activeDriverAlerts.value = alerts
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun startDriverMonitoring() {
+        // Start driver monitoring
+    }
+    
+    private fun validateDriverAlertData(driverId: String, alertData: DriverAlertData) {
+        if (driverId.isBlank()) throw Exception("Driver ID cannot be empty")
+    }
+    
+    private fun determineDriverSeverity(alertData: DriverAlertData): DriverSeverity {
+        return when (alertData.alertType) {
+            DriverAlertType.EMERGENCY -> DriverSeverity.CRITICAL
+            DriverAlertType.SPEEDING -> {
+                if (alertData.currentSpeed >= SPEEDING_THRESHOLD_KMH + 20) DriverSeverity.SEVERE
+                else if (alertData.currentSpeed >= SPEEDING_THRESHOLD_KMH + 10) DriverSeverity.HIGH
+                else DriverSeverity.MEDIUM
+            }
+            DriverAlertType.DRIVER_FATIGUE -> {
+                if (alertData.drivingHours >= FATIGUE_DRIVING_HOURS + 2) DriverSeverity.CRITICAL
+                else if (alertData.drivingHours >= FATIGUE_DRIVING_HOURS) DriverSeverity.HIGH
+                else DriverSeverity.MEDIUM
+            }
+            DriverAlertType.HARSH_BRAKING,
+            DriverAlertType.RAPID_ACCELERATION -> DriverSeverity.MEDIUM
+            DriverAlertType.ROUTE_DEVIATION -> DriverSeverity.HIGH
+            DriverAlertType.IDLING -> DriverSeverity.LOW
+            else -> DriverSeverity.LOW
+        }
+    }
+    
+    private fun isDuplicateDriverAlert(driverId: String, alertType: DriverAlertType, severity: DriverSeverity): Boolean {
+        val cutoffTime = Date(System.currentTimeMillis() - 5 * 60 * 1000L) // 5 minutes
+        return _activeDriverAlerts.value.any { alert ->
+            alert.driverId == driverId &&
+            alert.alertType == alertType &&
+            alert.severity == severity &&
+            alert.createdAt.after(cutoffTime)
+        }
+    }
+    
+    private fun determineSpeedingUrgency(currentSpeed: Float, speedLimit: Float): DriverUrgency {
+        val speedingPercentage = ((currentSpeed / speedLimit) - 1) * 100
+        return when {
+            speedingPercentage >= 50 -> DriverUrgency.EMERGENCY
+            speedingPercentage >= 25 -> DriverUrgency.CRITICAL
+            speedingPercentage >= 10 -> DriverUrgency.HIGH
+            else -> DriverUrgency.NORMAL
+        }
+    }
+    
+    private fun determineBrakingUrgency(brakingForce: Float): DriverUrgency {
+        return when {
+            brakingForce >= HARSH_BRAKING_THRESHOLD + 3 -> DriverUrgency.HIGH
+            brakingForce >= HARSH_BRAKING_THRESHOLD -> DriverUrgency.NORMAL
+            else -> DriverUrgency.NORMAL
+        }
+    }
+    
+    private fun determineAccelerationUrgency(accelerationForce: Float): DriverUrgency {
+        return when {
+            accelerationForce >= RAPID_ACCELERATION_THRESHOLD + 2 -> DriverUrgency.HIGH
+            accelerationForce >= RAPID_ACCELERATION_THRESHOLD -> DriverUrgency.NORMAL
+            else -> DriverUrgency.NORMAL
+        }
+    }
+    
+    private fun determineFatigueUrgency(drivingHours: Float, hoursSinceRest: Float): DriverUrgency {
+        return when {
+            drivingHours >= FATIGUE_DRIVING_HOURS + 2 || hoursSinceRest >= 10 -> DriverUrgency.EMERGENCY
+            drivingHours >= FATIGUE_DRIVING_HOURS || hoursSinceRest >= 8 -> DriverUrgency.CRITICAL
+            drivingHours >= FATIGUE_DRIVING_HOURS - 2 || hoursSinceRest >= 6 -> DriverUrgency.HIGH
+            else -> DriverUrgency.NORMAL
+        }
+    }
+    
+    private fun determineIdlingUrgency(idlingDuration: Int): DriverUrgency {
+        return when {
+            idlingDuration >= IDLING_THRESHOLD_MINUTES * 3 -> DriverUrgency.HIGH
+            idlingDuration >= IDLING_THRESHOLD_MINUTES -> DriverUrgency.NORMAL
+            else -> DriverUrgency.NORMAL
+        }
+    }
+    
+    private fun determineRouteDeviationUrgency(deviationDistance: Float): DriverUrgency {
+        return when {
+            deviationDistance >= ROUTE_DEVIATION_THRESHOLD_KM * 3 -> DriverUrgency.EMERGENCY
+            deviationDistance >= ROUTE_DEVIATION_THRESHOLD_KM * 2 -> DriverUrgency.HIGH
+            deviationDistance >= ROUTE_DEVIATION_THRESHOLD_KM -> DriverUrgency.NORMAL
+            else -> DriverUrgency.NORMAL
+        }
+    }
+    
+    private fun determineDriverRecipients(
+        driverId: String,
+        severity: DriverSeverity,
+        alertData: DriverAlertData
+    ): List<NotificationRecipient> {
+        val recipients = mutableListOf<NotificationRecipient>()
+        
+        // Get driver details
+        val driver = database.driverDao().getDriverById(driverId.toLong())
+        
+        // Always notify supervisor for critical alerts
+        if (severity == DriverSeverity.CRITICAL || severity == DriverSeverity.SEVERE) {
+            recipients.add(
+                NotificationRecipient(
+                    id = "driver_supervisor",
+                    type = RecipientType.ADMIN,
+                    address = "supervisor@edham.com",
+                    name = "Driver Supervisor"
+                )
+            )
+        }
+        
+        // Notify fleet manager for safety-related alerts
+        if (alertData.alertType == DriverAlertType.EMERGENCY || 
+            alertData.alertType == DriverAlertType.SPEEDING ||
+            alertData.alertType == DriverAlertType.DRIVER_FATIGUE) {
+            recipients.add(
+                NotificationRecipient(
+                    id = "fleet_manager",
+                    type = RecipientType.ADMIN,
+                    address = "fleet@edham.com",
+                    name = "Fleet Manager"
+                )
+            )
+        }
+        
+        // Notify driver (for awareness)
+        driver?.let {
+            if (alertData.alertType != DriverAlertType.EMERGENCY) {
+                recipients.add(
+                    NotificationRecipient(
+                        id = driverId,
+                        type = RecipientType.DRIVER,
+                        address = it.phone ?: "",
+                        name = it.name
+                    )
+                )
+            }
+        }
+        
+        return recipients
+    }
+    
+    private suspend fun processDriverAlert(alert: DriverAlert) {
+        try {
+            // Create notification request
+            val notificationRequest = NotificationRequest(
+                title = alert.title,
+                message = alert.message,
+                category = NotificationCategory.DRIVER,
+                priority = mapSeverityToPriority(alert.severity),
+                recipients = alert.recipients,
+                data = alert.metadata + mapOf(
+                    "alertId" to alert.id,
+                    "driverId" to alert.driverId,
+                    "alertType" to alert.alertType.name,
+                    "location" to (alert.location ?: "")
+                ),
+                channels = determineNotificationChannels(alert)
+            )
+            
+            // Send notification
+            smartNotificationManager.sendNotification(notificationRequest)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun generateAlertTitle(alertData: DriverAlertData): String {
+        return when (alertData.alertType) {
+            DriverAlertType.SPEEDING -> "تجاوز السرعة"
+            DriverAlertType.HARSH_BRAKING -> "كبح مفاجئ"
+            DriverAlertType.RAPID_ACCELERATION -> "تسارع مفاجئ"
+            DriverAlertType.DRIVER_FATIGUE -> "إرهاق السائق"
+            DriverAlertType.IDLING -> "توقف طويل"
+            DriverAlertType.ROUTE_DEVIATION -> "انحراف عن المسار"
+            DriverAlertType.EMERGENCY -> "طوارئ السائق"
+        }
+    }
+    
+    private fun generateAlertMessage(alertData: DriverAlertData): String {
+        return when (alertData.alertType) {
+            DriverAlertType.SPEEDING -> 
+                "السائق يتجاوز السرعة المسموح بها (${alertData.currentSpeed} كم/ساعة، الحد: ${alertData.speedLimit} كم/ساعة)"
+            DriverAlertType.HARSH_BRAKING -> 
+                "تم اكتشاف كبح مفاجئ بقوة ${alertData.brakingForce} في ${alertData.location}"
+            DriverAlertType.RAPID_ACCELERATION -> 
+                "تم اكتشاف تسارع مفاجئ بقوة ${alertData.accelerationForce} في ${alertData.location}"
+            DriverAlertType.DRIVER_FATIGUE -> 
+                "علامات إرهاق detected. ساعات القيادة: ${alertData.drivingHours}. آخر راحة: ${alertData.lastRestTime}"
+            DriverAlertType.IDLING -> 
+                "السائق متوقف لمدة ${alertData.idlingDuration} دقيقة في ${alertData.location}"
+            DriverAlertType.ROUTE_DEVIATION -> 
+                "السائق انحرف عن المسار المحدد بمقدار ${alertData.deviationDistance} كم"
+            DriverAlertType.EMERGENCY -> 
+                "حالة طوارئ: ${alertData.emergencyType}. ${alertData.description}. الموقع: ${alertData.location}"
+        }
+    }
+    
+    private fun mapSeverityToPriority(severity: DriverSeverity): NotificationPriority {
+        return when (severity) {
+            DriverSeverity.CRITICAL -> NotificationPriority.EMERGENCY
+            DriverSeverity.SEVERE -> NotificationPriority.HIGH
+            DriverSeverity.HIGH -> NotificationPriority.HIGH
+            DriverSeverity.MEDIUM -> NotificationPriority.NORMAL
+            DriverSeverity.LOW -> NotificationPriority.NORMAL
+        }
+    }
+    
+    private fun determineNotificationChannels(alert: DriverAlert): List<NotificationChannel> {
+        return when (alert.severity) {
+            DriverSeverity.CRITICAL -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL,
+                NotificationChannel.IN_APP
+            )
+            DriverSeverity.SEVERE -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL
+            )
+            DriverSeverity.HIGH -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.EMAIL
+            )
+            DriverSeverity.MEDIUM -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.IN_APP
+            )
+            DriverSeverity.LOW -> listOf(
+                NotificationChannel.IN_APP
+            )
+        }
+    }
+    
+    private fun addToActiveDriverAlerts(alert: DriverAlert) {
+        val currentAlerts = _activeDriverAlerts.value.toMutableList()
+        currentAlerts.add(0, alert)
+        
+        // Keep only max alerts
+        if (currentAlerts.size > MAX_ACTIVE_DRIVER_ALERTS) {
+            currentAlerts.removeAt(currentAlerts.size - 1)
+        }
+        
+        _activeDriverAlerts.value = currentAlerts
+    }
+    
+    private fun removeFromActiveDriverAlerts(alertId: String) {
+        val currentAlerts = _activeDriverAlerts.value.toMutableList()
+        currentAlerts.removeAll { it.id == alertId }
+        _activeDriverAlerts.value = currentAlerts
+    }
+    
+    private suspend fun updateDriverAnalytics() {
+        try {
+            val alerts = _activeDriverAlerts.value
+            val analytics = DriverAnalytics(
+                totalActive = alerts.size,
+                criticalAlerts = alerts.count { it.severity == DriverSeverity.CRITICAL },
+                severeAlerts = alerts.count { it.severity == DriverSeverity.SEVERE },
+                highAlerts = alerts.count { it.severity == DriverSeverity.HIGH },
+                mediumAlerts = alerts.count { it.severity == DriverSeverity.MEDIUM },
+                lowAlerts = alerts.count { it.severity == DriverSeverity.LOW },
+                typeStats = alerts.groupBy { it.alertType }
+                    .mapValues { it.value.size },
+                driverStats = alerts.groupBy { it.driverId }
+                    .mapValues { it.value.size }
+            )
+            
+            _driverAnalytics.value = analytics
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun notifyDriverAlertCreated(alert: DriverAlert) {
+        driverAlertListeners.forEach { listener ->
+            listener.onDriverAlertCreated(alert)
+        }
+    }
+    
+    private fun notifyDriverAlertResolved(alert: DriverAlert) {
+        driverAlertListeners.forEach { listener ->
+            listener.onDriverAlertResolved(alert)
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class DriverAlertData(
+    val alertType: DriverAlertType,
+    val currentSpeed: Float? = null,
+    val speedLimit: Float? = null,
+    val location: String? = null,
+    val vehicleId: String? = null,
+    val speedViolation: Float? = null,
+    val brakingForce: Float? = null,
+    val accelerationForce: Float? = null,
+    val drivingHours: Float? = null,
+    val lastRestTime: Date? = null,
+    val hoursSinceRest: Float? = null,
+    val idlingDuration: Int? = null,
+    val currentLocation: String? = null,
+    val plannedRoute: String? = null,
+    val deviationDistance: Float? = null,
+    val emergencyType: String? = null,
+    val description: String? = null,
+    val urgency: DriverUrgency = DriverUrgency.NORMAL,
+    val metadata: Map<String, String> = emptyMap()
+) {
+    fun toMetadata(): Map<String, String> {
+        return metadata + mapOf(
+            "alertType" to alertType.name,
+            "currentSpeed" to (currentSpeed?.toString() ?: ""),
+            "speedLimit" to (speedLimit?.toString() ?: ""),
+            "location" to (location ?: ""),
+            "vehicleId" to (vehicleId ?: ""),
+            "speedViolation" to (speedViolation?.toString() ?: ""),
+            "brakingForce" to (brakingForce?.toString() ?: ""),
+            "accelerationForce" to (accelerationForce?.toString() ?: ""),
+            "drivingHours" to (drivingHours?.toString() ?: ""),
+            "lastRestTime" to (lastRestTime?.toString() ?: ""),
+            "hoursSinceRest" to (hoursSinceRest?.toString() ?: ""),
+            "idlingDuration" to (idlingDuration?.toString() ?: ""),
+            "currentLocation" to (currentLocation ?: ""),
+            "plannedRoute" to (plannedRoute ?: ""),
+            "deviationDistance" to (deviationDistance?.toString() ?: ""),
+            "emergencyType" to (emergencyType ?: ""),
+            "description" to (description ?: ""),
+            "urgency" to urgency.name
+        )
+    }
+}
+
+data class DriverAlert(
+    val id: String,
+    val driverId: String,
+    val alertType: DriverAlertType,
+    val severity: DriverSeverity,
+    val title: String,
+    val message: String,
+    val location: String?,
+    val vehicleId: String?,
+    val currentSpeed: Float?,
+    val speedLimit: Float?,
+    val drivingHours: Float?,
+    val recipients: List<NotificationRecipient>,
+    val metadata: Map<String, String>,
+    val status: DriverAlertStatus,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val acknowledgedAt: Date?,
+    val acknowledgedBy: String?,
+    val resolvedAt: Date?,
+    val resolvedBy: String?,
+    val resolution: String?
+)
+
+data class DriverAnalytics(
+    val totalActive: Int = 0,
+    val criticalAlerts: Int = 0,
+    val severeAlerts: Int = 0,
+    val highAlerts: Int = 0,
+    val mediumAlerts: Int = 0,
+    val lowAlerts: Int = 0,
+    val typeStats: Map<DriverAlertType, Int> = emptyMap(),
+    val driverStats: Map<String, Int> = emptyMap()
+)
+
+/**
+ * Interfaces
+ */
+interface DriverAlertListener {
+    fun onDriverAlertCreated(alert: DriverAlert)
+    fun onDriverAlertResolved(alert: DriverAlert)
+}
+
+/**
+ * Enums
+ */
+enum class DriverAlertState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class DriverSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    SEVERE,
+    CRITICAL
+}
+
+enum class DriverAlertStatus {
+    ACTIVE,
+    ACKNOWLEDGED,
+    RESOLVED
+}
+
+enum class DriverAlertType {
+    SPEEDING,
+    HARSH_BRAKING,
+    RAPID_ACCELERATION,
+    DRIVER_FATIGUE,
+    IDLING,
+    ROUTE_DEVIATION,
+    EMERGENCY
+}
+
+enum class DriverUrgency {
+    NORMAL,
+    HIGH,
+    CRITICAL,
+    EMERGENCY
+}

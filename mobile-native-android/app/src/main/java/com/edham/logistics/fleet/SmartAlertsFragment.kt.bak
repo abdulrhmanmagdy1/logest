@@ -1,0 +1,395 @@
+package com.edham.logistics.fleet
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentSmartAlertsBinding
+import com.edham.logistics.fleet.adapters.SmartAlertAdapter
+import com.edham.logistics.fleet.models.SmartAlert
+import com.edham.logistics.fleet.viewmodels.SmartAlertsViewModel
+import com.google.android.material.chip.Chip
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Smart Alerts Fragment - Advanced alert management and notification system
+ * 
+ * Features:
+ * - Real-time alert notifications
+ * - Alert filtering and categorization
+ * - Priority-based alert management
+ * - Alert actions and resolution
+ * - Bulk alert operations
+ * - Alert history and analytics
+ * - Custom alert creation
+ */
+class SmartAlertsFragment @Inject constructor(
+    private val smartAlertAdapter: SmartAlertAdapter
+) : Fragment() {
+
+    private var _binding: FragmentSmartAlertsBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: SmartAlertsViewModel
+    private var selectedAlertTypes = mutableSetOf<String>()
+    private var selectedPriorities = mutableSetOf<String>()
+    
+    companion object {
+        private const val ALERT_TYPE_ALL = "الكل"
+        private const val PRIORITY_ALL = "جميع الأولويات"
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentSmartAlertsBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupRecyclerView()
+        setupClickListeners()
+        setupChipListeners()
+        observeViewModel()
+        
+        // Load initial data
+        viewModel.loadAlerts()
+    }
+
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[SmartAlertsViewModel::class.java]
+    }
+
+    private fun setupRecyclerView() {
+        binding.rvAlerts.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = smartAlertAdapter
+            isNestedScrollingEnabled = false
+        }
+    }
+
+    private fun setupClickListeners() {
+        // Clear filters
+        binding.btnClearFilters.setOnClickListener {
+            clearAllFilters()
+        }
+        
+        // Load more alerts
+        binding.btnLoadMore.setOnClickListener {
+            loadMoreAlerts()
+        }
+        
+        // Mark all as read
+        binding.fabMarkAllRead.setOnClickListener {
+            markAllAlertsAsRead()
+        }
+        
+        // Create new alert
+        binding.fabCreateAlert.setOnClickListener {
+            showCreateAlertDialog()
+        }
+        
+        // Toolbar menu
+        binding.toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_refresh -> {
+                    refreshAlerts()
+                    true
+                }
+                R.id.action_settings -> {
+                    navigateToAlertSettings()
+                    true
+                }
+                R.id.action_export -> {
+                    exportAlerts()
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun setupChipListeners() {
+        // Alert type chips
+        binding.chipGroupAlertType.setOnCheckedStateChangeListener { group, checkedIds ->
+            selectedAlertTypes.clear()
+            
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as Chip
+                if (chip.isChecked) {
+                    selectedAlertTypes.add(chip.text.toString())
+                }
+            }
+            
+            // Apply filter
+            applyFilters()
+        }
+        
+        // Priority chips
+        binding.chipGroupPriority.setOnCheckedStateChangeListener { group, checkedIds ->
+            selectedPriorities.clear()
+            
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as Chip
+                if (chip.isChecked) {
+                    selectedPriorities.add(chip.text.toString())
+                }
+            }
+            
+            // Apply filter
+            applyFilters()
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.alertsState.collect { state ->
+                when (state) {
+                    is SmartAlertsState.Loading -> {
+                        showLoadingState()
+                    }
+                    is SmartAlertsState.Success -> {
+                        hideLoadingState()
+                        updateAlertsList(state.alerts)
+                        updateAlertSummary(state.summary)
+                    }
+                    is SmartAlertsState.Error -> {
+                        hideLoadingState()
+                        showError(state.message)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.filteredAlerts.collect { alerts ->
+                smartAlertAdapter.submitList(alerts)
+                updateAlertCount(alerts.size)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.alertActions.collect { action ->
+                handleAlertAction(action)
+            }
+        }
+    }
+
+    private fun updateAlertsList(alerts: List<SmartAlert>) {
+        smartAlertAdapter.submitList(alerts)
+        
+        // Show/hide load more button
+        binding.btnLoadMore.visibility = if (alerts.size >= 20) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
+    }
+
+    private fun updateAlertSummary(summary: AlertSummary) {
+        binding.tvCriticalCount.text = summary.criticalCount.toString()
+        binding.tvHighCount.text = summary.highCount.toString()
+        binding.tvMediumCount.text = summary.mediumCount.toString()
+        binding.tvLowCount.text = summary.lowCount.toString()
+        
+        // Animate number changes
+        animateNumberChange(binding.tvCriticalCount, summary.criticalCount.toString())
+        animateNumberChange(binding.tvHighCount, summary.highCount.toString())
+        animateNumberChange(binding.tvMediumCount, summary.mediumCount.toString())
+        animateNumberChange(binding.tvLowCount, summary.lowCount.toString())
+    }
+
+    private fun updateAlertCount(count: Int) {
+        binding.tvAlertCount.text = "$count تنبيه"
+    }
+
+    private fun applyFilters() {
+        val typeFilter = if (selectedAlertTypes.contains(ALERT_TYPE_ALL)) {
+            emptyList()
+        } else {
+            selectedAlertTypes.toList()
+        }
+        
+        val priorityFilter = if (selectedPriorities.contains(PRIORITY_ALL)) {
+            emptyList()
+        } else {
+            selectedPriorities.toList()
+        }
+        
+        viewModel.applyFilters(typeFilter, priorityFilter)
+    }
+
+    private fun clearAllFilters() {
+        // Reset chip selections
+        binding.chipGroupAlertType.clearCheck()
+        binding.chipGroupPriority.clearCheck()
+        
+        // Select "All" options
+        (binding.chipGroupAlertType.getChildAt(0) as Chip).isChecked = true
+        (binding.chipGroupPriority.getChildAt(0) as Chip).isChecked = true
+        
+        // Clear filter sets
+        selectedAlertTypes.clear()
+        selectedPriorities.clear()
+        selectedAlertTypes.add(ALERT_TYPE_ALL)
+        selectedPriorities.add(PRIORITY_ALL)
+        
+        // Apply cleared filters
+        applyFilters()
+    }
+
+    private fun loadMoreAlerts() {
+        binding.progressLoadMore.visibility = View.VISIBLE
+        viewModel.loadMoreAlerts { success ->
+            binding.progressLoadMore.visibility = View.GONE
+        }
+    }
+
+    private fun markAllAlertsAsRead() {
+        viewModel.markAllAsRead { success, message ->
+            if (success) {
+                showSuccessMessage("تم تعيين جميع التنبيهات كمقروءة")
+            } else {
+                showErrorMessage("فشل تعيين التنبيهات كمقروءة: $message")
+            }
+        }
+    }
+
+    private fun showCreateAlertDialog() {
+        // Show create alert dialog
+        val dialog = CreateAlertDialogFragment()
+        dialog.show(childFragmentManager, "create_alert_dialog")
+        
+        // Listen for alert creation
+        dialog.setOnAlertCreated { alert ->
+            viewModel.createAlert(alert)
+        }
+    }
+
+    private fun refreshAlerts() {
+        viewModel.refreshAlerts()
+    }
+
+    private fun navigateToAlertSettings() {
+        // Navigate to alert settings screen
+    }
+
+    private fun exportAlerts() {
+        viewModel.exportAlerts { success, message ->
+            if (success) {
+                showSuccessMessage("تم تصدير التنبيهات بنجاح")
+            } else {
+                showErrorMessage("فشل تصدير التنبيهات: $message")
+            }
+        }
+    }
+
+    private fun handleAlertAction(action: AlertAction) {
+        when (action) {
+            is AlertAction.MarkAsRead -> {
+                showSuccessMessage("تم تعيين التنبيه كمقروء")
+            }
+            is AlertAction.MarkAsUnread -> {
+                showSuccessMessage("تم تعيين التنبيه كغير مقروء")
+            }
+            is AlertAction.Dismiss -> {
+                showSuccessMessage("تم تجاهل التنبيه")
+            }
+            is AlertAction.Resolve -> {
+                showSuccessMessage("تم حل التنبيه")
+            }
+            is AlertAction.Snooze -> {
+                showSuccessMessage("تم تأجيل التنبيه لـ ${action.duration}")
+            }
+        }
+    }
+
+    private fun showLoadingState() {
+        binding.layoutLoading.visibility = View.VISIBLE
+        binding.contentGroup.visibility = View.GONE
+    }
+
+    private fun hideLoadingState() {
+        binding.layoutLoading.visibility = View.GONE
+        binding.contentGroup.visibility = View.VISIBLE
+    }
+
+    private fun showSuccessMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun showErrorMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_LONG
+        ).show()
+    }
+
+    private fun animateNumberChange(textView: android.widget.TextView, newValue: String) {
+        textView.animate()
+            .scaleX(1.2f)
+            .scaleY(1.2f)
+            .setDuration(100)
+            .withEndAction {
+                textView.text = newValue
+                textView.animate()
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(100)
+                    .start()
+            }
+            .start()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh alerts when fragment becomes visible
+        viewModel.refreshAlerts()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class AlertSummary(
+    val criticalCount: Int,
+    val highCount: Int,
+    val mediumCount: Int,
+    val lowCount: Int
+)
+
+sealed class SmartAlertsState {
+    object Loading : SmartAlertsState()
+    data class Success(val alerts: List<SmartAlert>, val summary: AlertSummary) : SmartAlertsState()
+    data class Error(val message: String) : SmartAlertsState()
+}
+
+sealed class AlertAction {
+    data class MarkAsRead(val alertId: String) : AlertAction()
+    data class MarkAsUnread(val alertId: String) : AlertAction()
+    data class Dismiss(val alertId: String) : AlertAction()
+    data class Resolve(val alertId: String, val resolution: String) : AlertAction()
+    data class Snooze(val alertId: String, val duration: String) : AlertAction()
+}

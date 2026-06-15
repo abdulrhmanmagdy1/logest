@@ -1,0 +1,722 @@
+package com.edham.logistics.shipment
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.ShipmentEntity
+import com.edham.logistics.data.local.entity.TemperatureReadingEntity
+import com.edham.logistics.data.local.entity.ColdChainViolationEntity
+import com.edham.logistics.data.remote.api.ShipmentApi
+import com.edham.logistics.tracking.TemperatureTracker
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Cold Chain Manager - Advanced cold chain shipment management system
+ * 
+ * Features:
+ * - Temperature monitoring
+ * - Cold chain compliance
+ * - Violation detection
+ * - Alert management
+ * - Quality assurance
+ * - Regulatory compliance
+ */
+@Singleton
+class ColdChainManager @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val shipmentApi: ShipmentApi,
+    private val temperatureTracker: TemperatureTracker,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _coldChainState = MutableStateFlow<ColdChainState>(ColdChainState.Idle)
+    val coldChainState: StateFlow<ColdChainState> = _coldChainState.asStateFlow()
+    
+    private val _coldChainShipments = MutableStateFlow<List<ColdChainShipment>>(emptyList())
+    val coldChainShipments: StateFlow<List<ColdChainShipment>> = _coldChainShipments.asStateFlow()
+    
+    private val _temperatureReadings = MutableStateFlow<List<TemperatureReadingEntity>>(emptyList())
+    val temperatureReadings: StateFlow<List<TemperatureReadingEntity>> = _temperatureReadings.asStateFlow()
+    
+    private val _violations = MutableStateFlow<List<ColdChainViolationEntity>>(emptyList())
+    val violations: StateFlow<List<ColdChainViolationEntity>> = _violations.asStateFlow()
+    
+    private val _complianceAnalytics = MutableStateFlow<ColdChainAnalytics?>(null)
+    val complianceAnalytics: StateFlow<ColdChainAnalytics?> = _complianceAnalytics.asStateFlow()
+    
+    private val _coldChainAlerts = MutableStateFlow<List<ColdChainAlert>>(emptyList())
+    val coldChainAlerts: StateFlow<List<ColdChainAlert>> = _coldChainAlerts.asStateFlow()
+    
+    private var isMonitoring = false
+    private var activeShipments: MutableSet<Long> = mutableSetOf()
+    private var complianceStandards: MutableMap<String, ComplianceStandard> = mutableMapOf()
+    
+    companion object {
+        private const val TAG = "ColdChainManager"
+        private const val MONITORING_INTERVAL = 30000L // 30 seconds
+        private const val VIOLATION_THRESHOLD = 5f // 5 degrees deviation
+        private const val CRITICAL_VIOLATION_THRESHOLD = 10f // 10 degrees deviation
+        private const val MAX_READINGS_PER_SHIPMENT = 1000
+        private const val COMPLIANCE_THRESHOLD = 0.95 // 95% compliance required
+    }
+    
+    init {
+        initializeComplianceStandards()
+    }
+    
+    /**
+     * Initialize compliance standards
+     */
+    private fun initializeComplianceStandards() {
+        complianceStandards["PHARMACEUTICAL"] = ComplianceStandard(
+            name = "Pharmaceutical",
+            minTemperature = 2f,
+            maxTemperature = 8f,
+            criticalMinTemperature = 0f,
+            criticalMaxTemperature = 10f,
+            maxDuration = 7200000L, // 2 hours
+            requiredDocumentation = listOf("Temperature log", "Chain of custody", "Quality certificate"),
+            alertThreshold = 3f
+        )
+        
+        complianceStandards["FOOD"] = ComplianceStandard(
+            name = "Food",
+            minTemperature = 0f,
+            maxTemperature = 4f,
+            criticalMinTemperature = -2f,
+            criticalMaxTemperature = 6f,
+            maxDuration = 14400000L, // 4 hours
+            requiredDocumentation = listOf("Temperature log", "Food safety certificate"),
+            alertThreshold = 2f
+        )
+        
+        complianceStandards["MEDICAL"] = ComplianceStandard(
+            name = "Medical Supplies",
+            minTemperature = 1f,
+            maxTemperature = 5f,
+            criticalMinTemperature = -1f,
+            criticalMaxTemperature = 7f,
+            maxDuration = 10800000L, // 3 hours
+            requiredDocumentation = listOf("Temperature log", "Medical certification", "Sterility report"),
+            alertThreshold = 4f
+        )
+        
+        complianceStandards["CHEMICAL"] = ComplianceStandard(
+            name = "Chemical",
+            minTemperature = 5f,
+            maxTemperature = 25f,
+            criticalMinTemperature = 0f,
+            criticalMaxTemperature = 30f,
+            maxDuration = 21600000L, // 6 hours
+            requiredDocumentation = listOf("Temperature log", "Safety data sheet", "Handling certificate"),
+            alertThreshold = 5f
+        )
+    }
+    
+    /**
+     * Start cold chain monitoring for shipment
+     */
+    suspend fun startMonitoring(shipmentId: Long): Result<ColdChainShipment> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _coldChainState.value = ColdChainState.Starting
+                
+                // Get shipment
+                val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                    ?: throw Exception("Shipment not found")
+                
+                // Validate cold chain requirements
+                if (!shipment.isColdChain) {
+                    throw Exception("Shipment is not a cold chain shipment")
+                }
+                
+                // Get compliance standard
+                val standard = getComplianceStandard(shipment.temperatureRequirements)
+                
+                // Create cold chain shipment
+                val coldChainShipment = ColdChainShipment(
+                    shipment = shipment,
+                    complianceStandard = standard,
+                    currentStatus = ColdChainStatus.MONITORING,
+                    complianceRate = 1.0f,
+                    violationCount = 0,
+                    lastTemperature = null,
+                    monitoringStartedAt = Date(),
+                    requirementsMet = true
+                )
+                
+                // Start temperature tracking
+                temperatureTracker.initialize(shipmentId, ColdChainRequirements(
+                    targetTemperature = standard.minTemperature,
+                    minTemperature = standard.minTemperature,
+                    maxTemperature = standard.maxTemperature,
+                    productType = shipment.temperatureRequirements,
+                    complianceStandard = standard.name
+                ))
+                temperatureTracker.startTracking()
+                
+                // Add to active shipments
+                activeShipments.add(shipmentId)
+                
+                // Update state
+                updateColdChainShipments()
+                
+                _coldChainState.value = ColdChainState.Monitoring
+                Result.success(coldChainShipment)
+                
+            } catch (e: Exception) {
+                _coldChainState.value = ColdChainState.Error("Failed to start monitoring: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Stop cold chain monitoring
+     */
+    suspend fun stopMonitoring(shipmentId: Long): Result<ColdChainShipment> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get cold chain shipment
+                val coldChainShipment = getColdChainShipment(shipmentId)
+                    ?: throw Exception("Cold chain shipment not found")
+                
+                // Stop temperature tracking
+                temperatureTracker.stopTracking()
+                
+                // Remove from active shipments
+                activeShipments.remove(shipmentId)
+                
+                // Generate final compliance report
+                val finalReport = generateComplianceReport(shipmentId)
+                
+                // Update shipment status
+                val updatedShipment = coldChainShipment.copy(
+                    currentStatus = ColdChainStatus.COMPLETED,
+                    monitoringEndedAt = Date(),
+                    finalComplianceReport = finalReport
+                )
+                
+                // Update state
+                updateColdChainShipments()
+                
+                _coldChainState.value = ColdChainState.Stopped
+                Result.success(updatedShipment)
+                
+            } catch (e: Exception) {
+                _coldChainState.value = ColdChainState.Error("Failed to stop monitoring: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Record temperature reading
+     */
+    suspend fun recordTemperatureReading(
+        shipmentId: Long,
+        temperature: Float,
+        sensorId: String,
+        location: String? = null,
+        recordedBy: String
+    ): Result<TemperatureReadingEntity> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Validate shipment is being monitored
+                if (!activeShipments.contains(shipmentId)) {
+                    throw Exception("Shipment is not being monitored")
+                }
+                
+                // Create temperature reading
+                val reading = TemperatureReadingEntity(
+                    id = 0,
+                    shipmentId = shipmentId,
+                    temperature = temperature,
+                    sensorId = sensorId,
+                    location = location,
+                    recordedAt = Date(),
+                    recordedBy = recordedBy,
+                    isValid = true,
+                    metadata = serializeReadingMetadata(),
+                    createdAt = Date()
+                )
+                
+                // Save reading
+                val readingId = database.temperatureReadingDao().insertReading(reading)
+                val savedReading = reading.copy(id = readingId)
+                
+                // Update temperature tracker
+                temperatureTracker.updateTemperature(temperature, sensorId)
+                
+                // Check for violations
+                checkTemperatureViolation(shipmentId, temperature, savedReading)
+                
+                // Update readings list
+                updateTemperatureReadings(shipmentId)
+                
+                Result.success(savedReading)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get cold chain shipments
+     */
+    suspend fun getColdChainShipments(): List<ColdChainShipment> {
+        return withContext(Dispatchers.IO) {
+            val coldChainShipments = database.shipmentDao().getShipmentsByColdChain(true)
+            
+            coldChainShipments.map { shipment ->
+                val standard = getComplianceStandard(shipment.temperatureRequirements)
+                val complianceRate = calculateComplianceRate(shipment.id)
+                val violationCount = database.coldChainViolationDao().getViolationCount(shipment.id)
+                val lastReading = database.temperatureReadingDao().getLatestReading(shipment.id)
+                
+                ColdChainShipment(
+                    shipment = shipment,
+                    complianceStandard = standard,
+                    currentStatus = determineColdChainStatus(shipment),
+                    complianceRate = complianceRate,
+                    violationCount = violationCount,
+                    lastTemperature = lastReading?.temperature,
+                    monitoringStartedAt = shipment.createdAt,
+                    requirementsMet = complianceRate >= COMPLIANCE_THRESHOLD
+                )
+            }
+        }
+    }
+    
+    /**
+     * Get temperature readings for shipment
+     */
+    suspend fun getTemperatureReadings(shipmentId: Long): List<TemperatureReadingEntity> {
+        return withContext(Dispatchers.IO) {
+            database.temperatureReadingDao().getReadingsByShipment(shipmentId)
+        }
+    }
+    
+    /**
+     * Get violations for shipment
+     */
+    suspend fun getViolations(shipmentId: Long): List<ColdChainViolationEntity> {
+        return withContext(Dispatchers.IO) {
+            database.coldChainViolationDao().getViolationsByShipment(shipmentId)
+        }
+    }
+    
+    /**
+     * Get compliance analytics
+     */
+    suspend fun getComplianceAnalytics(): ColdChainAnalytics {
+        return withContext(Dispatchers.IO) {
+            val allColdChainShipments = database.shipmentDao().getShipmentsByColdChain(true)
+            val allViolations = database.coldChainViolationDao().getAllViolations()
+            val allReadings = database.temperatureReadingDao().getAllReadings()
+            
+            val totalShipments = allColdChainShipments.size
+            val compliantShipments = allColdChainShipments.count { shipment ->
+                calculateComplianceRate(shipment.id) >= COMPLIANCE_THRESHOLD
+            }
+            val totalViolations = allViolations.size
+            val criticalViolations = allViolations.count { it.severity == ViolationSeverity.CRITICAL }
+            val averageTemperature = calculateAverageTemperature(allReadings)
+            val temperatureVariance = calculateTemperatureVariance(allReadings)
+            val complianceByStandard = calculateComplianceByStandard(allColdChainShipments)
+            val violationTypes = calculateViolationTypes(allViolations)
+            
+            ColdChainAnalytics(
+                totalShipments = totalShipments,
+                compliantShipments = compliantShipments,
+                complianceRate = if (totalShipments > 0) compliantShipments.toFloat() / totalShipments else 1f,
+                totalViolations = totalViolations,
+                criticalViolations = criticalViolations,
+                averageTemperature = averageTemperature,
+                temperatureVariance = temperatureVariance,
+                complianceByStandard = complianceByStandard,
+                violationTypes = violationTypes,
+                averageMonitoringDuration = calculateAverageMonitoringDuration(allColdChainShipments),
+                documentationCompliance = calculateDocumentationCompliance(allColdChainShipments)
+            )
+        }
+    }
+    
+    /**
+     * Generate compliance report
+     */
+    suspend fun generateComplianceReport(shipmentId: Long): ComplianceReport {
+        return withContext(Dispatchers.IO) {
+            val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                ?: throw Exception("Shipment not found")
+            
+            val readings = database.temperatureReadingDao().getReadingsByShipment(shipmentId)
+            val violations = database.coldChainViolationDao().getViolationsByShipment(shipmentId)
+            val standard = getComplianceStandard(shipment.temperatureRequirements)
+            
+            ComplianceReport(
+                shipmentId = shipmentId,
+                shipmentIdString = shipment.shipmentId,
+                standard = standard.name,
+                monitoringPeriod = calculateMonitoringPeriod(readings),
+                totalReadings = readings.size,
+                averageTemperature = readings.map { it.temperature }.average().toFloat(),
+                minTemperature = readings.minOfOrNull { it.temperature } ?: 0f,
+                maxTemperature = readings.maxOfOrNull { it.temperature } ?: 0f,
+                temperatureVariance = calculateTemperatureVariance(readings),
+                complianceRate = calculateComplianceRate(shipmentId),
+                violations = violations,
+                violationsByType = violations.groupBy { it.violationType }.mapValues { it.value.size },
+                documentationComplete = checkDocumentationCompleteness(shipment),
+                overallCompliance = determineOverallCompliance(shipmentId),
+                generatedAt = Date()
+            )
+        }
+    }
+    
+    /**
+     * Check temperature violation
+     */
+    private suspend fun checkTemperatureViolation(
+        shipmentId: Long,
+        temperature: Float,
+        reading: TemperatureReadingEntity
+    ) {
+        val shipment = database.shipmentDao().getShipmentById(shipmentId) ?: return
+        val standard = getComplianceStandard(shipment.temperatureRequirements)
+        
+        val isViolation = temperature < standard.minTemperature || temperature > standard.maxTemperature
+        val isCritical = temperature < standard.criticalMinTemperature || temperature > standard.criticalMaxTemperature
+        
+        if (isViolation) {
+            val violation = ColdChainViolationEntity(
+                id = 0,
+                shipmentId = shipmentId,
+                temperature = temperature,
+                expectedMin = standard.minTemperature,
+                expectedMax = standard.maxTemperature,
+                deviation = calculateDeviation(temperature, standard),
+                severity = if (isCritical) ViolationSeverity.CRITICAL else ViolationSeverity.WARNING,
+                violationType = if (temperature < standard.minTemperature) ViolationType.TOO_COLD else ViolationType.TOO_HOT,
+                readingId = reading.id,
+                occurredAt = reading.recordedAt,
+                resolvedAt = null,
+                resolvedBy = null,
+                resolutionAction = null,
+                createdAt = Date()
+            )
+            
+            // Save violation
+            val violationId = database.coldChainViolationDao().insertViolation(violation)
+            val savedViolation = violation.copy(id = violationId)
+            
+            // Update violations list
+            updateViolations(shipmentId)
+            
+            // Send alert
+            sendColdChainAlert(savedViolation)
+            
+            // Update temperature tracker
+            temperatureTracker.updateTemperature(temperature, reading.sensorId)
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private fun getComplianceStandard(requirements: String): ComplianceStandard {
+        return complianceStandards[requirements.uppercase()] ?: complianceStandards["FOOD"]!!
+    }
+    
+    private suspend fun getColdChainShipment(shipmentId: Long): ColdChainShipment? {
+        val shipments = getColdChainShipments()
+        return shipments.find { it.shipment.id == shipmentId }
+    }
+    
+    private fun updateColdChainShipments() {
+        // Implementation would update the cold chain shipments list
+    }
+    
+    private fun updateTemperatureReadings(shipmentId: Long) {
+        val readings = getTemperatureReadings(shipmentId)
+        _temperatureReadings.value = readings
+    }
+    
+    private fun updateViolations(shipmentId: Long) {
+        val violations = getViolations(shipmentId)
+        _violations.value = violations
+    }
+    
+    private fun calculateComplianceRate(shipmentId: Long): Float {
+        val readings = database.temperatureReadingDao().getReadingsByShipment(shipmentId)
+        if (readings.isEmpty()) return 1f
+        
+        val shipment = database.shipmentDao().getShipmentById(shipmentId) ?: return 1f
+        val standard = getComplianceStandard(shipment.temperatureRequirements)
+        
+        val compliantReadings = readings.count { reading ->
+            reading.temperature >= standard.minTemperature && reading.temperature <= standard.maxTemperature
+        }
+        
+        return compliantReadings.toFloat() / readings.size
+    }
+    
+    private fun determineColdChainStatus(shipment: ShipmentEntity): ColdChainStatus {
+        return when (shipment.status) {
+            ShipmentStatus.CREATED -> ColdChainStatus.PENDING
+            ShipmentStatus.ASSIGNED -> ColdChainStatus.PENDING
+            ShipmentStatus.SCHEDULED -> ColdChainStatus.PENDING
+            ShipmentStatus.IN_TRANSIT -> ColdChainStatus.ACTIVE
+            ShipmentStatus.DELIVERED -> ColdChainStatus.COMPLETED
+            ShipmentStatus.CANCELLED -> ColdChainStatus.CANCELLED
+            else -> ColdChainStatus.UNKNOWN
+        }
+    }
+    
+    private fun serializeReadingMetadata(): String {
+        // Implementation would serialize reading metadata
+        return "{}"
+    }
+    
+    private fun calculateDeviation(temperature: Float, standard: ComplianceStandard): Float {
+        return when {
+            temperature < standard.minTemperature -> standard.minTemperature - temperature
+            temperature > standard.maxTemperature -> temperature - standard.maxTemperature
+            else -> 0f
+        }
+    }
+    
+    private fun sendColdChainAlert(violation: ColdChainViolationEntity) {
+        val alert = ColdChainAlert(
+            type = ColdChainAlertType.TEMPERATURE_VIOLATION,
+            shipmentId = violation.shipmentId,
+            message = "Temperature violation detected: ${violation.temperature}°C (expected: ${violation.expectedMin}-${violation.expectedMax}°C)",
+            severity = violation.severity,
+            timestamp = violation.occurredAt,
+            data = mapOf(
+                "violationId" to violation.id,
+                "temperature" to violation.temperature,
+                "deviation" to violation.deviation,
+                "violationType" to violation.violationType
+            )
+        )
+        
+        val currentAlerts = _coldChainAlerts.value.toMutableList()
+        currentAlerts.add(alert)
+        _coldChainAlerts.value = currentAlerts
+    }
+    
+    private fun calculateAverageTemperature(readings: List<TemperatureReadingEntity>): Float {
+        if (readings.isEmpty()) return 0f
+        return readings.map { it.temperature }.average().toFloat()
+    }
+    
+    private fun calculateTemperatureVariance(readings: List<TemperatureReadingEntity>): Float {
+        if (readings.isEmpty()) return 0f
+        
+        val mean = readings.map { it.temperature }.average()
+        val variance = readings.map { (it.temperature - mean).pow(2).toDouble() }.average()
+        
+        return variance.toFloat()
+    }
+    
+    private fun calculateComplianceByStandard(shipments: List<ShipmentEntity>): Map<String, Float> {
+        return shipments.groupBy { it.temperatureRequirements }
+            .mapValues { (standard, shipments) ->
+                val compliantShipments = shipments.count { shipment ->
+                    calculateComplianceRate(shipment.id) >= COMPLIANCE_THRESHOLD
+                }
+                if (shipments.isNotEmpty()) compliantShipments.toFloat() / shipments.size else 1f
+            }
+    }
+    
+    private fun calculateViolationTypes(violations: List<ColdChainViolationEntity>): Map<ViolationType, Int> {
+        return violations.groupBy { it.violationType }.mapValues { it.value.size }
+    }
+    
+    private fun calculateAverageMonitoringDuration(shipments: List<ShipmentEntity>): Double {
+        if (shipments.isEmpty()) return 0.0
+        
+        val totalDuration = shipments.sumOf { shipment ->
+            val deliveredAt = shipment.deliveredAt?.time ?: System.currentTimeMillis()
+            deliveredAt - shipment.createdAt.time
+        }
+        
+        return totalDuration / shipments.size / (1000 * 60 * 60) // Convert to hours
+    }
+    
+    private fun calculateDocumentationCompliance(shipments: List<ShipmentEntity>): Float {
+        if (shipments.isEmpty()) return 1f
+        
+        val compliantShipments = shipments.count { shipment ->
+            checkDocumentationCompleteness(shipment)
+        }
+        
+        return compliantShipments.toFloat() / shipments.size
+    }
+    
+    private fun checkDocumentationCompleteness(shipment: ShipmentEntity): Boolean {
+        // Implementation would check if all required documentation is present
+        return true // Placeholder
+    }
+    
+    private fun determineOverallCompliance(shipmentId: Long): OverallCompliance {
+        val complianceRate = calculateComplianceRate(shipmentId)
+        val violations = database.coldChainViolationDao().getViolationsByShipment(shipmentId)
+        
+        return when {
+            complianceRate >= 0.95 && violations.isEmpty() -> OverallCompliance.EXCELLENT
+            complianceRate >= 0.90 && violations.all { it.severity != ViolationSeverity.CRITICAL } -> OverallCompliance.GOOD
+            complianceRate >= 0.80 -> OverallCompliance.ACCEPTABLE
+            complianceRate >= 0.70 -> OverallCompliance.NEEDS_IMPROVEMENT
+            else -> OverallCompliance.NON_COMPLIANT
+        }
+    }
+    
+    private fun calculateMonitoringPeriod(readings: List<TemperatureReadingEntity>): Long {
+        if (readings.size < 2) return 0L
+        
+        val firstReading = readings.minByOrNull { it.recordedAt } ?: return 0L
+        val lastReading = readings.maxByOrNull { it.recordedAt } ?: return 0L
+        
+        return lastReading.recordedAt.time - firstReading.recordedAt.time
+    }
+    
+    /**
+     * Get monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+    
+    /**
+     * Get active shipments count
+     */
+    fun getActiveShipmentsCount(): Int = activeShipments.size
+}
+
+/**
+ * Data classes
+ */
+data class ColdChainShipment(
+    val shipment: ShipmentEntity,
+    val complianceStandard: ComplianceStandard,
+    val currentStatus: ColdChainStatus,
+    val complianceRate: Float,
+    val violationCount: Int,
+    val lastTemperature: Float?,
+    val monitoringStartedAt: Date,
+    val monitoringEndedAt: Date? = null,
+    val requirementsMet: Boolean,
+    val finalComplianceReport: ComplianceReport? = null
+)
+
+data class ComplianceStandard(
+    val name: String,
+    val minTemperature: Float,
+    val maxTemperature: Float,
+    val criticalMinTemperature: Float,
+    val criticalMaxTemperature: Float,
+    val maxDuration: Long,
+    val requiredDocumentation: List<String>,
+    val alertThreshold: Float
+)
+
+data class ComplianceReport(
+    val shipmentId: Long,
+    val shipmentIdString: String,
+    val standard: String,
+    val monitoringPeriod: Long,
+    val totalReadings: Int,
+    val averageTemperature: Float,
+    val minTemperature: Float,
+    val maxTemperature: Float,
+    val temperatureVariance: Float,
+    val complianceRate: Float,
+    val violations: List<ColdChainViolationEntity>,
+    val violationsByType: Map<ViolationType, Int>,
+    val documentationComplete: Boolean,
+    val overallCompliance: OverallCompliance,
+    val generatedAt: Date
+)
+
+data class ColdChainAnalytics(
+    val totalShipments: Int,
+    val compliantShipments: Int,
+    val complianceRate: Float,
+    val totalViolations: Int,
+    val criticalViolations: Int,
+    val averageTemperature: Float,
+    val temperatureVariance: Float,
+    val complianceByStandard: Map<String, Float>,
+    val violationTypes: Map<ViolationType, Int>,
+    val averageMonitoringDuration: Double,
+    val documentationCompliance: Float
+)
+
+data class ColdChainAlert(
+    val type: ColdChainAlertType,
+    val shipmentId: Long,
+    val message: String,
+    val severity: ViolationSeverity,
+    val timestamp: Date,
+    val data: Map<String, Any>
+)
+
+/**
+ * Enums
+ */
+enum class ColdChainState {
+    Idle,
+    Starting,
+    Monitoring,
+    Stopped,
+    Error
+}
+
+enum class ColdChainStatus {
+    PENDING,
+    MONITORING,
+    ACTIVE,
+    COMPLETED,
+    CANCELLED,
+    UNKNOWN
+}
+
+enum class ViolationType {
+    TOO_COLD,
+    TOO_HOT,
+    SENSOR_FAILURE,
+    MONITORING_GAP,
+    DOCUMENTATION_MISSING
+}
+
+enum class ViolationSeverity {
+    WARNING,
+    CRITICAL
+}
+
+enum class OverallCompliance {
+    EXCELLENT,
+    GOOD,
+    ACCEPTABLE,
+    NEEDS_IMPROVEMENT,
+    NON_COMPLIANT
+}
+
+enum class ColdChainAlertType {
+    TEMPERATURE_VIOLATION,
+    SENSOR_FAILURE,
+    MONITORING_GAP,
+    COMPLIANCE_WARNING,
+    DOCUMENTATION_ALERT
+}

@@ -1,0 +1,451 @@
+package com.edham.logistics.maintenance
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentVehicleMaintenanceHistoryBinding
+import com.edham.logistics.maintenance.adapters.MaintenanceHistoryAdapter
+import com.edham.logistics.maintenance.viewmodels.VehicleMaintenanceHistoryViewModel
+import com.google.android.material.datepicker.MaterialDatePicker
+import kotlinx.coroutines.launch
+import java.util.*
+import javax.inject.Inject
+
+/**
+ * Vehicle Maintenance History Fragment - Comprehensive maintenance history viewing and analysis
+ * 
+ * Features:
+ * - Vehicle-specific maintenance history
+ * - Date range filtering
+ * - Detailed maintenance records
+ * - Cost analysis and trends
+ * - Maintenance statistics
+ * - Export functionality
+ * - Search and filter capabilities
+ */
+class VehicleMaintenanceHistoryFragment @Inject constructor(
+    private val maintenanceHistoryAdapter: MaintenanceHistoryAdapter
+) : Fragment() {
+
+    private var _binding: FragmentVehicleMaintenanceHistoryBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: VehicleMaintenanceHistoryViewModel
+    private var selectedVehicleId: Long? = null
+    private var currentDateRange = DateRange.last30Days()
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentVehicleMaintenanceHistoryBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupRecyclerView()
+        setupClickListeners()
+        observeViewModel()
+        
+        // Load initial data
+        loadMaintenanceHistory()
+    }
+
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[VehicleMaintenanceHistoryViewModel::class.java]
+    }
+
+    private fun setupRecyclerView() {
+        binding.rvMaintenanceHistory.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = maintenanceHistoryAdapter
+            isNestedScrollingEnabled = false
+        }
+    }
+
+    private fun setupClickListeners() {
+        // Date range selector
+        binding.cardDateRange.setOnClickListener {
+            showDateRangePicker()
+        }
+        
+        // Quick date options
+        binding.btnLast7Days.setOnClickListener {
+            selectDateRange(DateRange.last7Days())
+        }
+        
+        binding.btnLast30Days.setOnClickListener {
+            selectDateRange(DateRange.last30Days())
+        }
+        
+        binding.btnLast90Days.setOnClickListener {
+            selectDateRange(DateRange.last90Days())
+        }
+        
+        binding.btnCustomRange.setOnClickListener {
+            showCustomDateRangePicker()
+        }
+        
+        // Vehicle search
+        binding.etVehicleSearch.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH) {
+                searchVehicles(binding.etVehicleSearch.text.toString())
+                true
+            } else {
+                false
+            }
+        }
+        
+        // Load more
+        binding.btnLoadMore.setOnClickListener {
+            loadMoreHistory()
+        }
+        
+        // Export
+        binding.fabExport.setOnClickListener {
+            exportMaintenanceHistory()
+        }
+        
+        // Toolbar menu
+        binding.toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_refresh -> {
+                    refreshMaintenanceHistory()
+                    true
+                }
+                R.id.action_filter -> {
+                    showAdvancedFilters()
+                    true
+                }
+                R.id.action_statistics -> {
+                    showDetailedStatistics()
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.historyState.collect { state ->
+                when (state) {
+                    is MaintenanceHistoryState.Loading -> {
+                        showLoadingState()
+                    }
+                    is MaintenanceHistoryState.Success -> {
+                        hideLoadingState()
+                        updateMaintenanceHistory(state.historyItems)
+                        updateMaintenanceStats(state.statistics)
+                        updateVehicleChips(state.availableVehicles)
+                    }
+                    is MaintenanceHistoryState.Error -> {
+                        hideLoadingState()
+                        showError(state.message)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.filteredHistory.collect { history ->
+                maintenanceHistoryAdapter.submitList(history)
+                updateLoadMoreButton(history.size)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.selectedVehicle.collect { vehicle ->
+                updateSelectedVehicle(vehicle)
+            }
+        }
+    }
+
+    private fun loadMaintenanceHistory() {
+        viewModel.loadMaintenanceHistory(selectedVehicleId, currentDateRange)
+    }
+
+    private fun updateMaintenanceHistory(historyItems: List<MaintenanceHistoryItem>) {
+        maintenanceHistoryAdapter.submitList(historyItems)
+    }
+
+    private fun updateMaintenanceStats(stats: MaintenanceStatistics) {
+        binding.tvTotalMaintenance.text = stats.totalMaintenance.toString()
+        binding.tvTotalCost.text = "${stats.totalCost.formatNumber()} ريال"
+        binding.tvAvgDuration.text = "${stats.averageDuration} ساعة"
+    }
+
+    private fun updateVehicleChips(vehicles: List<VehicleInfo>) {
+        val chipContainer = binding.llVehicleChips
+        chipContainer.removeAllViews()
+        
+        vehicles.forEach { vehicle ->
+            val chip = com.google.android.material.chip.Chip(context).apply {
+                text = vehicle.vehicleId
+                isCheckable = true
+                isClickable = true
+                setOnCheckedChangeListener { _, isChecked ->
+                    if (isChecked) {
+                        selectVehicle(vehicle.id)
+                    }
+                }
+            }
+            chipContainer.addView(chip)
+        }
+    }
+
+    private fun updateSelectedVehicle(vehicle: VehicleInfo?) {
+        vehicle?.let {
+            binding.etVehicleSearch.setText(it.vehicleId)
+            selectedVehicleId = it.id
+        }
+    }
+
+    private fun updateLoadMoreButton(currentSize: Int) {
+        binding.btnLoadMore.visibility = if (currentSize >= 20) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
+    }
+
+    private fun selectDateRange(dateRange: DateRange) {
+        currentDateRange = dateRange
+        updateDateRangeDisplay(dateRange)
+        loadMaintenanceHistory()
+    }
+
+    private fun updateDateRangeDisplay(dateRange: DateRange) {
+        val displayText = when {
+            dateRange.isLast7Days() -> "آخر 7 أيام"
+            dateRange.isLast30Days() -> "آخر 30 يوم"
+            dateRange.isLast90Days() -> "آخر 90 يوم"
+            else -> {
+                val formatter = java.text.SimpleDateFormat("dd/MM/yyyy", Locale.getDefault())
+                "${formatter.format(dateRange.startDate)} - ${formatter.format(dateRange.endDate)}"
+            }
+        }
+        binding.tvDateRange.text = displayText
+    }
+
+    private fun searchVehicles(query: String) {
+        viewModel.searchVehicles(query)
+    }
+
+    private fun selectVehicle(vehicleId: Long) {
+        selectedVehicleId = vehicleId
+        loadMaintenanceHistory()
+    }
+
+    private fun showDateRangePicker() {
+        showCustomDateRangePicker()
+    }
+
+    private fun showCustomDateRangePicker() {
+        val dateRangePicker = MaterialDatePicker.Builder.dateRangePicker()
+            .setTitleText("اختر فترة التاريخ")
+            .setSelection(
+                androidx.core.util.Pair(
+                    currentDateRange.startDate.time,
+                    currentDateRange.endDate.time
+                )
+            )
+            .build()
+        
+        dateRangePicker.addOnPositiveButtonClickListener { selection ->
+            selection?.let {
+                val startDate = Date(it.first ?: 0)
+                val endDate = Date(it.second ?: 0)
+                selectDateRange(DateRange(startDate, endDate))
+            }
+        }
+        
+        dateRangePicker.show(childFragmentManager, "date_range_picker")
+    }
+
+    private fun loadMoreHistory() {
+        binding.progressLoadMore.visibility = View.VISIBLE
+        viewModel.loadMoreHistory { success ->
+            binding.progressLoadMore.visibility = View.GONE
+        }
+    }
+
+    private fun exportMaintenanceHistory() {
+        viewModel.exportMaintenanceHistory { success, message ->
+            if (success) {
+                showSuccessMessage("تم تصدير تاريخ الصيانة بنجاح")
+            } else {
+                showErrorMessage("فشل تصدير البيانات: $message")
+            }
+        }
+    }
+
+    private fun refreshMaintenanceHistory() {
+        loadMaintenanceHistory()
+    }
+
+    private fun showAdvancedFilters() {
+        // Show advanced filters dialog
+        val dialog = MaintenanceFiltersDialogFragment()
+        dialog.show(childFragmentManager, "maintenance_filters_dialog")
+        
+        dialog.setOnFiltersApplied { filters ->
+            viewModel.applyAdvancedFilters(filters)
+        }
+    }
+
+    private fun showDetailedStatistics() {
+        // Navigate to detailed statistics screen
+    }
+
+    private fun showLoadingState() {
+        binding.layoutLoading.visibility = View.VISIBLE
+        binding.contentGroup.visibility = View.GONE
+    }
+
+    private fun hideLoadingState() {
+        binding.layoutLoading.visibility = View.GONE
+        binding.contentGroup.visibility = View.VISIBLE
+    }
+
+    private fun showSuccessMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun showErrorMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_LONG
+        ).show()
+    }
+
+    private fun Float.formatNumber(): String {
+        return this.toInt().toString().reversed().chunked(3).joinToString(",").reversed()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh maintenance history when fragment becomes visible
+        loadMaintenanceHistory()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+
+/**
+ * Data classes
+ */
+data class MaintenanceHistoryItem(
+    val id: String,
+    val vehicleId: String,
+    val vehicleName: String,
+    val maintenanceType: String,
+    val description: String,
+    val scheduledDate: Date,
+    val completionDate: Date?,
+    val technicianName: String,
+    val status: String,
+    val priority: String,
+    val estimatedCost: Float,
+    val actualCost: Float,
+    val duration: Float,
+    val partsUsed: List<PartUsed>,
+    val notes: String,
+    val attachments: List<String>
+)
+
+data class MaintenanceStatistics(
+    val totalMaintenance: Int,
+    val totalCost: Float,
+    val averageDuration: Float,
+    val completedMaintenance: Int,
+    val pendingMaintenance: Int,
+    val costByType: Map<String, Float>,
+    val durationByType: Map<String, Float>
+)
+
+data class VehicleInfo(
+    val id: Long,
+    val vehicleId: String,
+    val make: String,
+    val model: String,
+    val year: Int
+)
+
+data class PartUsed(
+    val partId: String,
+    val partName: String,
+    val quantity: Int,
+    val unitPrice: Float,
+    val totalPrice: Float
+)
+
+data class DateRange(
+    val startDate: Date,
+    val endDate: Date
+) {
+    fun isLast7Days(): Boolean {
+        val now = Date()
+        val sevenDaysAgo = Date(now.time - 7L * 24 * 60 * 60 * 1000)
+        return startDate.time <= sevenDaysAgo.time && endDate.time >= now.time
+    }
+    
+    fun isLast30Days(): Boolean {
+        val now = Date()
+        val thirtyDaysAgo = Date(now.time - 30L * 24 * 60 * 60 * 1000)
+        return startDate.time <= thirtyDaysAgo.time && endDate.time >= now.time
+    }
+    
+    fun isLast90Days(): Boolean {
+        val now = Date()
+        val ninetyDaysAgo = Date(now.time - 90L * 24 * 60 * 60 * 1000)
+        return startDate.time <= ninetyDaysAgo.time && endDate.time >= now.time
+    }
+    
+    companion object {
+        fun last7Days(): DateRange {
+            val now = Date()
+            val sevenDaysAgo = Date(now.time - 7L * 24 * 60 * 60 * 1000)
+            return DateRange(sevenDaysAgo, now)
+        }
+        
+        fun last30Days(): DateRange {
+            val now = Date()
+            val thirtyDaysAgo = Date(now.time - 30L * 24 * 60 * 60 * 1000)
+            return DateRange(thirtyDaysAgo, now)
+        }
+        
+        fun last90Days(): DateRange {
+            val now = Date()
+            val ninetyDaysAgo = Date(now.time - 90L * 24 * 60 * 60 * 1000)
+            return DateRange(ninetyDaysAgo, now)
+        }
+    }
+}
+
+/**
+ * Enums
+ */
+enum class MaintenanceHistoryState {
+    Loading,
+    Success,
+    Error
+}

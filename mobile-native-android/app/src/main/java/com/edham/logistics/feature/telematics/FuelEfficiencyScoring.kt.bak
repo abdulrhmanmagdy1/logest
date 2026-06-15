@@ -1,0 +1,535 @@
+package com.edham.logistics.feature.telematics
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Fuel Efficiency Scoring System - Advanced fuel consumption assessment and scoring
+ * Calculates comprehensive fuel efficiency scores based on consumption patterns and driving behavior
+ */
+class FuelEfficiencyScoring {
+    
+    companion object {
+        private const val TAG = "FuelEfficiencyScoring"
+        
+        // Scoring weights
+        private const val FUEL_CONSUMPTION_WEIGHT = 0.40
+        private const val IDLE_TIME_WEIGHT = 0.25
+        private const val DRIVING_STYLE_WEIGHT = 0.20
+        private const val ROUTE_EFFICIENCY_WEIGHT = 0.15
+        
+        // Fuel efficiency thresholds (km/l)
+        private const val EXCELLENT_EFFICIENCY = 10.0
+        private const val GOOD_EFFICIENCY = 8.0
+        private const val AVERAGE_EFFICIENCY = 6.0
+        private const val POOR_EFFICIENCY = 4.0
+        
+        // Idle time thresholds (percentage)
+        private const val EXCELLENT_IDLE_TIME = 5.0
+        private const val GOOD_IDLE_TIME = 10.0
+        private const val AVERAGE_IDLE_TIME = 15.0
+        private const val POOR_IDLE_TIME = 20.0
+        
+        // Cost thresholds
+        private const val EXCELLENT_COST_PER_KM = 0.15
+        private const val GOOD_COST_PER_KM = 0.20
+        private const val AVERAGE_COST_PER_KM = 0.25
+        private const val POOR_COST_PER_KM = 0.30
+    }
+    
+    /**
+     * Calculate comprehensive fuel efficiency score
+     */
+    suspend fun calculateFuelEfficiencyScore(
+        driverId: String,
+        telematicsData: List<TelematicsData>,
+        fuelPricePerLiter: Double = 1.5,
+        timeWindow: TimeWindow = TimeWindow.LAST_30_DAYS,
+        previousScore: Double? = null
+    ): FuelEfficiencyResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Calculating fuel efficiency score for driver $driverId")
+                
+                // Filter data by time window
+                val filteredData = filterDataByTimeWindow(telematicsData, timeWindow)
+                
+                if (filteredData.isEmpty()) {
+                    return@withContext FuelEfficiencyResult.createError(driverId, timeWindow)
+                }
+                
+                // Calculate metrics
+                val totalDistance = filteredData.sumOf { it.totalDistance ?: 0.0 }
+                val totalFuelConsumed = filteredData.sumOf { it.totalFuelConsumed ?: 0.0 }
+                val totalDrivingTime = filteredData.sumOf { it.totalDrivingTime ?: 0.0 }
+                val totalIdleTime = filteredData.sumOf { it.totalIdleTime ?: 0.0 }
+                
+                // Calculate efficiency metrics
+                val fuelEfficiency = if (totalFuelConsumed > 0) totalDistance / totalFuelConsumed else 0.0
+                val idleTimePercentage = if (totalDrivingTime > 0) (totalIdleTime / totalDrivingTime) * 100 else 0.0
+                val costPerKm = if (totalDistance > 0) (totalFuelConsumed * fuelPricePerLiter) / totalDistance else 0.0
+                
+                // Calculate individual component scores
+                val consumptionScore = calculateConsumptionScore(fuelEfficiency)
+                val idleScore = calculateIdleScore(idleTimePercentage)
+                val drivingStyleScore = calculateDrivingStyleScore(filteredData)
+                val routeEfficiencyScore = calculateRouteEfficiencyScore(filteredData)
+                
+                // Calculate weighted overall score
+                val overallScore = calculateWeightedScore(
+                    consumptionScore,
+                    idleScore,
+                    drivingStyleScore,
+                    routeEfficiencyScore
+                )
+                
+                // Apply time-based smoothing
+                val smoothedScore = applyScoreSmoothing(overallScore, previousScore)
+                
+                // Generate efficiency insights
+                val insights = generateEfficiencyInsights(
+                    fuelEfficiency,
+                    idleTimePercentage,
+                    costPerKm,
+                    filteredData
+                )
+                
+                // Determine efficiency level
+                val efficiencyLevel = determineEfficiencyLevel(smoothedScore)
+                
+                val result = FuelEfficiencyResult(
+                    driverId = driverId,
+                    overallScore = smoothedScore,
+                    consumptionScore = consumptionScore,
+                    idleScore = idleScore,
+                    drivingStyleScore = drivingStyleScore,
+                    routeEfficiencyScore = routeEfficiencyScore,
+                    efficiencyLevel = efficiencyLevel,
+                    totalDistance = totalDistance,
+                    totalFuelConsumed = totalFuelConsumed,
+                    fuelEfficiency = fuelEfficiency, // km/l
+                    idleTimePercentage = idleTimePercentage,
+                    costPerKm = costPerKm,
+                    estimatedMonthlyCost = calculateMonthlyCost(totalFuelConsumed, fuelPricePerLiter, timeWindow),
+                    savingsPotential = calculateSavingsPotential(fuelEfficiency, totalDistance, fuelPricePerLiter),
+                    insights = insights,
+                    calculatedAt = LocalDateTime.now(),
+                    timeWindow = timeWindow
+                )
+                
+                Log.d(TAG, "Fuel efficiency score calculation completed: ${result.overallScore}")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error calculating fuel efficiency score", e)
+                FuelEfficiencyResult.createError(driverId, timeWindow)
+            }
+        }
+    }
+    
+    /**
+     * Calculate fuel consumption score component
+     */
+    private fun calculateConsumptionScore(fuelEfficiency: Double): Double {
+        return when {
+            fuelEfficiency >= EXCELLENT_EFFICIENCY -> 100.0
+            fuelEfficiency >= GOOD_EFFICIENCY -> 90.0
+            fuelEfficiency >= AVERAGE_EFFICIENCY -> 75.0
+            fuelEfficiency >= POOR_EFFICIENCY -> 60.0
+            fuelEfficiency > 0 -> 40.0
+            else -> 0.0
+        }
+    }
+    
+    /**
+     * Calculate idle time score component
+     */
+    private fun calculateIdleScore(idleTimePercentage: Double): Double {
+        return when {
+            idleTimePercentage <= EXCELLENT_IDLE_TIME -> 100.0
+            idleTimePercentage <= GOOD_IDLE_TIME -> 85.0
+            idleTimePercentage <= AVERAGE_IDLE_TIME -> 70.0
+            idleTimePercentage <= POOR_IDLE_TIME -> 50.0
+            else -> 30.0
+        }
+    }
+    
+    /**
+     * Calculate driving style score based on events
+     */
+    private fun calculateDrivingStyleScore(telematicsData: List<TelematicsData>): Double {
+        val totalHarshEvents = telematicsData.sumOf { 
+            (it.harshBrakingCount ?: 0) + (it.rapidAccelerationCount ?: 0) + (it.sharpTurnCount ?: 0)
+        }
+        
+        val eventsPer100km = if (telematicsData.any { it.totalDistance ?: 0.0 > 0 }) {
+            val totalDistance = telematicsData.sumOf { it.totalDistance ?: 0.0 }
+            (totalHarshEvents / totalDistance) * 100
+        } else {
+            0.0
+        }
+        
+        return when {
+            eventsPer100km <= 2.0 -> 100.0
+            eventsPer100km <= 5.0 -> 85.0
+            eventsPer100km <= 10.0 -> 70.0
+            eventsPer100km <= 15.0 -> 55.0
+            else -> 40.0
+        }
+    }
+    
+    /**
+     * Calculate route efficiency score
+     */
+    private fun calculateRouteEfficiencyScore(telematicsData: List<TelematicsData>): Double {
+        val averageSpeed = telematicsData.mapNotNull { it.averageSpeed }.averageOrNull() ?: 0.0
+        val maxSpeed = telematicsData.mapNotNull { it.maxSpeed }.maxOrNull() ?: 0.0
+        
+        // Score based on speed consistency and optimal speed ranges
+        val speedConsistency = if (maxSpeed > 0) {
+            val speedVariance = telematicsData.mapNotNull { it.averageSpeed }.let { speeds ->
+                if (speeds.isNotEmpty()) {
+                    val mean = speeds.average()
+                    speeds.map { (it - mean).let { diff -> diff * diff } }.average()
+                } else 0.0
+            }
+            
+            // Lower variance is better
+            maxOf(0.0, 100.0 - (speedVariance * 10))
+        } else {
+            0.0
+        }
+        
+        // Optimal speed range scoring (40-80 km/h is typically most efficient)
+        val optimalSpeedScore = when {
+            averageSpeed in 40.0..80.0 -> 100.0
+            averageSpeed in 30.0..90.0 -> 85.0
+            averageSpeed in 20.0..100.0 -> 70.0
+            else -> 50.0
+        }
+        
+        return (speedConsistency + optimalSpeedScore) / 2.0
+    }
+    
+    /**
+     * Calculate weighted overall fuel efficiency score
+     */
+    private fun calculateWeightedScore(
+        consumptionScore: Double,
+        idleScore: Double,
+        drivingStyleScore: Double,
+        routeEfficiencyScore: Double
+    ): Double {
+        return (consumptionScore * FUEL_CONSUMPTION_WEIGHT) +
+               (idleScore * IDLE_TIME_WEIGHT) +
+               (drivingStyleScore * DRIVING_STYLE_WEIGHT) +
+               (routeEfficiencyScore * ROUTE_EFFICIENCY_WEIGHT)
+    }
+    
+    /**
+     * Apply score smoothing based on previous score
+     */
+    private fun applyScoreSmoothing(currentScore: Double, previousScore: Double?): Double {
+        if (previousScore == null) return currentScore
+        
+        // Apply exponential moving average for smoothing
+        val alpha = 0.3 // Smoothing factor
+        return (alpha * currentScore) + ((1 - alpha) * previousScore)
+    }
+    
+    /**
+     * Filter telematics data by time window
+     */
+    private fun filterDataByTimeWindow(
+        data: List<TelematicsData>,
+        timeWindow: TimeWindow
+    ): List<TelematicsData> {
+        val now = LocalDateTime.now()
+        val cutoffDate = when (timeWindow) {
+            TimeWindow.LAST_7_DAYS -> now.minusDays(7)
+            TimeWindow.LAST_30_DAYS -> now.minusDays(30)
+            TimeWindow.LAST_90_DAYS -> now.minusDays(90)
+            TimeWindow.LAST_YEAR -> now.minusDays(365)
+        }
+        
+        return data.filter { it.timestamp.isAfter(cutoffDate) }
+    }
+    
+    /**
+     * Calculate estimated monthly cost
+     */
+    private fun calculateMonthlyCost(
+        totalFuelConsumed: Double,
+        fuelPricePerLiter: Double,
+        timeWindow: TimeWindow
+    ): Double {
+        val daysInWindow = when (timeWindow) {
+            TimeWindow.LAST_7_DAYS -> 7
+            TimeWindow.LAST_30_DAYS -> 30
+            TimeWindow.LAST_90_DAYS -> 90
+            TimeWindow.LAST_YEAR -> 365
+        }
+        
+        val dailyCost = (totalFuelConsumed * fuelPricePerLiter) / daysInWindow
+        return dailyCost * 30 // Monthly estimate
+    }
+    
+    /**
+     * Calculate potential savings
+     */
+    private fun calculateSavingsPotential(
+        currentEfficiency: Double,
+        totalDistance: Double,
+        fuelPricePerLiter: Double
+    ): Double {
+        if (currentEfficiency == 0.0 || totalDistance == 0.0) return 0.0
+        
+        // Calculate potential savings if efficiency improved to excellent level
+        val targetEfficiency = EXCELLENT_EFFICIENCY
+        val currentFuelNeeded = totalDistance / currentEfficiency
+        val targetFuelNeeded = totalDistance / targetEfficiency
+        
+        val fuelSavings = currentFuelNeeded - targetFuelNeeded
+        return fuelSavings * fuelPricePerLiter
+    }
+    
+    /**
+     * Generate fuel efficiency insights
+     */
+    private fun generateEfficiencyInsights(
+        fuelEfficiency: Double,
+        idleTimePercentage: Double,
+        costPerKm: Double,
+        telematicsData: List<TelematicsData>
+    ): List<FuelEfficiencyInsight> {
+        val insights = mutableListOf<FuelEfficiencyInsight>()
+        
+        // Fuel efficiency insights
+        when {
+            fuelEfficiency < POOR_EFFICIENCY -> {
+                insights.add(
+                    FuelEfficiencyInsight(
+                        type = FuelEfficiencyInsight.Type.POOR_EFFICIENCY,
+                        severity = FuelEfficiencyInsight.Severity.HIGH,
+                        title = "Poor Fuel Efficiency",
+                        description = "Your fuel efficiency is ${String.format("%.1f", fuelEfficiency)} km/l, which is below optimal levels.",
+                        recommendation = "Maintain steady speeds, avoid rapid acceleration, and ensure proper tire pressure.",
+                        potentialSavings = calculateSavingsPotential(fuelEfficiency, 
+                            telematicsData.sumOf { it.totalDistance ?: 0.0 }, 1.5)
+                    )
+                )
+            }
+            fuelEfficiency >= EXCELLENT_EFFICIENCY -> {
+                insights.add(
+                    FuelEfficiencyInsight(
+                        type = FuelEfficiencyInsight.Type.EXCELLENT_EFFICIENCY,
+                        severity = FuelEfficiencyInsight.Severity.POSITIVE,
+                        title = "Excellent Fuel Efficiency",
+                        description = "Your fuel efficiency is ${String.format("%.1f", fuelEfficiency)} km/l, which is excellent!",
+                        recommendation = "Keep up the great driving habits and regular vehicle maintenance.",
+                        potentialSavings = 0.0
+                    )
+                )
+            }
+        }
+        
+        // Idle time insights
+        if (idleTimePercentage > AVERAGE_IDLE_TIME) {
+            insights.add(
+                FuelEfficiencyInsight(
+                    type = FuelEfficiencyInsight.Type.EXCESSIVE_IDLE_TIME,
+                    severity = FuelEfficiencyInsight.Severity.MEDIUM,
+                    title = "Excessive Idle Time",
+                    description = "Your idle time is ${String.format("%.1f", idleTimePercentage)}%, which wastes fuel.",
+                    recommendation = "Turn off engine during stops longer than 30 seconds.",
+                    potentialSavings = (idleTimePercentage - GOOD_IDLE_TIME) * 0.1 * 
+                        telematicsData.sumOf { it.totalDistance ?: 0.0 }
+                )
+            )
+        }
+        
+        // Cost insights
+        if (costPerKm > AVERAGE_COST_PER_KM) {
+            insights.add(
+                FuelEfficiencyInsight(
+                    type = FuelEfficiencyInsight.Type.HIGH_COST_PER_KM,
+                    severity = FuelEfficiencyInsight.Severity.MEDIUM,
+                    title = "High Cost Per Kilometer",
+                    description = "Your cost per km is ${String.format("%.3f", costPerKm)}, which is above average.",
+                    recommendation = "Improve driving habits and consider route optimization to reduce costs.",
+                    potentialSavings = (costPerKm - GOOD_COST_PER_KM) * 
+                        telematicsData.sumOf { it.totalDistance ?: 0.0 }
+                )
+            )
+        }
+        
+        return insights
+    }
+    
+    /**
+     * Determine efficiency level based on score
+     */
+    private fun determineEfficiencyLevel(score: Double): FuelEfficiencyLevel {
+        return when {
+            score >= 90.0 -> FuelEfficiencyLevel.EXCELLENT
+            score >= 80.0 -> FuelEfficiencyLevel.GOOD
+            score >= 70.0 -> FuelEfficiencyLevel.AVERAGE
+            score >= 60.0 -> FuelEfficiencyLevel.BELOW_AVERAGE
+            else -> FuelEfficiencyLevel.POOR
+        }
+    }
+    
+    /**
+     * Get fuel efficiency trend analysis
+     */
+    suspend fun getFuelEfficiencyTrend(
+        driverId: String,
+        historicalScores: List<FuelEfficiencyResult>
+    ): FuelEfficiencyTrend {
+        return withContext(Dispatchers.IO) {
+            if (historicalScores.size < 2) {
+                return@withContext FuelEfficiencyTrend(
+                    trend = FuelEfficiencyTrend.TrendType.INSUFFICIENT_DATA,
+                    changePercentage = 0.0,
+                    averageEfficiency = 0.0,
+                    bestEfficiency = 0.0,
+                    worstEfficiency = 0.0,
+                    averageCostPerKm = 0.0
+                )
+            }
+            
+            val recentScore = historicalScores.first().overallScore
+            val previousScore = historicalScores[1].overallScore
+            val changePercentage = ((recentScore - previousScore) / previousScore) * 100
+            
+            val trend = when {
+                changePercentage > 5.0 -> FuelEfficiencyTrend.TrendType.IMPROVING
+                changePercentage < -5.0 -> FuelEfficiencyTrend.TrendType.DECLINING
+                else -> FuelEfficiencyTrend.TrendType.STABLE
+            }
+            
+            val allEfficiencies = historicalScores.map { it.fuelEfficiency }
+            val allCostsPerKm = historicalScores.map { it.costPerKm }
+            
+            FuelEfficiencyTrend(
+                trend = trend,
+                changePercentage = changePercentage,
+                averageEfficiency = allEfficiencies.average(),
+                bestEfficiency = allEfficiencies.maxOrNull() ?: 0.0,
+                worstEfficiency = allEfficiencies.minOrNull() ?: 0.0,
+                averageCostPerKm = allCostsPerKm.average()
+            )
+        }
+    }
+}
+
+/**
+ * Fuel efficiency level enum
+ */
+enum class FuelEfficiencyLevel {
+    EXCELLENT,
+    GOOD,
+    AVERAGE,
+    BELOW_AVERAGE,
+    POOR
+}
+
+/**
+ * Fuel efficiency result data class
+ */
+data class FuelEfficiencyResult(
+    val driverId: String,
+    val overallScore: Double,
+    val consumptionScore: Double,
+    val idleScore: Double,
+    val drivingStyleScore: Double,
+    val routeEfficiencyScore: Double,
+    val efficiencyLevel: FuelEfficiencyLevel,
+    val totalDistance: Double,
+    val totalFuelConsumed: Double,
+    val fuelEfficiency: Double, // km/l
+    val idleTimePercentage: Double,
+    val costPerKm: Double,
+    val estimatedMonthlyCost: Double,
+    val savingsPotential: Double,
+    val insights: List<FuelEfficiencyInsight>,
+    val calculatedAt: LocalDateTime,
+    val timeWindow: TimeWindow,
+    val errorMessage: String? = null
+) {
+    companion object {
+        fun createError(driverId: String, timeWindow: TimeWindow): FuelEfficiencyResult {
+            return FuelEfficiencyResult(
+                driverId = driverId,
+                overallScore = 0.0,
+                consumptionScore = 0.0,
+                idleScore = 0.0,
+                drivingStyleScore = 0.0,
+                routeEfficiencyScore = 0.0,
+                efficiencyLevel = FuelEfficiencyLevel.POOR,
+                totalDistance = 0.0,
+                totalFuelConsumed = 0.0,
+                fuelEfficiency = 0.0,
+                idleTimePercentage = 0.0,
+                costPerKm = 0.0,
+                estimatedMonthlyCost = 0.0,
+                savingsPotential = 0.0,
+                insights = emptyList(),
+                calculatedAt = LocalDateTime.now(),
+                timeWindow = timeWindow,
+                errorMessage = "Error calculating fuel efficiency score"
+            )
+        }
+    }
+}
+
+/**
+ * Fuel efficiency insight data class
+ */
+data class FuelEfficiencyInsight(
+    val type: Type,
+    val severity: Severity,
+    val title: String,
+    val description: String,
+    val recommendation: String,
+    val potentialSavings: Double
+) {
+    enum class Type {
+        POOR_EFFICIENCY,
+        EXCELLENT_EFFICIENCY,
+        EXCESSIVE_IDLE_TIME,
+        HIGH_COST_PER_KM,
+        MAINTENANCE_NEEDED
+    }
+    
+    enum class Severity {
+        POSITIVE,
+        LOW,
+        MEDIUM,
+        HIGH,
+        CRITICAL
+    }
+}
+
+/**
+ * Fuel efficiency trend data class
+ */
+data class FuelEfficiencyTrend(
+    val trend: TrendType,
+    val changePercentage: Double,
+    val averageEfficiency: Double,
+    val bestEfficiency: Double,
+    val worstEfficiency: Double,
+    val averageCostPerKm: Double
+) {
+    enum class TrendType {
+        IMPROVING,
+        DECLINING,
+        STABLE,
+        INSUFFICIENT_DATA
+    }
+}

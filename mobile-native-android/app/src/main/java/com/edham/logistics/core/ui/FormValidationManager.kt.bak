@@ -1,0 +1,507 @@
+package com.edham.logistics.core.ui
+
+import android.content.Context
+import android.graphics.Color
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.View
+import android.widget.EditText
+import android.widget.TextView
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.regex.Pattern
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Form Validation Manager - Manages form validation with real-time feedback
+ * Provides consistent validation patterns across the application
+ */
+@Singleton
+class FormValidationManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val validationResults = ConcurrentHashMap<String, MutableList<ValidationResult>>()
+    private val textWatchers = ConcurrentHashMap<String, TextWatcher>()
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    
+    // Default validation configuration
+    private var defaultConfig = FormValidationConfig()
+    
+    /**
+     * Initialize form validation manager
+     */
+    fun initialize(screenId: String, config: FormValidationConfig = FormValidationConfig()) {
+        this.defaultConfig = config
+        validationResults[screenId] = mutableListOf()
+    }
+
+    /**
+     * Validate form data
+     */
+    fun validate(
+        formData: Map<String, Any>,
+        validationRules: List<ValidationRule>
+    ): List<ValidationResult> {
+        val results = mutableListOf<ValidationResult>()
+        
+        validationRules.forEach { rule ->
+            val value = formData[rule.field]?.toString() ?: ""
+            val result = validateField(value, rule)
+            results.add(result)
+        }
+        
+        return results
+    }
+
+    /**
+     * Validate and show messages for a screen
+     */
+    fun validateAndShowMessages(
+        screenId: String,
+        formData: Map<String, Any>,
+        validationRules: List<ValidationRule>,
+        errorContainer: View? = null
+    ): Boolean {
+        val results = validate(formData, validationRules)
+        showValidationMessages(screenId, results, errorContainer)
+        return results.all { it.isValid }
+    }
+
+    /**
+     * Validate single field
+     */
+    fun validateField(value: String, rule: ValidationRule): ValidationResult {
+        return when (rule.type) {
+            ValidationType.REQUIRED -> validateRequired(value, rule)
+            ValidationType.EMAIL -> validateEmail(value, rule)
+            ValidationType.PHONE -> validatePhone(value, rule)
+            ValidationType.PASSWORD -> validatePassword(value, rule)
+            ValidationType.MIN_LENGTH -> validateMinLength(value, rule)
+            ValidationType.MAX_LENGTH -> validateMaxLength(value, rule)
+            ValidationType.PATTERN -> validatePattern(value, rule)
+            ValidationType.CUSTOM -> validateCustom(value, rule)
+        }
+    }
+
+    /**
+     * Setup real-time validation for EditText
+     */
+    fun setupRealTimeValidation(
+        screenId: String,
+        editText: EditText,
+        fieldName: String,
+        validationRules: List<ValidationRule>,
+        errorTextView: TextView? = null
+    ) {
+        if (!defaultConfig.showRealtimeValidation) return
+
+        // Remove existing text watcher
+        textWatchers[fieldName]?.let { watcher ->
+            editText.removeTextChangedListener(watcher)
+        }
+
+        // Create new text watcher
+        val textWatcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+
+            override fun afterTextChanged(s: Editable?) {
+                val value = s?.toString() ?: ""
+                val results = validationRules.map { rule ->
+                    validateField(value, rule)
+                }
+                
+                // Update error text view
+                errorTextView?.let { textView ->
+                    val invalidResults = results.filter { !it.isValid }
+                    if (invalidResults.isNotEmpty()) {
+                        textView.text = invalidResults.first().message
+                        textView.setTextColor(Color.parseColor("#F44336"))
+                        textView.visibility = View.VISIBLE
+                    } else {
+                        textView.text = ""
+                        textView.visibility = View.GONE
+                    }
+                }
+                
+                // Show haptic feedback if enabled
+                if (defaultConfig.enableHapticFeedback && results.any { !it.isValid }) {
+                    editText.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+                }
+            }
+        }
+
+        editText.addTextChangedListener(textWatcher)
+        textWatchers[fieldName] = textWatcher
+    }
+
+    /**
+     * Show validation messages
+     */
+    fun showValidationMessages(
+        screenId: String,
+        validationResults: List<ValidationResult>,
+        errorContainer: View? = null
+    ) {
+        this.validationResults[screenId]?.clear()
+        this.validationResults[screenId]?.addAll(validationResults)
+        
+        validationResults.forEach { result ->
+            if (!result.isValid) {
+                showFieldError(result.field, result.message, result.severity)
+            } else {
+                hideFieldError(result.field)
+            }
+        }
+    }
+
+    /**
+     * Show field error
+     */
+    private fun showFieldError(fieldName: String, message: String, severity: ValidationSeverity) {
+        // Implementation would depend on how errors are displayed in the app
+        // This could be Toast, Snackbar, or inline error views
+    }
+
+    /**
+     * Hide field error
+     */
+    private fun hideFieldError(fieldName: String) {
+        // Implementation would hide the error for the specific field
+    }
+
+    /**
+     * Validate required field
+     */
+    private fun validateRequired(value: String, rule: ValidationRule): ValidationResult {
+        val isValid = value.isNotBlank()
+        return ValidationResult(
+            field = rule.field,
+            isValid = isValid,
+            message = if (isValid) "" else "${getFieldDisplayName(rule.field)} مطلوب",
+            severity = if (isValid) ValidationSeverity.INFO else ValidationSeverity.ERROR
+        )
+    }
+
+    /**
+     * Validate email
+     */
+    private fun validateEmail(value: String, rule: ValidationRule): ValidationResult {
+        val emailPattern = Pattern.compile(
+            "[a-zA-Z0-9._-]+@[a-z]+\\.+[a-z]+",
+            Pattern.CASE_INSENSITIVE
+        )
+        
+        val isValid = !rule.required && value.isBlank() || 
+                emailPattern.matcher(value).matches()
+        
+        return ValidationResult(
+            field = rule.field,
+            isValid = isValid,
+            message = if (isValid) "" else "البريد الإلكتروني غير صحيح",
+            severity = if (isValid) ValidationSeverity.INFO else ValidationSeverity.ERROR
+        )
+    }
+
+    /**
+     * Validate phone number
+     */
+    private fun validatePhone(value: String, rule: ValidationRule): ValidationResult {
+        // Simple phone validation for Saudi Arabia
+        val phonePattern = Pattern.compile("^05[0-9]{8}$")
+        val isValid = !rule.required && value.isBlank() || 
+                phonePattern.matcher(value).matches()
+        
+        return ValidationResult(
+            field = rule.field,
+            isValid = isValid,
+            message = if (isValid) "" else "رقم الهاتف غير صحيح (يجب أن يبدأ بـ 05 ويتكون من 10 أرقام)",
+            severity = if (isValid) ValidationSeverity.INFO else ValidationSeverity.ERROR
+        )
+    }
+
+    /**
+     * Validate password
+     */
+    private fun validatePassword(value: String, rule: ValidationRule): ValidationResult {
+        val isValid = !rule.required && value.isBlank() || 
+                value.length >= 8 && 
+                value.any { it.isUpperCase() } && 
+                value.any { it.isLowerCase() } && 
+                value.any { it.isDigit() }
+        
+        return ValidationResult(
+            field = rule.field,
+            isValid = isValid,
+            message = if (isValid) "" else "كلمة المرور يجب أن تحتوي على 8 أحرف على الأقل وتشمل أحرف كبيرة وصغيرة وأرقام",
+            severity = if (isValid) ValidationSeverity.INFO else ValidationSeverity.ERROR
+        )
+    }
+
+    /**
+     * Validate minimum length
+     */
+    private fun validateMinLength(value: String, rule: ValidationRule): ValidationResult {
+        val isValid = !rule.required && value.isBlank() || 
+                value.length >= (rule.minLength ?: 0)
+        
+        return ValidationResult(
+            field = rule.field,
+            isValid = isValid,
+            message = if (isValid) "" else "${getFieldDisplayName(rule.field)} يجب أن يحتوي على ${rule.minLength} أحرف على الأقل",
+            severity = if (isValid) ValidationSeverity.INFO else ValidationSeverity.ERROR
+        )
+    }
+
+    /**
+     * Validate maximum length
+     */
+    private fun validateMaxLength(value: String, rule: ValidationRule): ValidationResult {
+        val isValid = !rule.required && value.isBlank() || 
+                value.length <= (rule.maxLength ?: Int.MAX_VALUE)
+        
+        return ValidationResult(
+            field = rule.field,
+            isValid = isValid,
+            message = if (isValid) "" else "${getFieldDisplayName(rule.field)} يجب ألا يتجاوز ${rule.maxLength} حرف",
+            severity = if (isValid) ValidationSeverity.INFO else ValidationSeverity.ERROR
+        )
+    }
+
+    /**
+     * Validate pattern
+     */
+    private fun validatePattern(value: String, rule: ValidationRule): ValidationResult {
+        val pattern = rule.pattern?.let { Pattern.compile(it) }
+        val isValid = !rule.required && value.isBlank() || 
+                (pattern?.matcher(value)?.matches() ?: true)
+        
+        return ValidationResult(
+            field = rule.field,
+            isValid = isValid,
+            message = if (isValid) "" else "${getFieldDisplayName(rule.field)} غير صحيح",
+            severity = if (isValid) ValidationSeverity.INFO else ValidationSeverity.ERROR
+        )
+    }
+
+    /**
+     * Validate with custom validator
+     */
+    private fun validateCustom(value: String, rule: ValidationRule): ValidationResult {
+        val isValid = rule.customValidator?.invoke(value) ?: true
+        return ValidationResult(
+            field = rule.field,
+            isValid = isValid,
+            message = if (isValid) "" else "${getFieldDisplayName(rule.field)} غير صحيح",
+            severity = if (isValid) ValidationSeverity.INFO else ValidationSeverity.ERROR
+        )
+    }
+
+    /**
+     * Get field display name
+     */
+    private fun getFieldDisplayName(fieldName: String): String {
+        return when (fieldName.lowercase()) {
+            "name", "fullname" -> "الاسم"
+            "email" -> "البريد الإلكتروني"
+            "phone", "mobile" -> "رقم الهاتف"
+            "password" -> "كلمة المرور"
+            "address" -> "العنوان"
+            "city" -> "المدينة"
+            "country" -> "البلد"
+            "zipcode", "postalcode" -> "الرمز البريدي"
+            else -> fieldName
+        }
+    }
+
+    /**
+     * Clear validation for a screen
+     */
+    fun clearValidation(screenId: String) {
+        validationResults[screenId]?.clear()
+        textWatchers.forEach { (fieldName, watcher) ->
+            // Remove text watchers from all EditText fields
+            // This would need access to the actual EditText views
+        }
+        textWatchers.clear()
+    }
+
+    /**
+     * Clear field validation
+     */
+    fun clearFieldValidation(fieldName: String) {
+        textWatchers[fieldName]?.let { watcher ->
+            // Remove text watcher from specific field
+            textWatchers.remove(fieldName)
+        }
+    }
+
+    /**
+     * Get validation results for a screen
+     */
+    fun getValidationResults(screenId: String): List<ValidationResult> {
+        return validationResults[screenId]?.toList() ?: emptyList()
+    }
+
+    /**
+     * Check if form is valid
+     */
+    fun isFormValid(screenId: String): Boolean {
+        return validationResults[screenId]?.all { it.isValid } ?: true
+    }
+
+    /**
+     * Get invalid results for a screen
+     */
+    fun getInvalidResults(screenId: String): List<ValidationResult> {
+        return validationResults[screenId]?.filter { !it.isValid } ?: emptyList()
+    }
+
+    /**
+     * Update validation configuration
+     */
+    fun updateConfig(config: FormValidationConfig) {
+        this.defaultConfig = config
+    }
+
+    /**
+     * Create common validation rules
+     */
+    fun createCommonRules(): Map<String, List<ValidationRule>> {
+        return mapOf(
+            "name" to listOf(
+                ValidationRule("name", ValidationType.REQUIRED, required = true),
+                ValidationRule("name", ValidationType.MIN_LENGTH, minLength = 2),
+                ValidationRule("name", ValidationType.MAX_LENGTH, maxLength = 50)
+            ),
+            "email" to listOf(
+                ValidationRule("email", ValidationType.REQUIRED, required = true),
+                ValidationRule("email", ValidationType.EMAIL)
+            ),
+            "phone" to listOf(
+                ValidationRule("phone", ValidationType.REQUIRED, required = true),
+                ValidationRule("phone", ValidationType.PHONE)
+            ),
+            "password" to listOf(
+                ValidationRule("password", ValidationType.REQUIRED, required = true),
+                ValidationRule("password", ValidationType.MIN_LENGTH, minLength = 8),
+                ValidationRule("password", ValidationType.PASSWORD)
+            ),
+            "address" to listOf(
+                ValidationRule("address", ValidationType.REQUIRED, required = true),
+                ValidationRule("address", ValidationType.MIN_LENGTH, minLength = 10),
+                ValidationRule("address", ValidationType.MAX_LENGTH, maxLength = 200)
+            )
+        )
+    }
+
+    /**
+     * Validate shipment form
+     */
+    fun validateShipmentForm(formData: Map<String, Any>): List<ValidationResult> {
+        val rules = listOf(
+            ValidationRule("senderName", ValidationType.REQUIRED, required = true),
+            ValidationRule("senderPhone", ValidationType.REQUIRED, required = true),
+            ValidationRule("senderPhone", ValidationType.PHONE),
+            ValidationRule("recipientName", ValidationType.REQUIRED, required = true),
+            ValidationRule("recipientPhone", ValidationType.REQUIRED, required = true),
+            ValidationRule("recipientPhone", ValidationType.PHONE),
+            ValidationRule("pickupAddress", ValidationType.REQUIRED, required = true),
+            ValidationRule("deliveryAddress", ValidationType.REQUIRED, required = true),
+            ValidationRule("weight", ValidationType.REQUIRED, required = true),
+            ValidationRule("description", ValidationType.MAX_LENGTH, maxLength = 500)
+        )
+        
+        return validate(formData, rules)
+    }
+
+    /**
+     * Validate user registration form
+     */
+    fun validateUserRegistrationForm(formData: Map<String, Any>): List<ValidationResult> {
+        val rules = listOf(
+            ValidationRule("fullName", ValidationType.REQUIRED, required = true),
+            ValidationRule("fullName", ValidationType.MIN_LENGTH, minLength = 2),
+            ValidationRule("fullName", ValidationType.MAX_LENGTH, maxLength = 100),
+            ValidationRule("email", ValidationType.REQUIRED, required = true),
+            ValidationRule("email", ValidationType.EMAIL),
+            ValidationRule("phone", ValidationType.REQUIRED, required = true),
+            ValidationRule("phone", ValidationType.PHONE),
+            ValidationRule("password", ValidationType.REQUIRED, required = true),
+            ValidationRule("password", ValidationType.MIN_LENGTH, minLength = 8),
+            ValidationRule("password", ValidationType.PASSWORD),
+            ValidationRule("confirmPassword", ValidationType.REQUIRED, required = true),
+            ValidationRule("confirmPassword", ValidationType.CUSTOM, customValidator = { value ->
+                // Check if confirm password matches password
+                formData["password"]?.toString() == value
+            })
+        )
+        
+        return validate(formData, rules)
+    }
+
+    /**
+     * Cleanup form validation manager
+     */
+    fun cleanup(screenId: String? = null) {
+        if (screenId != null) {
+            clearValidation(screenId)
+        } else {
+            validationResults.clear()
+            textWatchers.clear()
+        }
+        
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class FormValidationConfig(
+    val enableValidation: Boolean = true,
+    val showRealtimeValidation: Boolean = true,
+    val showErrorIcons: Boolean = true,
+    val enableHapticFeedback: Boolean = true,
+    val errorColor: Int = Color.parseColor("#F44336"),
+    val successColor: Int = Color.parseColor("#4CAF50"),
+    val warningColor: Int = Color.parseColor("#FF9800")
+)
+
+data class ValidationRule(
+    val field: String,
+    val type: ValidationType,
+    val required: Boolean = false,
+    val minLength: Int? = null,
+    val maxLength: Int? = null,
+    val pattern: String? = null,
+    val customValidator: ((String) -> Boolean)? = null
+)
+
+data class ValidationResult(
+    val field: String,
+    val isValid: Boolean,
+    val message: String,
+    val severity: ValidationSeverity = ValidationSeverity.ERROR
+)
+
+enum class ValidationType {
+    REQUIRED,
+    EMAIL,
+    PHONE,
+    PASSWORD,
+    MIN_LENGTH,
+    MAX_LENGTH,
+    PATTERN,
+    CUSTOM
+}
+
+enum class ValidationSeverity {
+    ERROR,
+    WARNING,
+    INFO
+}

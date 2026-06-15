@@ -1,0 +1,941 @@
+package com.edham.logistics.finance.tax
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.TaxApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Tax Calculation Service - Manages tax calculations and compliance
+ * 
+ * Features:
+ * - VAT calculation (15% for Saudi Arabia)
+ * - Tax exemption management
+ * - Tax reporting and analytics
+ * - Tax compliance tracking
+ * - Multi-currency tax support
+ * - Tax audit trail
+ * - Tax optimization recommendations
+ */
+@Singleton
+class TaxCalculationService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val taxApi: TaxApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _taxCalculationState = MutableStateFlow<TaxCalculationState>(TaxCalculationState.Idle)
+    val taxCalculationState: StateFlow<TaxCalculationState> = _taxCalculationState.asStateFlow()
+    
+    private val _taxCalculations = MutableStateFlow<List<TaxCalculation>>(emptyList())
+    val taxCalculations: StateFlow<List<TaxCalculation>> = _taxCalculations.asStateFlow()
+    
+    private val _taxStats = MutableStateFlow<TaxStats>(TaxStats())
+    val taxStats: StateFlow<TaxStats> = _taxStats.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "TaxCalculationService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val SAUDI_VAT_RATE = 0.15f // 15% VAT
+        private const val TAX_REPORTING_PERIOD_MONTHS = 3 // Quarterly reporting
+    }
+    
+    /**
+     * Initialize tax calculation service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _taxCalculationState.value = TaxCalculationState.Initializing
+                
+                // Load tax configuration
+                loadTaxConfiguration()
+                
+                // Load tax rates
+                loadTaxRates()
+                
+                // Load recent tax calculations
+                loadRecentTaxCalculations()
+                
+                isInitialized = true
+                _taxCalculationState.value = TaxCalculationState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _taxCalculationState.value = TaxCalculationState.Error("Failed to initialize tax calculation service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Calculate tax for invoice
+     */
+    suspend fun calculateInvoiceTax(
+        invoiceId: String,
+        taxableAmount: Float,
+        currency: String = DEFAULT_CURRENCY,
+        taxExemptions: List<TaxExemption> = emptyList()
+    ): Result<TaxCalculation> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Tax calculation service not initialized")
+                }
+                
+                _taxCalculationState.value = TaxCalculationState.Processing
+                
+                // Validate inputs
+                validateTaxCalculationInputs(taxableAmount, currency)
+                
+                // Get tax rates for currency
+                val taxRates = getTaxRatesForCurrency(currency)
+                
+                // Calculate tax
+                val taxCalculation = calculateTax(
+                    invoiceId = invoiceId,
+                    taxableAmount = taxableAmount,
+                    currency = currency,
+                    taxRates = taxRates,
+                    taxExemptions = taxExemptions,
+                    taxType = TaxType.INVOICE_TAX
+                )
+                
+                // Save tax calculation
+                val savedTaxCalculation = database.taxCalculationDao().insertTaxCalculation(taxCalculation.toEntity())
+                    .let { id -> taxCalculation.copy(id = id.toString()) }
+                
+                // Add to tax calculations list
+                addToTaxCalculations(savedTaxCalculation)
+                
+                // Update stats
+                updateTaxStats()
+                
+                _taxCalculationState.value = TaxCalculationState.Ready
+                Result.success(savedTaxCalculation)
+                
+            } catch (e: Exception) {
+                _taxCalculationState.value = TaxCalculationState.Error("Tax calculation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Calculate tax for expense
+     */
+    suspend fun calculateExpenseTax(
+        expenseId: String,
+        expenseAmount: Float,
+        currency: String = DEFAULT_CURRENCY,
+        expenseCategory: String,
+        taxExemptions: List<TaxExemption> = emptyList()
+    ): Result<TaxCalculation> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Tax calculation service not initialized")
+                }
+                
+                _taxCalculationState.value = TaxCalculationState.Processing
+                
+                // Validate inputs
+                validateTaxCalculationInputs(expenseAmount, currency)
+                
+                // Check if expense is tax-deductible
+                val isTaxDeductible = isExpenseTaxDeductible(expenseCategory)
+                
+                // Get tax rates for currency
+                val taxRates = getTaxRatesForCurrency(currency)
+                
+                // Calculate tax
+                val taxCalculation = if (isTaxDeductible) {
+                    calculateTax(
+                        invoiceId = expenseId,
+                        taxableAmount = expenseAmount,
+                        currency = currency,
+                        taxRates = taxRates,
+                        taxExemptions = taxExemptions,
+                        taxType = TaxType.EXPENSE_TAX
+                    )
+                } else {
+                    createZeroTaxCalculation(
+                        invoiceId = expenseId,
+                        amount = expenseAmount,
+                        currency = currency,
+                        taxType = TaxType.EXPENSE_TAX,
+                        reason = "Expense category is not tax-deductible"
+                    )
+                }
+                
+                // Save tax calculation
+                val savedTaxCalculation = database.taxCalculationDao().insertTaxCalculation(taxCalculation.toEntity())
+                    .let { id -> taxCalculation.copy(id = id.toString()) }
+                
+                // Add to tax calculations list
+                addToTaxCalculations(savedTaxCalculation)
+                
+                // Update stats
+                updateTaxStats()
+                
+                _taxCalculationState.value = TaxCalculationState.Ready
+                Result.success(savedTaxCalculation)
+                
+            } catch (e: Exception) {
+                _taxCalculationState.value = TaxCalculationState.Error("Expense tax calculation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get tax calculation by ID
+     */
+    suspend fun getTaxCalculation(taxCalculationId: String): TaxCalculation? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _taxCalculations.value.find { it.id == taxCalculationId }
+                    ?: database.taxCalculationDao().getTaxCalculationById(taxCalculationId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get tax calculation history
+     */
+    suspend fun getTaxCalculationHistory(
+        dateRange: DateRange = DateRange.last30Days(),
+        taxType: TaxType? = null
+    ): Result<List<TaxCalculation>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val taxCalculations = database.taxCalculationDao().getTaxCalculationHistory(
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    taxType = taxType
+                ).map { it.toDomainModel() }
+                
+                Result.success(taxCalculations)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Generate tax report
+     */
+    suspend fun generateTaxReport(
+        dateRange: DateRange = DateRange.currentQuarter(),
+        reportType: TaxReportType = TaxReportType.QUARTERLY
+    ): Result<TaxReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Tax calculation service not initialized")
+                }
+                
+                _taxCalculationState.value = TaxCalculationState.Processing
+                
+                // Get tax calculations for the period
+                val taxCalculations = getTaxCalculationHistory(dateRange).getOrThrow()
+                
+                // Separate by tax type
+                val invoiceTaxes = taxCalculations.filter { it.taxType == TaxType.INVOICE_TAX }
+                val expenseTaxes = taxCalculations.filter { it.taxType == TaxType.EXPENSE_TAX }
+                
+                // Calculate totals
+                val totalTaxableAmount = taxCalculations.sumOf { it.taxableAmount.toDouble() }.toFloat()
+                val totalTaxAmount = taxCalculations.sumOf { it.taxAmount.toDouble() }.toFloat()
+                val totalInvoiceTax = invoiceTaxes.sumOf { it.taxAmount.toDouble() }.toFloat()
+                val totalExpenseTax = expenseTaxes.sumOf { it.taxAmount.toDouble() }.toFloat()
+                
+                // Group by currency
+                val taxByCurrency = taxCalculations.groupBy { it.currency }
+                    .mapValues { (_, calculations) ->
+                        TaxByCurrency(
+                            currency = calculations.first().currency,
+                            taxableAmount = calculations.sumOf { it.taxableAmount.toDouble() }.toFloat(),
+                            taxAmount = calculations.sumOf { it.taxAmount.toDouble() }.toFloat(),
+                            calculationCount = calculations.size
+                        )
+                    }
+                
+                // Generate monthly breakdown
+                val monthlyBreakdown = generateMonthlyTaxBreakdown(taxCalculations, dateRange)
+                
+                // Generate tax recommendations
+                val recommendations = generateTaxRecommendations(taxCalculations, dateRange)
+                
+                val taxReport = TaxReport(
+                    id = UUID.randomUUID().toString(),
+                    reportType = reportType,
+                    period = dateRange,
+                    totalTaxableAmount = totalTaxableAmount,
+                    totalTaxAmount = totalTaxAmount,
+                    totalInvoiceTax = totalInvoiceTax,
+                    totalExpenseTax = totalExpenseTax,
+                    taxByCurrency = taxByCurrency.values.toList(),
+                    monthlyBreakdown = monthlyBreakdown,
+                    taxCalculations = taxCalculations,
+                    recommendations = recommendations,
+                    generatedAt = Date(),
+                    currency = DEFAULT_CURRENCY
+                )
+                
+                _taxCalculationState.value = TaxCalculationState.Ready
+                Result.success(taxReport)
+                
+            } catch (e: Exception) {
+                _taxCalculationState.value = TaxCalculationState.Error("Tax report generation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get tax compliance status
+     */
+    suspend fun getTaxComplianceStatus(
+        dateRange: DateRange = DateRange.currentQuarter()
+    ): Result<TaxComplianceStatus> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val taxCalculations = getTaxCalculationHistory(dateRange).getOrThrow()
+                
+                // Check compliance requirements
+                val hasAllRequiredCalculations = checkRequiredTaxCalculations(taxCalculations, dateRange)
+                val hasValidTaxRates = validateTaxRates(taxCalculations)
+                val hasProperDocumentation = checkTaxDocumentation(taxCalculations)
+                val isWithinReportingDeadlines = checkReportingDeadlines(dateRange)
+                
+                val complianceStatus = TaxComplianceStatus(
+                    isCompliant = hasAllRequiredCalculations && hasValidTaxRates && hasProperDocumentation && isWithinReportingDeadlines,
+                    hasAllRequiredCalculations = hasAllRequiredCalculations,
+                    hasValidTaxRates = hasValidTaxRates,
+                    hasProperDocumentation = hasProperDocumentation,
+                    isWithinReportingDeadlines = isWithinReportingDeadlines,
+                    totalCalculations = taxCalculations.size,
+                    missingCalculations = getMissingTaxCalculations(dateRange),
+                    invalidCalculations = getInvalidTaxCalculations(taxCalculations),
+                    nextReportingDeadline = getNextReportingDeadline(),
+                    recommendations = generateComplianceRecommendations(taxCalculations, dateRange)
+                )
+                
+                Result.success(complianceStatus)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get tax optimization recommendations
+     */
+    suspend fun getTaxOptimizationRecommendations(
+        dateRange: DateRange = DateRange.last12Months()
+    ): Result<List<TaxOptimizationRecommendation>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val taxCalculations = getTaxCalculationHistory(dateRange).getOrThrow()
+                
+                val recommendations = mutableListOf<TaxOptimizationRecommendation>()
+                
+                // Analyze expense patterns for tax optimization
+                val expenseTaxes = taxCalculations.filter { it.taxType == TaxType.EXPENSE_TAX }
+                val expenseByCategory = expenseTaxes.groupBy { it.metadata["category"] ?: "Unknown" }
+                
+                expenseByCategory.forEach { (category, expenses) ->
+                    val totalExpense = expenses.sumOf { it.taxableAmount.toDouble() }.toFloat()
+                    val totalTaxPaid = expenses.sumOf { it.taxAmount.toDouble() }.toFloat()
+                    val effectiveTaxRate = if (totalExpense > 0) (totalTaxPaid / totalExpense) * 100f else 0f
+                    
+                    // Check if category could be optimized
+                    if (effectiveTaxRate > SAUDI_VAT_RATE * 100 && totalExpense > 10000f) {
+                        recommendations.add(
+                            TaxOptimizationRecommendation(
+                                type = OptimizationType.EXPENSE_CATEGORIZATION,
+                                category = category,
+                                description = "Consider reviewing expense categorization for $category to optimize tax deductions",
+                                potentialSavings = calculatePotentialSavings(totalExpense, effectiveTaxRate),
+                                priority = if (totalExpense > 50000f) RecommendationPriority.HIGH else RecommendationPriority.MEDIUM
+                            )
+                        )
+                    }
+                }
+                
+                // Check for tax exemption opportunities
+                val taxExemptions = taxCalculations.filter { it.taxExemptions.isNotEmpty() }
+                val totalExemptedAmount = taxExemptions.sumOf { it.taxableAmount.toDouble() }.toFloat()
+                
+                if (totalExemptedAmount < 1000f) {
+                    recommendations.add(
+                        TaxOptimizationRecommendation(
+                            type = OptimizationType.TAX_EXEMPTIONS,
+                            category = "General",
+                            description = "Consider exploring tax exemption opportunities for qualifying expenses",
+                            potentialSavings = 500f, // Estimated
+                            priority = RecommendationPriority.LOW
+                        )
+                    )
+                }
+                
+                Result.success(recommendations)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadTaxConfiguration() {
+        // Load tax configuration from API or local storage
+    }
+    
+    private suspend fun loadTaxRates() {
+        // Load current tax rates from API or local storage
+    }
+    
+    private suspend fun loadRecentTaxCalculations() {
+        try {
+            val taxCalculations = database.taxCalculationDao().getRecentTaxCalculations(50)
+                .map { it.toDomainModel() }
+            
+            _taxCalculations.value = taxCalculations
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun validateTaxCalculationInputs(amount: Float, currency: String) {
+        if (amount <= 0) throw Exception("Amount must be positive")
+        if (currency.isBlank()) throw Exception("Currency cannot be empty")
+    }
+    
+    private fun getTaxRatesForCurrency(currency: String): TaxRates {
+        return when (currency) {
+            "SAR" -> TaxRates(
+                vatRate = SAUDI_VAT_RATE,
+                incomeTaxRate = 0f, // Saudi Arabia doesn't have income tax for most businesses
+                corporateTaxRate = 0.20f, // 20% corporate tax
+                withholdingTaxRate = 0.05f, // 5% withholding tax
+                otherTaxRates = emptyMap()
+            )
+            else -> TaxRates(
+                vatRate = 0.15f, // Default 15% VAT
+                incomeTaxRate = 0f,
+                corporateTaxRate = 0.20f,
+                withholdingTaxRate = 0.05f,
+                otherTaxRates = emptyMap()
+            )
+        }
+    }
+    
+    private fun calculateTax(
+        invoiceId: String,
+        taxableAmount: Float,
+        currency: String,
+        taxRates: TaxRates,
+        taxExemptions: List<TaxExemption>,
+        taxType: TaxType
+    ): TaxCalculation {
+        // Apply tax exemptions
+        val exemptionAmount = taxExemptions.sumOf { it.exemptionAmount.toDouble() }.toFloat()
+        val adjustedTaxableAmount = maxOf(0f, taxableAmount - exemptionAmount)
+        
+        // Calculate VAT
+        val vatAmount = adjustedTaxableAmount * taxRates.vatRate
+        
+        // Calculate other taxes
+        val otherTaxes = calculateOtherTaxes(adjustedTaxableAmount, taxRates)
+        
+        val totalTaxAmount = vatAmount + otherTaxes
+        
+        return TaxCalculation(
+            id = UUID.randomUUID().toString(),
+            invoiceId = invoiceId,
+            taxableAmount = taxableAmount,
+            exemptionAmount = exemptionAmount,
+            adjustedTaxableAmount = adjustedTaxableAmount,
+            vatAmount = vatAmount,
+            otherTaxes = otherTaxes,
+            totalTaxAmount = totalTaxAmount,
+            currency = currency,
+            taxRates = taxRates,
+            taxExemptions = taxExemptions,
+            taxType = taxType,
+            calculationDate = Date(),
+            metadata = mapOf(
+                "calculation_method" to "standard_vat",
+                "exemption_count" to taxExemptions.size.toString()
+            )
+        )
+    }
+    
+    private fun createZeroTaxCalculation(
+        invoiceId: String,
+        amount: Float,
+        currency: String,
+        taxType: TaxType,
+        reason: String
+    ): TaxCalculation {
+        return TaxCalculation(
+            id = UUID.randomUUID().toString(),
+            invoiceId = invoiceId,
+            taxableAmount = amount,
+            exemptionAmount = amount,
+            adjustedTaxableAmount = 0f,
+            vatAmount = 0f,
+            otherTaxes = 0f,
+            totalTaxAmount = 0f,
+            currency = currency,
+            taxRates = getTaxRatesForCurrency(currency),
+            taxExemptions = emptyList(),
+            taxType = taxType,
+            calculationDate = Date(),
+            metadata = mapOf(
+                "zero_tax_reason" to reason,
+                "calculation_method" to "zero_tax"
+            )
+        )
+    }
+    
+    private fun isExpenseTaxDeductible(expenseCategory: String): Boolean {
+        // Define tax-deductible expense categories
+        val deductibleCategories = setOf(
+            "FUEL",
+            "MAINTENANCE",
+            "INSURANCE",
+            "TIRES",
+            "PARTS",
+            "TOLLS",
+            "PARKING",
+            "MEALS",
+            "ACCOMMODATION",
+            "OFFICE_SUPPLIES",
+            "UTILITIES",
+            "MARKETING",
+            "TRAINING",
+            "LEGAL"
+        )
+        
+        return deductibleCategories.contains(expenseCategory.uppercase())
+    }
+    
+    private fun calculateOtherTaxes(taxableAmount: Float, taxRates: TaxRates): Float {
+        var otherTaxes = 0f
+        
+        // Add withholding tax if applicable
+        if (taxRates.withholdingTaxRate > 0) {
+            otherTaxes += taxableAmount * taxRates.withholdingTaxRate
+        }
+        
+        // Add corporate tax if applicable (simplified calculation)
+        if (taxRates.corporateTaxRate > 0 && taxableAmount > 100000f) {
+            otherTaxes += (taxableAmount - 100000f) * taxRates.corporateTaxRate
+        }
+        
+        return otherTaxes
+    }
+    
+    private fun generateMonthlyTaxBreakdown(
+        taxCalculations: List<TaxCalculation>,
+        dateRange: DateRange
+    ): List<MonthlyTaxBreakdown> {
+        return taxCalculations.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.calculationDate
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { (_, calculations) ->
+            MonthlyTaxBreakdown(
+                month = calculations.first().let {
+                    val calendar = Calendar.getInstance()
+                    calendar.time = it.calculationDate
+                    calendar.getDisplayName(Calendar.MONTH, Calendar.LONG, Locale.getDefault())
+                },
+                year = calculations.first().let {
+                    val calendar = Calendar.getInstance()
+                    calendar.time = it.calculationDate
+                    calendar.get(Calendar.YEAR)
+                },
+                taxableAmount = calculations.sumOf { it.taxableAmount.toDouble() }.toFloat(),
+                taxAmount = calculations.sumOf { it.totalTaxAmount.toDouble() }.toFloat(),
+                calculationCount = calculations.size
+            )
+        }.values.toList().sortedBy { "${it.year}-${it.month}" }
+    }
+    
+    private fun generateTaxRecommendations(
+        taxCalculations: List<TaxCalculation>,
+        dateRange: DateRange
+    ): List<TaxRecommendation> {
+        val recommendations = mutableListOf<TaxRecommendation>()
+        
+        // Check for high tax burden
+        val totalTaxableAmount = taxCalculations.sumOf { it.taxableAmount.toDouble() }.toFloat()
+        val totalTaxAmount = taxCalculations.sumOf { it.totalTaxAmount.toDouble() }.toFloat()
+        val effectiveTaxRate = if (totalTaxableAmount > 0) (totalTaxAmount / totalTaxableAmount) * 100f else 0f
+        
+        if (effectiveTaxRate > SAUDI_VAT_RATE * 100) {
+            recommendations.add(
+                TaxRecommendation(
+                    type = RecommendationType.TAX_OPTIMIZATION,
+                    description = "Effective tax rate is higher than standard VAT rate. Consider reviewing tax calculations and exemptions.",
+                    priority = RecommendationPriority.HIGH
+                )
+            )
+        }
+        
+        // Check for documentation requirements
+        val undocumentedCalculations = taxCalculations.filter { 
+            it.metadata["documentation_status"] != "complete" 
+        }
+        
+        if (undocumentedCalculations.isNotEmpty()) {
+            recommendations.add(
+                TaxRecommendation(
+                    type = RecommendationType.DOCUMENTATION,
+                    description = "Some tax calculations lack proper documentation. Complete documentation to ensure compliance.",
+                    priority = RecommendationPriority.MEDIUM
+                )
+            )
+        }
+        
+        return recommendations
+    }
+    
+    private fun checkRequiredTaxCalculations(
+        taxCalculations: List<TaxCalculation>,
+        dateRange: DateRange
+    ): Boolean {
+        // Check if all invoices and expenses have tax calculations
+        // This would integrate with invoice and expense services
+        return true // Simplified for now
+    }
+    
+    private fun validateTaxRates(taxCalculations: List<TaxCalculation>): Boolean {
+        return taxCalculations.all { calculation ->
+            calculation.taxRates.vatRate == SAUDI_VAT_RATE
+        }
+    }
+    
+    private fun checkTaxDocumentation(taxCalculations: List<TaxCalculation>): Boolean {
+        return taxCalculations.all { calculation ->
+            calculation.metadata["documentation_status"] == "complete"
+        }
+    }
+    
+    private fun checkReportingDeadlines(dateRange: DateRange): Boolean {
+        val calendar = Calendar.getInstance()
+        val currentDate = calendar.time
+        
+        // Quarterly reporting deadline is 30 days after quarter end
+        calendar.time = dateRange.endDate
+        calendar.add(Calendar.DAY_OF_MONTH, 30)
+        val reportingDeadline = calendar.time
+        
+        return currentDate.before(reportingDeadline)
+    }
+    
+    private fun getMissingTaxCalculations(dateRange: DateRange): List<String> {
+        // Return list of missing tax calculations
+        return emptyList() // Simplified for now
+    }
+    
+    private fun getInvalidTaxCalculations(taxCalculations: List<TaxCalculation>): List<String> {
+        return taxCalculations.filter { calculation ->
+            calculation.taxRates.vatRate != SAUDI_VAT_RATE
+        }.map { it.id }
+    }
+    
+    private fun getNextReportingDeadline(): Date {
+        val calendar = Calendar.getInstance()
+        val currentMonth = calendar.get(Calendar.MONTH)
+        val currentQuarter = (currentMonth / 3) + 1
+        
+        if (currentQuarter <= 4) {
+            calendar.set(Calendar.MONTH, (currentQuarter * 3) - 1) // Last month of quarter
+            calendar.set(Calendar.DAY_OF_MONTH, calendar.getActualMaximum(Calendar.DAY_OF_MONTH))
+            calendar.add(Calendar.DAY_OF_MONTH, 30) // 30 days after quarter end
+        } else {
+            calendar.add(Calendar.YEAR, 1)
+            calendar.set(Calendar.MONTH, Calendar.MARCH)
+            calendar.set(Calendar.DAY_OF_MONTH, 30)
+        }
+        
+        return calendar.time
+    }
+    
+    private fun generateComplianceRecommendations(
+        taxCalculations: List<TaxCalculation>,
+        dateRange: DateRange
+    ): List<TaxRecommendation> {
+        val recommendations = mutableListOf<TaxRecommendation>()
+        
+        // Add compliance recommendations based on analysis
+        // This would include specific recommendations based on compliance checks
+        
+        return recommendations
+    }
+    
+    private fun calculatePotentialSavings(
+        totalExpense: Float,
+        effectiveTaxRate: Float
+    ): Float {
+        val standardTaxAmount = totalExpense * SAUDI_VAT_RATE
+        val currentTaxAmount = totalExpense * (effectiveTaxRate / 100f)
+        return currentTaxAmount - standardTaxAmount
+    }
+    
+    private fun addToTaxCalculations(taxCalculation: TaxCalculation) {
+        val currentTaxCalculations = _taxCalculations.value.toMutableList()
+        currentTaxCalculations.add(0, taxCalculation) // Add to beginning
+        
+        // Keep only last 100 tax calculations in cache
+        if (currentTaxCalculations.size > 100) {
+            currentTaxCalculations.removeAt(currentTaxCalculations.size - 1)
+        }
+        
+        _taxCalculations.value = currentTaxCalculations
+    }
+    
+    private suspend fun updateTaxStats() {
+        try {
+            val taxCalculations = _taxCalculations.value
+            val stats = TaxStats(
+                totalCalculations = taxCalculations.size,
+                totalTaxableAmount = taxCalculations.sumOf { it.taxableAmount.toDouble() }.toFloat(),
+                totalTaxAmount = taxCalculations.sumOf { it.totalTaxAmount.toDouble() }.toFloat(),
+                averageTaxRate = if (taxCalculations.isNotEmpty()) {
+                    val totalTaxable = taxCalculations.sumOf { it.taxableAmount.toDouble() }.toFloat()
+                    val totalTax = taxCalculations.sumOf { it.totalTaxAmount.toDouble() }.toFloat()
+                    if (totalTaxable > 0) (totalTax / totalTaxable) * 100f else 0f
+                } else 0f,
+                invoiceTaxCalculations = taxCalculations.count { it.taxType == TaxType.INVOICE_TAX },
+                expenseTaxCalculations = taxCalculations.count { it.taxType == TaxType.EXPENSE_TAX },
+                currencyStats = taxCalculations.groupBy { it.currency }.mapValues { it.value.size }
+            )
+            
+            _taxStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class TaxCalculation(
+    val id: String = "",
+    val invoiceId: String,
+    val taxableAmount: Float,
+    val exemptionAmount: Float,
+    val adjustedTaxableAmount: Float,
+    val vatAmount: Float,
+    val otherTaxes: Float,
+    val totalTaxAmount: Float,
+    val currency: String,
+    val taxRates: TaxRates,
+    val taxExemptions: List<TaxExemption>,
+    val taxType: TaxType,
+    val calculationDate: Date,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class TaxRates(
+    val vatRate: Float,
+    val incomeTaxRate: Float,
+    val corporateTaxRate: Float,
+    val withholdingTaxRate: Float,
+    val otherTaxRates: Map<String, Float>
+)
+
+data class TaxExemption(
+    val id: String = UUID.randomUUID().toString(),
+    val type: TaxExemptionType,
+    val description: String,
+    val exemptionAmount: Float,
+    val certificateNumber: String? = null,
+    val validUntil: Date? = null,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class TaxReport(
+    val id: String,
+    val reportType: TaxReportType,
+    val period: DateRange,
+    val totalTaxableAmount: Float,
+    val totalTaxAmount: Float,
+    val totalInvoiceTax: Float,
+    val totalExpenseTax: Float,
+    val taxByCurrency: List<TaxByCurrency>,
+    val monthlyBreakdown: List<MonthlyTaxBreakdown>,
+    val taxCalculations: List<TaxCalculation>,
+    val recommendations: List<TaxRecommendation>,
+    val generatedAt: Date,
+    val currency: String
+)
+
+data class TaxComplianceStatus(
+    val isCompliant: Boolean,
+    val hasAllRequiredCalculations: Boolean,
+    val hasValidTaxRates: Boolean,
+    val hasProperDocumentation: Boolean,
+    val isWithinReportingDeadlines: Boolean,
+    val totalCalculations: Int,
+    val missingCalculations: List<String>,
+    val invalidCalculations: List<String>,
+    val nextReportingDeadline: Date,
+    val recommendations: List<TaxRecommendation>
+)
+
+data class TaxOptimizationRecommendation(
+    val type: OptimizationType,
+    val category: String,
+    val description: String,
+    val potentialSavings: Float,
+    val priority: RecommendationPriority
+)
+
+data class TaxStats(
+    val totalCalculations: Int = 0,
+    val totalTaxableAmount: Float = 0f,
+    val totalTaxAmount: Float = 0f,
+    val averageTaxRate: Float = 0f,
+    val invoiceTaxCalculations: Int = 0,
+    val expenseTaxCalculations: Int = 0,
+    val currencyStats: Map<String, Int> = emptyMap()
+)
+
+data class TaxByCurrency(
+    val currency: String,
+    val taxableAmount: Float,
+    val taxAmount: Float,
+    val calculationCount: Int
+)
+
+data class MonthlyTaxBreakdown(
+    val month: String,
+    val year: Int,
+    val taxableAmount: Float,
+    val taxAmount: Float,
+    val calculationCount: Int
+)
+
+data class TaxRecommendation(
+    val type: RecommendationType,
+    val description: String,
+    val priority: RecommendationPriority
+)
+
+/**
+ * Enums
+ */
+enum class TaxCalculationState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class TaxType {
+    INVOICE_TAX,
+    EXPENSE_TAX,
+    PAYROLL_TAX,
+    CORPORATE_TAX
+}
+
+enum class TaxExemptionType {
+    ZERO_RATED,
+    EXEMPTED,
+    EXPORT,
+    EDUCATIONAL,
+    HEALTHCARE,
+    FINANCIAL_SERVICES
+}
+
+enum class TaxReportType {
+    MONTHLY,
+    QUARTERLY,
+    ANNUAL,
+    CUSTOM
+}
+
+enum class OptimizationType {
+    EXPENSE_CATEGORIZATION,
+    TAX_EXEMPTIONS,
+    TIMING_OPTIMIZATION,
+    STRUCTURE_OPTIMIZATION
+}
+
+enum class RecommendationType {
+    TAX_OPTIMIZATION,
+    DOCUMENTATION,
+    COMPLIANCE,
+    REPORTING
+}
+
+enum class RecommendationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+/**
+ * Extension functions
+ */
+fun DateRange.currentQuarter(): DateRange {
+    val calendar = Calendar.getInstance()
+    val currentMonth = calendar.get(Calendar.MONTH)
+    val currentQuarter = (currentMonth / 3)
+    val quarterStartMonth = currentQuarter * 3
+    
+    calendar.set(Calendar.MONTH, quarterStartMonth)
+    calendar.set(Calendar.DAY_OF_MONTH, 1)
+    val startDate = calendar.time
+    
+    calendar.set(Calendar.MONTH, quarterStartMonth + 2)
+    calendar.set(Calendar.DAY_OF_MONTH, calendar.getActualMaximum(Calendar.DAY_OF_MONTH))
+    val endDate = calendar.time
+    
+    return DateRange(startDate, endDate)
+}
+
+fun DateRange.last12Months(): DateRange {
+    val calendar = Calendar.getInstance()
+    val end = calendar.time
+    calendar.add(Calendar.MONTH, -12)
+    val start = calendar.time
+    return DateRange(start, end)
+}

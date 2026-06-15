@@ -33,16 +33,16 @@ class SoAAdapter(private var items: List<SoAEntry>) :
         // Color based on status
         when(item.status.uppercase()) {
             "PAID" -> {
-                holder.status.setTextColor(holder.itemView.context.getColor(R.color.ed_success))
+                holder.status.setTextColor(holder.itemView.context.getColor(R.color.status_success))
                 holder.status.setBackgroundResource(R.drawable.status_paid_bg)
             }
             "PARTIAL" -> {
-                holder.status.setTextColor(holder.itemView.context.getColor(R.color.ed_orange))
+                holder.status.setTextColor(holder.itemView.context.getColor(R.color.status_warning))
                 holder.status.setBackgroundResource(R.drawable.status_partial_bg)
             }
             else -> {
-                holder.status.setTextColor(holder.itemView.context.getColor(R.color.ed_rust))
-                holder.status.setBackgroundResource(R.drawable.ed_rust_15)
+                holder.status.setTextColor(holder.itemView.context.getColor(R.color.status_error))
+                holder.status.setBackgroundResource(R.drawable.severity_bg)
             }
         }
     }

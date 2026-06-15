@@ -1,0 +1,735 @@
+package com.edham.logistics.tracking
+
+import android.content.Context
+import android.location.Location
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.TemperatureReadingEntity
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.remote.api.TemperatureMonitoringApi
+import com.edham.logistics.utils.BatteryOptimizer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlin.math.abs
+import kotlin.math.pow
+
+/**
+ * Temperature Tracker - Advanced temperature monitoring for cold chain logistics
+ * 
+ * Features:
+ * - Real-time temperature monitoring
+ * - Cold chain compliance
+ * - Temperature alerts
+ * - Historical tracking
+ * - Sensor integration
+ * - Compliance reporting
+ */
+@Singleton
+class TemperatureTracker @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val temperatureMonitoringApi: TemperatureMonitoringApi,
+    private val batteryOptimizer: BatteryOptimizer
+) {
+    
+    private val _trackingState = MutableStateFlow<TemperatureTrackingState>(TemperatureTrackingState.Stopped)
+    val trackingState: StateFlow<TemperatureTrackingState> = _trackingState.asStateFlow()
+    
+    private val _currentTemperature = MutableStateFlow<TemperatureInfo?>(null)
+    val currentTemperature: StateFlow<TemperatureInfo?> = _currentTemperature.asStateFlow()
+    
+    private val _temperatureHistory = MutableStateFlow<List<TemperatureReadingEntity>>(emptyList())
+    val temperatureHistory: StateFlow<List<TemperatureReadingEntity>> = _temperatureHistory.asStateFlow()
+    
+    private val _temperatureAnalytics = MutableStateFlow<TemperatureAnalytics?>(null)
+    val temperatureAnalytics: StateFlow<TemperatureAnalytics?> = _temperatureAnalytics.asStateFlow()
+    
+    private val _temperatureAlerts = MutableStateFlow<List<TemperatureAlert>>(emptyList())
+    val temperatureAlerts: StateFlow<List<TemperatureAlert>> = _temperatureAlerts.asStateFlow()
+    
+    private var currentVehicleId: String? = null
+    private var isTracking = false
+    private var currentTemperatureCelsius: Float = 0f
+    private var targetTemperature: Float = 4f // Default 4°C for cold chain
+    private var minTemperature: Float = 2f
+    private var maxTemperature: Float = 8f
+    private var temperatureReadings: MutableList<TemperatureReading> = mutableListOf()
+    private var lastUpdateTime: Long = 0L
+    private var complianceViolations: MutableList<ComplianceViolation> = mutableListOf()
+    
+    private val trackingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    companion object {
+        private const val TAG = "TemperatureTracker"
+        private const val TEMPERATURE_UPDATE_INTERVAL = 60000L // 1 minute
+        private const val MAX_TEMPERATURE_READINGS = 1440 // 24 hours of readings
+        private const val CRITICAL_TEMPERATURE_THRESHOLD = 5f // ±5°C from target
+        private const val WARNING_TEMPERATURE_THRESHOLD = 3f // ±3°C from target
+        private const val COMPLIANCE_THRESHOLD = 0.95 // 95% compliance required
+    }
+    
+    /**
+     * Initialize temperature tracking for vehicle
+     */
+    fun initialize(vehicleId: String, coldChainRequirements: ColdChainRequirements) {
+        try {
+            _trackingState.value = TemperatureTrackingState.Initializing
+            
+            currentVehicleId = vehicleId
+            temperatureReadings.clear()
+            complianceViolations.clear()
+            
+            // Load vehicle information
+            trackingScope.launch {
+                loadVehicleInfo(vehicleId)
+            }
+            
+            // Initialize sensors
+            trackingScope.launch {
+                initializeSensors()
+            }
+            
+            _trackingState.value = TemperatureTrackingState.Ready
+            
+        } catch (e: Exception) {
+            _trackingState.value = TemperatureTrackingState.Error("Failed to initialize: ${e.message}")
+        }
+    }
+    
+    /**
+     * Start temperature tracking
+     */
+    fun startTracking() {
+        if (isTracking) return
+        
+        try {
+            _trackingState.value = TemperatureTrackingState.Starting
+            
+            isTracking = true
+            lastUpdateTime = System.currentTimeMillis()
+            
+            _trackingState.value = TemperatureTrackingState.Tracking
+            
+        } catch (e: Exception) {
+            _trackingState.value = TemperatureTrackingState.Error("Failed to start tracking: " + (e.message ?: "Unknown error"))
+        }
+    }
+    
+    /**
+     * Stop temperature tracking
+     */
+    fun stopTracking() {
+        if (!isTracking) return
+        
+        try {
+            _trackingState.value = TemperatureTrackingState.Stopping
+            
+            isTracking = false
+            
+            // Save final data
+            trackingScope.launch {
+                saveTemperatureData()
+            }
+            
+            _trackingState.value = TemperatureTrackingState.Stopped
+            
+        } catch (e: Exception) {
+            _trackingState.value = TemperatureTrackingState.Error("Failed to stop tracking: " + (e.message ?: "Unknown error"))
+        }
+    }
+    
+    /**
+     * Update temperature reading
+     */
+    fun updateTemperature(temperature: Float, sensorId: String = "default") {
+        if (!isTracking) return
+        
+        try {
+            val currentTime = System.currentTimeMillis()
+            currentTemperatureCelsius = temperature
+            
+            // Create temperature info
+            val temperatureInfo = TemperatureInfo(
+                currentTemperature = temperature,
+                targetTemperature = targetTemperature,
+                temperatureDifference = temperature - targetTemperature,
+                isWithinRange = temperature >= minTemperature && temperature <= maxTemperature,
+                isCritical = abs(temperature - targetTemperature) > CRITICAL_TEMPERATURE_THRESHOLD,
+                isWarning = abs(temperature - targetTemperature) > WARNING_TEMPERATURE_THRESHOLD,
+                timestamp = currentTime,
+                sensorId = sensorId,
+                batteryLevel = batteryOptimizer.getBatteryLevel()
+            )
+            
+            _currentTemperature.value = temperatureInfo
+            
+            // Add temperature reading
+            addTemperatureReading(temperatureInfo)
+            
+            // Check for temperature alerts
+            checkTemperatureAlerts(temperatureInfo)
+            
+            // Check compliance
+            checkCompliance(temperatureInfo)
+            
+            // Update analytics
+            updateTemperatureAnalytics()
+            
+            lastUpdateTime = currentTime
+            
+        } catch (e: Exception) {
+            _trackingState.value = TemperatureTrackingState.Error("Failed to update temperature: " + (e.message ?: "Unknown error"))
+        }
+    }
+    
+    /**
+     * Get current temperature
+     */
+    fun getCurrentTemperature(): Float = currentTemperatureCelsius
+    
+    /**
+     * Get average temperature
+     */
+    fun getAverageTemperature(): Float {
+        val readings = temperatureReadings.toList()
+        return if (readings.isNotEmpty()) {
+            readings.map { it.currentTemperature }.average().toFloat()
+        } else 0f
+    }
+    
+    /**
+     * Get temperature compliance rate
+     */
+    fun getComplianceRate(): Float {
+        val readings = temperatureReadings.toList()
+        if (readings.isEmpty()) return 1f
+        
+        val compliantReadings = readings.count { it.isWithinRange }
+        return compliantReadings.toFloat() / readings.size
+    }
+    
+    /**
+     * Get temperature statistics
+     */
+    fun getTemperatureStatistics(): TemperatureStatistics {
+        val readings = temperatureReadings.toList()
+        
+        return TemperatureStatistics(
+            currentTemperature = currentTemperatureCelsius,
+            targetTemperature = targetTemperature,
+            averageTemperature = getAverageTemperature(),
+            minTemperature = readings.minOfOrNull { it.currentTemperature } ?: currentTemperatureCelsius,
+            maxTemperature = readings.maxOfOrNull { it.currentTemperature } ?: currentTemperatureCelsius,
+            temperatureVariance = calculateTemperatureVariance(readings),
+            complianceRate = getComplianceRate(),
+            totalViolations = complianceViolations.size,
+            criticalViolations = complianceViolations.count { it.severity == ComplianceSeverity.CRITICAL },
+            monitoringDuration = if (readings.isNotEmpty()) readings.last().timestamp - readings.first().timestamp else 0L
+        )
+    }
+    
+    /**
+     * Load vehicle information
+     */
+    private suspend fun loadVehicleInfo(vehicleId: String) {
+        // Implementation would load vehicle info from database
+    }
+    
+    /**
+     * Initialize temperature sensors
+     */
+    private suspend fun initializeSensors() {
+        // Implementation would initialize temperature sensors
+    }
+    
+    /**
+     * Add temperature reading
+     */
+    private fun addTemperatureReading(temperatureInfo: TemperatureInfo) {
+        val reading = TemperatureReading(
+            currentTemperature = temperatureInfo.currentTemperature,
+            targetTemperature = temperatureInfo.targetTemperature,
+            timestamp = temperatureInfo.timestamp,
+            sensorId = temperatureInfo.sensorId,
+            batteryLevel = temperatureInfo.batteryLevel,
+            isWithinRange = temperatureInfo.isWithinRange
+        )
+        
+        temperatureReadings.add(reading)
+        
+        // Limit readings to prevent memory issues
+        if (temperatureReadings.size > MAX_TEMPERATURE_READINGS) {
+            temperatureReadings.removeAt(0)
+        }
+    }
+    
+    /**
+     * Check for temperature alerts
+     */
+    private fun checkTemperatureAlerts(temperatureInfo: TemperatureInfo) {
+        // Critical temperature alert
+        if (temperatureInfo.isCritical) {
+            val alertType = if (temperatureInfo.currentTemperature > maxTemperature) {
+                TemperatureAlertType.HIGH_TEMPERATURE_CRITICAL
+            } else {
+                TemperatureAlertType.LOW_TEMPERATURE_CRITICAL
+            }
+            
+            createTemperatureAlert(
+                alertType,
+                "Critical temperature: ${temperatureInfo.currentTemperature.toInt()}°C (target: ${temperatureInfo.targetTemperature.toInt()}°C)",
+                TemperatureAlertSeverity.CRITICAL
+            )
+        }
+        
+        // Warning temperature alert
+        else if (temperatureInfo.isWarning) {
+            val alertType = if (temperatureInfo.currentTemperature > maxTemperature) {
+                TemperatureAlertType.HIGH_TEMPERATURE_WARNING
+            } else {
+                TemperatureAlertType.LOW_TEMPERATURE_WARNING
+            }
+            
+            createTemperatureAlert(
+                alertType,
+                "Temperature warning: ${temperatureInfo.currentTemperature.toInt()}°C (target: ${temperatureInfo.targetTemperature.toInt()}°C)",
+                TemperatureAlertSeverity.WARNING
+            )
+        }
+        
+        // Sensor failure alert
+        if (temperatureInfo.currentTemperature < -50f || temperatureInfo.currentTemperature > 100f) {
+            createTemperatureAlert(
+                TemperatureAlertType.SENSOR_FAILURE,
+                "Sensor failure detected: Invalid temperature reading",
+                TemperatureAlertSeverity.CRITICAL
+            )
+        }
+    }
+    
+    /**
+     * Check compliance
+     */
+    private fun checkCompliance(temperatureInfo: TemperatureInfo) {
+        if (!temperatureInfo.isWithinRange) {
+            val violation = ComplianceViolation(
+                id = 0,
+                timestamp = Date(temperatureInfo.timestamp),
+                actualTemperature = temperatureInfo.currentTemperature,
+                targetTemperature = temperatureInfo.targetTemperature,
+                minTemperature = minTemperature,
+                maxTemperature = maxTemperature,
+                severity = determineViolationSeverity(temperatureInfo),
+                isResolved = false,
+                location = null // Would be populated with actual location
+            )
+            
+            complianceViolations.add(violation)
+            
+            // Create compliance alert
+            createTemperatureAlert(
+                TemperatureAlertType.COMPLIANCE_VIOLATION,
+                "Cold chain compliance violation: ${temperatureInfo.currentTemperature.toInt()}°C",
+                TemperatureAlertSeverity.CRITICAL
+            )
+        }
+    }
+    
+    /**
+     * Determine violation severity
+     */
+    private fun determineViolationSeverity(temperatureInfo: TemperatureInfo): ComplianceSeverity {
+        val deviation = abs(temperatureInfo.currentTemperature - temperatureInfo.targetTemperature)
+        
+        return when {
+            deviation > CRITICAL_TEMPERATURE_THRESHOLD -> ComplianceSeverity.CRITICAL
+            deviation > WARNING_TEMPERATURE_THRESHOLD -> ComplianceSeverity.WARNING
+            else -> ComplianceSeverity.MINOR
+        }
+    }
+    
+    /**
+     * Create temperature alert
+     */
+    private fun createTemperatureAlert(type: TemperatureAlertType, message: String, severity: TemperatureAlertSeverity) {
+        val alert = TemperatureAlert(
+            type = type,
+            severity = severity,
+            message = message,
+            timestamp = System.currentTimeMillis(),
+            data = mapOf(
+                "currentTemperature" to currentTemperatureCelsius,
+                "targetTemperature" to targetTemperature,
+                "minTemperature" to minTemperature,
+                "maxTemperature" to maxTemperature,
+                "complianceRate" to getComplianceRate()
+            )
+        )
+        
+        val currentAlerts = _temperatureAlerts.value.toMutableList()
+        currentAlerts.add(alert)
+        _temperatureAlerts.value = currentAlerts
+    }
+    
+    /**
+     * Update temperature analytics
+     */
+    private fun updateTemperatureAnalytics() {
+        val readings = temperatureReadings.toList()
+        if (readings.isEmpty()) return
+        
+        val analytics = TemperatureAnalytics(
+            averageTemperature = getAverageTemperature(),
+            temperatureVariance = calculateTemperatureVariance(readings),
+            temperatureStability = calculateTemperatureStability(readings),
+            complianceRate = getComplianceRate(),
+            violationPattern = analyzeViolationPattern(),
+            temperatureTrends = calculateTemperatureTrends(readings),
+            sensorPerformance = analyzeSensorPerformance(readings),
+            predictions = generateTemperaturePredictions(readings)
+        )
+        
+        _temperatureAnalytics.value = analytics
+    }
+    
+    /**
+     * Calculate temperature variance
+     */
+    private fun calculateTemperatureVariance(readings: List<TemperatureReading>): Float {
+        if (readings.isEmpty()) return 0f
+        
+        val mean = readings.map { it.currentTemperature }.average()
+        val variance = readings.map { (it.currentTemperature - mean).pow(2).toDouble() }.average()
+        
+        return variance.toFloat()
+    }
+    
+    /**
+     * Calculate temperature stability
+     */
+    private fun calculateTemperatureStability(readings: List<TemperatureReading>): Float {
+        if (readings.size < 2) return 1f
+        
+        val variance = calculateTemperatureVariance(readings)
+        val maxAcceptableVariance = 2.0f // Maximum acceptable variance
+        
+        return maxOf(0f, 1f - (variance / maxAcceptableVariance))
+    }
+    
+    /**
+     * Analyze violation pattern
+     */
+    private fun analyzeViolationPattern(): ViolationPattern {
+        if (complianceViolations.isEmpty()) {
+            return ViolationPattern()
+        }
+        
+        val recentViolations = complianceViolations.takeLast(10)
+        val averageViolationDuration = calculateAverageViolationDuration(recentViolations)
+        val mostCommonViolationType = recentViolations.groupBy { it.severity }.maxByOrNull { it.value.size }?.key
+        
+        return ViolationPattern(
+            totalViolations = complianceViolations.size,
+            recentViolations = recentViolations.size,
+            averageDuration = averageViolationDuration,
+            mostCommonSeverity = mostCommonViolationType ?: ComplianceSeverity.MINOR,
+            violationFrequency = if (recentViolations.isNotEmpty()) {
+                val timeSpan = recentViolations.last().timestamp.time - recentViolations.first().timestamp.time
+                recentViolations.size.toFloat() / (timeSpan / (1000 * 60 * 60)) // Violations per hour
+            } else 0f
+        )
+    }
+    
+    /**
+     * Calculate temperature trends
+     */
+    private fun calculateTemperatureTrends(readings: List<TemperatureReading>): TemperatureTrends {
+        if (readings.size < 20) return TemperatureTrends()
+        
+        val recentReadings = readings.takeLast(10)
+        val olderReadings = readings.dropLast(10).takeLast(10)
+        
+        val recentAverage = recentReadings.map { it.currentTemperature }.average()
+        val olderAverage = olderReadings.map { it.currentTemperature }.average()
+        
+        val trend = when {
+            recentAverage > olderAverage + 1.0 -> TemperatureTrend.RISING
+            recentAverage < olderAverage - 1.0 -> TemperatureTrend.FALLING
+            else -> TemperatureTrend.STABLE
+        }
+        
+        return TemperatureTrends(
+            currentTrend = trend,
+            trendMagnitude = (recentAverage - olderAverage).toFloat(),
+            trendDuration = recentReadings.last().timestamp - olderReadings.first().timestamp
+        )
+    }
+    
+    /**
+     * Analyze sensor performance
+     */
+    private fun analyzeSensorPerformance(readings: List<TemperatureReading>): SensorPerformance {
+        val validReadings = readings.filter { it.currentTemperature >= -50f && it.currentTemperature <= 100f }
+        val invalidReadings = readings.size - validReadings.size
+        
+        val reliability = if (readings.isNotEmpty()) {
+            validReadings.size.toFloat() / readings.size
+        } else 0f
+        
+        return SensorPerformance(
+            reliability = reliability,
+            invalidReadings = invalidReadings,
+            averageResponseTime = calculateAverageResponseTime(readings),
+            sensorHealth = if (reliability > 0.95) SensorHealth.EXCELLENT else if (reliability > 0.90) SensorHealth.GOOD else SensorHealth.POOR
+        )
+    }
+    
+    /**
+     * Generate temperature predictions
+     */
+    private fun generateTemperaturePredictions(readings: List<TemperatureReading>): TemperaturePredictions {
+        val currentTrend = calculateTemperatureTrends(readings)
+        val currentTemp = currentTemperatureCelsius
+        
+        val predictedTemperature = when (currentTrend.currentTrend) {
+            TemperatureTrend.RISING -> currentTemp + 2f
+            TemperatureTrend.FALLING -> currentTemp - 2f
+            TemperatureTrend.STABLE -> currentTemp
+        }
+        
+        val riskOfViolation = calculateRiskOfViolation(predictedTemperature)
+        
+        return TemperaturePredictions(
+            predictedTemperature = predictedTemperature,
+            riskOfViolation = riskOfViolation,
+            recommendedAction = getRecommendedAction(riskOfViolation),
+            nextCheckTime = System.currentTimeMillis() + TEMPERATURE_UPDATE_INTERVAL
+        )
+    }
+    
+    /**
+     * Calculate average violation duration
+     */
+    private fun calculateAverageViolationDuration(violations: List<ComplianceViolation>): Long {
+        // Implementation would calculate average duration of violations
+        return 300000L // 5 minutes default
+    }
+    
+    /**
+     * Calculate average response time
+     */
+    private fun calculateAverageResponseTime(readings: List<TemperatureReading>): Long {
+        // Implementation would calculate sensor response time
+        return 5000L // 5 seconds default
+    }
+    
+    /**
+     * Calculate risk of violation
+     */
+    private fun calculateRiskOfViolation(predictedTemperature: Float): Float {
+        val deviation = abs(predictedTemperature - targetTemperature)
+        
+        return when {
+            deviation > CRITICAL_TEMPERATURE_THRESHOLD -> 1.0f
+            deviation > WARNING_TEMPERATURE_THRESHOLD -> 0.7f
+            deviation > 1f -> 0.4f
+            else -> 0.1f
+        }
+    }
+    
+    /**
+     * Get recommended action
+     */
+    private fun getRecommendedAction(riskOfViolation: Float): String {
+        return when {
+            riskOfViolation > 0.8 -> "IMMEDIATE ACTION REQUIRED"
+            riskOfViolation > 0.6 -> "Check temperature control system"
+            riskOfViolation > 0.4 -> "Monitor closely"
+            else -> "Continue monitoring"
+        }
+    }
+    
+    /**
+     * Save temperature data
+     */
+    private suspend fun saveTemperatureData() {
+        // Implementation would save temperature data to database
+    }
+    
+    /**
+     * Clear temperature data
+     */
+    fun clearTemperatureData() {
+        temperatureReadings.clear()
+        complianceViolations.clear()
+        _currentTemperature.value = null
+        _temperatureHistory.value = emptyList()
+        _temperatureAnalytics.value = null
+        _temperatureAlerts.value = emptyList()
+    }
+    
+    /**
+     * Get tracking status
+     */
+    fun isTracking(): Boolean = isTracking
+}
+
+/**
+ * Data classes
+ */
+data class ColdChainRequirements(
+    val targetTemperature: Float,
+    val minTemperature: Float,
+    val maxTemperature: Float,
+    val productType: String,
+    val complianceStandard: String
+)
+
+data class TemperatureInfo(
+    val currentTemperature: Float,
+    val targetTemperature: Float,
+    val temperatureDifference: Float,
+    val isWithinRange: Boolean,
+    val isCritical: Boolean,
+    val isWarning: Boolean,
+    val timestamp: Long,
+    val sensorId: String,
+    val batteryLevel: Int
+)
+
+data class TemperatureReading(
+    val currentTemperature: Float,
+    val targetTemperature: Float,
+    val timestamp: Long,
+    val sensorId: String,
+    val batteryLevel: Int,
+    val isWithinRange: Boolean = false
+)
+
+data class TemperatureStatistics(
+    val currentTemperature: Float,
+    val targetTemperature: Float,
+    val averageTemperature: Float,
+    val minTemperature: Float,
+    val maxTemperature: Float,
+    val temperatureVariance: Float,
+    val complianceRate: Float,
+    val totalViolations: Int,
+    val criticalViolations: Int,
+    val monitoringDuration: Long
+)
+
+data class TemperatureAnalytics(
+    val averageTemperature: Float,
+    val temperatureVariance: Float,
+    val temperatureStability: Float,
+    val complianceRate: Float,
+    val violationPattern: ViolationPattern,
+    val temperatureTrends: TemperatureTrends,
+    val sensorPerformance: SensorPerformance,
+    val predictions: TemperaturePredictions
+)
+
+data class ComplianceViolation(
+    val id: Long,
+    val timestamp: Date,
+    val actualTemperature: Float,
+    val targetTemperature: Float,
+    val minTemperature: Float,
+    val maxTemperature: Float,
+    val severity: ComplianceSeverity,
+    val isResolved: Boolean,
+    val location: Location?
+)
+
+data class ViolationPattern(
+    val totalViolations: Int = 0,
+    val recentViolations: Int = 0,
+    val averageDuration: Long = 0L,
+    val mostCommonSeverity: ComplianceSeverity = ComplianceSeverity.MINOR,
+    val violationFrequency: Float = 0f
+)
+
+data class TemperatureTrends(
+    val currentTrend: TemperatureTrend = TemperatureTrend.STABLE,
+    val trendMagnitude: Float = 0f,
+    val trendDuration: Long = 0L
+)
+
+data class SensorPerformance(
+    val reliability: Float,
+    val invalidReadings: Int,
+    val averageResponseTime: Long,
+    val sensorHealth: SensorHealth
+)
+
+data class TemperaturePredictions(
+    val predictedTemperature: Float,
+    val riskOfViolation: Float,
+    val recommendedAction: String,
+    val nextCheckTime: Long
+)
+
+data class TemperatureAlert(
+    val type: TemperatureAlertType,
+    val severity: TemperatureAlertSeverity,
+    val message: String,
+    val timestamp: Long,
+    val data: Map<String, Any>
+)
+
+/**
+ * Enums
+ */
+sealed class TemperatureTrackingState {
+    object Stopped : TemperatureTrackingState()
+    object Initializing : TemperatureTrackingState()
+    object Ready : TemperatureTrackingState()
+    object Starting : TemperatureTrackingState()
+    object Tracking : TemperatureTrackingState()
+    object Stopping : TemperatureTrackingState()
+    data class Error(val message: String = "") : TemperatureTrackingState()
+}
+
+enum class ComplianceSeverity {
+    MINOR,
+    WARNING,
+    CRITICAL
+}
+
+enum class TemperatureAlertType {
+    HIGH_TEMPERATURE_CRITICAL,
+    LOW_TEMPERATURE_CRITICAL,
+    HIGH_TEMPERATURE_WARNING,
+    LOW_TEMPERATURE_WARNING,
+    SENSOR_FAILURE,
+    COMPLIANCE_VIOLATION,
+    SENSOR_DISCONNECTED
+}
+
+enum class TemperatureAlertSeverity {
+    INFO,
+    WARNING,
+    CRITICAL
+}
+
+enum class TemperatureTrend {
+    RISING,
+    FALLING,
+    STABLE
+}
+
+enum class SensorHealth {
+    EXCELLENT,
+    GOOD,
+    POOR,
+    FAILED
+}

@@ -1,0 +1,591 @@
+package com.edham.logistics.core.ui
+
+import android.app.AlertDialog
+import android.app.Dialog
+import android.content.Context
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Button
+import android.widget.ImageView
+import android.widget.TextView
+import androidx.fragment.app.FragmentManager
+import kotlinx.coroutines.*
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Dialog Manager - Manages confirmation dialogs and user interactions
+ * Provides consistent dialog patterns across the application
+ */
+@Singleton
+class DialogManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val activeDialogs = ConcurrentHashMap<String, Dialog>()
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    
+    // Default dialog configuration
+    private var defaultConfig = DialogConfig()
+    
+    /**
+     * Initialize dialog manager
+     */
+    fun initialize(screenId: String, config: DialogConfig = DialogConfig()) {
+        this.defaultConfig = config
+    }
+
+    /**
+     * Show confirmation dialog
+     */
+    fun showConfirmationDialog(
+        screenId: String,
+        fragmentManager: FragmentManager,
+        title: String,
+        message: String,
+        confirmText: String = "تأكيد",
+        cancelText: String = "إلغاء",
+        onConfirm: () -> Unit,
+        onCancel: (() -> Unit)? = null,
+        dialogType: DialogType = DialogType.CONFIRMATION
+    ) {
+        hideDialog(screenId) // Hide any existing dialog
+        
+        val dialog = createDialog(
+            title,
+            message,
+            confirmText,
+            cancelText,
+            onConfirm,
+            onCancel,
+            dialogType
+        )
+        
+        dialog.show(fragmentManager, "confirmation_dialog_$screenId")
+        activeDialogs[screenId] = dialog
+    }
+
+    /**
+     * Show warning dialog
+     */
+    fun showWarningDialog(
+        screenId: String,
+        fragmentManager: FragmentManager,
+        title: String,
+        message: String,
+        confirmText: String = "فهمت",
+        onConfirm: () -> Unit
+    ) {
+        hideDialog(screenId)
+        
+        val dialog = createDialog(
+            title,
+            message,
+            confirmText,
+            null,
+            onConfirm,
+            null,
+            DialogType.WARNING
+        )
+        
+        dialog.show(fragmentManager, "warning_dialog_$screenId")
+        activeDialogs[screenId] = dialog
+    }
+
+    /**
+     * Show error dialog
+     */
+    fun showErrorDialog(
+        screenId: String,
+        fragmentManager: FragmentManager,
+        title: String = "خطأ",
+        message: String,
+        confirmText: String = "موافق",
+        onConfirm: () -> Unit
+    ) {
+        hideDialog(screenId)
+        
+        val dialog = createDialog(
+            title,
+            message,
+            confirmText,
+            null,
+            onConfirm,
+            null,
+            DialogType.ERROR
+        )
+        
+        dialog.show(fragmentManager, "error_dialog_$screenId")
+        activeDialogs[screenId] = dialog
+    }
+
+    /**
+     * Show info dialog
+     */
+    fun showInfoDialog(
+        screenId: String,
+        fragmentManager: FragmentManager,
+        title: String,
+        message: String,
+        confirmText: String = "موافق",
+        onConfirm: () -> Unit
+    ) {
+        hideDialog(screenId)
+        
+        val dialog = createDialog(
+            title,
+            message,
+            confirmText,
+            null,
+            onConfirm,
+            null,
+            DialogType.INFO
+        )
+        
+        dialog.show(fragmentManager, "info_dialog_$screenId")
+        activeDialogs[screenId] = dialog
+    }
+
+    /**
+     * Show action dialog with custom actions
+     */
+    fun showActionDialog(
+        screenId: String,
+        fragmentManager: FragmentManager,
+        title: String,
+        message: String,
+        actions: List<DialogAction>
+    ) {
+        hideDialog(screenId)
+        
+        val dialog = createActionDialog(title, message, actions)
+        dialog.show(fragmentManager, "action_dialog_$screenId")
+        activeDialogs[screenId] = dialog
+    }
+
+    /**
+     * Show progress dialog
+     */
+    fun showProgressDialog(
+        screenId: String,
+        fragmentManager: FragmentManager,
+        title: String = "جاري التحميل...",
+        message: String? = null,
+        cancelable: Boolean = false
+    ) {
+        hideDialog(screenId)
+        
+        val dialog = createProgressDialog(title, message, cancelable)
+        dialog.show(fragmentManager, "progress_dialog_$screenId")
+        activeDialogs[screenId] = dialog
+    }
+
+    /**
+     * Update progress dialog
+     */
+    fun updateProgressDialog(
+        screenId: String,
+        message: String? = null,
+        progress: Int? = null
+    ) {
+        val dialog = activeDialogs[screenId]
+        if (dialog is ProgressDialog) {
+            message?.let { dialog.updateMessage(it) }
+            progress?.let { dialog.updateProgress(it) }
+        }
+    }
+
+    /**
+     * Hide dialog
+     */
+    fun hideDialog(screenId: String) {
+        activeDialogs[screenId]?.let { dialog ->
+            dialog.dismiss()
+            activeDialogs.remove(screenId)
+        }
+    }
+
+    /**
+     * Hide all dialogs
+     */
+    fun hideAllDialogs() {
+        activeDialogs.forEach { (screenId, dialog) ->
+            dialog.dismiss()
+        }
+        activeDialogs.clear()
+    }
+
+    /**
+     * Check if dialog is showing
+     */
+    fun isDialogShowing(screenId: String): Boolean {
+        return activeDialogs.containsKey(screenId)
+    }
+
+    /**
+     * Get active dialog count
+     */
+    fun getActiveDialogCount(): Int {
+        return activeDialogs.size
+    }
+
+    /**
+     * Create basic dialog
+     */
+    private fun createDialog(
+        title: String,
+        message: String,
+        confirmText: String,
+        cancelText: String?,
+        onConfirm: () -> Unit,
+        onCancel: (() -> Unit)?,
+        dialogType: DialogType
+    ): AlertDialog {
+        val builder = AlertDialog.Builder(context)
+        
+        // Create custom view
+        val customView = createDialogView(title, message, dialogType)
+        builder.setView(customView)
+        
+        // Set buttons
+        builder.setPositiveButton(confirmText) { _, _ ->
+            onConfirm()
+        }
+        
+        cancelText?.let { text ->
+            builder.setNegativeButton(text) { _, _ ->
+                onCancel?.invoke()
+            }
+        }
+        
+        val dialog = builder.create()
+        
+        // Configure dialog appearance
+        configureDialog(dialog, dialogType)
+        
+        return dialog
+    }
+
+    /**
+     * Create action dialog
+     */
+    private fun createActionDialog(
+        title: String,
+        message: String,
+        actions: List<DialogAction>
+    ): AlertDialog {
+        val builder = AlertDialog.Builder(context)
+        
+        // Create custom view
+        val customView = createActionDialogView(title, message, actions)
+        builder.setView(customView)
+        
+        val dialog = builder.create()
+        configureDialog(dialog, DialogType.CUSTOM)
+        
+        return dialog
+    }
+
+    /**
+     * Create progress dialog
+     */
+    private fun createProgressDialog(
+        title: String,
+        message: String?,
+        cancelable: Boolean
+    ): ProgressDialog {
+        return ProgressDialog(context, title, message, cancelable)
+    }
+
+    /**
+     * Create dialog view
+     */
+    private fun createDialogView(
+        title: String,
+        message: String,
+        dialogType: DialogType
+    ): View {
+        val inflater = LayoutInflater.from(context)
+        val view = inflater.inflate(android.R.layout.simple_list_item_1, null) as TextView
+        
+        // Style the view based on dialog type
+        when (dialogType) {
+            DialogType.CONFIRMATION -> {
+                view.text = "$title\n\n$message"
+                view.setTextColor(Color.parseColor("#333333"))
+                view.textSize = 16f
+            }
+            DialogType.WARNING -> {
+                view.text = "⚠️ $title\n\n$message"
+                view.setTextColor(Color.parseColor("#FF9800"))
+                view.textSize = 16f
+            }
+            DialogType.ERROR -> {
+                view.text = "❌ $title\n\n$message"
+                view.setTextColor(Color.parseColor("#F44336"))
+                view.textSize = 16f
+            }
+            DialogType.INFO -> {
+                view.text = "ℹ️ $title\n\n$message"
+                view.setTextColor(Color.parseColor("#2196F3"))
+                view.textSize = 16f
+            }
+            else -> {
+                view.text = "$title\n\n$message"
+                view.setTextColor(Color.parseColor("#333333"))
+                view.textSize = 16f
+            }
+        }
+        
+        view.setPadding(48, 48, 48, 48)
+        view.gravity = android.view.Gravity.CENTER
+        
+        return view
+    }
+
+    /**
+     * Create action dialog view
+     */
+    private fun createActionDialogView(
+        title: String,
+        message: String,
+        actions: List<DialogAction>
+    ): View {
+        val container = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(48, 48, 48, 48)
+        }
+        
+        // Title
+        val titleView = TextView(context).apply {
+            text = title
+            textSize = 18f
+            setTextColor(Color.parseColor("#333333"))
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, 0, 0, 24)
+        }
+        container.addView(titleView)
+        
+        // Message
+        val messageView = TextView(context).apply {
+            text = message
+            textSize = 14f
+            setTextColor(Color.parseColor("#666666"))
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, 0, 0, 32)
+        }
+        container.addView(messageView)
+        
+        // Actions
+        val actionsContainer = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, 16, 0, 0)
+        }
+        
+        actions.forEach { action ->
+            val button = Button(context).apply {
+                text = action.text
+                textSize = 14f
+                setTextColor(Color.WHITE)
+                background = createActionButtonBackground(action.type)
+                setPadding(24, 12, 24, 12)
+                setOnClickListener {
+                    action.onAction()
+                }
+            }
+            
+            actionsContainer.addView(button)
+            
+            // Add margin between buttons
+            if (actions.indexOf(action) < actions.size - 1) {
+                val params = button.layoutParams as ViewGroup.MarginLayoutParams
+                params.marginEnd = 16
+                button.layoutParams = params
+            }
+        }
+        
+        container.addView(actionsContainer)
+        return container
+    }
+
+    /**
+     * Create action button background
+     */
+    private fun createActionButtonBackground(actionType: ActionType): GradientDrawable {
+        val color = when (actionType) {
+            ActionType.PRIMARY -> Color.parseColor("#2196F3")
+            ActionType.SECONDARY -> Color.parseColor("#9E9E9E")
+            ActionType.DANGER -> Color.parseColor("#F44336")
+            ActionType.WARNING -> Color.parseColor("#FF9800")
+            ActionType.SUCCESS -> Color.parseColor("#4CAF50")
+        }
+        
+        return GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = 6f
+        }
+    }
+
+    /**
+     * Configure dialog appearance
+     */
+    private fun configureDialog(dialog: AlertDialog, dialogType: DialogType) {
+        if (defaultConfig.enableBackdrop) {
+            dialog.window?.setBackgroundDrawable(ColorDrawable(Color.parseColor("#80000000")))
+        }
+        
+        if (!defaultConfig.enableAnimations) {
+            dialog.window?.setWindowAnimations(android.R.style.Animation_Dialog)
+        }
+        
+        // Make dialog non-cancelable for important dialogs
+        when (dialogType) {
+            DialogType.ERROR, DialogType.WARNING -> {
+                dialog.setCancelable(false)
+                dialog.setCanceledOnTouchOutside(false)
+            }
+            else -> {
+                dialog.setCancelable(true)
+                dialog.setCanceledOnTouchOutside(true)
+            }
+        }
+    }
+
+    /**
+     * Update dialog configuration
+     */
+    fun updateConfig(config: DialogConfig) {
+        this.defaultConfig = config
+    }
+
+    /**
+     * Show custom dialog with view
+     */
+    fun showCustomDialog(
+        screenId: String,
+        fragmentManager: FragmentManager,
+        customView: View,
+        cancelable: Boolean = true
+    ) {
+        hideDialog(screenId)
+        
+        val dialog = AlertDialog.Builder(context)
+            .setView(customView)
+            .setCancelable(cancelable)
+            .create()
+        
+        configureDialog(dialog, DialogType.CUSTOM)
+        dialog.show(fragmentManager, "custom_dialog_$screenId")
+        activeDialogs[screenId] = dialog
+    }
+
+    /**
+     * Cleanup dialog manager
+     */
+    fun cleanup(screenId: String? = null) {
+        if (screenId != null) {
+            hideDialog(screenId)
+        } else {
+            hideAllDialogs()
+        }
+        
+        coroutineScope.cancel()
+    }
+}
+
+/**
+ * Custom progress dialog
+ */
+class ProgressDialog(
+    context: Context,
+    private val title: String,
+    private val message: String?,
+    cancelable: Boolean
+) : AlertDialog(context) {
+
+    private val titleView: TextView
+    private val messageView: TextView
+
+    init {
+        val container = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(48, 48, 48, 48)
+        }
+
+        titleView = TextView(context).apply {
+            text = title
+            textSize = 16f
+            setTextColor(Color.parseColor("#333333"))
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, 0, 0, 16)
+        }
+        container.addView(titleView)
+
+        message?.let { msg ->
+            messageView = TextView(context).apply {
+                text = msg
+                textSize = 14f
+                setTextColor(Color.parseColor("#666666"))
+                gravity = android.view.Gravity.CENTER
+                setPadding(0, 8, 0, 0)
+            }
+            container.addView(messageView)
+        } ?: run {
+            messageView = TextView(context)
+        }
+
+        setView(container)
+        setCancelable(cancelable)
+        setCanceledOnTouchOutside(false)
+    }
+
+    fun updateMessage(newMessage: String) {
+        messageView.text = newMessage
+    }
+
+    fun updateProgress(progress: Int) {
+        // Update progress if needed
+        titleView.text = "$title ($progress%)"
+    }
+}
+
+/**
+ * Data classes and enums
+ */
+data class DialogConfig(
+    val enableBackdrop: Boolean = true,
+    val enableAnimations: Boolean = true,
+    val defaultDialogType: DialogType = DialogType.CONFIRMATION,
+    val cornerRadius: Float = 8f,
+    val buttonHeight: Int = 48
+)
+
+data class DialogAction(
+    val text: String,
+    val type: ActionType,
+    val onAction: () -> Unit
+)
+
+enum class DialogType {
+    CONFIRMATION,
+    WARNING,
+    ERROR,
+    INFO,
+    CUSTOM
+}
+
+enum class ActionType {
+    PRIMARY,
+    SECONDARY,
+    DANGER,
+    WARNING,
+    SUCCESS
+}

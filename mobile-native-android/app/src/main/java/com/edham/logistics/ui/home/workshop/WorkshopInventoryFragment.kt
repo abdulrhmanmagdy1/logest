@@ -10,6 +10,7 @@ import androidx.fragment.app.viewModels
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.edham.logistics.R
+import com.edham.logistics.ui.home.workshop.adapter.InventoryAdapter
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
@@ -17,6 +18,7 @@ class WorkshopInventoryFragment : Fragment() {
 
     private val viewModel: WorkshopViewModel by viewModels()
     private lateinit var rvInventory: RecyclerView
+    private lateinit var adapter: InventoryAdapter
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -31,6 +33,8 @@ class WorkshopInventoryFragment : Fragment() {
         
         rvInventory = view.findViewById(R.id.rvInventory)
         rvInventory.layoutManager = LinearLayoutManager(requireContext())
+        adapter = InventoryAdapter(emptyList())
+        rvInventory.adapter = adapter
         
         observeViewModel(view)
         viewModel.loadInventory()
@@ -38,10 +42,9 @@ class WorkshopInventoryFragment : Fragment() {
 
     private fun observeViewModel(view: View) {
         viewModel.inventory.observe(viewLifecycleOwner) { parts ->
-            // In a real app, create an adapter
-            // rvInventory.adapter = InventoryAdapter(parts)
+            adapter.updateData(parts)
             
-            val lowStockCount = parts.count { it.quantity < 10 } // Logic
+            val lowStockCount = parts.count { it.quantity < it.minQuantity }
             view.findViewById<View>(R.id.cardLowStock).visibility = 
                 if (lowStockCount > 0) View.VISIBLE else View.GONE
         }

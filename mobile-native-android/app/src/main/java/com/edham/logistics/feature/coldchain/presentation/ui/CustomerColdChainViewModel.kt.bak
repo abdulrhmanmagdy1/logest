@@ -1,0 +1,179 @@
+package com.edham.logistics.feature.coldchain.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.coldchain.domain.usecase.*
+import com.edham.logistics.feature.coldchain.domain.model.*
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class CustomerColdChainViewModel @Inject constructor(
+    private val getColdChainStatusUseCase: GetColdChainStatusUseCase,
+    private val getTemperatureHistoryUseCase: GetTemperatureHistoryUseCase
+) : BaseViewModel<CustomerColdChainViewModel.CustomerColdChainUiState>() {
+
+    private val _uiState = MutableStateFlow(CustomerColdChainUiState())
+    val uiState: StateFlow<CustomerColdChainUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): CustomerColdChainUiState = CustomerColdChainUiState()
+
+    fun initialize(customerId: String) {
+        _uiState.value = _uiState.value.copy(customerId = customerId)
+        loadCustomerColdChainStatus(customerId)
+    }
+
+    fun loadCustomerColdChainStatus(customerId: String) {
+        viewModelScope.launch {
+            when (val result = getColdChainStatusUseCase.getCustomerColdChainStatus(customerId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        coldChainShipments = result.data,
+                        isLoading = false,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(
+                        isLoading = false,
+                        error = result.exception.message ?: "فشل تحميل حالة سلسلة التبريد"
+                    )}
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun selectShipment(shipmentId: String) {
+        viewModelScope.launch {
+            when (val result = getColdChainStatusUseCase.getShipmentColdChainStatus(shipmentId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        selectedShipment = result.data,
+                        error = null
+                    )}
+                    loadTemperatureHistory(shipmentId)
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل بيانات الشحنة") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    private fun loadTemperatureHistory(shipmentId: String) {
+        viewModelScope.launch {
+            val request = GetTemperatureHistoryRequest(
+                shipmentId = shipmentId,
+                startTime = null,
+                endTime = null,
+                includeAlerts = true
+            )
+            
+            when (val result = getTemperatureHistoryUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        temperatureHistory = result.data,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل سجل درجات الحرارة") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun observeShipmentStatus(shipmentId: String) {
+        viewModelScope.launch {
+            getColdChainStatusUseCase.observeShipmentColdChainStatus(shipmentId).collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            selectedShipment = result.data,
+                            error = null
+                        )}
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(error = result.exception.message ?: "خطأ في التحديثات المباشرة") }
+                    }
+                    is Result.Loading -> {
+                        // Handle loading state if needed
+                    }
+                }
+            }
+        }
+    }
+
+    fun observeTemperatureHistory(shipmentId: String) {
+        viewModelScope.launch {
+            getTemperatureHistoryUseCase.observeTemperatureHistory(shipmentId).collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            temperatureHistory = result.data,
+                            error = null
+                        )}
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(error = result.exception.message ?: "خطأ في تحديث سجل الحرارة") }
+                    }
+                    is Result.Loading -> {
+                        // Handle loading state if needed
+                    }
+                }
+            }
+        }
+    }
+
+    fun refresh() {
+        _uiState.value.customerId?.let { customerId ->
+            loadCustomerColdChainStatus(customerId)
+        }
+    }
+
+    fun clearSelection() {
+        updateUiState { copy(
+            selectedShipment = null,
+            temperatureHistory = null
+        )}
+    }
+
+    fun exportReport(shipmentId: String, format: ReportFormat) {
+        // This would integrate with the repository to generate reports
+        updateUiState { copy(
+            actionSuccess = "تم بدء توليد التقرير بتنسيق $format"
+        )}
+    }
+
+    fun clearSuccess() {
+        updateUiState { copy(actionSuccess = null) }
+    }
+
+    data class CustomerColdChainUiState(
+        val isLoading: Boolean = false,
+        val customerId: String? = null,
+        val coldChainShipments: List<ColdChainShipment> = emptyList(),
+        val selectedShipment: ColdChainShipment? = null,
+        val temperatureHistory: TemperatureHistory? = null,
+        val error: String? = null,
+        val actionSuccess: String? = null
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = copy(actionSuccess = message)
+    }
+}

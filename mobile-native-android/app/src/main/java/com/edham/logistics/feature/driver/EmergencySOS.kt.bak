@@ -1,0 +1,462 @@
+package com.edham.logistics.feature.driver
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.location.Location
+import android.os.Bundle
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentEmergencySosBinding
+import com.edham.logistics.utils.VoiceAlertManager
+import com.edham.logistics.utils.GPSOptimizer
+import com.google.android.gms.location.LocationServices
+import timber.log.Timber
+import java.util.*
+
+class EmergencySOSFragment : Fragment() {
+    
+    private var _binding: FragmentEmergencySosBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var voiceAlertManager: VoiceAlertManager
+    private lateinit var gpsOptimizer: GPSOptimizer
+    private var isEmergencyActive = false
+    private var emergencyStartTime: Long = 0
+    private var currentLocation: Location? = null
+    
+    companion object {
+        private const val LOCATION_PERMISSION_REQUEST_CODE = 1001
+        private const val CALL_PERMISSION_REQUEST_CODE = 1002
+    }
+    
+    override fun onCreateView(
+        inflater: android.view.LayoutInflater,
+        container: android.view.ViewGroup?,
+        savedInstanceState: Bundle?
+    ): android.view.View {
+        _binding = FragmentEmergencySosBindingBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: android.view.View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        voiceAlertManager = VoiceAlertManager(requireContext())
+        gpsOptimizer = GPSOptimizer(requireContext())
+        
+        setupUI()
+        setupClickListeners()
+        checkPermissions()
+        
+        voiceAlertManager.speak("Emergency SOS screen opened")
+    }
+    
+    private fun setupUI() {
+        // Large touch targets for one-hand usage
+        binding.btnTriggerSOS.minimumHeight = 88.dp
+        binding.btnTriggerSOS.minimumWidth = 160.dp
+        
+        binding.btnCancelSOS.minimumHeight = 72.dp
+        binding.btnCancelSOS.minimumWidth = 120.dp
+        
+        binding.btnCallEmergency.minimumHeight = 72.dp
+        binding.btnCallEmergency.minimumWidth = 120.dp
+        
+        binding.btnCallSupervisor.minimumHeight = 72.dp
+        binding.btnCallSupervisor.minimumWidth = 120.dp
+        
+        // Dark mode optimized colors
+        binding.cardEmergencyStatus.setCardBackgroundColor(
+            requireContext().getColor(R.color.dark_surface)
+        )
+        
+        // High visibility status colors
+        updateEmergencyStatusUI()
+    }
+    
+    private fun setupClickListeners() {
+        binding.btnTriggerSOS.setOnClickListener {
+            triggerEmergencySOS()
+        }
+        
+        binding.btnCancelSOS.setOnClickListener {
+            cancelEmergencySOS()
+        }
+        
+        binding.btnCallEmergency.setOnClickListener {
+            callEmergencyServices()
+        }
+        
+        binding.btnCallSupervisor.setOnClickListener {
+            callSupervisor()
+        }
+        
+        binding.btnShareLocation.setOnClickListener {
+            shareCurrentLocation()
+        }
+    }
+    
+    private fun checkPermissions() {
+        val permissionsToRequest = mutableListOf<String>()
+        
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.ACCESS_FINE_LOCATION) 
+            != PackageManager.PERMISSION_GRANTED) {
+            permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.CALL_PHONE) 
+            != PackageManager.PERMISSION_GRANTED) {
+            permissionsToRequest.add(Manifest.permission.CALL_PHONE)
+        }
+        
+        if (permissionsToRequest.isNotEmpty()) {
+            ActivityCompat.requestPermissions(
+                requireActivity(),
+                permissionsToRequest.toTypedArray(),
+                LOCATION_PERMISSION_REQUEST_CODE
+            )
+        } else {
+            getCurrentLocation()
+        }
+    }
+    
+    private fun triggerEmergencySOS() {
+        if (isEmergencyActive) {
+            voiceAlertManager.speak("Emergency alert is already active")
+            return
+        }
+        
+        // Get current location
+        getCurrentLocation()
+        
+        // Activate emergency mode
+        isEmergencyActive = true
+        emergencyStartTime = System.currentTimeMillis()
+        
+        // Update UI
+        updateEmergencyStatusUI()
+        binding.btnTriggerSOS.isEnabled = false
+        binding.btnCancelSOS.isEnabled = true
+        
+        // Voice alert
+        voiceAlertManager.speak("Emergency SOS activated. Help is on the way")
+        
+        // Send emergency alert
+        sendEmergencyAlert()
+        
+        // Start location sharing
+        startLocationSharing()
+        
+        // Start emergency countdown
+        startEmergencyCountdown()
+        
+        // Vibrate device
+        vibrateDevice()
+    }
+    
+    private fun cancelEmergencySOS() {
+        if (!isEmergencyActive) {
+            voiceAlertManager.speak("No emergency is currently active")
+            return
+        }
+        
+        // Cancel emergency mode
+        isEmergencyActive = false
+        
+        // Update UI
+        updateEmergencyStatusUI()
+        binding.btnTriggerSOS.isEnabled = true
+        binding.btnCancelSOS.isEnabled = false
+        
+        // Voice alert
+        voiceAlertManager.speak("Emergency SOS cancelled")
+        
+        // Send cancellation alert
+        sendEmergencyCancellation()
+        
+        // Stop location sharing
+        stopLocationSharing()
+        
+        // Stop countdown
+        stopEmergencyCountdown()
+    }
+    
+    private fun callEmergencyServices() {
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.CALL_PHONE) 
+            == PackageManager.PERMISSION_GRANTED) {
+            
+            val intent = Intent(android.content.Intent.ACTION_CALL)
+            intent.data = android.net.Uri.parse("tel:911") // Emergency number
+            
+            try {
+                startActivity(intent)
+                voiceAlertManager.speak("Calling emergency services")
+            } catch (e: Exception) {
+                Timber.e(e, "Error calling emergency services")
+                Toast.makeText(requireContext(), "Error calling emergency services", Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            requestCallPermission()
+        }
+    }
+    
+    private fun callSupervisor() {
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.CALL_PHONE) 
+            == PackageManager.PERMISSION_GRANTED) {
+            
+            // Get supervisor phone number from preferences or API
+            val supervisorPhone = getSupervisorPhoneNumber()
+            
+            if (supervisorPhone.isNotEmpty()) {
+                val intent = Intent(android.content.Intent.ACTION_CALL)
+                intent.data = android.net.Uri.parse("tel:$supervisorPhone")
+                
+                try {
+                    startActivity(intent)
+                    voiceAlertManager.speak("Calling supervisor")
+                } catch (e: Exception) {
+                    Timber.e(e, "Error calling supervisor")
+                    Toast.makeText(requireContext(), "Error calling supervisor", Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                Toast.makeText(requireContext(), "Supervisor number not available", Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            requestCallPermission()
+        }
+    }
+    
+    private fun shareCurrentLocation() {
+        currentLocation?.let { location ->
+            val locationText = "My current location: https://maps.google.com/?q=${location.latitude},${location.longitude}"
+            
+            val shareIntent = Intent().apply {
+                action = Intent.ACTION_SEND
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, locationText)
+            }
+            
+            try {
+                startActivity(Intent.createChooser(shareIntent, "Share Location"))
+                voiceAlertManager.speak("Sharing current location")
+            } catch (e: Exception) {
+                Timber.e(e, "Error sharing location")
+                Toast.makeText(requireContext(), "Error sharing location", Toast.LENGTH_SHORT).show()
+            }
+        } ?: run {
+            Toast.makeText(requireContext(), "Location not available", Toast.LENGTH_SHORT).show()
+            voiceAlertManager.speak("Location not available")
+        }
+    }
+    
+    private fun getCurrentLocation() {
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.ACCESS_FINE_LOCATION) 
+            == PackageManager.PERMISSION_GRANTED) {
+            
+            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(requireContext())
+            
+            try {
+                fusedLocationClient.lastLocation
+                    .addOnSuccessListener { location ->
+                        if (location != null) {
+                            currentLocation = location
+                            updateLocationUI()
+                        } else {
+                            // Request new location
+                            gpsOptimizer.startLocationUpdates()
+                        }
+                    }
+                    .addOnFailureListener { e ->
+                        Timber.e(e, "Error getting location")
+                        Toast.makeText(requireContext(), "Error getting location", Toast.LENGTH_SHORT).show()
+                    }
+            } catch (e: Exception) {
+                Timber.e(e, "Error accessing location services")
+            }
+        }
+    }
+    
+    private fun sendEmergencyAlert() {
+        val emergencyData = EmergencyData(
+            id = UUID.randomUUID().toString(),
+            driverId = getCurrentDriverId(),
+            location = currentLocation,
+            timestamp = System.currentTimeMillis(),
+            type = "SOS",
+            status = "ACTIVE",
+            message = binding.etEmergencyMessage.text.toString()
+        )
+        
+        // Send to server
+        // This would typically involve an API call
+        Timber.d("Emergency alert sent: ${emergencyData.id}")
+        
+        // Update UI
+        binding.tvEmergencyId.text = "Emergency ID: ${emergencyData.id}"
+    }
+    
+    private fun sendEmergencyCancellation() {
+        // Send cancellation to server
+        Timber.d("Emergency SOS cancelled")
+        
+        // Clear emergency ID
+        binding.tvEmergencyId.text = ""
+    }
+    
+    private fun startLocationSharing() {
+        // Start continuous location sharing
+        gpsOptimizer.startLocationUpdates()
+        Timber.d("Location sharing started")
+    }
+    
+    private fun stopLocationSharing() {
+        // Stop continuous location sharing
+        gpsOptimizer.stopLocationUpdates()
+        Timber.d("Location sharing stopped")
+    }
+    
+    private fun startEmergencyCountdown() {
+        // Start countdown timer for emergency duration
+        binding.tvEmergencyTimer.text = "00:00:00"
+        
+        // Implementation would start a timer to track emergency duration
+    }
+    
+    private fun stopEmergencyCountdown() {
+        // Stop emergency countdown timer
+        binding.tvEmergencyTimer.text = ""
+    }
+    
+    private fun updateEmergencyStatusUI() {
+        val status = if (isEmergencyActive) "ACTIVE" else "INACTIVE"
+        
+        binding.tvEmergencyStatus.text = status
+        
+        val color = if (isEmergencyActive) {
+            requireContext().getColor(R.color.status_error)
+        } else {
+            requireContext().getColor(R.color.status_idle)
+        }
+        
+        binding.viewStatusIndicator.setBackgroundColor(color)
+        
+        // Update button states
+        binding.btnTriggerSOS.isEnabled = !isEmergencyActive
+        binding.btnCancelSOS.isEnabled = isEmergencyActive
+    }
+    
+    private fun updateLocationUI() {
+        currentLocation?.let { location ->
+            binding.tvCurrentLocation.text = String.format(
+                "Lat: %.6f, Lng: %.6f",
+                location.latitude,
+                location.longitude
+            )
+        }
+    }
+    
+    private fun getSupervisorPhoneNumber(): String {
+        // Get supervisor phone number from preferences or API
+        // For now, return a placeholder
+        return "+1234567890"
+    }
+    
+    private fun getCurrentDriverId(): String {
+        // Get current driver ID from preferences or authentication
+        // For now, return a placeholder
+        return "driver_123"
+    }
+    
+    private fun requestCallPermission() {
+        ActivityCompat.requestPermissions(
+            requireActivity(),
+            arrayOf(Manifest.permission.CALL_PHONE),
+            CALL_PERMISSION_REQUEST_CODE
+        )
+    }
+    
+    private fun vibrateDevice() {
+        try {
+            val vibrator = requireContext().getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                val pattern = longArrayOf(0, 500, 200, 500)
+                vibrator.vibrate(android.os.VibrationEffect.createWaveform(pattern, -1))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(longArrayOf(0, 500, 200, 500), -1)
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error vibrating device")
+        }
+    }
+    
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        
+        when (requestCode) {
+            LOCATION_PERMISSION_REQUEST_CODE -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    getCurrentLocation()
+                } else {
+                    Toast.makeText(requireContext(), "Location permission required for emergency features", Toast.LENGTH_LONG).show()
+                }
+            }
+            CALL_PERMISSION_REQUEST_CODE -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    // Permission granted, can make calls
+                } else {
+                    Toast.makeText(requireContext(), "Call permission required for emergency calls", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+    
+    override fun onResume() {
+        super.onResume()
+        
+        // Start location updates if emergency is active
+        if (isEmergencyActive) {
+            gpsOptimizer.startLocationUpdates()
+        }
+    }
+    
+    override fun onPause() {
+        super.onPause()
+        
+        // Keep location updates running if emergency is active
+        // Otherwise stop to save battery
+        if (!isEmergencyActive) {
+            gpsOptimizer.stopLocationUpdates()
+        }
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        
+        // Clean up resources
+        gpsOptimizer.cleanup()
+        voiceAlertManager.cleanup()
+        _binding = null
+    }
+    
+    // Extension for dp to pixels
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+}
+
+data class EmergencyData(
+    val id: String,
+    val driverId: String,
+    val location: Location?,
+    val timestamp: Long,
+    val type: String,
+    val status: String,
+    val message: String
+)

@@ -1,0 +1,275 @@
+package com.edham.logistics.feature.notifications.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.notifications.domain.model.*
+import com.edham.logistics.feature.notifications.domain.usecase.*
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class NotificationViewModel @Inject constructor(
+    private val getNotificationsUseCase: GetNotificationsUseCase,
+    private val sendNotificationUseCase: SendNotificationUseCase,
+    private val updateNotificationSettingsUseCase: UpdateNotificationSettingsUseCase
+) : BaseViewModel<NotificationViewModel.NotificationUiState>() {
+
+    private val _uiState = MutableStateFlow(NotificationUiState())
+    val uiState: StateFlow<NotificationUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): NotificationUiState = NotificationUiState()
+
+    fun initialize(userId: String, userRole: UserRole) {
+        _uiState.value = _uiState.value.copy(
+            userId = userId,
+            userRole = userRole
+        )
+        loadNotifications()
+        observeNotifications()
+    }
+
+    fun loadNotifications() {
+        viewModelScope.launch {
+            val request = GetNotificationsRequest(
+                userId = _uiState.value.userId,
+                userRole = _uiState.value.userRole,
+                types = null,
+                categories = null,
+                isRead = null,
+                limit = 50,
+                offset = 0,
+                startDate = null,
+                endDate = null
+            )
+            
+            when (val result = getNotificationsUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        notifications = result.data,
+                        isLoading = false,
+                        error = null
+                    )}
+                    
+                    // Get unread count
+                    loadUnreadCount()
+                }
+                is Result.Error -> {
+                    updateUiState { copy(
+                        isLoading = false,
+                        error = result.exception.message ?: "فشل تحميل الإشعارات"
+                    )}
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    private fun observeNotifications() {
+        viewModelScope.launch {
+            getNotificationsUseCase.observeNotifications(
+                _uiState.value.userId,
+                _uiState.value.userRole
+            ).collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            notifications = result.data,
+                            error = null
+                        )}
+                        
+                        // Update unread count
+                        loadUnreadCount()
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(error = result.exception.message ?: "خطأ في تحديثات الإشعارات") }
+                    }
+                    is Result.Loading -> {
+                        // Handle loading state if needed
+                    }
+                }
+            }
+        }
+    }
+
+    private fun loadUnreadCount() {
+        viewModelScope.launch {
+            when (val result = getNotificationsUseCase.getUnreadCount(
+                _uiState.value.userId,
+                _uiState.value.userRole
+            )) {
+                is Result.Success -> {
+                    updateUiState { copy(unreadCount = result.data) }
+                }
+                is Result.Error -> {
+                    // Handle error silently
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun markAsRead(notificationId: String) {
+        viewModelScope.launch {
+            when (val result = getNotificationsUseCase.markAsRead(notificationId, _uiState.value.userId)) {
+                is Result.Success -> {
+                    updateNotificationInList(notificationId, true)
+                    loadUnreadCount()
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحديث الإشعار") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun markAllAsRead() {
+        viewModelScope.launch {
+            when (val result = getNotificationsUseCase.markAllAsRead(
+                _uiState.value.userId,
+                _uiState.value.userRole
+            )) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        notifications = _uiState.value.notifications.map { it.copy(isRead = true) },
+                        unreadCount = 0
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحديث جميع الإشعارات") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun deleteNotification(notificationId: String) {
+        viewModelScope.launch {
+            when (val result = getNotificationsUseCase.deleteNotification(notificationId, _uiState.value.userId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        notifications = _uiState.value.notifications.filter { it.id != notificationId }
+                    )}
+                    loadUnreadCount()
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل حذف الإشعار") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun refresh() {
+        loadNotifications()
+    }
+
+    fun filterByType(type: NotificationType?) {
+        viewModelScope.launch {
+            val request = GetNotificationsRequest(
+                userId = _uiState.value.userId,
+                userRole = _uiState.value.userRole,
+                types = if (type != null) listOf(type) else null,
+                categories = null,
+                isRead = null,
+                limit = 50,
+                offset = 0,
+                startDate = null,
+                endDate = null
+            )
+            
+            when (val result = getNotificationsUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        notifications = result.data,
+                        selectedType = type,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل فلترة الإشعارات") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun filterByCategory(category: NotificationCategory?) {
+        viewModelScope.launch {
+            val request = GetNotificationsRequest(
+                userId = _uiState.value.userId,
+                userRole = _uiState.value.userRole,
+                types = null,
+                categories = if (category != null) listOf(category) else null,
+                isRead = null,
+                limit = 50,
+                offset = 0,
+                startDate = null,
+                endDate = null
+            )
+            
+            when (val result = getNotificationsUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        notifications = result.data,
+                        selectedCategory = category,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل فلترة الإشعارات") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun clearError() {
+        updateUiState { copy(error = null) }
+    }
+
+    private fun updateNotificationInList(notificationId: String, isRead: Boolean) {
+        val updatedList = _uiState.value.notifications.map { notification ->
+            if (notification.id == notificationId) {
+                notification.copy(isRead = isRead)
+            } else {
+                notification
+            }
+        }
+        updateUiState { copy(notifications = updatedList) }
+    }
+
+    data class NotificationUiState(
+        val isLoading: Boolean = false,
+        val userId: String = "",
+        val userRole: UserRole = UserRole.CUSTOMER,
+        val notifications: List<Notification> = emptyList(),
+        val unreadCount: Int = 0,
+        val selectedType: NotificationType? = null,
+        val selectedCategory: NotificationCategory? = null,
+        val error: String? = null
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = this
+    }
+}

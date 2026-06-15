@@ -1,0 +1,461 @@
+package com.edham.logistics.offline
+
+import android.content.Context
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import com.edham.logistics.data.remote.model.Shipment
+import com.edham.logistics.data.remote.model.Driver
+import com.edham.logistics.data.remote.model.Vehicle
+import com.edham.logistics.data.remote.model.User
+import com.google.gson.Gson
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * Offline Data Manager
+ * Manages offline data viewing and state management
+ */
+class OfflineDataManager private constructor(context: Context) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: OfflineDataManager? = null
+        
+        fun getInstance(context: Context): OfflineDataManager {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: OfflineDataManager(context).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val cacheManager = LocalCacheManager.getInstance(context)
+    private val gson = Gson()
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+    
+    private val _offlineDataState = MutableStateFlow<OfflineDataState>(OfflineDataState.LOADING)
+    val offlineDataState = _offlineDataState.asStateFlow()
+    
+    private val _lastSyncTime = MutableStateFlow<Long>(0)
+    val lastSyncTime = _lastSyncTime.asStateFlow()
+    
+    /**
+     * Get shipments for offline viewing
+     */
+    suspend fun getShipmentsForOfflineView(): List<OfflineShipment> {
+        return try {
+            val cachedShipments = cacheManager.getCachedShipments()
+            _offlineDataState.value = if (cachedShipments.isNotEmpty()) {
+                OfflineDataState.AVAILABLE
+            } else {
+                OfflineDataState.EMPTY
+            }
+            
+            cachedShipments.map { cached ->
+                OfflineShipment(
+                    id = cached.id,
+                    trackingNumber = cached.trackingNumber,
+                    origin = cached.origin,
+                    destination = cached.destination,
+                    status = cached.status,
+                    estimatedDelivery = cached.estimatedDelivery,
+                    actualDelivery = cached.actualDelivery,
+                    weight = cached.weight,
+                    dimensions = cached.dimensions,
+                    specialInstructions = cached.specialInstructions,
+                    isOfflineData = true,
+                    lastUpdated = cached.lastUpdated,
+                    formattedLastUpdated = formatTimestamp(cached.lastUpdated)
+                )
+            }
+        } catch (e: Exception) {
+            _offlineDataState.value = OfflineDataState.ERROR
+            emptyList()
+        }
+    }
+    
+    /**
+     * Get drivers for offline viewing
+     */
+    suspend fun getDriversForOfflineView(): List<OfflineDriver> {
+        return try {
+            val cachedDrivers = cacheManager.getCachedDrivers()
+            
+            cachedDrivers.map { cached ->
+                OfflineDriver(
+                    id = cached.id,
+                    name = cached.name,
+                    email = cached.email,
+                    phone = cached.phone,
+                    licenseNumber = cached.licenseNumber,
+                    status = cached.status,
+                    currentLocation = cached.currentLocation,
+                    currentShipmentId = cached.currentShipmentId,
+                    totalDeliveries = cached.totalDeliveries,
+                    rating = cached.rating,
+                    vehicleId = cached.vehicleId,
+                    isOfflineData = true,
+                    lastUpdated = cached.lastUpdated,
+                    formattedLastUpdated = formatTimestamp(cached.lastUpdated)
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+    
+    /**
+     * Get vehicles for offline viewing
+     */
+    suspend fun getVehiclesForOfflineView(): List<OfflineVehicle> {
+        return try {
+            val cachedVehicles = cacheManager.getCachedVehicles()
+            
+            cachedVehicles.map { cached ->
+                OfflineVehicle(
+                    id = cached.id,
+                    plateNumber = cached.plateNumber,
+                    make = cached.make,
+                    model = cached.model,
+                    year = cached.year,
+                    type = cached.type,
+                    capacity = cached.capacity,
+                    status = cached.status,
+                    currentDriverId = cached.currentDriverId,
+                    location = cached.location,
+                    fuelLevel = cached.fuelLevel,
+                    mileage = cached.mileage,
+                    isOfflineData = true,
+                    lastUpdated = cached.lastUpdated,
+                    formattedLastUpdated = formatTimestamp(cached.lastUpdated)
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+    
+    /**
+     * Get user profile for offline viewing
+     */
+    suspend fun getUserForOfflineView(userId: String): OfflineUser? {
+        return try {
+            val cachedUser = cacheManager.getCachedUser(userId)
+            cachedUser?.let { cached ->
+                OfflineUser(
+                    id = cached.id,
+                    name = cached.name,
+                    email = cached.email,
+                    phone = cached.phone,
+                    role = cached.role,
+                    profilePicture = cached.profilePicture,
+                    preferences = cached.preferences,
+                    isOfflineData = true,
+                    lastUpdated = cached.lastUpdated,
+                    formattedLastUpdated = formatTimestamp(cached.lastUpdated)
+                )
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    /**
+     * Search shipments offline
+     */
+    suspend fun searchShipmentsOffline(query: String): List<OfflineShipment> {
+        val allShipments = getShipmentsForOfflineView()
+        return if (query.isBlank()) {
+            allShipments
+        } else {
+            allShipments.filter { shipment ->
+                shipment.trackingNumber.contains(query, ignoreCase = true) ||
+                shipment.origin.contains(query, ignoreCase = true) ||
+                shipment.destination.contains(query, ignoreCase = true) ||
+                shipment.status.contains(query, ignoreCase = true)
+            }
+        }
+    }
+    
+    /**
+     * Get shipment details for offline viewing
+     */
+    suspend fun getShipmentDetailsOffline(shipmentId: String): OfflineShipmentDetails? {
+        return try {
+            val cachedShipment = cacheManager.getCachedShipment(shipmentId)
+            cachedShipment?.let { cached ->
+                val driver = cached.driverId?.let { driverId ->
+                    cacheManager.getCachedDriver(driverId)
+                }
+                val vehicle = cached.vehicleId?.let { vehicleId ->
+                    cacheManager.getCachedVehicle(vehicleId)
+                }
+                
+                OfflineShipmentDetails(
+                    shipment = OfflineShipment(
+                        id = cached.id,
+                        trackingNumber = cached.trackingNumber,
+                        origin = cached.origin,
+                        destination = cached.destination,
+                        status = cached.status,
+                        estimatedDelivery = cached.estimatedDelivery,
+                        actualDelivery = cached.actualDelivery,
+                        weight = cached.weight,
+                        dimensions = cached.dimensions,
+                        specialInstructions = cached.specialInstructions,
+                        isOfflineData = true,
+                        lastUpdated = cached.lastUpdated,
+                        formattedLastUpdated = formatTimestamp(cached.lastUpdated)
+                    ),
+                    driver = driver?.let { d ->
+                        OfflineDriver(
+                            id = d.id,
+                            name = d.name,
+                            email = d.email,
+                            phone = d.phone,
+                            licenseNumber = d.licenseNumber,
+                            status = d.status,
+                            currentLocation = d.currentLocation,
+                            currentShipmentId = d.currentShipmentId,
+                            totalDeliveries = d.totalDeliveries,
+                            rating = d.rating,
+                            vehicleId = d.vehicleId,
+                            isOfflineData = true,
+                            lastUpdated = d.lastUpdated,
+                            formattedLastUpdated = formatTimestamp(d.lastUpdated)
+                        )
+                    },
+                    vehicle = vehicle?.let { v ->
+                        OfflineVehicle(
+                            id = v.id,
+                            plateNumber = v.plateNumber,
+                            make = v.make,
+                            model = v.model,
+                            year = v.year,
+                            type = v.type,
+                            capacity = v.capacity,
+                            status = v.status,
+                            currentDriverId = v.currentDriverId,
+                            location = v.location,
+                            fuelLevel = v.fuelLevel,
+                            mileage = v.mileage,
+                            isOfflineData = true,
+                            lastUpdated = v.lastUpdated,
+                            formattedLastUpdated = formatTimestamp(v.lastUpdated)
+                        )
+                    },
+                    isOfflineData = true
+                )
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    /**
+     * Check if data is available offline
+     */
+    suspend fun isDataAvailableOffline(entityType: String): Boolean {
+        return when (entityType.lowercase()) {
+            "shipments" -> cacheManager.getCachedShipments().isNotEmpty()
+            "drivers" -> cacheManager.getCachedDrivers().isNotEmpty()
+            "vehicles" -> cacheManager.getCachedVehicles().isNotEmpty()
+            else -> false
+        }
+    }
+    
+    /**
+     * Get data freshness indicator
+     */
+    suspend fun getDataFreshness(): DataFreshness {
+        val stats = cacheManager.getCacheStatistics()
+        val currentTime = System.currentTimeMillis()
+        val oldestData = getOldestDataTimestamp()
+        
+        return when {
+            stats.totalCacheSize == 0L -> DataFreshness.NO_DATA
+            oldestData == 0L -> DataFreshness.UNKNOWN
+            currentTime - oldestData < 60 * 60 * 1000 -> DataFreshness.FRESH // < 1 hour
+            currentTime - oldestData < 24 * 60 * 60 * 1000 -> DataFreshness.STALE // < 24 hours
+            else -> DataFreshness.VERY_STALE // > 24 hours
+        }
+    }
+    
+    /**
+     * Get offline data summary
+     */
+    suspend fun getOfflineDataSummary(): OfflineDataSummary {
+        val stats = cacheManager.getCacheStatistics()
+        val freshness = getDataFreshness()
+        
+        return OfflineDataSummary(
+            shipmentsCount = stats.shipmentsCount,
+            driversCount = stats.driversCount,
+            vehiclesCount = stats.vehiclesCount,
+            pendingActionsCount = stats.pendingActionsCount,
+            totalCacheSize = stats.totalCacheSize,
+            dataFreshness = freshness,
+            lastSyncTime = _lastSyncTime.value,
+            isConnected = cacheManager.isConnected.value
+        )
+    }
+    
+    /**
+     * Update last sync time
+     */
+    fun updateLastSyncTime(timestamp: Long = System.currentTimeMillis()) {
+        _lastSyncTime.value = timestamp
+    }
+    
+    /**
+     * Format timestamp for display
+     */
+    private fun formatTimestamp(timestamp: Long): String {
+        return try {
+            dateFormat.format(Date(timestamp))
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    /**
+     * Get oldest data timestamp
+     */
+    private suspend fun getOldestDataTimestamp(): Long {
+        return try {
+            val shipments = cacheManager.getCachedShipments()
+            val drivers = cacheManager.getCachedDrivers()
+            val vehicles = cacheManager.getCachedVehicles()
+            
+            val timestamps = mutableListOf<Long>()
+            if (shipments.isNotEmpty()) {
+                timestamps.add(shipments.minOf { it.lastUpdated })
+            }
+            if (drivers.isNotEmpty()) {
+                timestamps.add(drivers.minOf { it.lastUpdated })
+            }
+            if (vehicles.isNotEmpty()) {
+                timestamps.add(vehicles.minOf { it.lastUpdated })
+            }
+            
+            timestamps.minOrNull() ?: 0L
+        } catch (e: Exception) {
+            0L
+        }
+    }
+    
+    /**
+     * Refresh offline data state
+     */
+    suspend fun refreshOfflineDataState() {
+        val stats = cacheManager.getCacheStatistics()
+        _offlineDataState.value = when {
+            stats.totalCacheSize == 0L -> OfflineDataState.EMPTY
+            stats.pendingActionsCount > 0 -> OfflineDataState.PENDING_ACTIONS
+            else -> OfflineDataState.AVAILABLE
+        }
+    }
+}
+
+/**
+ * Offline data classes
+ */
+data class OfflineShipment(
+    val id: String,
+    val trackingNumber: String,
+    val origin: String,
+    val destination: String,
+    val status: String,
+    val estimatedDelivery: Long,
+    val actualDelivery: Long?,
+    val weight: Double,
+    val dimensions: String,
+    val specialInstructions: String?,
+    val isOfflineData: Boolean,
+    val lastUpdated: Long,
+    val formattedLastUpdated: String
+)
+
+data class OfflineDriver(
+    val id: String,
+    val name: String,
+    val email: String,
+    val phone: String,
+    val licenseNumber: String,
+    val status: String,
+    val currentLocation: String?,
+    val currentShipmentId: String?,
+    val totalDeliveries: Int,
+    val rating: Double,
+    val vehicleId: String?,
+    val isOfflineData: Boolean,
+    val lastUpdated: Long,
+    val formattedLastUpdated: String
+)
+
+data class OfflineVehicle(
+    val id: String,
+    val plateNumber: String,
+    val make: String,
+    val model: String,
+    val year: Int,
+    val type: String,
+    val capacity: Double,
+    val status: String,
+    val currentDriverId: String?,
+    val location: String?,
+    val fuelLevel: Double,
+    val mileage: Long,
+    val isOfflineData: Boolean,
+    val lastUpdated: Long,
+    val formattedLastUpdated: String
+)
+
+data class OfflineUser(
+    val id: String,
+    val name: String,
+    val email: String,
+    val phone: String,
+    val role: String,
+    val profilePicture: String?,
+    val preferences: Map<String, String>,
+    val isOfflineData: Boolean,
+    val lastUpdated: Long,
+    val formattedLastUpdated: String
+)
+
+data class OfflineShipmentDetails(
+    val shipment: OfflineShipment,
+    val driver: OfflineDriver?,
+    val vehicle: OfflineVehicle?,
+    val isOfflineData: Boolean
+)
+
+data class OfflineDataSummary(
+    val shipmentsCount: Int,
+    val driversCount: Int,
+    val vehiclesCount: Int,
+    val pendingActionsCount: Int,
+    val totalCacheSize: Long,
+    val dataFreshness: DataFreshness,
+    val lastSyncTime: Long,
+    val isConnected: Boolean
+)
+
+enum class OfflineDataState {
+    LOADING,
+    AVAILABLE,
+    EMPTY,
+    ERROR,
+    PENDING_ACTIONS
+}
+
+enum class DataFreshness {
+    NO_DATA,
+    FRESH,
+    STALE,
+    VERY_STALE,
+    UNKNOWN
+}

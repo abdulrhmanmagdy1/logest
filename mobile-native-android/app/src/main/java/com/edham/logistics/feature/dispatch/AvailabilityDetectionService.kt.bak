@@ -1,0 +1,707 @@
+package com.edham.logistics.feature.dispatch
+
+import android.util.Log
+import com.edham.logistics.data.model.Driver
+import com.edham.logistics.data.model.Shipment
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.temporal.ChronoUnit
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Availability Detection Service - Advanced driver availability management
+ * Monitors and manages driver availability with real-time updates
+ */
+class AvailabilityDetectionService {
+    
+    companion object {
+        private const val TAG = "AvailabilityDetectionService"
+        
+        // Availability thresholds
+        private const val MIN_WORKING_HOURS = 1.0 // Minimum hours to be considered available
+        private const val MAX_WORKING_HOURS = 12.0 // Maximum working hours per day
+        private const val MIN_REST_HOURS = 8.0 // Minimum rest hours between shifts
+        private const val MAX_CONSECUTIVE_HOURS = 8.0 // Maximum consecutive working hours
+        private const val BREAK_REQUIRED_HOURS = 4.0 // Break required after this many hours
+        
+        // Availability status levels
+        enum class AvailabilityLevel {
+            AVAILABLE,      // Fully available for assignments
+            LIMITED,        // Limited availability (capacity constraints)
+            BUSY,          // Currently on assignment
+            BREAK,          // On break/rest
+            OFF_DUTY,      // Off duty for the day
+            UNAVAILABLE     // Not available (maintenance, leave, etc.)
+        }
+        
+        // Detection strategies
+        enum class DetectionStrategy {
+            REAL_TIME,       // Real-time availability monitoring
+            SCHEDULE_BASED,   // Based on driver schedule
+            WORKLOAD_BASED,  // Based on current workload
+            HYBRID           // Combine multiple strategies
+        }
+    }
+    
+    /**
+     * Detect driver availability for assignment
+     */
+    suspend fun detectDriverAvailability(
+        driver: Driver,
+        shipment: Shipment? = null,
+        strategy: DetectionStrategy = DetectionStrategy.HYBRID,
+        currentTime: LocalDateTime = LocalDateTime.now()
+    ): AvailabilityResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Detecting availability for driver ${driver.id}")
+                
+                // Calculate availability factors
+                val workingHoursFactor = calculateWorkingHoursFactor(driver, currentTime)
+                val workloadFactor = calculateWorkloadFactor(driver)
+                val scheduleFactor = calculateScheduleFactor(driver, currentTime)
+                val locationFactor = calculateLocationFactor(driver, currentTime)
+                val statusFactor = calculateStatusFactor(driver)
+                
+                // Apply detection strategy
+                val availabilityScore = when (strategy) {
+                    DetectionStrategy.REAL_TIME -> calculateRealTimeAvailability(driver, currentTime)
+                    DetectionStrategy.SCHEDULE_BASED -> calculateScheduleBasedAvailability(driver, currentTime)
+                    DetectionStrategy.WORKLOAD_BASED -> calculateWorkloadBasedAvailability(driver)
+                    DetectionStrategy.HYBRID -> calculateHybridAvailability(
+                        workingHoursFactor, workloadFactor, scheduleFactor, locationFactor, statusFactor
+                    )
+                }
+                
+                // Determine availability level
+                val availabilityLevel = determineAvailabilityLevel(availabilityScore, driver, shipment)
+                
+                // Calculate availability metrics
+                val metrics = calculateAvailabilityMetrics(driver, availabilityScore, currentTime)
+                
+                // Generate recommendations
+                val recommendations = generateAvailabilityRecommendations(
+                    availabilityLevel, metrics, driver, shipment
+                )
+                
+                // Calculate availability duration
+                val availableDuration = calculateAvailableDuration(driver, currentTime)
+                
+                val result = AvailabilityResult(
+                    driverId = driver.id,
+                    driverName = driver.name,
+                    availabilityLevel = availabilityLevel,
+                    availabilityScore = availabilityScore,
+                    workingHoursFactor = workingHoursFactor,
+                    workloadFactor = workloadFactor,
+                    scheduleFactor = scheduleFactor,
+                    locationFactor = locationFactor,
+                    statusFactor = statusFactor,
+                    metrics = metrics,
+                    recommendations = recommendations,
+                    availableDuration = availableDuration,
+                    canAcceptShipment = canAcceptShipment(driver, shipment, availabilityLevel),
+                    strategy = strategy,
+                    detectedAt = currentTime
+                )
+                
+                Log.d(TAG, "Availability detected for driver ${driver.id}: ${availabilityLevel}")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error detecting driver availability", e)
+                AvailabilityResult.createDefault(driver.id, currentTime)
+            }
+        }
+    }
+    
+    /**
+     * Detect availability for multiple drivers
+     */
+    suspend fun detectMultipleDriversAvailability(
+        drivers: List<Driver>,
+        shipment: Shipment? = null,
+        strategy: DetectionStrategy = DetectionStrategy.HYBRID,
+        currentTime: LocalDateTime = LocalDateTime.now()
+    ): List<AvailabilityResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Detecting availability for ${drivers.size} drivers")
+                
+                val availabilityResults = drivers.map { driver ->
+                    detectDriverAvailability(driver, shipment, strategy, currentTime)
+                }
+                
+                // Sort by availability score (highest first)
+                val sortedResults = availabilityResults.sortedByDescending { it.availabilityScore }
+                
+                // Calculate aggregate metrics
+                val aggregateMetrics = calculateAggregateMetrics(sortedResults)
+                
+                // Update results with aggregate information
+                sortedResults.map { result ->
+                    result.copy(
+                        aggregateMetrics = aggregateMetrics,
+                        ranking = sortedResults.indexOf(result) + 1
+                    )
+                }
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error detecting multiple drivers availability", e)
+                emptyList()
+            }
+        }
+    }
+    
+    /**
+     * Calculate working hours factor
+     */
+    private fun calculateWorkingHoursFactor(driver: Driver, currentTime: LocalDateTime): Double {
+        val hoursWorkedToday = driver.hoursWorkedToday ?: 0.0
+        val hoursSinceLastBreak = driver.hoursSinceLastBreak ?: 0.0
+        val hoursSinceLastRest = calculateHoursSinceLastRest(driver, currentTime)
+        
+        var factor = 100.0 // Base factor
+        
+        // Working hours factor
+        when {
+            hoursWorkedToday >= MAX_WORKING_HOURS -> factor -= 100.0 // Not available
+            hoursWorkedToday >= MAX_WORKING_HOURS * 0.8 -> factor -= 50.0 // Limited availability
+            hoursWorkedToday >= MAX_WORKING_HOURS * 0.6 -> factor -= 25.0 // Reduced availability
+            hoursWorkedToday >= MAX_WORKING_HOURS * 0.4 -> factor -= 10.0 // Slightly reduced
+        }
+        
+        // Consecutive hours factor
+        if (hoursSinceLastBreak >= MAX_CONSECUTIVE_HOURS) {
+            factor -= 30.0 // Break required
+        } else if (hoursSinceLastBreak >= BREAK_REQUIRED_HOURS) {
+            factor -= 15.0 // Break recommended
+        }
+        
+        // Rest hours factor
+        if (hoursSinceLastRest < MIN_REST_HOURS) {
+            factor -= 20.0 // Insufficient rest
+        }
+        
+        return factor.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate workload factor
+     */
+    private fun calculateWorkloadFactor(driver: Driver): Double {
+        val currentWorkload = driver.activeShipments ?: 0
+        val maxCapacity = driver.maxConcurrentShipments
+        val utilizationRate = (currentWorkload.toDouble() / maxCapacity) * 100.0
+        
+        return when {
+            utilizationRate >= 100.0 -> 0.0 // Fully loaded
+            utilizationRate >= 85.0 -> 20.0 // Nearly full
+            utilizationRate >= 70.0 -> 40.0 // High workload
+            utilizationRate >= 50.0 -> 60.0 // Moderate workload
+            utilizationRate >= 30.0 -> 80.0 // Light workload
+            else -> 100.0 // Available capacity
+        }
+    }
+    
+    /**
+     * Calculate schedule factor
+     */
+    private fun calculateScheduleFactor(driver: Driver, currentTime: LocalDateTime): Double {
+        var factor = 100.0 // Base factor
+        
+        val preferredStartTime = driver.preferredStartTime
+        val preferredEndTime = driver.preferredEndTime
+        
+        if (preferredStartTime != null && preferredEndTime != null) {
+            val currentHour = currentTime.hour + currentTime.minute / 60.0
+            val startHour = preferredStartTime.hour + preferredStartTime.minute / 60.0
+            val endHour = preferredEndTime.hour + preferredEndTime.minute / 60.0
+            
+            when {
+                currentHour in startHour..endHour -> factor += 10.0 // Within preferred hours
+                currentHour < startHour -> factor -= 5.0 // Before preferred hours
+                currentHour > endHour -> factor -= 10.0 // After preferred hours
+            }
+        }
+        
+        // Day of week factor
+        val dayOfWeek = currentTime.dayOfWeek.value
+        val preferredDays = driver.preferredWorkingDays ?: setOf(1, 2, 3, 4, 5) // Mon-Fri
+        
+        if (dayOfWeek !in preferredDays) {
+            factor -= 20.0 // Not preferred day
+        }
+        
+        return factor.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate location factor
+     */
+    private fun calculateLocationFactor(driver: Driver, currentTime: LocalDateTime): Double {
+        var factor = 100.0 // Base factor
+        
+        // Check if driver has valid location
+        if (driver.currentLocation == null) {
+            factor -= 30.0 // No location data
+        }
+        
+        // Check last location update time
+        val lastLocationUpdate = driver.lastLocationUpdate
+        if (lastLocationUpdate != null) {
+            val hoursSinceUpdate = ChronoUnit.HOURS.between(lastLocationUpdate, currentTime)
+            
+            when {
+                hoursSinceUpdate > 2 -> factor -= 40.0 // Stale location data
+                hoursSinceUpdate > 1 -> factor -= 20.0 // Old location data
+                hoursSinceUpdate > 0.5 -> factor -= 10.0 // Slightly old location data
+            }
+        } else {
+            factor -= 25.0 // No location update time
+        }
+        
+        // Check preferred areas
+        val currentLocation = driver.currentLocation
+        val preferredAreas = driver.preferredWorkingAreas ?: emptyList()
+        
+        if (currentLocation != null && preferredAreas.isNotEmpty()) {
+            val isInPreferredArea = preferredAreas.any { area ->
+                // Simplified area check (would use geofencing in production)
+                currentLocation.latitude in area.latRange && 
+                currentLocation.longitude in area.lonRange
+            }
+            
+            if (isInPreferredArea) {
+                factor += 10.0 // In preferred area
+            }
+        }
+        
+        return factor.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate status factor
+     */
+    private fun calculateStatusFactor(driver: Driver): Double {
+        return when (driver.status) {
+            Driver.Status.AVAILABLE -> 100.0
+            Driver.Status.BUSY -> 30.0
+            Driver.Status.BREAK -> 20.0
+            Driver.Status.OFF_DUTY -> 0.0
+            else -> 10.0
+        }
+    }
+    
+    /**
+     * Calculate real-time availability
+     */
+    private fun calculateRealTimeAvailability(driver: Driver, currentTime: LocalDateTime): Double {
+        val statusFactor = calculateStatusFactor(driver)
+        val workingHoursFactor = calculateWorkingHoursFactor(driver, currentTime)
+        val locationFactor = calculateLocationFactor(driver, currentTime)
+        
+        // Real-time gives more weight to current status
+        return (statusFactor * 0.5) + (workingHoursFactor * 0.3) + (locationFactor * 0.2)
+    }
+    
+    /**
+     * Calculate schedule-based availability
+     */
+    private fun calculateScheduleBasedAvailability(driver: Driver, currentTime: LocalDateTime): Double {
+        val scheduleFactor = calculateScheduleFactor(driver, currentTime)
+        val workingHoursFactor = calculateWorkingHoursFactor(driver, currentTime)
+        
+        // Schedule-based gives more weight to schedule
+        return (scheduleFactor * 0.6) + (workingHoursFactor * 0.4)
+    }
+    
+    /**
+     * Calculate workload-based availability
+     */
+    private fun calculateWorkloadBasedAvailability(driver: Driver): Double {
+        val workloadFactor = calculateWorkloadFactor(driver)
+        val statusFactor = calculateStatusFactor(driver)
+        
+        // Workload-based gives more weight to current capacity
+        return (workloadFactor * 0.6) + (statusFactor * 0.4)
+    }
+    
+    /**
+     * Calculate hybrid availability
+     */
+    private fun calculateHybridAvailability(
+        workingHoursFactor: Double,
+        workloadFactor: Double,
+        scheduleFactor: Double,
+        locationFactor: Double,
+        statusFactor: Double
+    ): Double {
+        // Weighted combination of all factors
+        return (workingHoursFactor * 0.25) +
+               (workloadFactor * 0.25) +
+               (scheduleFactor * 0.20) +
+               (locationFactor * 0.15) +
+               (statusFactor * 0.15)
+    }
+    
+    /**
+     * Determine availability level
+     */
+    private fun determineAvailabilityLevel(
+        score: Double,
+        driver: Driver,
+        shipment: Shipment?
+    ): AvailabilityLevel {
+        return when {
+            score >= 80.0 -> AvailabilityLevel.AVAILABLE
+            score >= 60.0 -> AvailabilityLevel.LIMITED
+            score >= 40.0 -> AvailabilityLevel.BUSY
+            score >= 20.0 -> AvailabilityLevel.BREAK
+            score >= 10.0 -> AvailabilityLevel.OFF_DUTY
+            else -> AvailabilityLevel.UNAVAILABLE
+        }
+    }
+    
+    /**
+     * Calculate availability metrics
+     */
+    private fun calculateAvailabilityMetrics(
+        driver: Driver,
+        availabilityScore: Double,
+        currentTime: LocalDateTime
+    ): AvailabilityMetrics {
+        val hoursWorkedToday = driver.hoursWorkedToday ?: 0.0
+        val currentWorkload = driver.activeShipments ?: 0
+        val maxCapacity = driver.maxConcurrentShipments
+        val utilizationRate = (currentWorkload.toDouble() / maxCapacity) * 100.0
+        
+        val hoursUntilBreak = calculateHoursUntilBreak(driver, currentTime)
+        val hoursUntilEndOfShift = calculateHoursUntilEndOfShift(driver, currentTime)
+        
+        return AvailabilityMetrics(
+            availabilityScore = availabilityScore,
+            hoursWorkedToday = hoursWorkedToday,
+            currentWorkload = currentWorkload,
+            maxCapacity = maxCapacity,
+            utilizationRate = utilizationRate,
+            hoursUntilBreak = hoursUntilBreak,
+            hoursUntilEndOfShift = hoursUntilEndOfShift,
+            nextAvailableTime = calculateNextAvailableTime(driver, currentTime),
+            lastLocationUpdate = driver.lastLocationUpdate,
+            hasValidLocation = driver.currentLocation != null
+        )
+    }
+    
+    /**
+     * Generate availability recommendations
+     */
+    private fun generateAvailabilityRecommendations(
+        availabilityLevel: AvailabilityLevel,
+        metrics: AvailabilityMetrics,
+        driver: Driver,
+        shipment: Shipment?
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        when (availabilityLevel) {
+            AvailabilityLevel.AVAILABLE -> {
+                recommendations.add("Driver is fully available for assignments")
+                if (metrics.utilizationRate > 70.0) {
+                    recommendations.add("Consider monitoring workload to prevent overload")
+                }
+            }
+            
+            AvailabilityLevel.LIMITED -> {
+                recommendations.add("Driver has limited availability")
+                if (metrics.hoursWorkedToday >= MAX_WORKING_HOURS * 0.8) {
+                    recommendations.add("Approaching maximum working hours for today")
+                }
+                if (metrics.utilizationRate >= 85.0) {
+                    recommendations.add("High workload - consider alternative driver")
+                }
+            }
+            
+            AvailabilityLevel.BUSY -> {
+                recommendations.add("Driver is currently busy")
+                recommendations.add("Check back after current assignment completion")
+            }
+            
+            AvailabilityLevel.BREAK -> {
+                recommendations.add("Driver is on break/rest")
+                recommendations.add("Expected to be available after break period")
+                if (metrics.hoursUntilBreak <= 0) {
+                    recommendations.add("Break period may have ended - update driver status")
+                }
+            }
+            
+            AvailabilityLevel.OFF_DUTY -> {
+                recommendations.add("Driver is off duty")
+                recommendations.add("Check schedule for next available time")
+            }
+            
+            AvailabilityLevel.UNAVAILABLE -> {
+                recommendations.add("Driver is currently unavailable")
+                if (!metrics.hasValidLocation) {
+                    recommendations.add("Location data unavailable - check driver status")
+                }
+            }
+        }
+        
+        // Shipment-specific recommendations
+        if (shipment != null) {
+            if (shipment.weight > (driver.vehicle?.maxWeight ?: 0.0)) {
+                recommendations.add("Shipment exceeds vehicle capacity")
+            }
+            
+            if (shipment.volume > (driver.vehicle?.maxVolume ?: 0.0)) {
+                recommendations.add("Shipment exceeds vehicle volume capacity")
+            }
+            
+            if (shipment.requiresRefrigeration && !(driver.vehicle?.hasRefrigeration ?: false)) {
+                recommendations.add("Shipment requires refrigeration - vehicle not equipped")
+            }
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Calculate available duration
+     */
+    private fun calculateAvailableDuration(driver: Driver, currentTime: LocalDateTime): Double {
+        val hoursWorkedToday = driver.hoursWorkedToday ?: 0.0
+        val remainingHours = maxOf(0.0, MAX_WORKING_HOURS - hoursWorkedToday)
+        
+        // Adjust for breaks
+        val hoursSinceLastBreak = driver.hoursSinceLastBreak ?: 0.0
+        if (hoursSinceLastBreak >= BREAK_REQUIRED_HOURS) {
+            return 0.0 // Break required immediately
+        }
+        
+        return remainingHours
+    }
+    
+    /**
+     * Check if driver can accept shipment
+     */
+    private fun canAcceptShipment(
+        driver: Driver,
+        shipment: Shipment?,
+        availabilityLevel: AvailabilityLevel
+    ): Boolean {
+        if (shipment == null) return true
+        
+        // Check basic availability
+        if (availabilityLevel != AvailabilityLevel.AVAILABLE && 
+            availabilityLevel != AvailabilityLevel.LIMITED) {
+            return false
+        }
+        
+        // Check capacity
+        val currentWorkload = driver.activeShipments ?: 0
+        if (currentWorkload >= driver.maxConcurrentShipments) {
+            return false
+        }
+        
+        // Check vehicle compatibility
+        val vehicle = driver.vehicle ?: return false
+        
+        if (shipment.weight > vehicle.maxWeight) return false
+        if (shipment.volume > vehicle.maxVolume) return false
+        if (shipment.requiresRefrigeration && !vehicle.hasRefrigeration) return false
+        if (shipment.isHazardous && !vehicle.isHazardousCertified) return false
+        
+        return true
+    }
+    
+    /**
+     * Calculate hours since last rest
+     */
+    private fun calculateHoursSinceLastRest(driver: Driver, currentTime: LocalDateTime): Double {
+        val lastRestTime = driver.lastRestTime ?: return 24.0 // Assume 24 hours if no data
+        return ChronoUnit.HOURS.between(lastRestTime, currentTime)
+    }
+    
+    /**
+     * Calculate hours until break
+     */
+    private fun calculateHoursUntilBreak(driver: Driver, currentTime: LocalDateTime): Double {
+        val hoursSinceLastBreak = driver.hoursSinceLastBreak ?: 0.0
+        val hoursUntilBreak = maxOf(0.0, BREAK_REQUIRED_HOURS - hoursSinceLastBreak)
+        return hoursUntilBreak
+    }
+    
+    /**
+     * Calculate hours until end of shift
+     */
+    private fun calculateHoursUntilEndOfShift(driver: Driver, currentTime: LocalDateTime): Double {
+        val preferredEndTime = driver.preferredEndTime ?: return 4.0 // Default 4 hours
+        val currentHour = currentTime.hour + currentTime.minute / 60.0
+        val endHour = preferredEndTime.hour + preferredEndTime.minute / 60.0
+        
+        return if (currentHour < endHour) {
+            endHour - currentHour
+        } else {
+            (24.0 - currentHour) + endHour // Next day
+        }
+    }
+    
+    /**
+     * Calculate next available time
+     */
+    private fun calculateNextAvailableTime(driver: Driver, currentTime: LocalDateTime): LocalDateTime {
+        // Check current status
+        when (driver.status) {
+            Driver.Status.BREAK -> {
+                val breakEndTime = driver.breakEndTime ?: currentTime.plusHours(1)
+                return breakEndTime
+            }
+            Driver.Status.OFF_DUTY -> {
+                val nextShiftStart = driver.nextShiftStart ?: currentTime.plusDays(1)
+                return nextShiftStart
+            }
+            else -> {
+                return currentTime
+            }
+        }
+    }
+    
+    /**
+     * Calculate aggregate metrics for multiple drivers
+     */
+    private fun calculateAggregateMetrics(results: List<AvailabilityResult>): AggregateMetrics {
+        val totalDrivers = results.size
+        val availableDrivers = results.count { it.availabilityLevel == AvailabilityLevel.AVAILABLE }
+        val limitedDrivers = results.count { it.availabilityLevel == AvailabilityLevel.LIMITED }
+        val busyDrivers = results.count { it.availabilityLevel == AvailabilityLevel.BUSY }
+        
+        val averageAvailabilityScore = results.map { it.availabilityScore }.average()
+        val averageUtilizationRate = results.map { it.metrics.utilizationRate }.average()
+        
+        val availabilityDistribution = mapOf(
+            "AVAILABLE" to availableDrivers,
+            "LIMITED" to limitedDrivers,
+            "BUSY" to busyDrivers,
+            "BREAK" to results.count { it.availabilityLevel == AvailabilityLevel.BREAK },
+            "OFF_DUTY" to results.count { it.availabilityLevel == AvailabilityLevel.OFF_DUTY },
+            "UNAVAILABLE" to results.count { it.availabilityLevel == AvailabilityLevel.UNAVAILABLE }
+        )
+        
+        return AggregateMetrics(
+            totalDrivers = totalDrivers,
+            availableDrivers = availableDrivers,
+            limitedDrivers = limitedDrivers,
+            busyDrivers = busyDrivers,
+            averageAvailabilityScore = averageAvailabilityScore,
+            averageUtilizationRate = averageUtilizationRate,
+            availabilityDistribution = availabilityDistribution,
+            calculatedAt = LocalDateTime.now()
+        )
+    }
+    
+    /**
+     * Monitor availability changes
+     */
+    suspend fun monitorAvailabilityChanges(
+        drivers: List<Driver>,
+        onAvailabilityChange: (AvailabilityResult) -> Unit
+    ) {
+        // This would implement real-time monitoring
+        // For now, it's a placeholder for the monitoring logic
+    }
+}
+
+/**
+ * Availability result data class
+ */
+data class AvailabilityResult(
+    val driverId: String,
+    val driverName: String,
+    val availabilityLevel: AvailabilityDetectionService.AvailabilityLevel,
+    val availabilityScore: Double,
+    val workingHoursFactor: Double,
+    val workloadFactor: Double,
+    val scheduleFactor: Double,
+    val locationFactor: Double,
+    val statusFactor: Double,
+    val metrics: AvailabilityMetrics,
+    val recommendations: List<String>,
+    val availableDuration: Double,
+    val canAcceptShipment: Boolean,
+    val strategy: AvailabilityDetectionService.DetectionStrategy,
+    val detectedAt: LocalDateTime,
+    val aggregateMetrics: AggregateMetrics? = null,
+    val ranking: Int? = null
+) {
+    companion object {
+        fun createDefault(driverId: String, currentTime: LocalDateTime): AvailabilityResult {
+            return AvailabilityResult(
+                driverId = driverId,
+                driverName = "",
+                availabilityLevel = AvailabilityDetectionService.AvailabilityLevel.UNAVAILABLE,
+                availabilityScore = 0.0,
+                workingHoursFactor = 0.0,
+                workloadFactor = 0.0,
+                scheduleFactor = 0.0,
+                locationFactor = 0.0,
+                statusFactor = 0.0,
+                metrics = AvailabilityMetrics.createDefault(),
+                recommendations = emptyList(),
+                availableDuration = 0.0,
+                canAcceptShipment = false,
+                strategy = AvailabilityDetectionService.DetectionStrategy.HYBRID,
+                detectedAt = currentTime
+            )
+        }
+    }
+}
+
+/**
+ * Availability metrics data class
+ */
+data class AvailabilityMetrics(
+    val availabilityScore: Double,
+    val hoursWorkedToday: Double,
+    val currentWorkload: Int,
+    val maxCapacity: Int,
+    val utilizationRate: Double,
+    val hoursUntilBreak: Double,
+    val hoursUntilEndOfShift: Double,
+    val nextAvailableTime: LocalDateTime,
+    val lastLocationUpdate: LocalDateTime?,
+    val hasValidLocation: Boolean
+) {
+    companion object {
+        fun createDefault(): AvailabilityMetrics {
+            return AvailabilityMetrics(
+                availabilityScore = 0.0,
+                hoursWorkedToday = 0.0,
+                currentWorkload = 0,
+                maxCapacity = 0,
+                utilizationRate = 0.0,
+                hoursUntilBreak = 0.0,
+                hoursUntilEndOfShift = 0.0,
+                nextAvailableTime = LocalDateTime.now(),
+                lastLocationUpdate = null,
+                hasValidLocation = false
+            )
+        }
+    }
+}
+
+/**
+ * Aggregate metrics data class
+ */
+data class AggregateMetrics(
+    val totalDrivers: Int,
+    val availableDrivers: Int,
+    val limitedDrivers: Int,
+    val busyDrivers: Int,
+    val averageAvailabilityScore: Double,
+    val averageUtilizationRate: Double,
+    val availabilityDistribution: Map<String, Int>,
+    val calculatedAt: LocalDateTime
+)

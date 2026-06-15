@@ -1,0 +1,533 @@
+package com.edham.logistics.shipment
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.ShipmentEntity
+import com.edham.logistics.data.local.entity.ShipmentStatusEntity
+import com.edham.logistics.data.remote.api.ShipmentApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+// import javax.inject.Inject
+// import javax.inject.Singleton
+
+/**
+ * Status Tracking Manager - Comprehensive shipment status tracking system
+ * 
+ * Features:
+ * - Real-time status updates
+ * - Status change notifications
+ * - Status history tracking
+ * - Automated status transitions
+ * - Status-based workflows
+ * - Performance analytics
+ */
+// @Singleton
+class StatusTrackingManager(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val shipmentApi: ShipmentApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils,
+    private val workflowEngine: ShipmentWorkflowEngine
+) {
+    
+    private val _trackingState = MutableStateFlow<TrackingState>(TrackingState.Idle)
+    val trackingState: StateFlow<TrackingState> = _trackingState.asStateFlow()
+    
+    private val _currentStatus = MutableStateFlow<ShipmentStatusInfo?>(null)
+    val currentStatus: StateFlow<ShipmentStatusInfo?> = _currentStatus.asStateFlow()
+    
+    // private val _statusHistory = MutableStateFlow<List<ShipmentStatusEntity>>(emptyList())
+    // val statusHistory: StateFlow<List<ShipmentStatusEntity>> = _statusHistory.asStateFlow()
+    
+    private val _statusAnalytics = MutableStateFlow<StatusAnalytics?>(null)
+    val statusAnalytics: StateFlow<StatusAnalytics?> = _statusAnalytics.asStateFlow()
+    
+    private val _statusAlerts = MutableStateFlow<List<StatusAlert>>(emptyList())
+    val statusAlerts: StateFlow<List<StatusAlert>> = _statusAlerts.asStateFlow()
+    
+    private var currentShipmentId: Long? = null
+    private var isTracking = false
+    private var statusChangeListeners: MutableList<StatusChangeListener> = mutableListOf()
+    
+    companion object {
+        private const val TAG = "StatusTrackingManager"
+        private const val MAX_STATUS_HISTORY = 100
+        private const val STATUS_UPDATE_INTERVAL = 30000L // 30 seconds
+    }
+    
+    /**
+     * Start status tracking for shipment
+     */
+    fun startTracking(shipmentId: Long) {
+        if (isTracking) return
+        
+        try {
+            _trackingState.value = TrackingState.Starting
+            
+            currentShipmentId = shipmentId
+            isTracking = true
+            
+            // Load current status
+            loadCurrentStatus(shipmentId)
+            
+            // Load status history
+            loadStatusHistory(shipmentId)
+            
+            // Start real-time monitoring
+            startRealTimeMonitoring()
+            
+            _trackingState.value = TrackingState.Tracking
+            
+        } catch (e: Exception) {
+            _trackingState.value = TrackingState.Error("Failed to start tracking: ${e.message}")
+        }
+    }
+    
+    /**
+     * Stop status tracking
+     */
+    fun stopTracking() {
+        if (!isTracking) return
+        
+        try {
+            isTracking = false
+            currentShipmentId = null
+            
+            // Stop real-time monitoring
+            stopRealTimeMonitoring()
+            
+            _trackingState.value = TrackingState.Stopped
+            
+        } catch (e: Exception) {
+            _trackingState.value = TrackingState.Error("Failed to stop tracking: ${e.message}")
+        }
+    }
+    
+    /**
+     * Update shipment status
+     */
+    suspend fun updateStatus(
+        shipmentId: Long,
+        newStatus: ShipmentStatus,
+        reason: String,
+        updatedBy: String,
+        location: String? = null,
+        metadata: Map<String, Any> = emptyMap()
+    ): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get current shipment
+                val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                    ?: throw Exception("Shipment not found")
+                
+                // Validate status transition
+                if (!isValidStatusTransition(shipment.status, newStatus)) {
+                    throw Exception("Invalid status transition from ${shipment.status} to $newStatus")
+                }
+                
+                // Create status entity
+                // val statusEntity = ShipmentStatusEntity(
+                //     id = 0,
+                //     shipmentId = shipmentId,
+                    status = newStatus,
+                    previousStatus = shipment.status,
+                    changeReason = reason,
+                    location = location,
+                    metadata = serializeMetadata(metadata),
+                    changedBy = updatedBy,
+                    changedAt = Date(),
+                    createdAt = Date()
+                )
+                
+                // Save status change
+                val statusId = database.shipmentStatusDao().insertStatus(statusEntity)
+                val savedStatus = statusEntity.copy(id = statusId)
+                
+                // Update shipment status
+                val updatedShipment = shipment.copy(
+                    status = newStatus,
+                    updatedAt = Date(),
+                    updatedBy = updatedBy
+                )
+                database.shipmentDao().updateShipment(updatedShipment)
+                
+                // Process workflow
+                workflowEngine.processStateChange(shipmentId, newStatus, updatedBy)
+                
+                // Notify listeners
+                notifyStatusChange(savedStatus)
+                
+                // Send notifications
+                sendStatusNotifications(savedStatus)
+                
+                // Update current status if tracking this shipment
+                if (currentShipmentId == shipmentId) {
+                    _currentStatus.value = ShipmentStatusInfo(
+                        shipmentId = shipmentId,
+                        currentStatus = newStatus,
+                        previousStatus = shipment.status,
+                        changedAt = Date(),
+                        changedBy = updatedBy,
+                        changeReason = reason,
+                        location = location
+                    )
+                    updateStatusHistory()
+                }
+                
+                Result.success(savedStatus)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get current status
+     */
+    suspend fun getCurrentStatus(shipmentId: Long): ShipmentStatusInfo? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                    ?: return@withContext null
+                
+                val latestStatus = database.shipmentStatusDao().getLatestStatus(shipmentId)
+                
+                ShipmentStatusInfo(
+                    shipmentId = shipmentId,
+                    currentStatus = shipment.status,
+                    previousStatus = latestStatus?.previousStatus,
+                    changedAt = latestStatus?.changedAt ?: shipment.updatedAt,
+                    changedBy = latestStatus?.changedBy ?: shipment.updatedBy,
+                    changeReason = latestStatus?.changeReason ?: "",
+                    location = latestStatus?.location
+                )
+                
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get status history
+     */
+    suspend fun getStatusHistory(shipmentId: Long): List<Unit> {
+        return withContext(Dispatchers.IO) {
+            // database.shipmentStatusDao().getStatusHistory(shipmentId)
+            emptyList()
+        }
+    }
+    
+    /**
+     * Get status analytics
+     */
+    suspend fun getStatusAnalytics(shipmentId: Long): StatusAnalytics? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val statusHistory = database.shipmentStatusDao().getStatusHistory(shipmentId)
+                
+                if (statusHistory.isEmpty()) return@withContext null
+                
+                val analytics = StatusAnalytics(
+                    totalStatusChanges = statusHistory.size,
+                    averageTimeInStatus = calculateAverageTimeInStatus(statusHistory),
+                    longestStatusDuration = calculateLongestStatusDuration(statusHistory),
+                    shortestStatusDuration = calculateShortestStatusDuration(statusHistory),
+                    statusTransitionFrequency = calculateStatusTransitionFrequency(statusHistory),
+                    criticalStatusChanges = statusHistory.count { isCriticalStatusChange(it.status) },
+                    automatedChanges = statusHistory.count { it.metadata.contains("automated") },
+                    manualChanges = statusHistory.size - statusHistory.count { it.metadata.contains("automated") },
+                    statusEfficiency = calculateStatusEfficiency(statusHistory)
+                )
+                
+                analytics
+                
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get status statistics across all shipments
+     */
+    suspend fun getGlobalStatusStats(): GlobalStatusStats {
+        return withContext(Dispatchers.IO) {
+            val allStatuses = database.shipmentStatusDao().getAllStatuses()
+            val allShipments = database.shipmentDao().getAllShipments()
+            
+            val totalShipments = allShipments.size
+            val statusDistribution = calculateStatusDistribution(allShipments)
+            val averageStatusChanges = if (allShipments.isNotEmpty()) {
+                allStatuses.size.toFloat() / allShipments.size
+            } else 0f
+            val todayStatusChanges = allStatuses.count { isToday(it.changedAt) }
+            val automatedChanges = allStatuses.count { it.metadata.contains("automated") }
+            val criticalChanges = allStatuses.count { isCriticalStatusChange(it.status) }
+            
+            GlobalStatusStats(
+                totalShipments = totalShipments,
+                statusDistribution = statusDistribution,
+                averageStatusChanges = averageStatusChanges,
+                todayStatusChanges = todayStatusChanges,
+                automatedChanges = automatedChanges,
+                manualChanges = allStatuses.size - automatedChanges,
+                criticalChanges = criticalChanges,
+                automationRate = if (allStatuses.isNotEmpty()) {
+                    automatedChanges.toFloat() / allStatuses.size
+                } else 0f
+            )
+        }
+    }
+    
+    /**
+     * Add status change listener
+     */
+    fun addStatusChangeListener(listener: StatusChangeListener) {
+        statusChangeListeners.add(listener)
+    }
+    
+    /**
+     * Remove status change listener
+     */
+    fun removeStatusChangeListener(listener: StatusChangeListener) {
+        statusChangeListeners.remove(listener)
+    }
+    
+    /**
+     * Get next expected status
+     */
+    fun getNextExpectedStatus(currentStatus: ShipmentStatus): ShipmentStatus? {
+        return when (currentStatus) {
+            ShipmentStatus.CREATED -> ShipmentStatus.ASSIGNED
+            ShipmentStatus.ASSIGNED -> ShipmentStatus.SCHEDULED
+            ShipmentStatus.SCHEDULED -> ShipmentStatus.ASSIGNED
+            ShipmentStatus.ASSIGNED -> ShipmentStatus.IN_TRANSIT
+            ShipmentStatus.IN_TRANSIT -> ShipmentStatus.OUT_FOR_DELIVERY
+            ShipmentStatus.OUT_FOR_DELIVERY -> ShipmentStatus.DELIVERED
+            ShipmentStatus.DELIVERED -> null
+            ShipmentStatus.CANCELLED -> null
+            ShipmentStatus.RETURNED -> null
+        }
+    }
+    
+    /**
+     * Check if status change is valid
+     */
+    fun isValidStatusTransition(fromStatus: ShipmentStatus, toStatus: ShipmentStatus): Boolean {
+        val validTransitions = mapOf(
+            ShipmentStatus.CREATED to setOf(ShipmentStatus.ASSIGNED, ShipmentStatus.CANCELLED),
+            ShipmentStatus.ASSIGNED to setOf(ShipmentStatus.SCHEDULED, ShipmentStatus.CANCELLED),
+            ShipmentStatus.SCHEDULED to setOf(ShipmentStatus.ASSIGNED, ShipmentStatus.CANCELLED),
+            ShipmentStatus.ASSIGNED to setOf(ShipmentStatus.IN_TRANSIT, ShipmentStatus.CANCELLED),
+            ShipmentStatus.IN_TRANSIT to setOf(ShipmentStatus.OUT_FOR_DELIVERY, ShipmentStatus.RETURNED, ShipmentStatus.CANCELLED),
+            ShipmentStatus.OUT_FOR_DELIVERY to setOf(ShipmentStatus.DELIVERED, ShipmentStatus.RETURNED, ShipmentStatus.CANCELLED),
+            ShipmentStatus.DELIVERED to emptySet(),
+            ShipmentStatus.CANCELLED to emptySet(),
+            ShipmentStatus.RETURNED to emptySet()
+        )
+        
+        return validTransitions[fromStatus]?.contains(toStatus) == true
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadCurrentStatus(shipmentId: Long) {
+        val statusInfo = getCurrentStatus(shipmentId)
+        _currentStatus.value = statusInfo
+    }
+    
+    private suspend fun loadStatusHistory(shipmentId: Long) {
+        val history = getStatusHistory(shipmentId).take(MAX_STATUS_HISTORY)
+        _statusHistory.value = history
+    }
+    
+    private fun startRealTimeMonitoring() {
+        // Implementation would start real-time monitoring
+        // This could use WebSocket or other real-time communication
+    }
+    
+    private fun stopRealTimeMonitoring() {
+        // Implementation would stop real-time monitoring
+    }
+    
+    private fun notifyStatusChange(statusEntity: ShipmentStatusEntity) {
+        statusChangeListeners.forEach { listener ->
+            listener.onStatusChanged(statusEntity)
+        }
+    }
+    
+    // private suspend fun sendStatusNotifications(statusEntity: ShipmentStatusEntity) {
+        // Implementation would send notifications based on status
+        // This could include push notifications, SMS, or email
+    }
+    
+    private suspend fun updateStatusHistory() {
+        currentShipmentId?.let { shipmentId ->
+            val history = getStatusHistory(shipmentId).take(MAX_STATUS_HISTORY)
+            _statusHistory.value = history
+        }
+    }
+    
+    private fun serializeMetadata(metadata: Map<String, Any>): String {
+        // Implementation would serialize metadata to JSON
+        return metadata.toString()
+    }
+    
+    // private fun calculateAverageTimeInStatus(statusHistory: List<ShipmentStatusEntity>): Double {
+        if (statusHistory.size < 2) return 0.0
+        
+        val timeDiffs = mutableListOf<Long>()
+        for (i in 1 until statusHistory.size) {
+            val diff = statusHistory[i].changedAt.time - statusHistory[i-1].changedAt.time
+            timeDiffs.add(diff)
+        }
+        
+        return if (timeDiffs.isNotEmpty()) {
+            timeDiffs.average()
+        } else 0.0
+    }
+    
+    private fun calculateLongestStatusDuration(statusHistory: List<ShipmentStatusEntity>): Long {
+        if (statusHistory.size < 2) return 0L
+        
+        return statusHistory.zipWithNext { prev, current ->
+            current.changedAt.time - prev.changedAt.time
+        }.maxOrNull() ?: 0L
+    }
+    
+    // private fun calculateShortestStatusDuration(statusHistory: List<ShipmentStatusEntity>): Long {
+        if (statusHistory.size < 2) return 0L
+        
+        return statusHistory.zipWithNext { prev, current ->
+            current.changedAt.time - prev.changedAt.time
+        }.minOrNull() ?: 0L
+    }
+    
+    private fun calculateStatusTransitionFrequency(statusHistory: List<ShipmentStatusEntity>): Map<String, Int> {
+        val transitions = mutableMapOf<String, Int>()
+        
+        statusHistory.zipWithNext { prev, current ->
+            val transition = "${prev.previousStatus} -> ${current.status}"
+            transitions[transition] = transitions.getOrDefault(transition, 0) + 1
+        }
+        
+        return transitions
+    }
+    
+    private fun isCriticalStatusChange(status: ShipmentStatus): Boolean {
+        return when (status) {
+            ShipmentStatus.IN_TRANSIT, ShipmentStatus.DELIVERED, ShipmentStatus.CANCELLED -> true
+            else -> false
+        }
+    }
+    
+    // private fun calculateStatusEfficiency(statusHistory: List<ShipmentStatusEntity>): Float {
+        // Implementation would calculate efficiency based on expected vs actual status changes
+        return 0.85f // Placeholder
+    }
+    
+    private fun calculateStatusDistribution(shipments: List<ShipmentEntity>): Map<ShipmentStatus, Int> {
+        return shipments.groupBy { it.status }.mapValues { it.value.size }
+    }
+    
+    private fun isToday(date: Date): Boolean {
+        val today = Calendar.getInstance()
+        val checkDate = Calendar.getInstance()
+        checkDate.time = date
+        
+        return today.get(Calendar.YEAR) == checkDate.get(Calendar.YEAR) &&
+                today.get(Calendar.DAY_OF_YEAR) == checkDate.get(Calendar.DAY_OF_YEAR)
+    }
+    
+    /**
+     * Get tracking status
+     */
+    fun isTracking(): Boolean = isTracking
+}
+
+/**
+ * Data classes
+ */
+data class ShipmentStatusInfo(
+    val shipmentId: Long,
+    val currentStatus: ShipmentStatus,
+    val previousStatus: ShipmentStatus?,
+    val changedAt: Date,
+    val changedBy: String,
+    val changeReason: String,
+    val location: String?
+)
+
+data class StatusAnalytics(
+    val totalStatusChanges: Int,
+    val averageTimeInStatus: Double,
+    val longestStatusDuration: Long,
+    val shortestStatusDuration: Long,
+    val statusTransitionFrequency: Map<String, Int>,
+    val criticalStatusChanges: Int,
+    val automatedChanges: Int,
+    val manualChanges: Int,
+    val statusEfficiency: Float
+)
+
+data class GlobalStatusStats(
+    val totalShipments: Int,
+    val statusDistribution: Map<ShipmentStatus, Int>,
+    val averageStatusChanges: Float,
+    val todayStatusChanges: Int,
+    val automatedChanges: Int,
+    val manualChanges: Int,
+    val criticalChanges: Int,
+    val automationRate: Float
+)
+
+data class StatusAlert(
+    val type: StatusAlertType,
+    val shipmentId: Long,
+    val message: String,
+    val severity: AlertSeverity,
+    val timestamp: Date
+)
+
+/**
+ * Interfaces
+ */
+interface StatusChangeListener {
+    // fun onStatusChanged(statusEntity: ShipmentStatusEntity)
+}
+
+/**
+ * Enums
+ */
+enum class TrackingState {
+    Idle,
+    Starting,
+    Tracking,
+    Stopped,
+    Error
+}
+
+enum class StatusAlertType {
+    STATUS_CHANGED,
+    DELAY_WARNING,
+    CRITICAL_STATUS,
+    AUTOMATED_CHANGE,
+    MANUAL_CHANGE
+}
+
+enum class AlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

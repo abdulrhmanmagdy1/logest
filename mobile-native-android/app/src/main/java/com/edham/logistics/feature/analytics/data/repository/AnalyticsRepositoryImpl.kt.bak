@@ -1,0 +1,489 @@
+package com.edham.logistics.feature.analytics.data.repository
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.analytics.data.api.AnalyticsApiService
+import com.edham.logistics.feature.analytics.data.database.AnalyticsDatabase
+import com.edham.logistics.feature.analytics.data.service.AnalyticsWebSocketService
+import com.edham.logistics.feature.analytics.domain.model.*
+import com.edham.logistics.feature.analytics.domain.repository.AnalyticsRepository
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class AnalyticsRepositoryImpl @Inject constructor(
+    private val analyticsApiService: AnalyticsApiService,
+    private val analyticsDatabase: AnalyticsDatabase,
+    private val analyticsWebSocketService: AnalyticsWebSocketService
+) : AnalyticsRepository {
+
+    override suspend fun getAdminDashboardData(userId: String, filters: FilterOptions?): Result<AdminDashboardData> {
+        return try {
+            // Try local cache first
+            val cachedData = analyticsDatabase.adminDashboardDao().getDashboardData(userId)
+            if (cachedData != null && !isCacheExpired(cachedData.timestamp)) {
+                Result.Success(cachedData.toDomainModel())
+            } else {
+                // Fetch from API
+                val response = analyticsApiService.getAdminDashboardData(userId, filters)
+                if (response.isSuccessful) {
+                    response.body()?.let { data ->
+                        // Cache the data
+                        analyticsDatabase.adminDashboardDao().insertDashboardData(data.toEntity(userId))
+                        Result.Success(data)
+                    } ?: Result.Error(Exception("Empty response"))
+                } else {
+                    Result.Error(Exception("Failed to fetch admin dashboard data: ${response.code()}"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getCustomerDashboardData(userId: String, filters: FilterOptions?): Result<CustomerDashboardData> {
+        return try {
+            // Try local cache first
+            val cachedData = analyticsDatabase.customerDashboardDao().getDashboardData(userId)
+            if (cachedData != null && !isCacheExpired(cachedData.timestamp)) {
+                Result.Success(cachedData.toDomainModel())
+            } else {
+                // Fetch from API
+                val response = analyticsApiService.getCustomerDashboardData(userId, filters)
+                if (response.isSuccessful) {
+                    response.body()?.let { data ->
+                        // Cache the data
+                        analyticsDatabase.customerDashboardDao().insertDashboardData(data.toEntity(userId))
+                        Result.Success(data)
+                    } ?: Result.Error(Exception("Empty response"))
+                } else {
+                    Result.Error(Exception("Failed to fetch customer dashboard data: ${response.code()}"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getDriverDashboardData(userId: String, filters: FilterOptions?): Result<DriverDashboardData> {
+        return try {
+            // Try local cache first
+            val cachedData = analyticsDatabase.driverDashboardDao().getDashboardData(userId)
+            if (cachedData != null && !isCacheExpired(cachedData.timestamp)) {
+                Result.Success(cachedData.toDomainModel())
+            } else {
+                // Fetch from API
+                val response = analyticsApiService.getDriverDashboardData(userId, filters)
+                if (response.isSuccessful) {
+                    response.body()?.let { data ->
+                        // Cache the data
+                        analyticsDatabase.driverDashboardDao().insertDashboardData(data.toEntity(userId))
+                        Result.Success(data)
+                    } ?: Result.Error(Exception("Empty response"))
+                } else {
+                    Result.Error(Exception("Failed to fetch driver dashboard data: ${response.code()}"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getAccountantDashboardData(userId: String, filters: FilterOptions?): Result<AccountantDashboardData> {
+        return try {
+            // Try local cache first
+            val cachedData = analyticsDatabase.accountantDashboardDao().getDashboardData(userId)
+            if (cachedData != null && !isCacheExpired(cachedData.timestamp)) {
+                Result.Success(cachedData.toDomainModel())
+            } else {
+                // Fetch from API
+                val response = analyticsApiService.getAccountantDashboardData(userId, filters)
+                if (response.isSuccessful) {
+                    response.body()?.let { data ->
+                        // Cache the data
+                        analyticsDatabase.accountantDashboardDao().insertDashboardData(data.toEntity(userId))
+                        Result.Success(data)
+                    } ?: Result.Error(Exception("Empty response"))
+                } else {
+                    Result.Error(Exception("Failed to fetch accountant dashboard data: ${response.code()}"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeDashboardUpdates(userId: String, userRole: String): Flow<Result<DashboardData>> {
+        return flow {
+            try {
+                // Listen for WebSocket updates
+                analyticsWebSocketService.messageFlow.collect { message ->
+                    when (message.type) {
+                        AnalyticsWebSocketType.DASHBOARD_UPDATED -> {
+                            // Refresh dashboard data
+                            when (userRole) {
+                                "admin" -> {
+                                    val result = getAdminDashboardData(userId, null)
+                                    if (result is Result.Success) {
+                                        emit(Result.Success(DashboardData.AdminData(result.data)))
+                                    }
+                                }
+                                "customer" -> {
+                                    val result = getCustomerDashboardData(userId, null)
+                                    if (result is Result.Success) {
+                                        emit(Result.Success(DashboardData.CustomerData(result.data)))
+                                    }
+                                }
+                                "driver" -> {
+                                    val result = getDriverDashboardData(userId, null)
+                                    if (result is Result.Success) {
+                                        emit(Result.Success(DashboardData.DriverData(result.data)))
+                                    }
+                                }
+                                "accountant" -> {
+                                    val result = getAccountantDashboardData(userId, null)
+                                    if (result is Result.Success) {
+                                        emit(Result.Success(DashboardData.AccountantData(result.data)))
+                                    }
+                                }
+                            }
+                        }
+                        else -> {}
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun observeMetricUpdates(userId: String, userRole: String): Flow<Result<List<MetricCard>>> {
+        return flow {
+            try {
+                // Listen for metric updates
+                analyticsWebSocketService.messageFlow.collect { message ->
+                    when (message.type) {
+                        AnalyticsWebSocketType.METRIC_CHANGED -> {
+                            // Fetch updated metrics
+                            val metrics = getMetrics(userId, userRole, listOf(
+                                MetricType.TOTAL_SHIPMENTS,
+                                MetricType.ACTIVE_SHIPMENTS,
+                                MetricType.REVENUE,
+                                MetricType.PROFIT
+                            ))
+                            emit(metrics)
+                        }
+                        else -> {}
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getRevenueAnalytics(userId: String, filters: FilterOptions?): Result<RevenueAnalytics> {
+        return try {
+            val response = analyticsApiService.getRevenueAnalytics(userId, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch revenue analytics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getPerformanceAnalytics(userId: String, filters: FilterOptions?): Result<PerformanceAnalytics> {
+        return try {
+            val response = analyticsApiService.getPerformanceAnalytics(userId, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch performance analytics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getUsageAnalytics(userId: String, filters: FilterOptions?): Result<UsageAnalytics> {
+        return try {
+            val response = analyticsApiService.getUsageAnalytics(userId, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch usage analytics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getChartData(userId: String, chartType: ChartType, filters: FilterOptions?): Result<ChartData> {
+        return try {
+            val response = analyticsApiService.getChartData(userId, chartType, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch chart data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getRevenueChartData(userId: String, period: String): Result<ChartData> {
+        return try {
+            val response = analyticsApiService.getRevenueChartData(userId, period)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch revenue chart data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getPerformanceChartData(userId: String, period: String): Result<ChartData> {
+        return try {
+            val response = analyticsApiService.getPerformanceChartData(userId, period)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch performance chart data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getUsageChartData(userId: String, period: String): Result<ChartData> {
+        return try {
+            val response = analyticsApiService.getUsageChartData(userId, period)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch usage chart data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun generateReport(userId: String, reportType: ReportType, filters: FilterOptions?): Result<Report> {
+        return try {
+            val response = analyticsApiService.generateReport(userId, reportType, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { report ->
+                    Result.Success(report)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to generate report: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun exportReport(reportId: String, format: ExportFormat): Result<String> {
+        return try {
+            val response = analyticsApiService.exportReport(reportId, format)
+            if (response.isSuccessful) {
+                response.body()?.let { url ->
+                    Result.Success(url)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to export report: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun scheduleReport(userId: String, reportType: ReportType, schedule: ReportSchedule): Result<String> {
+        return try {
+            val response = analyticsApiService.scheduleReport(userId, reportType, schedule)
+            if (response.isSuccessful) {
+                response.body()?.let { scheduleId ->
+                    Result.Success(scheduleId)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to schedule report: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getMetrics(userId: String, userRole: String, metricTypes: List<MetricType>): Result<List<MetricCard>> {
+        return try {
+            val response = analyticsApiService.getMetrics(userId, userRole, metricTypes)
+            if (response.isSuccessful) {
+                response.body()?.let { metrics ->
+                    Result.Success(metrics)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch metrics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateMetric(userId: String, metricType: MetricType, value: Double): Result<Unit> {
+        return try {
+            val response = analyticsApiService.updateMetric(userId, metricType, value)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to update metric: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getActivityLogs(userId: String, userRole: String, limit: Int): Result<List<ActivityLog>> {
+        return try {
+            val response = analyticsApiService.getActivityLogs(userId, userRole, limit)
+            if (response.isSuccessful) {
+                response.body()?.let { logs ->
+                    Result.Success(logs)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to fetch activity logs: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun logActivity(activity: ActivityLog): Result<Unit> {
+        return try {
+            val response = analyticsApiService.logActivity(activity)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to log activity: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun connectToAnalyticsWebSocket(): Result<Unit> {
+        return try {
+            analyticsWebSocketService.connect("token") // In real app, get token from TokenManager
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun disconnectFromAnalyticsWebSocket(): Result<Unit> {
+        return try {
+            analyticsWebSocketService.disconnect()
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeAnalyticsMessages(): Flow<Result<AnalyticsWebSocketMessage>> {
+        return analyticsWebSocketService.messageFlow.map { message ->
+            Result.Success(message)
+        }
+    }
+
+    override suspend fun refreshDashboardData(userId: String, userRole: String): Result<Unit> {
+        return try {
+            when (userRole) {
+                "admin" -> {
+                    analyticsDatabase.adminDashboardDao().deleteDashboardData(userId)
+                    getAdminDashboardData(userId, null)
+                }
+                "customer" -> {
+                    analyticsDatabase.customerDashboardDao().deleteDashboardData(userId)
+                    getCustomerDashboardData(userId, null)
+                }
+                "driver" -> {
+                    analyticsDatabase.driverDashboardDao().deleteDashboardData(userId)
+                    getDriverDashboardData(userId, null)
+                }
+                "accountant" -> {
+                    analyticsDatabase.accountantDashboardDao().deleteDashboardData(userId)
+                    getAccountantDashboardData(userId, null)
+                }
+                else -> Result.Error(Exception("Invalid user role"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun clearCache(userId: String): Result<Unit> {
+        return try {
+            analyticsDatabase.adminDashboardDao().deleteDashboardData(userId)
+            analyticsDatabase.customerDashboardDao().deleteDashboardData(userId)
+            analyticsDatabase.driverDashboardDao().deleteDashboardData(userId)
+            analyticsDatabase.accountantDashboardDao().deleteDashboardData(userId)
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun searchAnalyticsData(userId: String, query: String, filters: FilterOptions?): Result<List<Any>> {
+        return try {
+            val response = analyticsApiService.searchAnalyticsData(userId, query, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to search analytics data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getFilteredData(userId: String, filters: FilterOptions): Result<Map<String, Any>> {
+        return try {
+            val response = analyticsApiService.getFilteredData(userId, filters)
+            if (response.isSuccessful) {
+                response.body()?.let { data ->
+                    Result.Success(data)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get filtered data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    private fun isCacheExpired(timestamp: Long): Boolean {
+        val cacheExpiryTime = 5 * 60 * 1000L // 5 minutes
+        return System.currentTimeMillis() - timestamp > cacheExpiryTime
+    }
+}

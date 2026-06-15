@@ -1,0 +1,1044 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.AlertApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Real-time Alert Service - Real-time alert monitoring and delivery
+ * 
+ * Features:
+ * - Real-time alert monitoring
+ * - WebSocket connections for live updates
+ * - Alert prioritization and routing
+ * - Multi-channel alert delivery
+ * - Alert escalation handling
+ * - Geofence-based alerts
+ * - Sensor-based alerts
+ * - System health monitoring
+ * - Alert aggregation and deduplication
+ * - Alert lifecycle management
+ */
+@Singleton
+class RealTimeAlertService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val alertApi: AlertApi,
+    private val networkUtils: NetworkUtils,
+    private val smartNotificationManager: SmartNotificationManager
+) {
+    
+    private val _alertState = MutableStateFlow<AlertState>(AlertState.Idle)
+    val alertState: StateFlow<AlertState> = _alertState.asStateFlow()
+    
+    private val _activeAlerts = MutableStateFlow<List<RealTimeAlert>>(emptyList())
+    val activeAlerts: StateFlow<List<RealTimeAlert>> = _activeAlerts.asStateFlow()
+    
+    private val _alertStats = MutableStateFlow<AlertStats>(AlertStats())
+    val alertStats: StateFlow<AlertStats> = _alertStats.asStateFlow()
+    
+    private val _connectionStatus = MutableStateFlow<ConnectionStatus>(ConnectionStatus.DISCONNECTED)
+    val connectionStatus: StateFlow<ConnectionStatus> = _connectionStatus.asStateFlow()
+    
+    private var isInitialized = false
+    private var isMonitoring = false
+    private val alertListeners = mutableListOf<RealTimeAlertListener>()
+    private val monitoringScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var webSocketJob: Job? = null
+    private var monitoringJob: Job? = null
+    
+    companion object {
+        private const val TAG = "RealTimeAlertService"
+        private const val RECONNECT_DELAY_MS = 5000L
+        private const val MONITORING_INTERVAL_MS = 1000L
+        private const val ALERT_DEDUPlication_WINDOW_MS = 30000L
+        private const val MAX_ACTIVE_ALERTS = 100
+        private const val ALERT_ESCALATION_THRESHOLD = 5 // minutes
+    }
+    
+    /**
+     * Initialize real-time alert service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _alertState.value = AlertState.Initializing
+                
+                // Load alert configuration
+                loadAlertConfiguration()
+                
+                // Initialize alert rules
+                initializeAlertRules()
+                
+                // Load active alerts
+                loadActiveAlerts()
+                
+                // Start alert monitoring
+                startAlertMonitoring()
+                
+                // Connect to real-time feed
+                connectToRealTimeFeed()
+                
+                isInitialized = true
+                _alertState.value = AlertState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _alertState.value = AlertState.Error("Failed to initialize alert service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Start real-time monitoring
+     */
+    suspend fun startMonitoring(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Alert service not initialized")
+                }
+                
+                if (isMonitoring) {
+                    return@withContext Result.success(true)
+                }
+                
+                isMonitoring = true
+                _alertState.value = AlertState.Monitoring
+                
+                // Start monitoring job
+                monitoringJob = monitoringScope.launch {
+                    while (isMonitoring) {
+                        try {
+                            // Monitor system health
+                            monitorSystemHealth()
+                            
+                            // Check for alert conditions
+                            checkAlertConditions()
+                            
+                            // Process alert queue
+                            processAlertQueue()
+                            
+                            // Update alert statistics
+                            updateAlertStats()
+                            
+                            delay(MONITORING_INTERVAL_MS)
+                            
+                        } catch (e: Exception) {
+                            Timber.e(e, "Error in alert monitoring loop")
+                            delay(1000) // Brief pause before retry
+                        }
+                    }
+                }
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                isMonitoring = false
+                _alertState.value = AlertState.Error("Failed to start monitoring: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Stop real-time monitoring
+     */
+    suspend fun stopMonitoring(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                isMonitoring = false
+                monitoringJob?.cancel()
+                _alertState.value = AlertState.Stopped
+                Result.success(true)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create real-time alert
+     */
+    suspend fun createAlert(
+        alertRequest: RealTimeAlertRequest
+    ): Result<RealTimeAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Validate alert request
+                validateAlertRequest(alertRequest)
+                
+                // Check for deduplication
+                if (isDuplicateAlert(alertRequest)) {
+                    throw Exception("Duplicate alert detected")
+                }
+                
+                // Create alert
+                val alert = RealTimeAlert(
+                    id = UUID.randomUUID().toString(),
+                    type = alertRequest.type,
+                    severity = alertRequest.severity,
+                    title = alertRequest.title,
+                    message = alertRequest.message,
+                    source = alertRequest.source,
+                    entityId = alertRequest.entityId,
+                    entityType = alertRequest.entityType,
+                    location = alertRequest.location,
+                    metadata = alertRequest.metadata,
+                    status = AlertStatus.ACTIVE,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    acknowledgedAt = null,
+                    acknowledgedBy = null,
+                    resolvedAt = null,
+                    resolvedBy = null,
+                    escalationLevel = 0
+                )
+                
+                // Save alert to database
+                database.realTimeAlertDao().insertAlert(alert.toEntity())
+                
+                // Add to active alerts
+                addToActiveAlerts(alert)
+                
+                // Process alert immediately
+                processAlert(alert)
+                
+                // Update statistics
+                updateAlertStats()
+                
+                // Notify listeners
+                notifyAlertCreated(alert)
+                
+                Result.success(alert)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Acknowledge alert
+     */
+    suspend fun acknowledgeAlert(
+        alertId: String,
+        acknowledgedBy: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activeAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Alert not found")
+                
+                // Update alert status
+                val updatedAlert = alert.copy(
+                    status = AlertStatus.ACKNOWLEDGED,
+                    acknowledgedAt = Date(),
+                    acknowledgedBy = acknowledgedBy,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.realTimeAlertDao().updateAlert(updatedAlert.toEntity())
+                
+                // Update active alerts
+                updateActiveAlert(updatedAlert)
+                
+                // Notify listeners
+                notifyAlertAcknowledged(updatedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Resolve alert
+     */
+    suspend fun resolveAlert(
+        alertId: String,
+        resolvedBy: String,
+        resolution: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activeAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Alert not found")
+                
+                // Update alert status
+                val updatedAlert = alert.copy(
+                    status = AlertStatus.RESOLVED,
+                    resolvedAt = Date(),
+                    resolvedBy = resolvedBy,
+                    resolution = resolution,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.realTimeAlertDao().updateAlert(updatedAlert.toEntity())
+                
+                // Remove from active alerts
+                removeFromActiveAlerts(alertId)
+                
+                // Notify listeners
+                notifyAlertResolved(updatedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Escalate alert
+     */
+    suspend fun escalateAlert(
+        alertId: String,
+        escalationReason: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activeAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Alert not found")
+                
+                // Check escalation rules
+                val newEscalationLevel = alert.escalationLevel + 1
+                val newSeverity = determineEscalatedSeverity(alert.severity, newEscalationLevel)
+                
+                // Update alert
+                val escalatedAlert = alert.copy(
+                    severity = newSeverity,
+                    escalationLevel = newEscalationLevel,
+                    escalationReason = escalationReason,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.realTimeAlertDao().updateAlert(escalatedAlert.toEntity())
+                
+                // Update active alerts
+                updateActiveAlert(escalatedAlert)
+                
+                // Process escalated alert
+                processAlert(escalatedAlert)
+                
+                // Notify listeners
+                notifyAlertEscalated(escalatedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get alerts by type
+     */
+    suspend fun getAlertsByType(type: AlertType): List<RealTimeAlert> {
+        return _activeAlerts.value.filter { it.type == type }
+    }
+    
+    /**
+     * Get alerts by severity
+     */
+    suspend fun getAlertsBySeverity(severity: AlertSeverity): List<RealTimeAlert> {
+        return _activeAlerts.value.filter { it.severity == severity }
+    }
+    
+    /**
+     * Get alerts by entity
+     */
+    suspend fun getAlertsByEntity(entityId: String, entityType: EntityType): List<RealTimeAlert> {
+        return _activeAlerts.value.filter { 
+            it.entityId == entityId && it.entityType == entityType 
+        }
+    }
+    
+    /**
+     * Get unacknowledged alerts
+     */
+    suspend fun getUnacknowledgedAlerts(): List<RealTimeAlert> {
+        return _activeAlerts.value.filter { it.status == AlertStatus.ACTIVE }
+    }
+    
+    /**
+     * Add real-time alert listener
+     */
+    fun addRealTimeAlertListener(listener: RealTimeAlertListener) {
+        alertListeners.add(listener)
+    }
+    
+    /**
+     * Remove real-time alert listener
+     */
+    fun removeRealTimeAlertListener(listener: RealTimeAlertListener) {
+        alertListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadAlertConfiguration() {
+        // Load alert configuration from database or remote config
+    }
+    
+    private suspend fun initializeAlertRules() {
+        // Initialize alert rules and conditions
+    }
+    
+    private suspend fun loadActiveAlerts() {
+        try {
+            val alerts = database.realTimeAlertDao().getActiveAlerts()
+                .map { it.toDomainModel() }
+                .sortedByDescending { it.createdAt }
+                .take(MAX_ACTIVE_ALERTS)
+            
+            _activeAlerts.value = alerts
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun startAlertMonitoring() {
+        // Start background alert monitoring
+    }
+    
+    private suspend fun connectToRealTimeFeed() {
+        webSocketJob = monitoringScope.launch {
+            while (isMonitoring) {
+                try {
+                    _connectionStatus.value = ConnectionStatus.CONNECTING
+                    
+                    // Connect to WebSocket
+                    alertApi.connectToRealTimeFeed { alertData ->
+                        handleRealTimeAlert(alertData)
+                    }
+                    
+                    _connectionStatus.value = ConnectionStatus.CONNECTED
+                    
+                    // Keep connection alive
+                    while (isMonitoring) {
+                        delay(30000) // Send ping every 30 seconds
+                        alertApi.sendPing()
+                    }
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "WebSocket connection failed")
+                    _connectionStatus.value = ConnectionStatus.DISCONNECTED
+                    
+                    // Reconnect after delay
+                    delay(RECONNECT_DELAY_MS)
+                }
+            }
+        }
+    }
+    
+    private suspend fun monitorSystemHealth() {
+        // Monitor system health and generate alerts if needed
+    }
+    
+    private suspend fun checkAlertConditions() {
+        // Check various alert conditions
+        checkShipmentConditions()
+        checkVehicleConditions()
+        checkDriverConditions()
+        checkTemperatureConditions()
+        checkMaintenanceConditions()
+        checkPaymentConditions()
+    }
+    
+    private suspend fun checkShipmentConditions() {
+        try {
+            // Check for delayed shipments
+            val delayedShipments = database.shipmentDao().getDelayedShipments()
+            delayedShipments.forEach { shipment ->
+                createAlert(
+                    RealTimeAlertRequest(
+                        type = AlertType.SHIPMENT_DELAY,
+                        severity = AlertSeverity.HIGH,
+                        title = "تأخير الشحنة",
+                        message = "الشحنة ${shipment.shipmentId} متأخرة عن الموعد المحدد",
+                        source = "SYSTEM",
+                        entityId = shipment.shipmentId,
+                        entityType = EntityType.SHIPMENT,
+                        metadata = mapOf(
+                            "delayMinutes" to shipment.delayMinutes.toString(),
+                            "estimatedDelivery" to shipment.estimatedDelivery.toString()
+                        )
+                    )
+                )
+            }
+            
+            // Check for shipments in danger zones
+            val dangerZoneShipments = database.shipmentDao().getShipmentsInDangerZones()
+            dangerZoneShipments.forEach { shipment ->
+                createAlert(
+                    RealTimeAlertRequest(
+                        type = AlertType.GEOFENCE_BREACH,
+                        severity = AlertSeverity.MEDIUM,
+                        title = "انتهاك المنطقة الجغرافية",
+                        message = "الشحنة ${shipment.shipmentId} في منطقة خطرة",
+                        source = "SYSTEM",
+                        entityId = shipment.shipmentId,
+                        entityType = EntityType.SHIPMENT,
+                        location = shipment.currentLocation,
+                        metadata = mapOf(
+                            "dangerZone" to shipment.currentDangerZone
+                        )
+                    )
+                )
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking shipment conditions")
+        }
+    }
+    
+    private suspend fun checkVehicleConditions() {
+        try {
+            // Check for low fuel
+            val lowFuelVehicles = database.vehicleDao().getLowFuelVehicles()
+            lowFuelVehicles.forEach { vehicle ->
+                createAlert(
+                    RealTimeAlertRequest(
+                        type = AlertType.LOW_FUEL,
+                        severity = AlertSeverity.MEDIUM,
+                        title = "مستوى وقود منخفض",
+                        message = "المركبة ${vehicle.vehicleId} مستوى الوقود منخفض (${vehicle.fuelLevel}%)",
+                        source = "SYSTEM",
+                        entityId = vehicle.id.toString(),
+                        entityType = EntityType.VEHICLE,
+                        metadata = mapOf(
+                            "fuelLevel" to vehicle.fuelLevel.toString(),
+                            "vehicleId" to vehicle.vehicleId
+                        )
+                    )
+                )
+            }
+            
+            // Check for maintenance due
+            val maintenanceDueVehicles = database.vehicleDao().getMaintenanceDueVehicles()
+            maintenanceDueVehicles.forEach { vehicle ->
+                createAlert(
+                    RealTimeAlertRequest(
+                        type = AlertType.MAINTENANCE_DUE,
+                        severity = AlertSeverity.MEDIUM,
+                        title = "صيانة مستحقة",
+                        message = "المركبة ${vehicle.vehicleId} تحتاج للصيانة",
+                        source = "SYSTEM",
+                        entityId = vehicle.id.toString(),
+                        entityType = EntityType.VEHICLE,
+                        metadata = mapOf(
+                            "lastMaintenance" to vehicle.lastMaintenanceDate.toString(),
+                            "nextMaintenance" to vehicle.nextMaintenanceDate.toString()
+                        )
+                    )
+                )
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking vehicle conditions")
+        }
+    }
+    
+    private suspend fun checkDriverConditions() {
+        try {
+            // Check for driver fatigue
+            val fatiguedDrivers = database.driverDao().getFatiguedDrivers()
+            fatiguedDrivers.forEach { driver ->
+                createAlert(
+                    RealTimeAlertRequest(
+                        type = AlertType.DRIVER_FATIGUE,
+                        severity = AlertSeverity.HIGH,
+                        title = "إرهاق السائق",
+                        message = "السائق ${driver.name} يظهر علامات إرهاق",
+                        source = "SYSTEM",
+                        entityId = driver.id.toString(),
+                        entityType = EntityType.DRIVER,
+                        metadata = mapOf(
+                            "drivingHours" to driver.drivingHours.toString(),
+                            "lastRest" to driver.lastRestTime.toString()
+                        )
+                    )
+                )
+            }
+            
+            // Check for speeding
+            val speedingDrivers = database.driverDao().getSpeedingDrivers()
+            speedingDrivers.forEach { driver ->
+                createAlert(
+                    RealTimeAlertRequest(
+                        type = AlertType.SPEEDING,
+                        severity = AlertSeverity.MEDIUM,
+                        title = "تجاوز السرعة",
+                        message = "السائق ${driver.name} يتجاوز السرعة المسموح بها",
+                        source = "SYSTEM",
+                        entityId = driver.id.toString(),
+                        entityType = EntityType.DRIVER,
+                        location = driver.currentLocation,
+                        metadata = mapOf(
+                            "currentSpeed" to driver.currentSpeed.toString(),
+                            "speedLimit" to driver.speedLimit.toString()
+                        )
+                    )
+                )
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking driver conditions")
+        }
+    }
+    
+    private suspend fun checkTemperatureConditions() {
+        try {
+            // Check for temperature violations
+            val temperatureViolations = database.sensorDao().getTemperatureViolations()
+            temperatureViolations.forEach { sensor ->
+                createAlert(
+                    RealTimeAlertRequest(
+                        type = AlertType.TEMPERATURE_VIOLATION,
+                        severity = if (sensor.isCritical) AlertSeverity.CRITICAL else AlertSeverity.HIGH,
+                        title = "انتهاك درجة الحرارة",
+                        message = "درجة الحرارة ${sensor.currentTemperature}°${sensor.unit} في ${sensor.location}",
+                        source = "SYSTEM",
+                        entityId = sensor.id.toString(),
+                        entityType = EntityType.SENSOR,
+                        location = sensor.location,
+                        metadata = mapOf(
+                            "currentTemperature" to sensor.currentTemperature.toString(),
+                            "threshold" to sensor.threshold.toString(),
+                            "unit" to sensor.unit
+                        )
+                    )
+                )
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking temperature conditions")
+        }
+    }
+    
+    private suspend fun checkMaintenanceConditions() {
+        // Check for maintenance-related alerts
+    }
+    
+    private suspend fun checkPaymentConditions() {
+        // Check for payment-related alerts
+    }
+    
+    private suspend fun processAlertQueue() {
+        // Process queued alerts
+    }
+    
+    private suspend fun processAlert(alert: RealTimeAlert) {
+        try {
+            // Determine notification channels based on severity
+            val channels = determineNotificationChannels(alert)
+            
+            // Create notification request
+            val notificationRequest = NotificationRequest(
+                title = alert.title,
+                message = alert.message,
+                category = mapAlertTypeToCategory(alert.type),
+                priority = mapSeverityToPriority(alert.severity),
+                recipients = determineAlertRecipients(alert),
+                data = alert.metadata,
+                channels = channels
+            )
+            
+            // Send notification
+            smartNotificationManager.sendNotification(notificationRequest)
+            
+            // Check for escalation
+            checkForEscalation(alert)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error processing alert: ${alert.id}")
+        }
+    }
+    
+    private suspend fun handleRealTimeAlert(alertData: Map<String, Any>) {
+        try {
+            // Parse alert data from real-time feed
+            val alert = parseRealTimeAlertData(alertData)
+            
+            // Check if alert already exists
+            if (_activeAlerts.value.any { it.id == alert.id }) {
+                return // Duplicate alert
+            }
+            
+            // Save and process alert
+            database.realTimeAlertDao().insertAlert(alert.toEntity())
+            addToActiveAlerts(alert)
+            processAlert(alert)
+            notifyAlertCreated(alert)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error handling real-time alert")
+        }
+    }
+    
+    private fun parseRealTimeAlertData(alertData: Map<String, Any>): RealTimeAlert {
+        // Parse alert data from real-time feed
+        return RealTimeAlert(
+            id = alertData["id"] as String,
+            type = AlertType.valueOf(alertData["type"] as String),
+            severity = AlertSeverity.valueOf(alertData["severity"] as String),
+            title = alertData["title"] as String,
+            message = alertData["message"] as String,
+            source = alertData["source"] as String,
+            entityId = alertData["entityId"] as String,
+            entityType = EntityType.valueOf(alertData["entityType"] as String),
+            location = alertData["location"] as? String,
+            metadata = alertData["metadata"] as? Map<String, String> ?: emptyMap(),
+            status = AlertStatus.ACTIVE,
+            createdAt = Date(),
+            updatedAt = Date(),
+            acknowledgedAt = null,
+            acknowledgedBy = null,
+            resolvedAt = null,
+            resolvedBy = null,
+            escalationLevel = 0
+        )
+    }
+    
+    private fun validateAlertRequest(request: RealTimeAlertRequest) {
+        if (request.title.isBlank()) throw Exception("Alert title cannot be empty")
+        if (request.message.isBlank()) throw Exception("Alert message cannot be empty")
+        if (request.entityId.isBlank()) throw Exception("Entity ID cannot be empty")
+    }
+    
+    private fun isDuplicateAlert(request: RealTimeAlertRequest): Boolean {
+        val cutoffTime = Date(System.currentTimeMillis() - ALERT_DEDUPlication_WINDOW_MS)
+        return _activeAlerts.value.any { alert ->
+            alert.type == request.type &&
+            alert.entityId == request.entityId &&
+            alert.entityType == request.entityType &&
+            alert.createdAt.after(cutoffTime)
+        }
+    }
+    
+    private fun addToActiveAlerts(alert: RealTimeAlert) {
+        val currentAlerts = _activeAlerts.value.toMutableList()
+        currentAlerts.add(0, alert)
+        
+        // Keep only max alerts
+        if (currentAlerts.size > MAX_ACTIVE_ALERTS) {
+            currentAlerts.removeAt(currentAlerts.size - 1)
+        }
+        
+        _activeAlerts.value = currentAlerts
+    }
+    
+    private fun updateActiveAlert(alert: RealTimeAlert) {
+        val currentAlerts = _activeAlerts.value.toMutableList()
+        val index = currentAlerts.indexOfFirst { it.id == alert.id }
+        
+        if (index != -1) {
+            currentAlerts[index] = alert
+            _activeAlerts.value = currentAlerts
+        }
+    }
+    
+    private fun removeFromActiveAlerts(alertId: String) {
+        val currentAlerts = _activeAlerts.value.toMutableList()
+        currentAlerts.removeAll { it.id == alertId }
+        _activeAlerts.value = currentAlerts
+    }
+    
+    private fun determineNotificationChannels(alert: RealTimeAlert): List<NotificationChannel> {
+        return when (alert.severity) {
+            AlertSeverity.CRITICAL -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL,
+                NotificationChannel.IN_APP
+            )
+            AlertSeverity.HIGH -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.IN_APP
+            )
+            AlertSeverity.MEDIUM -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.IN_APP
+            )
+            AlertSeverity.LOW -> listOf(
+                NotificationChannel.IN_APP
+            )
+        }
+    }
+    
+    private fun determineAlertRecipients(alert: RealTimeAlert): List<NotificationRecipient> {
+        // Determine recipients based on alert type and entity
+        return when (alert.entityType) {
+            EntityType.SHIPMENT -> listOf(
+                NotificationRecipient(
+                    id = "shipment_manager",
+                    type = RecipientType.ADMIN,
+                    address = "manager@edham.com",
+                    name = "Shipment Manager"
+                )
+            )
+            EntityType.VEHICLE -> listOf(
+                NotificationRecipient(
+                    id = "fleet_manager",
+                    type = RecipientType.ADMIN,
+                    address = "fleet@edham.com",
+                    name = "Fleet Manager"
+                )
+            )
+            EntityType.DRIVER -> listOf(
+                NotificationRecipient(
+                    id = "driver_supervisor",
+                    type = RecipientType.ADMIN,
+                    address = "supervisor@edham.com",
+                    name = "Driver Supervisor"
+                )
+            )
+            else -> emptyList()
+        }
+    }
+    
+    private fun mapAlertTypeToCategory(alertType: AlertType): NotificationCategory {
+        return when (alertType) {
+            AlertType.SHIPMENT_DELAY -> NotificationCategory.DELAY
+            AlertType.TEMPERATURE_VIOLATION -> NotificationCategory.TEMPERATURE
+            AlertType.MAINTENANCE_DUE -> NotificationCategory.MAINTENANCE
+            AlertType.PAYMENT_OVERDUE -> NotificationCategory.PAYMENT
+            AlertType.DRIVER_FATIGUE,
+            AlertType.SPEEDING -> NotificationCategory.DRIVER
+            else -> NotificationCategory.EMERGENCY
+        }
+    }
+    
+    private fun mapSeverityToPriority(severity: AlertSeverity): NotificationPriority {
+        return when (severity) {
+            AlertSeverity.CRITICAL -> NotificationPriority.EMERGENCY
+            AlertSeverity.HIGH -> NotificationPriority.HIGH
+            AlertSeverity.MEDIUM -> NotificationPriority.NORMAL
+            AlertSeverity.LOW -> NotificationPriority.LOW
+        }
+    }
+    
+    private fun determineEscalatedSeverity(currentSeverity: AlertSeverity, escalationLevel: Int): AlertSeverity {
+        return when (escalationLevel) {
+            1 -> when (currentSeverity) {
+                AlertSeverity.LOW -> AlertSeverity.MEDIUM
+                AlertSeverity.MEDIUM -> AlertSeverity.HIGH
+                AlertSeverity.HIGH -> AlertSeverity.CRITICAL
+                AlertSeverity.CRITICAL -> AlertSeverity.CRITICAL
+            }
+            2 -> when (currentSeverity) {
+                AlertSeverity.LOW -> AlertSeverity.HIGH
+                AlertSeverity.MEDIUM -> AlertSeverity.CRITICAL
+                AlertSeverity.HIGH -> AlertSeverity.CRITICAL
+                AlertSeverity.CRITICAL -> AlertSeverity.CRITICAL
+            }
+            else -> AlertSeverity.CRITICAL
+        }
+    }
+    
+    private suspend fun checkForEscalation(alert: RealTimeAlert) {
+        if (alert.status == AlertStatus.ACTIVE) {
+            val timeSinceCreation = System.currentTimeMillis() - alert.createdAt.time
+            val escalationThresholdMs = ALERT_ESCALATION_THRESHOLD * 60 * 1000L
+            
+            if (timeSinceCreation > escalationThresholdMs && alert.escalationLevel == 0) {
+                escalateAlert(alert.id, "Auto-escalation due to no acknowledgment")
+            }
+        }
+    }
+    
+    private suspend fun updateAlertStats() {
+        try {
+            val alerts = _activeAlerts.value
+            val stats = AlertStats(
+                totalActive = alerts.size,
+                criticalAlerts = alerts.count { it.severity == AlertSeverity.CRITICAL },
+                highAlerts = alerts.count { it.severity == AlertSeverity.HIGH },
+                mediumAlerts = alerts.count { it.severity == AlertSeverity.MEDIUM },
+                lowAlerts = alerts.count { it.severity == AlertSeverity.LOW },
+                unacknowledgedAlerts = alerts.count { it.status == AlertStatus.ACTIVE },
+                typeStats = alerts.groupBy { it.type }
+                    .mapValues { it.value.size },
+                entityStats = alerts.groupBy { it.entityType }
+                    .mapValues { it.value.size }
+            )
+            
+            _alertStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun notifyAlertCreated(alert: RealTimeAlert) {
+        alertListeners.forEach { listener ->
+            listener.onAlertCreated(alert)
+        }
+    }
+    
+    private fun notifyAlertAcknowledged(alert: RealTimeAlert) {
+        alertListeners.forEach { listener ->
+            listener.onAlertAcknowledged(alert)
+        }
+    }
+    
+    private fun notifyAlertResolved(alert: RealTimeAlert) {
+        alertListeners.forEach { listener ->
+            listener.onAlertResolved(alert)
+        }
+    }
+    
+    private fun notifyAlertEscalated(alert: RealTimeAlert) {
+        alertListeners.forEach { listener ->
+            listener.onAlertEscalated(alert)
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+    
+    /**
+     * Get monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+}
+
+/**
+ * Data classes
+ */
+data class RealTimeAlertRequest(
+    val type: AlertType,
+    val severity: AlertSeverity,
+    val title: String,
+    val message: String,
+    val source: String,
+    val entityId: String,
+    val entityType: EntityType,
+    val location: String? = null,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class RealTimeAlert(
+    val id: String,
+    val type: AlertType,
+    val severity: AlertSeverity,
+    val title: String,
+    val message: String,
+    val source: String,
+    val entityId: String,
+    val entityType: EntityType,
+    val location: String?,
+    val metadata: Map<String, String>,
+    val status: AlertStatus,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val acknowledgedAt: Date?,
+    val acknowledgedBy: String?,
+    val resolvedAt: Date?,
+    val resolvedBy: String?,
+    val escalationLevel: Int,
+    val escalationReason: String? = null,
+    val resolution: String? = null
+)
+
+data class AlertStats(
+    val totalActive: Int = 0,
+    val criticalAlerts: Int = 0,
+    val highAlerts: Int = 0,
+    val mediumAlerts: Int = 0,
+    val lowAlerts: Int = 0,
+    val unacknowledgedAlerts: Int = 0,
+    val typeStats: Map<AlertType, Int> = emptyMap(),
+    val entityStats: Map<EntityType, Int> = emptyMap()
+)
+
+/**
+ * Interfaces
+ */
+interface RealTimeAlertListener {
+    fun onAlertCreated(alert: RealTimeAlert)
+    fun onAlertAcknowledged(alert: RealTimeAlert)
+    fun onAlertResolved(alert: RealTimeAlert)
+    fun onAlertEscalated(alert: RealTimeAlert)
+    fun onConnectionStatusChanged(status: ConnectionStatus)
+}
+
+/**
+ * Enums
+ */
+enum class AlertState {
+    Idle,
+    Initializing,
+    Ready,
+    Monitoring,
+    Stopped,
+    Error
+}
+
+enum class ConnectionStatus {
+    CONNECTED,
+    CONNECTING,
+    DISCONNECTED,
+    ERROR
+}
+
+enum class AlertType {
+    SHIPMENT_DELAY,
+    GEOFENCE_BREACH,
+    LOW_FUEL,
+    MAINTENANCE_DUE,
+    DRIVER_FATIGUE,
+    SPEEDING,
+    TEMPERATURE_VIOLATION,
+    PAYMENT_OVERDUE,
+    SYSTEM_ERROR,
+    SECURITY_BREACH
+}
+
+enum class AlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class AlertStatus {
+    ACTIVE,
+    ACKNOWLEDGED,
+    RESOLVED,
+    ESCALATED
+}
+
+enum class EntityType {
+    SHIPMENT,
+    VEHICLE,
+    DRIVER,
+    SENSOR,
+    SYSTEM,
+    USER
+}

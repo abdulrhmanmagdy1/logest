@@ -1,0 +1,463 @@
+package com.edham.logistics.network
+
+import android.content.Context
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import com.google.gson.Gson
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
+import okhttp3.*
+import okio.ByteString
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * WebSocket Manager - Real-time communication for live tracking
+ * 
+ * Features:
+ * - Real-time location updates
+ * - Live status updates
+ * - Bidirectional communication
+ * - Automatic reconnection
+ * - Connection health monitoring
+ * - Message queuing
+ */
+@Singleton
+class WebSocketManager @Inject constructor(
+    private val context: Context,
+    private val networkUtils: NetworkUtils,
+    private val gson: Gson
+) {
+    
+    private val _connectionState = MutableSharedFlow<WebSocketConnectionState>()
+    val connectionState: SharedFlow<WebSocketConnectionState> = _connectionState.asSharedFlow()
+    
+    private val _messages = MutableSharedFlow<WebSocketMessage>()
+    val messages: SharedFlow<WebSocketMessage> = _messages.asSharedFlow()
+    
+    private val _locationUpdates = MutableSharedFlow<LocationUpdateMessage>()
+    val locationUpdates: SharedFlow<LocationUpdateMessage> = _locationUpdates.asSharedFlow()
+    
+    private val _statusUpdates = MutableSharedFlow<StatusUpdateMessage>()
+    val statusUpdates: SharedFlow<StatusUpdateMessage> = _statusUpdates.asSharedFlow()
+    
+    private val _alertUpdates = MutableSharedFlow<AlertMessage>()
+    val alertUpdates: SharedFlow<AlertMessage> = _alertUpdates.asSharedFlow()
+    
+    private var webSocket: WebSocket? = null
+    private var isConnected = false
+    private var reconnectAttempts = 0
+    private var maxReconnectAttempts = 5
+    private var reconnectDelay = 1000L
+    private var messageQueue: MutableList<WebSocketMessage> = mutableListOf()
+    private var connectionScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    companion object {
+        private const val TAG = "WebSocketManager"
+        private const val WEBSOCKET_URL = "wss://api.edhamlogistics.com/ws/tracking"
+        private const val HEARTBEAT_INTERVAL = 30000L // 30 seconds
+        private const val CONNECTION_TIMEOUT = 10000L // 10 seconds
+        private const val MAX_MESSAGE_QUEUE_SIZE = 100
+    }
+    
+    /**
+     * Connect to WebSocket
+     */
+    fun connect(vehicleId: String, authToken: String) {
+        if (isConnected) return
+        
+        try {
+            _connectionState.emit(WebSocketConnectionState.Connecting)
+            
+            val request = Request.Builder()
+                .url("$WEBSOCKET_URL?vehicleId=$vehicleId&token=$authToken")
+                .addHeader("Authorization", "Bearer $authToken")
+                .addHeader("User-Agent", "EdhamLogistics/Android")
+                .build()
+            
+            val client = OkHttpClient.Builder()
+                .connectTimeout(CONNECTION_TIMEOUT, java.util.concurrent.TimeUnit.MILLISECONDS)
+                .readTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS) // No timeout for reads
+                .writeTimeout(CONNECTION_TIMEOUT, java.util.concurrent.TimeUnit.MILLISECONDS)
+                .build()
+            
+            webSocket = client.newWebSocket(request, createWebSocketListener())
+            
+        } catch (e: Exception) {
+            connectionScope.launch {
+                _connectionState.emit(WebSocketConnectionState.Error("Failed to connect: ${e.message}"))
+            }
+        }
+    }
+    
+    /**
+     * Disconnect from WebSocket
+     */
+    fun disconnect() {
+        try {
+            webSocket?.close(1000, "Normal closure")
+            webSocket = null
+            isConnected = false
+            reconnectAttempts = 0
+            messageQueue.clear()
+            
+            connectionScope.launch {
+                _connectionState.emit(WebSocketConnectionState.Disconnected)
+            }
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    /**
+     * Send message
+     */
+    fun sendMessage(message: WebSocketMessage) {
+        if (isConnected) {
+            try {
+                val json = gson.toJson(message)
+                webSocket?.send(json)
+            } catch (e: Exception) {
+                connectionScope.launch {
+                    _connectionState.emit(WebSocketConnectionState.Error("Failed to send message: ${e.message}"))
+                }
+            }
+        } else {
+            // Queue message for later
+            queueMessage(message)
+        }
+    }
+    
+    /**
+     * Send location update
+     */
+    fun sendLocationUpdate(
+        vehicleId: String,
+        latitude: Double,
+        longitude: Double,
+        speed: Float,
+        heading: Float,
+        timestamp: Long
+    ) {
+        val message = LocationUpdateMessage(
+            type = MessageType.LOCATION_UPDATE,
+            vehicleId = vehicleId,
+            latitude = latitude,
+            longitude = longitude,
+            speed = speed,
+            heading = heading,
+            timestamp = timestamp
+        )
+        
+        sendMessage(message)
+    }
+    
+    /**
+     * Send status update
+     */
+    fun sendStatusUpdate(
+        vehicleId: String,
+        status: String,
+        batteryLevel: Int,
+        networkType: String,
+        timestamp: Long
+    ) {
+        val message = StatusUpdateMessage(
+            type = MessageType.STATUS_UPDATE,
+            vehicleId = vehicleId,
+            status = status,
+            batteryLevel = batteryLevel,
+            networkType = networkType,
+            timestamp = timestamp
+        )
+        
+        sendMessage(message)
+    }
+    
+    /**
+     * Send alert
+     */
+    fun sendAlert(
+        vehicleId: String,
+        alertType: String,
+        message: String,
+        severity: String,
+        data: Map<String, Any> = emptyMap()
+    ) {
+        val alertMessage = AlertMessage(
+            type = MessageType.ALERT,
+            vehicleId = vehicleId,
+            alertType = alertType,
+            message = message,
+            severity = severity,
+            timestamp = System.currentTimeMillis(),
+            data = data
+        )
+        
+        sendMessage(alertMessage)
+    }
+    
+    /**
+     * Create WebSocket listener
+     */
+    private fun createWebSocketListener(): WebSocketListener {
+        return object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                isConnected = true
+                reconnectAttempts = 0
+                
+                connectionScope.launch {
+                    _connectionState.emit(WebSocketConnectionState.Connected)
+                }
+                
+                // Send queued messages
+                sendQueuedMessages()
+                
+                // Start heartbeat
+                startHeartbeat()
+            }
+            
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                handleTextMessage(text)
+            }
+            
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                handleBinaryMessage(bytes)
+            }
+            
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                isConnected = false
+                
+                connectionScope.launch {
+                    _connectionState.emit(WebSocketConnectionState.Disconnecting)
+                }
+            }
+            
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                isConnected = false
+                
+                connectionScope.launch {
+                    _connectionState.emit(WebSocketConnectionState.Disconnected)
+                }
+                
+                // Attempt reconnection
+                attemptReconnection()
+            }
+            
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                isConnected = false
+                
+                connectionScope.launch {
+                    _connectionState.emit(WebSocketConnectionState.Error("Connection failed: ${t.message}"))
+                }
+                
+                // Attempt reconnection
+                attemptReconnection()
+            }
+        }
+    }
+    
+    /**
+     * Handle text message
+     */
+    private fun handleTextMessage(text: String) {
+        try {
+            val message = gson.fromJson(text, WebSocketMessage::class.java)
+            
+            connectionScope.launch {
+                _messages.emit(message)
+                
+                // Handle specific message types
+                when (message.type) {
+                    MessageType.LOCATION_UPDATE -> {
+                        val locationMessage = gson.fromJson(text, LocationUpdateMessage::class.java)
+                        _locationUpdates.emit(locationMessage)
+                    }
+                    MessageType.STATUS_UPDATE -> {
+                        val statusMessage = gson.fromJson(text, StatusUpdateMessage::class.java)
+                        _statusUpdates.emit(statusMessage)
+                    }
+                    MessageType.ALERT -> {
+                        val alertMessage = gson.fromJson(text, AlertMessage::class.java)
+                        _alertUpdates.emit(alertMessage)
+                    }
+                    MessageType.HEARTBEAT -> {
+                        // Handle heartbeat
+                    }
+                    else -> {
+                        // Handle other message types
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            connectionScope.launch {
+                _connectionState.emit(WebSocketConnectionState.Error("Failed to parse message: ${e.message}"))
+            }
+        }
+    }
+    
+    /**
+     * Handle binary message
+     */
+    private fun handleBinaryMessage(bytes: ByteString) {
+        // Handle binary messages if needed
+    }
+    
+    /**
+     * Queue message for later sending
+     */
+    private fun queueMessage(message: WebSocketMessage) {
+        if (messageQueue.size < MAX_MESSAGE_QUEUE_SIZE) {
+            messageQueue.add(message)
+        } else {
+            // Remove oldest message and add new one
+            messageQueue.removeAt(0)
+            messageQueue.add(message)
+        }
+    }
+    
+    /**
+     * Send queued messages
+     */
+    private fun sendQueuedMessages() {
+        while (messageQueue.isNotEmpty() && isConnected) {
+            val message = messageQueue.removeAt(0)
+            sendMessage(message)
+        }
+    }
+    
+    /**
+     * Start heartbeat
+     */
+    private fun startHeartbeat() {
+        connectionScope.launch {
+            while (isConnected) {
+                try {
+                    val heartbeat = WebSocketMessage(
+                        type = MessageType.HEARTBEAT,
+                        timestamp = System.currentTimeMillis()
+                    )
+                    sendMessage(heartbeat)
+                    kotlinx.coroutines.delay(HEARTBEAT_INTERVAL)
+                } catch (e: Exception) {
+                    break
+                }
+            }
+        }
+    }
+    
+    /**
+     * Attempt reconnection
+     */
+    private fun attemptReconnection() {
+        if (reconnectAttempts < maxReconnectAttempts && networkUtils.isNetworkAvailable()) {
+            connectionScope.launch {
+                try {
+                    kotlinx.coroutines.delay(reconnectDelay)
+                    _connectionState.emit(WebSocketConnectionState.Reconnecting)
+                    
+                    // Reconnect logic would go here
+                    // This would require storing connection parameters
+                    
+                    reconnectAttempts++
+                    reconnectDelay *= 2 // Exponential backoff
+                    
+                } catch (e: Exception) {
+                    // Handle error
+                }
+            }
+        } else {
+            connectionScope.launch {
+                _connectionState.emit(WebSocketConnectionState.Error("Max reconnection attempts reached"))
+            }
+        }
+    }
+    
+    /**
+     * Get connection status
+     */
+    fun isConnected(): Boolean = isConnected
+    
+    /**
+     * Get connection statistics
+     */
+    fun getConnectionStats(): WebSocketStats {
+        return WebSocketStats(
+            isConnected = isConnected,
+            reconnectAttempts = reconnectAttempts,
+            queuedMessages = messageQueue.size,
+            lastMessageTime = 0L // Would track last message time
+        )
+    }
+}
+
+/**
+ * Data classes
+ */
+data class WebSocketMessage(
+    val type: String,
+    val timestamp: Long,
+    val data: Map<String, Any> = emptyMap()
+)
+
+data class LocationUpdateMessage(
+    val type: String,
+    val vehicleId: String,
+    val latitude: Double,
+    val longitude: Double,
+    val speed: Float,
+    val heading: Float,
+    val timestamp: Long
+)
+
+data class StatusUpdateMessage(
+    val type: String,
+    val vehicleId: String,
+    val status: String,
+    val batteryLevel: Int,
+    val networkType: String,
+    val timestamp: Long
+)
+
+data class AlertMessage(
+    val type: String,
+    val vehicleId: String,
+    val alertType: String,
+    val message: String,
+    val severity: String,
+    val timestamp: Long,
+    val data: Map<String, Any> = emptyMap()
+)
+
+data class WebSocketStats(
+    val isConnected: Boolean,
+    val reconnectAttempts: Int,
+    val queuedMessages: Int,
+    val lastMessageTime: Long
+)
+
+/**
+ * Enums
+ */
+enum class WebSocketConnectionState {
+    Connecting,
+    Connected,
+    Disconnecting,
+    Disconnected,
+    Reconnecting,
+    Error
+}
+
+enum class MessageType {
+    LOCATION_UPDATE,
+    STATUS_UPDATE,
+    ALERT,
+    HEARTBEAT,
+    COMMAND,
+    ACKNOWLEDGMENT
+}

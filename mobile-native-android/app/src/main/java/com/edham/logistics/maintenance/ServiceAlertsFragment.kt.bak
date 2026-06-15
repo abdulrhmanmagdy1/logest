@@ -1,0 +1,339 @@
+package com.edham.logistics.maintenance
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentServiceAlertsBinding
+import com.edham.logistics.maintenance.adapters.ServiceAlertAdapter
+import com.edham.logistics.maintenance.viewmodels.ServiceAlertsViewModel
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Service Alerts Fragment - Comprehensive service alerts management and viewing
+ * 
+ * Features:
+ * - Real-time alerts display
+ * - Alert filtering and categorization
+ * - Alert status management
+ * - Priority-based sorting
+ * - Alert actions and responses
+ * - Alert analytics and statistics
+ * - Bulk alert operations
+ */
+class ServiceAlertsFragment @Inject constructor(
+    private val serviceAlertAdapter: ServiceAlertAdapter
+) : Fragment() {
+
+    private var _binding: FragmentServiceAlertsBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: ServiceAlertsViewModel
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentServiceAlertsBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupRecyclerView()
+        setupClickListeners()
+        observeViewModel()
+        
+        // Load initial data
+        loadServiceAlerts()
+    }
+
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[ServiceAlertsViewModel::class.java]
+    }
+
+    private fun setupRecyclerView() {
+        binding.rvServiceAlerts.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = serviceAlertAdapter
+            isNestedScrollingEnabled = false
+        }
+    }
+
+    private fun setupClickListeners() {
+        // Clear filters
+        binding.btnClearFilters.setOnClickListener {
+            clearAllFilters()
+        }
+        
+        // Load more alerts
+        binding.btnLoadMore.setOnClickListener {
+            loadMoreAlerts()
+        }
+        
+        // Mark all as read
+        binding.fabMarkAllRead.setOnClickListener {
+            markAllAlertsAsRead()
+        }
+        
+        // Create alert
+        binding.fabCreateAlert.setOnClickListener {
+            showCreateAlertDialog()
+        }
+        
+        // Toolbar menu
+        binding.toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_refresh -> {
+                    refreshAlerts()
+                    true
+                }
+                R.id.action_export -> {
+                    exportAlerts()
+                    true
+                }
+                R.id.action_settings -> {
+                    navigateToAlertSettings()
+                    true
+                }
+                else -> false
+            }
+        }
+        
+        // Filter chips
+        setupFilterListeners()
+    }
+
+    private fun setupFilterListeners() {
+        // Alert type filter
+        binding.chipGroupAlertType.setOnCheckedStateChangeListener { group, checkedIds ->
+            val selectedTypes = mutableListOf<String>()
+            
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as com.google.android.material.chip.Chip
+                if (chip.isChecked) {
+                    selectedTypes.add(chip.text.toString())
+                }
+            }
+            
+            viewModel.applyAlertTypeFilter(selectedTypes)
+        }
+        
+        // Status filter
+        binding.chipGroupStatus.setOnCheckedStateChangeListener { group, checkedIds ->
+            val selectedStatuses = mutableListOf<String>()
+            
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as com.google.android.material.chip.Chip
+                if (chip.isChecked) {
+                    selectedStatuses.add(chip.text.toString())
+                }
+            }
+            
+            viewModel.applyStatusFilter(selectedStatuses)
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.alertsState.collect { state ->
+                when (state) {
+                    is ServiceAlertsState.Loading -> {
+                        showLoadingState()
+                    }
+                    is ServiceAlertsState.Success -> {
+                        hideLoadingState()
+                        updateAlertsList(state.alerts)
+                        updateAlertSummary(state.summary)
+                    }
+                    is ServiceAlertsState.Error -> {
+                        hideLoadingState()
+                        showError(state.message)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.filteredAlerts.collect { alerts ->
+                serviceAlertAdapter.submitList(alerts)
+                updateLoadMoreButton(alerts.size)
+            }
+        }
+    }
+
+    private fun loadServiceAlerts() {
+        viewModel.loadServiceAlerts()
+    }
+
+    private fun updateAlertsList(alerts: List<ServiceAlert>) {
+        serviceAlertAdapter.submitList(alerts)
+    }
+
+    private fun updateAlertSummary(summary: AlertSummary) {
+        binding.tvCriticalCount.text = summary.criticalCount.toString()
+        binding.tvHighCount.text = summary.highCount.toString()
+        binding.tvMediumCount.text = summary.mediumCount.toString()
+        binding.tvLowCount.text = summary.lowCount.toString()
+    }
+
+    private fun updateLoadMoreButton(currentSize: Int) {
+        binding.btnLoadMore.visibility = if (currentSize >= 20) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
+    }
+
+    private fun clearAllFilters() {
+        // Reset chip selections
+        binding.chipGroupAlertType.clearCheck()
+        binding.chipGroupStatus.clearCheck()
+        
+        // Select "All" options
+        (binding.chipGroupAlertType.getChildAt(0) as com.google.android.material.chip.Chip).isChecked = true
+        (binding.chipGroupStatus.getChildAt(0) as com.google.android.material.chip.Chip).isChecked = true
+        
+        // Apply cleared filters
+        viewModel.clearAllFilters()
+    }
+
+    private fun loadMoreAlerts() {
+        binding.progressLoadMore.visibility = View.VISIBLE
+        viewModel.loadMoreAlerts { success ->
+            binding.progressLoadMore.visibility = View.GONE
+        }
+    }
+
+    private fun markAllAlertsAsRead() {
+        viewModel.markAllAlertsAsRead { success, message ->
+            if (success) {
+                showSuccessMessage("تم تعيين جميع التنبيهات كمقروءة")
+            } else {
+                showErrorMessage("فشل تعيين التنبيهات كمقروءة: $message")
+            }
+        }
+    }
+
+    private fun showCreateAlertDialog() {
+        val dialog = CreateServiceAlertDialogFragment()
+        dialog.show(childFragmentManager, "create_service_alert_dialog")
+        
+        dialog.setOnAlertCreated { alert ->
+            viewModel.createServiceAlert(alert)
+        }
+    }
+
+    private fun refreshAlerts() {
+        loadServiceAlerts()
+    }
+
+    private fun exportAlerts() {
+        viewModel.exportAlerts { success, message ->
+            if (success) {
+                showSuccessMessage("تم تصدير التنبيهات بنجاح")
+            } else {
+                showErrorMessage("فشل تصدير التنبيهات: $message")
+            }
+        }
+    }
+
+    private fun navigateToAlertSettings() {
+        // Navigate to alert settings screen
+    }
+
+    private fun showLoadingState() {
+        binding.layoutLoading.visibility = View.VISIBLE
+        binding.contentGroup.visibility = View.GONE
+    }
+
+    private fun hideLoadingState() {
+        binding.layoutLoading.visibility = View.GONE
+        binding.contentGroup.visibility = View.VISIBLE
+    }
+
+    private fun showSuccessMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun showErrorMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_LONG
+        ).show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh alerts when fragment becomes visible
+        loadServiceAlerts()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+
+/**
+ * Data classes
+ */
+data class ServiceAlert(
+    val id: String,
+    val vehicleId: String,
+    val vehicleName: String,
+    val alertType: String,
+    val severity: String,
+    val title: String,
+    val message: String,
+    val timestamp: Date,
+    val status: String,
+    val priority: String,
+    val assignedTo: String?,
+    val dueDate: Date?,
+    val resolvedDate: Date?,
+    val actions: List<AlertAction>,
+    val attachments: List<String>
+)
+
+data class AlertSummary(
+    val criticalCount: Int,
+    val highCount: Int,
+    val mediumCount: Int,
+    val lowCount: Int,
+    val totalCount: Int,
+    val unreadCount: Int,
+    val overdueCount: Int
+)
+
+data class AlertAction(
+    val id: String,
+    val type: String,
+    val description: String,
+    val timestamp: Date,
+    val performedBy: String,
+    val result: String
+)
+
+/**
+ * Enums
+ */
+enum class ServiceAlertsState {
+    Loading,
+    Success,
+    Error
+}

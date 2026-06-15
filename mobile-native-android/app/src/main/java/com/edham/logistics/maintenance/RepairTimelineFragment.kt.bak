@@ -1,0 +1,337 @@
+package com.edham.logistics.maintenance
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentRepairTimelineBinding
+import com.edham.logistics.maintenance.adapters.RepairTimelineAdapter
+import com.edham.logistics.maintenance.viewmodels.RepairTimelineViewModel
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Repair Timeline Fragment - Interactive timeline for repair tracking and management
+ * 
+ * Features:
+ * - Chronological repair timeline
+ * - Real-time repair status updates
+ * - Filter by status and priority
+ * - Repair details and progress
+ * - Technician assignments
+ * - Parts tracking
+ * - Cost analysis
+ * - Time tracking
+ */
+class RepairTimelineFragment @Inject constructor(
+    private val repairTimelineAdapter: RepairTimelineAdapter
+) : Fragment() {
+
+    private var _binding: FragmentRepairTimelineBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: RepairTimelineViewModel
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentRepairTimelineBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupRecyclerView()
+        setupClickListeners()
+        observeViewModel()
+        
+        // Load initial data
+        loadRepairTimeline()
+    }
+
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[RepairTimelineViewModel::class.java]
+    }
+
+    private fun setupRecyclerView() {
+        binding.rvRepairTimeline.apply {
+            layoutManager = LinearLayoutManager(context)
+            adapter = repairTimelineAdapter
+            isNestedScrollingEnabled = false
+        }
+    }
+
+    private fun setupClickListeners() {
+        // Clear filters
+        binding.btnClearFilters.setOnClickListener {
+            clearAllFilters()
+        }
+        
+        // Load more
+        binding.btnLoadMore.setOnClickListener {
+            loadMoreRepairs()
+        }
+        
+        // Add repair
+        binding.fabAddRepair.setOnClickListener {
+            showAddRepairDialog()
+        }
+        
+        // Toolbar menu
+        binding.toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_refresh -> {
+                    refreshRepairTimeline()
+                    true
+                }
+                R.id.action_export -> {
+                    exportRepairData()
+                    true
+                }
+                R.id.action_statistics -> {
+                    showRepairStatistics()
+                    true
+                }
+                else -> false
+            }
+        }
+        
+        // Filter chips
+        setupFilterListeners()
+    }
+
+    private fun setupFilterListeners() {
+        // Status filter
+        binding.chipGroupStatus.setOnCheckedStateChangeListener { group, checkedIds ->
+            val selectedStatuses = mutableListOf<String>()
+            
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as com.google.android.material.chip.Chip
+                if (chip.isChecked) {
+                    selectedStatuses.add(chip.text.toString())
+                }
+            }
+            
+            viewModel.applyStatusFilter(selectedStatuses)
+        }
+        
+        // Priority filter
+        binding.chipGroupPriority.setOnCheckedStateChangeListener { group, checkedIds ->
+            val selectedPriorities = mutableListOf<String>()
+            
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as com.google.android.material.chip.Chip
+                if (chip.isChecked) {
+                    selectedPriorities.add(chip.text.toString())
+                }
+            }
+            
+            viewModel.applyPriorityFilter(selectedPriorities)
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.timelineState.collect { state ->
+                when (state) {
+                    is RepairTimelineState.Loading -> {
+                        showLoadingState()
+                    }
+                    is RepairTimelineState.Success -> {
+                        hideLoadingState()
+                        updateTimeline(state.repairItems)
+                        updateTimelineStats(state.stats)
+                    }
+                    is RepairTimelineState.Error -> {
+                        hideLoadingState()
+                        showError(state.message)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.filteredRepairs.collect { repairs ->
+                repairTimelineAdapter.submitList(repairs)
+                updateLoadMoreButton(repairs.size)
+            }
+        }
+    }
+
+    private fun loadRepairTimeline() {
+        viewModel.loadRepairTimeline()
+    }
+
+    private fun updateTimeline(repairItems: List<RepairTimelineItem>) {
+        repairTimelineAdapter.submitList(repairItems)
+    }
+
+    private fun updateTimelineStats(stats: RepairTimelineStats) {
+        binding.tvInProgressCount.text = stats.inProgressCount.toString()
+        binding.tvCompletedTodayCount.text = stats.completedTodayCount.toString()
+        binding.tvAvgDuration.text = "${stats.averageDuration} س"
+    }
+
+    private fun updateLoadMoreButton(currentSize: Int) {
+        binding.btnLoadMore.visibility = if (currentSize >= 20) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
+    }
+
+    private fun clearAllFilters() {
+        // Reset chip selections
+        binding.chipGroupStatus.clearCheck()
+        binding.chipGroupPriority.clearCheck()
+        
+        // Select "All" options
+        (binding.chipGroupStatus.getChildAt(0) as com.google.android.material.chip.Chip).isChecked = true
+        (binding.chipGroupPriority.getChildAt(0) as com.google.android.material.chip.Chip).isChecked = true
+        
+        // Apply cleared filters
+        viewModel.clearAllFilters()
+    }
+
+    private fun loadMoreRepairs() {
+        binding.progressLoadMore.visibility = View.VISIBLE
+        viewModel.loadMoreRepairs { success ->
+            binding.progressLoadMore.visibility = View.GONE
+        }
+    }
+
+    private fun showAddRepairDialog() {
+        val dialog = AddRepairDialogFragment()
+        dialog.show(childFragmentManager, "add_repair_dialog")
+        
+        dialog.setOnRepairCreated { repair ->
+            viewModel.addRepair(repair)
+        }
+    }
+
+    private fun refreshRepairTimeline() {
+        loadRepairTimeline()
+    }
+
+    private fun exportRepairData() {
+        viewModel.exportRepairData { success, message ->
+            if (success) {
+                showSuccessMessage("تم تصدير بيانات الإصلاحات بنجاح")
+            } else {
+                showErrorMessage("فشل تصدير البيانات: $message")
+            }
+        }
+    }
+
+    private fun showRepairStatistics() {
+        // Navigate to repair statistics screen
+    }
+
+    private fun showLoadingState() {
+        binding.layoutLoading.visibility = View.VISIBLE
+        binding.contentGroup.visibility = View.GONE
+    }
+
+    private fun hideLoadingState() {
+        binding.layoutLoading.visibility = View.GONE
+        binding.contentGroup.visibility = View.VISIBLE
+    }
+
+    private fun showSuccessMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun showErrorMessage(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_LONG
+        ).show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh timeline when fragment becomes visible
+        loadRepairTimeline()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+
+/**
+ * Data classes
+ */
+data class RepairTimelineItem(
+    val id: String,
+    val vehicleId: String,
+    val vehicleName: String,
+    val repairType: String,
+    val description: String,
+    val reportedDate: Date,
+    val reportedBy: String,
+    val technicianId: String,
+    val technicianName: String,
+    val startDate: Date?,
+    val estimatedCompletionDate: Date?,
+    val actualCompletionDate: Date?,
+    val status: String,
+    val priority: String,
+    val progress: Int,
+    val estimatedCost: Float,
+    val actualCost: Float,
+    val partsUsed: List<RepairPart>,
+    val laborHours: Float,
+    val notes: String,
+    val timelineEvents: List<TimelineEvent>
+)
+
+data class TimelineEvent(
+    val id: String,
+    val type: String,
+    val description: String,
+    val timestamp: Date,
+    val technicianId: String?,
+    val technicianName: String?,
+    val attachments: List<String>
+)
+
+data class RepairPart(
+    val partId: String,
+    val partName: String,
+    val quantity: Int,
+    val unitPrice: Float,
+    val totalPrice: Float
+)
+
+data class RepairTimelineStats(
+    val inProgressCount: Int,
+    val completedTodayCount: Int,
+    val averageDuration: Float,
+    val totalCost: Float,
+    val onTimeCompletionRate: Float
+)
+
+/**
+ * Enums
+ */
+enum class RepairTimelineState {
+    Loading,
+    Success,
+    Error
+}

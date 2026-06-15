@@ -25,8 +25,8 @@ class InventoryAdapter(private var items: List<PartItem>) :
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val item = items[position]
         holder.name.text = item.name
-        holder.code.text = "كود: ${item.id.take(8)}"
-        holder.stock.text = "${item.quantity} ${item.unit}"
+        holder.code.text = "كود: ${item.code}"
+        holder.stock.text = "${item.quantity} قطعة"
         
         if (item.quantity < 10) {
             holder.stock.setTextColor(holder.itemView.context.getColor(R.color.ed_rust))

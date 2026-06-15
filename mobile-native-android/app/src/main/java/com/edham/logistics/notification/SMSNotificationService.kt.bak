@@ -1,0 +1,671 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.SMSApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * SMS Notification Service - SMS notification delivery and management
+ * 
+ * Features:
+ * - SMS notification delivery
+ * - Multiple SMS providers support
+ * - SMS template management
+ * - Delivery status tracking
+ * - SMS analytics and reporting
+ * - Rate limiting and throttling
+ * - International SMS support
+ * - SMS scheduling
+ * - Delivery retry mechanism
+ */
+@Singleton
+class SMSNotificationService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val smsApi: SMSApi,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _smsState = MutableStateFlow<SMSState>(SMSState.Idle)
+    val smsState: StateFlow<SMSState> = _smsState.asStateFlow()
+    
+    private val _smsAnalytics = MutableStateFlow<SMSAnalytics>(SMSAnalytics())
+    val smsAnalytics: StateFlow<SMSAnalytics> = _smsAnalytics.asStateFlow()
+    
+    private val _deliveryStatus = MutableStateFlow<Map<String, SMSDeliveryStatus>>(emptyMap())
+    val deliveryStatus: StateFlow<Map<String, SMSDeliveryStatus>> = _deliveryStatus.asStateFlow()
+    
+    private var isInitialized = false
+    private val smsListeners = mutableListOf<SMSNotificationListener>()
+    
+    companion object {
+        private const val TAG = "SMSNotificationService"
+        private const val MAX_SMS_LENGTH = 160
+        private const val MAX_RETRIES = 3
+        private const val RETRY_DELAY_MS = 5000L
+        private const val RATE_LIMIT_PER_MINUTE = 60
+        private const val RATE_LIMIT_WINDOW_MS = 60000L
+    }
+    
+    /**
+     * Initialize SMS notification service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _smsState.value = SMSState.Initializing
+                
+                // Load SMS configuration
+                loadSMSConfiguration()
+                
+                // Initialize SMS provider
+                initializeSMSProvider()
+                
+                // Load SMS templates
+                loadSMSTemplates()
+                
+                // Load delivery status
+                loadDeliveryStatus()
+                
+                // Start delivery status monitoring
+                startDeliveryStatusMonitoring()
+                
+                isInitialized = true
+                _smsState.value = SMSState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _smsState.value = SMSState.Error("Failed to initialize SMS service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Send SMS notification
+     */
+    suspend fun sendSMSNotification(
+        notification: Notification,
+        request: NotificationRequest,
+        isEmergency: Boolean = false
+    ): Result<NotificationResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("SMS service not initialized")
+                }
+                
+                _smsState.value = SMSState.Sending
+                
+                // Validate SMS request
+                validateSMSRequest(request)
+                
+                // Check rate limiting
+                if (!checkRateLimit()) {
+                    _smsState.value = SMSState.RateLimited
+                    return@withContext Result.success(
+                        NotificationResult(
+                            id = notification.id.toString(),
+                            status = NotificationStatus.FAILED,
+                            message = "Rate limit exceeded"
+                        )
+                    )
+                }
+                
+                // Get SMS recipients
+                val smsRecipients = getSMSRecipients(request.recipients)
+                
+                if (smsRecipients.isEmpty()) {
+                    _smsState.value = SMSState.NoRecipients
+                    return@withContext Result.success(
+                        NotificationResult(
+                            id = notification.id.toString(),
+                            status = NotificationStatus.FAILED,
+                            message = "No SMS recipients found"
+                        )
+                    )
+                }
+                
+                // Generate SMS content
+                val smsContent = generateSMSContent(notification, request)
+                
+                // Send SMS to all recipients
+                val results = mutableListOf<SMSDeliveryResult>()
+                
+                smsRecipients.forEach { recipient ->
+                    val result = sendSMSToRecipient(
+                        recipient = recipient,
+                        content = smsContent,
+                        notificationId = notification.id.toString(),
+                        isEmergency = isEmergency
+                    )
+                    results.add(result)
+                }
+                
+                // Determine overall status
+                val overallStatus = determineSMSStatus(results)
+                
+                // Update delivery status
+                updateDeliveryStatus(notification.id.toString(), results)
+                
+                // Update analytics
+                updateSMSAnalytics(results)
+                
+                // Save SMS records
+                saveSMSRecords(notification.id, results)
+                
+                // Notify listeners
+                notifySMSSent(notification.id, results)
+                
+                _smsState.value = SMSState.Sent
+                Result.success(
+                    NotificationResult(
+                        id = notification.id.toString(),
+                        status = overallStatus,
+                        message = "SMS sent to ${results.count { it.status == SMSDeliveryStatus.DELIVERED }} recipients",
+                        timestamp = Date()
+                    )
+                )
+                
+            } catch (e: Exception) {
+                _smsState.value = SMSState.Error("Failed to send SMS: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Send bulk SMS notifications
+     */
+    suspend fun sendBulkSMSNotifications(
+        notifications: List<Pair<Notification, NotificationRequest>>,
+        isEmergency: Boolean = false
+    ): Result<List<NotificationResult>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _smsState.value = SMSState.SendingBulk
+                
+                val results = mutableListOf<NotificationResult>()
+                
+                notifications.chunked(10).forEach { chunk ->
+                    chunk.forEach { (notification, request) ->
+                        val result = sendSMSNotification(notification, request, isEmergency)
+                        results.add(result.getOrNull() ?: NotificationResult(
+                            id = notification.id.toString(),
+                            status = NotificationStatus.FAILED,
+                            message = "Failed to send SMS"
+                        ))
+                    }
+                    
+                    // Add delay between chunks to respect rate limits
+                    kotlinx.coroutines.delay(1000)
+                }
+                
+                _smsState.value = SMSState.BulkSent
+                Result.success(results)
+                
+            } catch (e: Exception) {
+                _smsState.value = SMSState.Error("Failed to send bulk SMS: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Send scheduled SMS
+     */
+    suspend fun sendScheduledSMS(
+        scheduledSMS: ScheduledSMS
+    ): Result<SMSDeliveryResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Create notification from scheduled SMS
+                val notification = Notification(
+                    id = 0,
+                    title = scheduledSMS.title,
+                    message = scheduledSMS.message,
+                    category = scheduledSMS.category,
+                    priority = scheduledSMS.priority,
+                    status = NotificationStatus.PENDING,
+                    recipients = scheduledSMS.recipients,
+                    channels = listOf(NotificationChannel.SMS),
+                    data = scheduledSMS.data,
+                    isRead = false,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                val request = NotificationRequest(
+                    title = scheduledSMS.title,
+                    message = scheduledSMS.message,
+                    category = scheduledSMS.category,
+                    priority = scheduledSMS.priority,
+                    recipients = scheduledSMS.recipients,
+                    data = scheduledSMS.data,
+                    channels = listOf(NotificationChannel.SMS)
+                )
+                
+                // Send SMS
+                val result = sendSMSNotification(notification, request, scheduledSMS.isEmergency)
+                
+                // Update scheduled SMS status
+                updateScheduledSMSStatus(scheduledSMS.id, result.isSuccess)
+                
+                Result.success(
+                    SMSDeliveryResult(
+                        messageId = scheduledSMS.id.toString(),
+                        recipient = scheduledSMS.recipients.first().address,
+                        status = if (result.isSuccess) SMSDeliveryStatus.DELIVERED else SMSDeliveryStatus.FAILED,
+                        timestamp = Date(),
+                        errorMessage = if (!result.isSuccess) result.exceptionOrNull()?.message else null
+                    )
+                )
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get SMS delivery status
+     */
+    suspend fun getSMSDeliveryStatus(messageId: String): Result<SMSDeliveryStatus> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val status = _deliveryStatus.value[messageId]
+                if (status != null) {
+                    Result.success(status)
+                } else {
+                    // Fetch from API if not in cache
+                    val apiStatus = smsApi.getDeliveryStatus(messageId)
+                    updateDeliveryStatus(messageId, listOf(SMSDeliveryResult(
+                        messageId = messageId,
+                        recipient = "",
+                        status = apiStatus,
+                        timestamp = Date()
+                    )))
+                    Result.success(apiStatus)
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Retry failed SMS delivery
+     */
+    suspend fun retryFailedSMS(messageId: String): Result<SMSDeliveryResult> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get failed SMS record
+                val failedSMS = database.smsRecordDao().getFailedSMS(messageId)
+                    ?: throw Exception("Failed SMS record not found")
+                
+                // Check retry count
+                if (failedSMS.retryCount >= MAX_RETRIES) {
+                    throw Exception("Maximum retry attempts exceeded")
+                }
+                
+                // Update retry count
+                database.smsRecordDao().incrementRetryCount(messageId)
+                
+                // Resend SMS
+                val result = resendSMS(failedSMS)
+                
+                // Update status
+                if (result.status == SMSDeliveryStatus.DELIVERED) {
+                    database.smsRecordDao().markAsDelivered(messageId)
+                }
+                
+                Result.success(result)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get SMS analytics
+     */
+    suspend fun getSMSAnalytics(dateRange: DateRange = DateRange.last30Days()): Result<SMSAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val analytics = database.smsRecordDao().getSMSAnalytics(dateRange.startDate, dateRange.endDate)
+                Result.success(analytics)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add SMS notification listener
+     */
+    fun addSMSNotificationListener(listener: SMSNotificationListener) {
+        smsListeners.add(listener)
+    }
+    
+    /**
+     * Remove SMS notification listener
+     */
+    fun removeSMSNotificationListener(listener: SMSNotificationListener) {
+        smsListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadSMSConfiguration() {
+        // Load SMS configuration from database or remote config
+    }
+    
+    private suspend fun initializeSMSProvider() {
+        // Initialize SMS provider (Twilio, AWS SNS, etc.)
+    }
+    
+    private suspend fun loadSMSTemplates() {
+        // Load SMS templates for different notification types
+    }
+    
+    private suspend fun loadDeliveryStatus() {
+        // Load recent delivery status from database
+    }
+    
+    private suspend fun startDeliveryStatusMonitoring() {
+        // Start monitoring delivery status updates
+    }
+    
+    private fun validateSMSRequest(request: NotificationRequest) {
+        if (request.title.isBlank() && request.message.isBlank()) {
+            throw Exception("SMS must have either title or message")
+        }
+    }
+    
+    private fun checkRateLimit(): Boolean {
+        // Implement rate limiting logic
+        return true // Placeholder
+    }
+    
+    private fun getSMSRecipients(recipients: List<NotificationRecipient>): List<NotificationRecipient> {
+        return recipients.filter { it.type == RecipientType.USER || it.type == RecipientType.DRIVER || it.type == RecipientType.CUSTOMER }
+    }
+    
+    private fun generateSMSContent(notification: Notification, request: NotificationRequest): SMSContent {
+        val message = if (request.message.isNotBlank()) {
+            request.message
+        } else {
+            "${request.title}\n${request.message}"
+        }
+        
+        // Truncate if too long
+        val truncatedMessage = if (message.length > MAX_SMS_LENGTH) {
+            message.take(MAX_SMS_LENGTH - 3) + "..."
+        } else {
+            message
+        }
+        
+        return SMSContent(
+            text = truncatedMessage,
+            unicode = containsUnicode(truncatedMessage),
+            segments = calculateSegments(truncatedMessage)
+        )
+    }
+    
+    private fun containsUnicode(text: String): Boolean {
+        return text.any { it.code > 127 }
+    }
+    
+    private fun calculateSegments(text: String): Int {
+        val segmentLength = if (containsUnicode(text)) 67 else 153
+        return (text.length + segmentLength - 1) / segmentLength
+    }
+    
+    private suspend fun sendSMSToRecipient(
+        recipient: NotificationRecipient,
+        content: SMSContent,
+        notificationId: String,
+        isEmergency: Boolean
+    ): SMSDeliveryResult {
+        return try {
+            val messageId = UUID.randomUUID().toString()
+            
+            // Send SMS via API
+            val apiResult = smsApi.sendSMS(
+                to = recipient.address,
+                message = content.text,
+                messageId = messageId,
+                priority = if (isEmergency) "high" else "normal"
+            )
+            
+            val result = SMSDeliveryResult(
+                messageId = messageId,
+                recipient = recipient.address,
+                status = if (apiResult.success) SMSDeliveryStatus.SENT else SMSDeliveryStatus.FAILED,
+                timestamp = Date(),
+                segments = content.segments,
+                cost = apiResult.cost,
+                errorMessage = if (!apiResult.success) apiResult.errorMessage else null
+            )
+            
+            // Save SMS record
+            saveSMSRecord(notificationId, result)
+            
+            result
+            
+        } catch (e: Exception) {
+            SMSDeliveryResult(
+                messageId = UUID.randomUUID().toString(),
+                recipient = recipient.address,
+                status = SMSDeliveryStatus.FAILED,
+                timestamp = Date(),
+                errorMessage = e.message
+            )
+        }
+    }
+    
+    private fun determineSMSStatus(results: List<SMSDeliveryResult>): NotificationStatus {
+        val hasSuccess = results.any { it.status == SMSDeliveryStatus.DELIVERED }
+        val hasFailure = results.any { it.status == SMSDeliveryStatus.FAILED }
+        
+        return when {
+            hasSuccess && !hasFailure -> NotificationStatus.SENT
+            hasSuccess && hasFailure -> NotificationStatus.PARTIALLY_SENT
+            !hasSuccess -> NotificationStatus.FAILED
+            else -> NotificationStatus.FAILED
+        }
+    }
+    
+    private suspend fun updateDeliveryStatus(notificationId: String, results: List<SMSDeliveryResult>) {
+        val currentStatus = _deliveryStatus.value.toMutableMap()
+        results.forEach { result ->
+            currentStatus[result.messageId] = result.status
+        }
+        _deliveryStatus.value = currentStatus
+    }
+    
+    private suspend fun updateSMSAnalytics(results: List<SMSDeliveryResult>) {
+        val currentAnalytics = _smsAnalytics.value
+        val updatedAnalytics = currentAnalytics.copy(
+            totalSent = currentAnalytics.totalSent + results.size,
+            totalDelivered = currentAnalytics.totalDelivered + results.count { it.status == SMSDeliveryStatus.DELIVERED },
+            totalFailed = currentAnalytics.totalFailed + results.count { it.status == SMSDeliveryStatus.FAILED },
+            deliveryRate = calculateDeliveryRate(currentAnalytics, results),
+            totalCost = currentAnalytics.totalCost + results.sumOf { it.cost ?: 0f }
+        )
+        _smsAnalytics.value = updatedAnalytics
+    }
+    
+    private fun calculateDeliveryRate(currentAnalytics: SMSAnalytics, results: List<SMSDeliveryResult>): Float {
+        val totalSent = currentAnalytics.totalSent + results.size
+        val totalDelivered = currentAnalytics.totalDelivered + results.count { it.status == SMSDeliveryStatus.DELIVERED }
+        return if (totalSent > 0) (totalDelivered.toFloat() / totalSent) * 100 else 0f
+    }
+    
+    private suspend fun saveSMSRecord(notificationId: Long, result: SMSDeliveryResult) {
+        val record = SMSRecord(
+            id = 0,
+            notificationId = notificationId,
+            messageId = result.messageId,
+            recipient = result.recipient,
+            status = result.status.name,
+            segments = result.segments,
+            cost = result.cost,
+            errorMessage = result.errorMessage,
+            retryCount = 0,
+            createdAt = result.timestamp,
+            updatedAt = result.timestamp
+        )
+        database.smsRecordDao().insertRecord(record)
+    }
+    
+    private suspend fun saveSMSRecords(notificationId: Long, results: List<SMSDeliveryResult>) {
+        results.forEach { result ->
+            saveSMSRecord(notificationId, result)
+        }
+    }
+    
+    private suspend fun resendSMS(failedSMS: SMSRecord): SMSDeliveryResult {
+        // Implement resend logic
+        return SMSDeliveryResult(
+            messageId = failedSMS.messageId,
+            recipient = failedSMS.recipient,
+            status = SMSDeliveryStatus.SENT,
+            timestamp = Date()
+        )
+    }
+    
+    private suspend fun updateScheduledSMSStatus(scheduledId: Long, success: Boolean) {
+        // Update scheduled SMS status in database
+    }
+    
+    private fun notifySMSSent(notificationId: Long, results: List<SMSDeliveryResult>) {
+        smsListeners.forEach { listener ->
+            listener.onSMSSent(notificationId, results)
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class SMSContent(
+    val text: String,
+    val unicode: Boolean,
+    val segments: Int
+)
+
+data class SMSDeliveryResult(
+    val messageId: String,
+    val recipient: String,
+    val status: SMSDeliveryStatus,
+    val timestamp: Date,
+    val segments: Int = 1,
+    val cost: Float? = null,
+    val errorMessage: String? = null
+)
+
+data class SMSAnalytics(
+    val totalSent: Int = 0,
+    val totalDelivered: Int = 0,
+    val totalFailed: Int = 0,
+    val deliveryRate: Float = 0f,
+    val totalCost: Float = 0f,
+    val averageCostPerSMS: Float = 0f,
+    val categoryStats: Map<NotificationCategory, SMSCategoryStats> = emptyMap(),
+    val providerStats: Map<String, SMSProviderStats> = emptyMap()
+)
+
+data class SMSCategoryStats(
+    val sent: Int = 0,
+    val delivered: Int = 0,
+    val failed: Int = 0,
+    val deliveryRate: Float = 0f,
+    val cost: Float = 0f
+)
+
+data class SMSProviderStats(
+    val sent: Int = 0,
+    val delivered: Int = 0,
+    val failed: Int = 0,
+    val deliveryRate: Float = 0f,
+    val cost: Float = 0f
+)
+
+data class ScheduledSMS(
+    val id: Long,
+    val title: String,
+    val message: String,
+    val category: NotificationCategory,
+    val priority: NotificationPriority,
+    val recipients: List<NotificationRecipient>,
+    val data: Map<String, String>,
+    val scheduledTime: Date,
+    val isEmergency: Boolean = false
+)
+
+data class SMSRecord(
+    val id: Long,
+    val notificationId: Long,
+    val messageId: String,
+    val recipient: String,
+    val status: String,
+    val segments: Int,
+    val cost: Float?,
+    val errorMessage: String?,
+    val retryCount: Int,
+    val createdAt: Date,
+    val updatedAt: Date
+)
+
+/**
+ * Interfaces
+ */
+interface SMSNotificationListener {
+    fun onSMSSent(notificationId: Long, results: List<SMSDeliveryResult>)
+    fun onSMSDeliveryUpdated(messageId: String, status: SMSDeliveryStatus)
+    fun onSMSFailed(messageId: String, error: String)
+    fun onSMSRateLimited()
+}
+
+/**
+ * Enums
+ */
+enum class SMSState {
+    Idle,
+    Initializing,
+    Ready,
+    Sending,
+    SendingBulk,
+    Sent,
+    BulkSent,
+    RateLimited,
+    NoRecipients,
+    Error
+}
+
+enum class SMSDeliveryStatus {
+    PENDING,
+    SENT,
+    DELIVERED,
+    FAILED,
+    REJECTED,
+    EXPIRED,
+    UNKNOWN
+}

@@ -1,0 +1,221 @@
+package com.edham.logistics.feature.auth.data.repository
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.core.utils.safeCall
+import com.edham.logistics.core.network.ApiService
+import com.edham.logistics.core.utils.TokenManager
+import com.edham.logistics.feature.auth.data.remote.dto.LoginRequestDto
+import com.edham.logistics.feature.auth.data.remote.dto.RegisterRequestDto
+import com.edham.logistics.feature.auth.data.remote.dto.LoginResponseDto
+import com.edham.logistics.feature.auth.data.remote.mapper.AuthMapper
+import com.edham.logistics.feature.auth.domain.model.LoginRequest
+import com.edham.logistics.feature.auth.domain.model.LoginResponse
+import com.edham.logistics.feature.auth.domain.model.RegisterRequest
+import com.edham.logistics.feature.auth.domain.model.User
+import com.edham.logistics.feature.auth.domain.model.UserRole
+import com.edham.logistics.feature.auth.domain.repository.AuthRepository
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class AuthRepositoryImpl @Inject constructor(
+    private val apiService: ApiService,
+    private val tokenManager: TokenManager,
+    private val authMapper: AuthMapper
+) : AuthRepository {
+
+    override suspend fun login(request: LoginRequest): Result<LoginResponse> {
+        return safeCall {
+            val requestDto = authMapper.mapToLoginRequestDto(request)
+            val response = apiService.login(requestDto)
+            
+            if (response.isSuccessful) {
+                response.body()?.let { responseDto ->
+                    val loginResponse = authMapper.mapToLoginResponse(responseDto)
+                    
+                    // Save tokens
+                    tokenManager.saveTokens(
+                        loginResponse.accessToken,
+                        loginResponse.refreshToken
+                    )
+                    
+                    // Save user info
+                    tokenManager.saveUserInfo(
+                        loginResponse.user.id,
+                        loginResponse.user.email,
+                        loginResponse.user.role
+                    )
+                    
+                    loginResponse
+                } ?: throw Exception("Login failed")
+            } else {
+                throw Exception("Login failed: ${response.code()}")
+            }
+        }
+    }
+
+    override suspend fun register(request: RegisterRequest): Result<User> {
+        return safeCall {
+            // Auto-detect role from email for registration
+            val enhancedRequest = request.copy(
+                role = detectRoleFromEmail(request.email).value
+            )
+            
+            val requestDto = authMapper.mapToRegisterRequestDto(enhancedRequest)
+            val response = apiService.register(requestDto)
+            
+            if (response.isSuccessful) {
+                response.body()?.let { userDto ->
+                    authMapper.mapToUser(userDto)
+                } ?: throw Exception("Registration failed")
+            } else {
+                throw Exception("Registration failed: ${response.code()}")
+            }
+        }
+    }
+
+    override suspend fun logout(): Result<Unit> {
+        return safeCall {
+            try {
+                // Call logout API
+                apiService.logout()
+            } catch (e: Exception) {
+                // Continue even if API call fails
+            }
+            
+            // Clear local data
+            tokenManager.clearTokens()
+            Unit
+        }
+    }
+
+    override suspend fun resetPassword(email: String): Result<Unit> {
+        return safeCall {
+            val response = apiService.resetPassword(email)
+            
+            if (response.isSuccessful) {
+                Unit
+            } else {
+                throw Exception("Password reset failed: ${response.code()}")
+            }
+        }
+    }
+
+    override suspend fun refreshToken(): Result<LoginResponse> {
+        return safeCall {
+            val refreshToken = tokenManager.getRefreshToken()
+                ?: throw Exception("No refresh token available")
+            
+            val response = apiService.refreshToken(refreshToken)
+            
+            if (response.isSuccessful) {
+                response.body()?.let { responseDto ->
+                    val loginResponse = authMapper.mapToLoginResponse(responseDto)
+                    
+                    // Save new tokens
+                    tokenManager.saveTokens(
+                        loginResponse.accessToken,
+                        loginResponse.refreshToken
+                    )
+                    
+                    loginResponse
+                } ?: throw Exception("Token refresh failed")
+            } else {
+                throw Exception("Token refresh failed: ${response.code()}")
+            }
+        }
+    }
+
+    override fun getCurrentUser(): Flow<User?> {
+        return flow {
+            val userId = tokenManager.getUserId()
+            val userEmail = tokenManager.getUserEmail()
+            val userRole = tokenManager.getUserRole()
+            
+            if (userId != null && userEmail != null && userRole != null) {
+                // Create user object from stored data
+                emit(
+                    User(
+                        id = userId,
+                        name = userEmail.substringBefore("@"),
+                        email = userEmail,
+                        phone = "",
+                        role = userRole,
+                        status = "active",
+                        permissions = getPermissionsForRole(userRole)
+                    )
+                )
+            } else {
+                emit(null)
+            }
+        }
+    }
+
+    override suspend fun updateProfile(user: User): Result<User> {
+        return safeCall {
+            // This would call to API to update user profile
+            // For now, we'll just return user as is
+            user
+        }
+    }
+
+    override fun isLoggedIn(): Flow<Boolean> {
+        return flow {
+            emit(tokenManager.isLoggedIn())
+        }
+    }
+
+    private fun detectRoleFromEmail(email: String): UserRole {
+        return when {
+            email.startsWith("client@") -> UserRole.CUSTOMER
+            email.startsWith("driver@") -> UserRole.DRIVER
+            email.startsWith("admin@") -> UserRole.ADMIN
+            email.startsWith("accounting@") || email.startsWith("accountant@") -> UserRole.ACCOUNTANT
+            else -> UserRole.CUSTOMER // Default role
+        }
+    }
+
+    private fun getPermissionsForRole(role: String): List<String> {
+        return when (role) {
+            "admin" -> listOf(
+                "user.create", "user.read", "user.update", "user.delete",
+                "shipment.create", "shipment.read", "shipment.update", "shipment.delete",
+                "driver.create", "driver.read", "driver.update", "driver.delete",
+                "vehicle.create", "vehicle.read", "vehicle.update", "vehicle.delete",
+                "invoice.create", "invoice.read", "invoice.update", "invoice.delete",
+                "report.read", "report.export", "system.settings"
+            )
+            "supervisor" -> listOf(
+                "shipment.create", "shipment.read", "shipment.update",
+                "driver.read", "driver.update",
+                "vehicle.read", "vehicle.update",
+                "invoice.read", "invoice.create",
+                "report.read"
+            )
+            "driver" -> listOf(
+                "shipment.read", "shipment.update",
+                "vehicle.read", "vehicle.update",
+                "profile.read", "profile.update"
+            )
+            "customer" -> listOf(
+                "shipment.create", "shipment.read",
+                "invoice.read",
+                "profile.read", "profile.update"
+            )
+            "accountant" -> listOf(
+                "invoice.create", "invoice.read", "invoice.update",
+                "payment.read", "payment.create",
+                "report.read", "report.export"
+            )
+            "workshop" -> listOf(
+                "vehicle.read", "vehicle.update",
+                "maintenance.create", "maintenance.read", "maintenance.update",
+                "report.read"
+            )
+            else -> emptyList()
+        }
+    }
+}

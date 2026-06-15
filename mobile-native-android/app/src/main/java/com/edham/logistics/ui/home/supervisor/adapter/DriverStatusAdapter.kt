@@ -8,14 +8,17 @@ import androidx.recyclerview.widget.RecyclerView
 import com.edham.logistics.R
 import com.edham.logistics.feature.driver.data.models.DriverProfile
 
-class DriverStatusAdapter(private var drivers: List<DriverProfile>) :
-    RecyclerView.Adapter<DriverStatusAdapter.ViewHolder>() {
+class DriverStatusAdapter(
+    private var drivers: List<DriverProfile>,
+    private val onItemClick: ((DriverProfile) -> Unit)? = null
+) : RecyclerView.Adapter<DriverStatusAdapter.ViewHolder>() {
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val name: TextView = view.findViewById(R.id.driver_name)
-        val status: TextView = view.findViewById(R.id.driver_status_text)
-        val plate: TextView = view.findViewById(R.id.driver_plate)
-        val avatar: TextView = view.findViewById(R.id.driver_avatar_text)
+        val name: TextView = view.findViewById(R.id.tvName)
+        val subInfo: TextView = view.findViewById(R.id.tvSubInfo)
+        val statusBadge: TextView = view.findViewById(R.id.tvStatusBadge)
+        val avatar: TextView = view.findViewById(R.id.tvAvatar)
+        val medal: TextView? = view.findViewById(R.id.tvMedal)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -27,16 +30,37 @@ class DriverStatusAdapter(private var drivers: List<DriverProfile>) :
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val driver = drivers[position]
         holder.name.text = "${driver.firstName} ${driver.lastName}"
-        holder.status.text = driver.status
-        holder.plate.text = driver.plateNumber ?: "---"
-        holder.avatar.text = driver.firstName.take(1) + driver.lastName.take(1)
+        holder.avatar.text = (driver.firstName.take(1) + driver.lastName.take(1)).uppercase()
         
-        // Dynamic status coloring
-        when(driver.status.uppercase()) {
-            "ACTIVE", "ONLINE" -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.customer_success))
-            "BUSY", "IN_TRANSIT" -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.customer_warning))
-            else -> holder.status.setTextColor(holder.itemView.context.getColor(R.color.customer_text_muted))
+        // Medals for top 3
+        holder.medal?.visibility = if (position < 3) View.VISIBLE else View.GONE
+        holder.medal?.text = when(position) {
+            0 -> "🥇"
+            1 -> "🥈"
+            2 -> "🥉"
+            else -> ""
         }
+
+        holder.subInfo.text = "الالتزام: %98 | ${driver.plateNumber ?: "---"}"
+        holder.statusBadge.text = driver.status
+        
+        // Dynamic status coloring (using professional palette)
+        when(driver.status.uppercase()) {
+            "ACTIVE", "ONLINE" -> {
+                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.status_success))
+                holder.statusBadge.setBackgroundResource(R.drawable.bg_role_badge) // Reuse for now
+            }
+            "BUSY", "IN_TRANSIT" -> {
+                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.status_warning))
+                holder.statusBadge.setBackgroundResource(R.drawable.bg_tag_orange)
+            }
+            else -> {
+                holder.statusBadge.setTextColor(holder.itemView.context.getColor(R.color.text_tertiary))
+                holder.statusBadge.setBackgroundResource(R.drawable.bg_circle_gray)
+            }
+        }
+
+        holder.itemView.setOnClickListener { onItemClick?.invoke(driver) }
     }
 
     override fun getItemCount() = drivers.size

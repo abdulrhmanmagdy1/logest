@@ -1,0 +1,338 @@
+package com.edham.logistics.core.auth
+
+import android.content.Context
+import android.content.SharedPreferences
+import com.edham.logistics.auth.AuthenticationManager
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Centralized Session Manager
+ * Handles session expiration, token refresh, and UI state protection
+ * Ensures token refresh doesn't affect UI state
+ */
+@Singleton
+class SessionManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val authenticationManager: AuthenticationManager
+) {
+    
+    private val coroutineScope = CoroutineScope(Dispatchers.IO)
+    
+    private val _sessionState = MutableStateFlow<SessionState>(SessionState.Unknown)
+    val sessionState: StateFlow<SessionState> = _sessionState.asStateFlow()
+    
+    private val _tokenRefreshState = MutableStateFlow<TokenRefreshState>(TokenRefreshState.Idle)
+    val tokenRefreshState: StateFlow<TokenRefreshState> = _tokenRefreshState.asStateFlow()
+    
+    private val _uiProtectionState = MutableStateFlow<UiProtectionState>(UiProtectionState.Normal)
+    val uiProtectionState: StateFlow<UiProtectionState> = _uiProtectionState.asStateFlow()
+    
+    private val isRefreshing = AtomicBoolean(false)
+    private val lastRefreshAttempt = AtomicLong(0)
+    private val refreshFailureCount = AtomicLong(0)
+    
+    private val prefs: SharedPreferences by lazy {
+        context.getSharedPreferences("session_prefs", Context.MODE_PRIVATE)
+    }
+
+    private val encryptedPrefs: SharedPreferences by lazy {
+        context.getSharedPreferences("encrypted_session_prefs", Context.MODE_PRIVATE)
+    }
+    
+    init {
+        Timber.d("SessionManager initialized")
+        initializeSessionState()
+        startSessionMonitoring()
+    }
+    
+    /**
+     * Initialize session state based on current authentication state
+     */
+    private fun initializeSessionState() {
+        coroutineScope.launch {
+            authenticationManager.authState
+                .onEach { authState ->
+                    when (authState) {
+                        is com.edham.logistics.auth.AuthState.Authenticated -> {
+                            updateSessionState(SessionState.Active)
+                            Timber.d("Session initialized as active")
+                        }
+                        is com.edham.logistics.auth.AuthState.Unauthenticated -> {
+                            updateSessionState(SessionState.Inactive)
+                            Timber.d("Session initialized as inactive")
+                        }
+                        else -> {
+                            updateSessionState(SessionState.Unknown)
+                            Timber.d("Session initialized as unknown")
+                        }
+                    }
+                }
+                .catch { e ->
+                    updateSessionState(SessionState.Error(e.message ?: "Session initialization error"))
+                    Timber.e(e, "Error initializing session state")
+                }
+                .launchIn(this)
+        }
+    }
+    
+    /**
+     * Start continuous session monitoring
+     */
+    private fun startSessionMonitoring() {
+        coroutineScope.launch {
+            while (true) {
+                try {
+                    checkSessionValidity()
+                    kotlinx.coroutines.delay(30000) // Check every 30 seconds
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in session monitoring loop")
+                    kotlinx.coroutines.delay(60000) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    /**
+     * Check session validity and handle expiration
+     */
+    private fun checkSessionValidity() {
+        val currentState = _sessionState.value
+        
+        if (currentState !is SessionState.Active) {
+            return
+        }
+        
+        val isTokenValid = authenticationManager.hasValidToken()
+        val isSessionValid = authenticationManager.isSessionValid()
+        
+        when {
+            !isTokenValid -> {
+                handleTokenExpired()
+            }
+            !isSessionValid -> {
+                handleSessionExpired()
+            }
+            else -> {
+                // Session is valid
+                Timber.d("Session check passed - token and session are valid")
+            }
+        }
+    }
+    
+    /**
+     * Handle token expiration with automatic refresh
+     */
+    private fun handleTokenExpired() {
+        val currentTime = System.currentTimeMillis()
+        val timeSinceLastRefresh = currentTime - lastRefreshAttempt.get()
+        
+        // Prevent rapid refresh attempts (minimum 5 seconds between attempts)
+        if (timeSinceLastRefresh < 5000) {
+            Timber.d("Token refresh too recent, skipping")
+            return
+        }
+        
+        if (isRefreshing.compareAndSet(false, true)) {
+            lastRefreshAttempt.set(currentTime)
+            
+            coroutineScope.launch {
+                try {
+                    _tokenRefreshState.value = TokenRefreshState.Refreshing
+                    _uiProtectionState.value = UiProtectionState.Protected
+                    
+                    Timber.d("Starting automatic token refresh")
+                    
+                    val refreshResult = authenticationManager.refreshToken()
+                    
+                    refreshResult.onSuccess { success ->
+                        if (success) {
+                            _tokenRefreshState.value = TokenRefreshState.Success
+                            updateSessionState(SessionState.Active)
+                            refreshFailureCount.set(0)
+                            Timber.d("Token refresh successful")
+                        } else {
+                            _tokenRefreshState.value = TokenRefreshState.Failed("Refresh returned false")
+                            handleRefreshFailure("Token refresh returned false")
+                        }
+                    }
+                    
+                    refreshResult.onFailure { error ->
+                        _tokenRefreshState.value = TokenRefreshState.Failed(error.message ?: "Unknown error")
+                        handleRefreshFailure(error.message ?: "Unknown error")
+                    }
+                    
+                } catch (e: Exception) {
+                    _tokenRefreshState.value = TokenRefreshState.Failed(e.message ?: "Exception occurred")
+                    handleRefreshFailure(e.message ?: "Exception occurred")
+                } finally {
+                    isRefreshing.set(false)
+                    _uiProtectionState.value = UiProtectionState.Normal
+                    _tokenRefreshState.value = TokenRefreshState.Idle
+                }
+            }
+        }
+    }
+    
+    /**
+     * Handle session expiration (different from token expiration)
+     */
+    private fun handleSessionExpired() {
+        coroutineScope.launch {
+            _sessionState.value = SessionState.Expired("Session expired due to inactivity")
+            _uiProtectionState.value = UiProtectionState.Protected
+            
+            Timber.d("Session expired due to inactivity")
+            
+            // Force logout after session expiration
+            delay(2000) // Give user time to see the message
+            
+            try {
+                authenticationManager.logout()
+                updateSessionState(SessionState.Inactive)
+                _uiProtectionState.value = UiProtectionState.Normal
+                Timber.d("Forced logout due to session expiration")
+            } catch (e: Exception) {
+                updateSessionState(SessionState.Error("Logout failed: ${e.message}"))
+                Timber.e(e, "Failed to logout after session expiration")
+            }
+        }
+    }
+    
+    /**
+     * Handle refresh failure with retry logic
+     */
+    private fun handleRefreshFailure(error: String) {
+        val failureCount = refreshFailureCount.incrementAndGet()
+        
+        Timber.w("Token refresh failed (attempt $failureCount): $error")
+        
+        when {
+            failureCount <= 3 -> {
+                // Retry automatically for first 3 failures
+                updateSessionState(SessionState.Refreshing("Retrying... ($failureCount/3)"))
+                coroutineScope.launch {
+                    kotlinx.coroutines.delay(5000) // Wait 5 seconds before retry
+                    handleTokenExpired()
+                }
+            }
+            failureCount <= 5 -> {
+                // Show error but allow manual retry
+                updateSessionState(SessionState.Error("Token refresh failed. Please try again."))
+            }
+            else -> {
+                // Force logout after too many failures
+                updateSessionState(SessionState.Error("Too many refresh attempts. Please login again."))
+                coroutineScope.launch {
+                    kotlinx.coroutines.delay(3000)
+                    authenticationManager.logout()
+                    updateSessionState(SessionState.Inactive)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Update session state and persist if needed
+     */
+    private fun updateSessionState(newState: SessionState) {
+        val oldState = _sessionState.value
+        _sessionState.value = newState
+        
+        // Persist certain state changes
+        when (newState) {
+            is SessionState.Active -> {
+                prefs.edit()
+                    .putLong("session_active_time", System.currentTimeMillis())
+                    .apply()
+            }
+            is SessionState.Inactive -> {
+                prefs.edit()
+                    .remove("session_active_time")
+                    .apply()
+            }
+        }
+        
+        if (oldState != newState) {
+            Timber.d("Session state changed: $oldState -> $newState")
+        }
+    }
+    
+    /**
+     * Force session refresh manually
+     */
+    fun forceSessionRefresh() {
+        coroutineScope.launch {
+            handleTokenExpired()
+        }
+    }
+    
+    /**
+     * Check if UI should be protected during operations
+     */
+    fun shouldProtectUI(): Boolean {
+        return _uiProtectionState.value is UiProtectionState.Protected
+    }
+    
+    /**
+     * Get current session information
+     */
+    fun getSessionInfo(): SessionInfo {
+        val currentState = _sessionState.value
+        val refreshState = _tokenRefreshState.value
+        val failureCount = refreshFailureCount.get()
+        
+        return SessionInfo(
+            state = currentState,
+            isRefreshing = refreshState is TokenRefreshState.Refreshing,
+            lastRefreshAttempt = lastRefreshAttempt.get(),
+            refreshFailureCount = failureCount,
+            canRetry = failureCount <= 5
+        )
+    }
+    
+    /**
+     * Reset session manager state
+     */
+    fun reset() {
+        coroutineScope.launch {
+            isRefreshing.set(false)
+            lastRefreshAttempt.set(0)
+            refreshFailureCount.set(0)
+            updateSessionState(SessionState.Unknown)
+            _tokenRefreshState.value = TokenRefreshState.Idle
+            _uiProtectionState.value = UiProtectionState.Normal
+            Timber.d("SessionManager reset")
+        }
+    }
+}
+
+/**
+ * UI Protection State
+ */
+sealed class UiProtectionState {
+    object Normal : UiProtectionState()
+    object Protected : UiProtectionState()
+}
+
+/**
+ * Session Information
+ */
+data class SessionInfo(
+    val state: SessionState,
+    val isRefreshing: Boolean,
+    val lastRefreshAttempt: Long,
+    val refreshFailureCount: Long,
+    val canRetry: Boolean
+)

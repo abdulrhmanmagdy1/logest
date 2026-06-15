@@ -4,7 +4,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.edham.logistics.core.network.api.DriverApi
 import com.edham.logistics.core.utils.Resource
+import com.edham.logistics.feature.driver.data.models.PathAnalysis
 import com.edham.logistics.feature.driver.data.models.Trip
+import com.edham.logistics.feature.driver.data.models.analyzeTripPath
 import com.edham.logistics.feature.driver.service.LocationForegroundService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,6 +22,9 @@ class ActiveTripViewModel @Inject constructor(
     private val _trip = MutableStateFlow<Resource<Trip>>(Resource.Loading())
     val trip = _trip.asStateFlow()
 
+    private val _pathAnalysis = MutableStateFlow<PathAnalysis?>(null)
+    val pathAnalysis = _pathAnalysis.asStateFlow()
+
     private val _eta = MutableStateFlow("Recalculating...")
     val eta = _eta.asStateFlow()
 
@@ -31,13 +36,14 @@ class ActiveTripViewModel @Inject constructor(
         viewModelScope.launch {
             _trip.value = Resource.Loading()
             try {
-                // In a real app, you'd have an endpoint for a single trip
-                // For now, let's assume we fetch all trips and filter
+                // Fetch active trips and find the specific one
                 val response = api.getTrips("", status = "active")
                 if (response.isSuccessful && response.body()?.success == true) {
                     val activeTrip = response.body()?.data?.find { it.tripId == tripId || it.id == tripId }
                     if (activeTrip != null) {
                         _trip.value = Resource.Success(activeTrip)
+                        // Perform smart path analysis
+                        _pathAnalysis.value = analyzeTripPath(emptyList())
                     } else {
                         _trip.value = Resource.Error("Trip not found")
                     }
@@ -60,10 +66,9 @@ class ActiveTripViewModel @Inject constructor(
     }
 
     private fun recalculateETA(curLat: Double, curLng: Double, destLat: Double, destLng: Double) {
-        // Simple calculation for demo
         val distance = FloatArray(1)
         android.location.Location.distanceBetween(curLat, curLng, destLat, destLng, distance)
         val minutes = (distance[0] / 1000 / 40 * 60).toInt() // Assume 40km/h avg speed
-        _eta.value = "$minutes mins remaining"
+        _eta.value = "$minutes دقيقة"
     }
 }

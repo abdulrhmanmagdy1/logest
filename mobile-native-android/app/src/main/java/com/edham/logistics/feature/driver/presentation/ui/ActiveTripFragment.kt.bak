@@ -1,0 +1,395 @@
+package com.edham.logistics.feature.driver.presentation.ui
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.databinding.FragmentActiveTripBinding
+import com.edham.logistics.feature.driver.presentation.ui.ActiveTripViewModel
+import com.edham.logistics.feature.driver.domain.model.LocationPoint
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class ActiveTripFragment : Fragment() {
+
+    private var _binding: FragmentActiveTripBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: ActiveTripViewModel by viewModels()
+
+    private val requestPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        if (isGranted) {
+            getCurrentLocation()
+        } else {
+            showSnackbar("يجب منح إذن الوصول للموقع")
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentActiveTripBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize with trip ID from arguments
+        arguments?.getString("tripId")?.let { tripId ->
+            viewModel.initialize(tripId)
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonMarkLoaded.setOnClickListener {
+            checkLocationAndAction { location ->
+                viewModel.markLoaded(location)
+            }
+        }
+        
+        binding.buttonMarkInTransit.setOnClickListener {
+            checkLocationAndAction { location ->
+                viewModel.markInTransit(location)
+            }
+        }
+        
+        binding.buttonMarkArrived.setOnClickListener {
+            checkLocationAndAction { location ->
+                viewModel.markArrived(location)
+            }
+        }
+        
+        binding.buttonUploadProof.setOnClickListener {
+            viewModel.showDeliveryProofDialog()
+        }
+        
+        binding.buttonNavigation.setOnClickListener {
+            navigateToNavigation()
+        }
+        
+        binding.buttonCallCustomer.setOnClickListener {
+            callCustomer()
+        }
+        
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refreshTrip()
+        }
+        
+        // Delivery proof dialog buttons
+        binding.buttonCapturePhoto.setOnClickListener {
+            capturePhoto()
+        }
+        
+        binding.buttonCaptureSignature.setOnClickListener {
+            captureSignature()
+        }
+        
+        binding.buttonSubmitProof.setOnClickListener {
+            submitDeliveryProof()
+        }
+        
+        binding.buttonCancelProof.setOnClickListener {
+            viewModel.hideDeliveryProofDialog()
+        }
+    }
+
+    private fun updateUI(uiState: ActiveTripViewModel.ActiveTripUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+        
+        // Show success messages
+        uiState.actionSuccess?.let { message ->
+            showSnackbar(message)
+            viewModel.clearSuccess()
+        }
+        
+        // Show/hide delivery proof dialog
+        if (uiState.showDeliveryProofDialog) {
+            binding.layoutDeliveryProofDialog.visible()
+        } else {
+            binding.layoutDeliveryProofDialog.gone()
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.scrollView.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.scrollView.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.scrollView.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refreshTrip()
+        }
+    }
+
+    private fun showContent(uiState: ActiveTripViewModel.ActiveTripUiState) {
+        binding.progressBar.gone()
+        binding.scrollView.alpha = 1.0f
+        binding.scrollView.visible()
+        binding.layoutError.gone()
+        
+        uiState.trip?.let { trip ->
+            updateTripInfo(trip)
+            updateActionButtons(trip.status)
+        }
+    }
+
+    private fun updateTripInfo(trip: com.edham.logistics.feature.driver.domain.model.DriverTrip) {
+        binding.textTrackingNumber.text = trip.trackingNumber
+        binding.textCustomerName.text = trip.customerName
+        binding.textCustomerPhone.text = trip.customerPhone
+        binding.textPickupLocation.text = trip.pickupLocation.address
+        binding.textDeliveryLocation.text = trip.deliveryLocation.address
+        binding.textCargoType.text = formatCargoType(trip.cargoType)
+        binding.textWeight.text = "${trip.weight} كجم"
+        binding.textPrice.text = formatPrice(trip.price)
+        binding.textStatus.text = formatTripStatus(trip.status)
+        
+        // Set status color
+        binding.textStatus.setTextColor(getTripStatusColor(trip.status))
+        
+        // Show special instructions if available
+        if (trip.specialInstructions?.isNotBlank() == true) {
+            binding.textSpecialInstructions.text = trip.specialInstructions
+            binding.textSpecialInstructions.visible()
+        } else {
+            binding.textSpecialInstructions.gone()
+        }
+        
+        // Show priority badge
+        binding.textPriority.text = formatPriority(trip.priority)
+        binding.textPriority.setBackgroundColor(getPriorityColor(trip.priority))
+        
+        // Update customer call button
+        binding.buttonCallCustomer.setOnClickListener {
+            callCustomer(trip.customerPhone)
+        }
+    }
+
+    private fun updateActionButtons(status: com.edham.logistics.feature.driver.domain.model.TripStatus) {
+        // Hide all action buttons first
+        binding.buttonMarkLoaded.gone()
+        binding.buttonMarkInTransit.gone()
+        binding.buttonMarkArrived.gone()
+        binding.buttonUploadProof.gone()
+        
+        // Show relevant buttons based on status
+        when (status) {
+            com.edham.logistics.feature.driver.domain.model.TripStatus.STARTED -> {
+                binding.buttonMarkLoaded.visible()
+            }
+            com.edham.logistics.feature.driver.domain.model.TripStatus.IN_TRANSIT -> {
+                binding.buttonMarkInTransit.visible()
+            }
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ARRIVED -> {
+                binding.buttonUploadProof.visible()
+            }
+            else -> {
+                // No action buttons for other statuses
+            }
+        }
+    }
+
+    private fun checkLocationAndAction(action: (LocationPoint) -> Unit) {
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.ACCESS_FINE_LOCATION)
+            == PackageManager.PERMISSION_GRANTED) {
+            getCurrentLocation()
+            // In real app, we would get actual location here
+            val mockLocation = LocationPoint(
+                latitude = 24.7136,
+                longitude = 46.6753,
+                address = "الرياض، شارع الملك",
+                city = "الرياض",
+                timestamp = java.time.Instant.now().toString()
+            )
+            action(mockLocation)
+        } else {
+            requestPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
+
+    private fun getCurrentLocation() {
+        // In real app, we would use FusedLocationProviderClient here
+        // For now, we'll use mock location
+    }
+
+    private fun capturePhoto() {
+        // In real app, we would open camera here
+        showSnackbar("سيتم فتح الكاميرا لالتقاط الصورة")
+        // For demo, we'll use mock base64 string
+        binding.editTextPhoto.setText("mock_photo_base64_data")
+    }
+
+    private fun captureSignature() {
+        // In real app, we would open signature pad here
+        showSnackbar("سيتم فتح لوحة التوقيع")
+        // For demo, we'll use mock base64 string
+        binding.editTextSignature.setText("mock_signature_base64_data")
+    }
+
+    private fun submitDeliveryProof() {
+        val recipientName = binding.editTextRecipientName.text.toString()
+        val recipientPhone = binding.editTextRecipientPhone.text.toString()
+        val notes = binding.editTextNotes.text.toString()
+        val photoBase64 = binding.editTextPhoto.text.toString().takeIf { it.isNotBlank() }
+        val signatureBase64 = binding.editTextSignature.text.toString().takeIf { it.isNotBlank() }
+        
+        if (recipientName.isBlank() || recipientPhone.isBlank()) {
+            showSnackbar("يرجى إدخال اسم المستلم ورقم الهاتف")
+            return
+        }
+        
+        val location = LocationPoint(
+            latitude = 21.4225,
+            longitude = 39.8262,
+            address = "جدة، شارع الأمير",
+            city = "جدة",
+            timestamp = java.time.Instant.now().toString()
+        )
+        
+        viewModel.uploadDeliveryProof(
+            photoBase64 = photoBase64,
+            signatureBase64 = signatureBase64,
+            recipientName = recipientName,
+            recipientPhone = recipientPhone,
+            notes = notes,
+            location = location
+        )
+    }
+
+    private fun navigateToNavigation() {
+        val tripId = viewModel.uiState.value.trip?.id
+        tripId?.let {
+            val action = ActiveTripFragmentDirections
+                .actionActiveTripFragmentToNavigationFragment(it)
+            findNavController().navigate(action)
+        }
+    }
+
+    private fun callCustomer(phoneNumber: String? = null) {
+        val phone = phoneNumber ?: viewModel.uiState.value.trip?.customerPhone
+        phone?.let {
+            val callIntent = android.content.Intent(android.content.Intent.ACTION_DIAL).apply {
+                data = android.net.Uri.parse("tel:$it")
+            }
+            startActivity(callIntent)
+        }
+    }
+
+    private fun formatCargoType(cargoType: String): String {
+        return when (cargoType) {
+            "general" -> "بضائع عامة"
+            "refrigerated" -> "بضائع مبردة"
+            "fragile" -> "بضائع قابلة للكسر"
+            "heavy" -> "بضائع ثقيلة"
+            "urgent" -> "بضائع عاجلة"
+            "documents" -> "مستندات"
+            "electronics" -> "إلكترونيات"
+            "food" -> "مواد غذائية"
+            "medical" -> "معدات طبية"
+            "chemicals" -> "مواد كيميائية"
+            "livestock" -> "مواشي"
+            "vehicles" -> "مركبات"
+            else -> cargoType
+        }
+    }
+
+    private fun formatTripStatus(status: com.edham.logistics.feature.driver.domain.model.TripStatus): String {
+        return when (status) {
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ASSIGNED -> "مخصص"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ACCEPTED -> "مقبول"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.REJECTED -> "مرفوض"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.STARTED -> "بدأت"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.IN_TRANSIT -> "قيد النقل"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ARRIVED -> "وصلت"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.DELIVERED -> "تم التسليم"
+            com.edham.logistics.feature.driver.domain.model.TripStatus.CANCELLED -> "ملغية"
+        }
+    }
+
+    private fun formatPriority(priority: String): String {
+        return when (priority) {
+            "normal" -> "عادي"
+            "express" -> "سريع"
+            "urgent" -> "عاجل"
+            "economy" -> "اقتصادي"
+            else -> priority
+        }
+    }
+
+    private fun formatPrice(price: Double): String {
+        return String.format("%.2f ريال", price)
+    }
+
+    private fun getTripStatusColor(status: com.edham.logistics.feature.driver.domain.model.TripStatus): Int {
+        return when (status) {
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ASSIGNED -> android.graphics.Color.parseColor("#FF9800")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ACCEPTED -> android.graphics.Color.parseColor("#2196F3")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.REJECTED -> android.graphics.Color.parseColor("#F44336")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.STARTED -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.IN_TRANSIT -> android.graphics.Color.parseColor("#2196F3")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.ARRIVED -> android.graphics.Color.parseColor("#9C27B0")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.DELIVERED -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.driver.domain.model.TripStatus.CANCELLED -> android.graphics.Color.parseColor("#F44336")
+        }
+    }
+
+    private fun getPriorityColor(priority: String): Int {
+        return when (priority) {
+            "normal" -> android.graphics.Color.parseColor("#9E9E9E")
+            "express" -> android.graphics.Color.parseColor("#2196F3")
+            "urgent" -> android.graphics.Color.parseColor("#F44336")
+            "economy" -> android.graphics.Color.parseColor("#4CAF50")
+            else -> android.graphics.Color.parseColor("#9E9E9E")
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

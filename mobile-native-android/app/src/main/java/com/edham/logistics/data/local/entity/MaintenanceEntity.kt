@@ -7,7 +7,7 @@ import java.util.Date
 @Entity(tableName = "maintenance_schedules")
 data class MaintenanceEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val vehicleId: Long = 0,
+    val vehicleId: String = "",
     val maintenanceType: String = "",
     val scheduledDate: Long = 0L,
     val estimatedDuration: Int = 0,

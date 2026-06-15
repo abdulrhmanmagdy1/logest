@@ -1,0 +1,511 @@
+package com.edham.logistics.offline
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.os.Build
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * Offline Connection Indicator
+ * Shows clear offline/online status in the UI
+ */
+class OfflineConnectionIndicator private constructor(context: Context) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: OfflineConnectionIndicator? = null
+        
+        fun getInstance(context: Context): OfflineConnectionIndicator {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: OfflineConnectionIndicator(context).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    
+    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.UNKNOWN)
+    val connectionState = _connectionState.asStateFlow()
+    
+    private val _isConnected = MutableStateFlow(false)
+    val isConnected = _isConnected.asStateFlow()
+    
+    private val _connectionType = MutableStateFlow<ConnectionType>(ConnectionType.NONE)
+    val connectionType = _connectionType.asStateFlow()
+    
+    private val _networkSpeed = MutableStateFlow<NetworkSpeed>(NetworkSpeed.UNKNOWN)
+    val networkSpeed = _networkSpeed.asStateFlow()
+    
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    
+    init {
+        startNetworkMonitoring()
+    }
+    
+    /**
+     * Start monitoring network connectivity
+     */
+    private fun startNetworkMonitoring() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            networkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    super.onAvailable(network)
+                    updateConnectionState(true, network)
+                }
+                
+                override fun onLost(network: Network) {
+                    super.onLost(network)
+                    updateConnectionState(false, null)
+                }
+                
+                override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                    super.onCapabilitiesChanged(network, networkCapabilities)
+                    updateNetworkCapabilities(networkCapabilities)
+                }
+            }
+            
+            val networkRequest = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            
+            connectivityManager.registerNetworkCallback(networkRequest, networkCallback!!)
+        } else {
+            // Fallback for older Android versions
+            scope.launch {
+                while (true) {
+                    val isConnected = checkConnectivityLegacy()
+                    _isConnected.value = isConnected
+                    _connectionState.value = if (isConnected) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED
+                    delay(2000) // Check every 2 seconds
+                }
+            }
+        }
+        
+        // Initial check
+        val initialConnection = checkCurrentConnection()
+        _isConnected.value = initialConnection.first
+        _connectionState.value = initialConnection.second
+    }
+    
+    /**
+     * Update connection state
+     */
+    private fun updateConnectionState(connected: Boolean, network: Network?) {
+        scope.launch {
+            _isConnected.value = connected
+            _connectionState.value = if (connected) {
+                ConnectionState.CONNECTED
+            } else {
+                ConnectionState.DISCONNECTED
+            }
+            
+            if (network != null) {
+                val capabilities = connectivityManager.getNetworkCapabilities(network)
+                capabilities?.let { updateNetworkCapabilities(it) }
+            } else {
+                _connectionType.value = ConnectionType.NONE
+                _networkSpeed.value = NetworkSpeed.UNKNOWN
+            }
+        }
+    }
+    
+    /**
+     * Update network capabilities
+     */
+    private fun updateNetworkCapabilities(capabilities: NetworkCapabilities) {
+        scope.launch {
+            when {
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
+                    _connectionType.value = ConnectionType.WIFI
+                    _networkSpeed.value = NetworkSpeed.FAST
+                }
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> {
+                    _connectionType.value = ConnectionType.CELLULAR
+                    _networkSpeed.value = getCellularSpeed(capabilities)
+                }
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> {
+                    _connectionType.value = ConnectionType.ETHERNET
+                    _networkSpeed.value = NetworkSpeed.FAST
+                }
+                else -> {
+                    _connectionType.value = ConnectionType.UNKNOWN
+                    _networkSpeed.value = NetworkSpeed.UNKNOWN
+                }
+            }
+        }
+    }
+    
+    /**
+     * Get cellular network speed
+     */
+    private fun getCellularSpeed(capabilities: NetworkCapabilities): NetworkSpeed {
+        return when {
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_5G) -> NetworkSpeed.VERY_FAST
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_4G) -> NetworkSpeed.FAST
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_3G) -> NetworkSpeed.MEDIUM
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_2G) -> NetworkSpeed.SLOW
+            else -> NetworkSpeed.UNKNOWN
+        }
+    }
+    
+    /**
+     * Check current connection
+     */
+    private fun checkCurrentConnection(): Pair<Boolean, ConnectionState> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = connectivityManager.activeNetwork
+            val capabilities = network?.let { connectivityManager.getNetworkCapabilities(it) }
+            val isConnected = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+            val state = if (isConnected) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED
+            Pair(isConnected, state)
+        } else {
+            @Suppress("DEPRECATION")
+            val networkInfo = connectivityManager.activeNetworkInfo
+            val isConnected = networkInfo?.isConnected == true
+            val state = if (isConnected) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED
+            Pair(isConnected, state)
+        }
+    }
+    
+    /**
+     * Check connectivity for legacy Android versions
+     */
+    private fun checkConnectivityLegacy(): Boolean {
+        return try {
+            @Suppress("DEPRECATION")
+            val networkInfo = connectivityManager.activeNetworkInfo
+            networkInfo?.isConnected == true
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Stop network monitoring
+     */
+    fun stopNetworkMonitoring() {
+        networkCallback?.let {
+            connectivityManager.unregisterNetworkCallback(it)
+        }
+        scope.cancel()
+    }
+}
+
+/**
+ * Connection Indicator Composable
+ */
+@Composable
+fun ConnectionIndicator(
+    modifier: Modifier = Modifier,
+    showText: Boolean = true,
+    compact: Boolean = false
+) {
+    val context = LocalContext.current
+    val connectionIndicator = remember { OfflineConnectionIndicator.getInstance(context) }
+    
+    val isConnected by connectionIndicator.isConnected.collectAsState()
+    val connectionState by connectionIndicator.connectionState.collectAsState()
+    val connectionType by connectionIndicator.connectionType.collectAsState()
+    val networkSpeed by connectionIndicator.networkSpeed.collectAsState()
+    
+    if (connectionState == ConnectionState.DISCONNECTED || !isConnected) {
+        OfflineIndicator(
+            modifier = modifier,
+            showText = showText,
+            compact = compact
+        )
+    } else if (!compact && showText) {
+        OnlineIndicator(
+            modifier = modifier,
+            connectionType = connectionType,
+            networkSpeed = networkSpeed
+        )
+    }
+}
+
+/**
+ * Offline Indicator
+ */
+@Composable
+private fun OfflineIndicator(
+    modifier: Modifier = Modifier,
+    showText: Boolean = true,
+    compact: Boolean = false
+) {
+    val infiniteTransition = rememberInfiniteTransition()
+    val alpha by infiniteTransition.animateFloat(
+        initialValue = 0.3f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000),
+            repeatMode = RepeatMode.Reverse
+        )
+    )
+    
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.Red.copy(alpha = alpha))
+            .padding(horizontal = if (compact) 8.dp else 12.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Icon(
+            imageVector = Icons.Default.CloudOff,
+            contentDescription = "Offline",
+            tint = Color.White,
+            modifier = Modifier.size(if (compact) 16.dp else 20.dp)
+        )
+        
+        if (showText && !compact) {
+            Text(
+                text = "بدون اتصال",
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+        }
+    }
+}
+
+/**
+ * Online Indicator
+ */
+@Composable
+private fun OnlineIndicator(
+    modifier: Modifier = Modifier,
+    connectionType: ConnectionType,
+    networkSpeed: NetworkSpeed
+) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.Green.copy(alpha = 0.8f))
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Icon(
+            imageVector = getConnectionIcon(connectionType),
+            contentDescription = "Online",
+            tint = Color.White,
+            modifier = Modifier.size(16.dp)
+        )
+        
+        Text(
+            text = getConnectionText(connectionType, networkSpeed),
+            color = Color.White,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+/**
+ * Connection Status Banner
+ */
+@Composable
+fun ConnectionStatusBanner(
+    modifier: Modifier = Modifier,
+    onDismiss: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val connectionIndicator = remember { OfflineConnectionIndicator.getInstance(context) }
+    
+    val isConnected by connectionIndicator.isConnected.collectAsState()
+    val connectionState by connectionIndicator.connectionState.collectAsState()
+    
+    AnimatedVisibility(
+        visible = !isConnected,
+        enter = slideInVertically() + fadeIn(),
+        exit = slideOutVertically() + fadeOut(),
+        modifier = modifier
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = Color.Red
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = "Warning",
+                        tint = Color.White,
+                        modifier = Modifier.size(24.dp)
+                    )
+                    
+                    Column {
+                        Text(
+                            text = "لا يوجد اتصال بالإنترنت",
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        
+                        Text(
+                            text = "سيتم مزامنة بياناتك عند عودة الاتصال",
+                            color = Color.White.copy(alpha = 0.8f),
+                            fontSize = 14.sp
+                        )
+                    }
+                }
+                
+                onDismiss?.let { dismiss ->
+                    IconButton(onClick = dismiss) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Dismiss",
+                            tint = Color.White
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Floating Connection Status
+ */
+@Composable
+fun FloatingConnectionStatus(
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val connectionIndicator = remember { OfflineConnectionIndicator.getInstance(context) }
+    
+    val isConnected by connectionIndicator.isConnected.collectAsState()
+    val pendingActionsCount = remember { 0 } // This would come from OfflineActionQueue
+    
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.TopEnd
+    ) {
+        if (!isConnected) {
+            Card(
+                modifier = Modifier
+                    .padding(16.dp)
+                    .clip(RoundedCornerShape(50)),
+                colors = CardDefaults.cardColors(
+                    containerColor = Color.Red
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.CloudOff,
+                        contentDescription = "Offline",
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    
+                    if (pendingActionsCount > 0) {
+                        Badge {
+                            Text(
+                                text = pendingActionsCount.toString(),
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Helper functions
+ */
+private fun getConnectionIcon(connectionType: ConnectionType): ImageVector {
+    return when (connectionType) {
+        ConnectionType.WIFI -> Icons.Default.Wifi
+        ConnectionType.CELLULAR -> Icons.Default.SignalCellularAlt
+        ConnectionType.ETHERNET -> Icons.Default.Router
+        else -> Icons.Default.Cloud
+    }
+}
+
+private fun getConnectionText(connectionType: ConnectionType, networkSpeed: NetworkSpeed): String {
+    return when (connectionType) {
+        ConnectionType.WIFI -> "WiFi"
+        ConnectionType.CELLULAR -> when (networkSpeed) {
+            NetworkSpeed.VERY_FAST -> "5G"
+            NetworkSpeed.FAST -> "4G"
+            NetworkSpeed.MEDIUM -> "3G"
+            NetworkSpeed.SLOW -> "2G"
+            else -> "موبايل"
+        }
+        ConnectionType.ETHERNET -> "Ethernet"
+        else -> "متصل"
+    }
+}
+
+/**
+ * Enums
+ */
+enum class ConnectionState {
+    UNKNOWN,
+    CONNECTED,
+    DISCONNECTED,
+    CONNECTING
+}
+
+enum class ConnectionType {
+    NONE,
+    WIFI,
+    CELLULAR,
+    ETHERNET,
+    UNKNOWN
+}
+
+enum class NetworkSpeed {
+    UNKNOWN,
+    SLOW,
+    MEDIUM,
+    FAST,
+    VERY_FAST
+}

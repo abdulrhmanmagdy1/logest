@@ -1,0 +1,600 @@
+package com.edham.logistics.monitoring.crashlytics
+
+import android.content.Context
+import com.google.firebase.crashlytics.FirebaseCrashlytics
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Firebase Crashlytics Manager - Advanced crash reporting and analytics
+ * Implements comprehensive crash tracking, custom logging, and performance monitoring
+ */
+
+@Singleton
+class FirebaseCrashlyticsManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val crashlyticsScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val crashlytics = FirebaseCrashlytics.getInstance()
+    private val customKeys = ConcurrentHashMap<String, String>()
+    private val crashListeners = mutableListOf<CrashListener>()
+    
+    // Performance metrics
+    private val totalCrashes = AtomicLong(0)
+    private val totalNonFatalErrors = AtomicLong(0)
+    private val totalCustomLogs = AtomicLong(0)
+    
+    // Configuration
+    private val enableCrashlytics = true
+    private val enableCustomLogging = true
+    private val enablePerformanceMonitoring = true
+    
+    init {
+        initializeCrashlytics()
+    }
+    
+    /**
+     * Report crash with context
+     */
+    fun reportCrash(throwable: Throwable, context: Map<String, Any> = emptyMap()) {
+        if (!enableCrashlytics) return
+        
+        try {
+            totalCrashes.incrementAndGet()
+            
+            // Set custom keys from context
+            context.forEach { (key, value) ->
+                setCustomKey(key, value.toString())
+            }
+            
+            // Add additional context
+            setCustomKey("crash_time", System.currentTimeMillis().toString())
+            setCustomKey("app_version", getAppVersion())
+            setCustomKey("device_model", android.os.Build.MODEL)
+            setCustomKey("os_version", android.os.Build.VERSION.RELEASE)
+            
+            // Report the crash
+            crashlytics.recordException(throwable)
+            
+            // Notify listeners
+            crashListeners.forEach { listener ->
+                listener.onCrashReported(throwable, context)
+            }
+            
+            Timber.e(throwable, "Crash reported to Firebase Crashlytics")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error reporting crash to Firebase Crashlytics")
+        }
+    }
+    
+    /**
+     * Report non-fatal error
+     */
+    fun reportNonFatal(throwable: Throwable, context: Map<String, Any> = emptyMap()) {
+        if (!enableCrashlytics) return
+        
+        try {
+            totalNonFatalErrors.incrementAndGet()
+            
+            // Set custom keys from context
+            context.forEach { (key, value) ->
+                setCustomKey(key, value.toString())
+            }
+            
+            // Add error context
+            setCustomKey("error_time", System.currentTimeMillis().toString())
+            setCustomKey("error_type", "non_fatal")
+            setCustomKey("app_version", getAppVersion())
+            
+            // Report the non-fatal error
+            crashlytics.recordException(throwable)
+            
+            // Notify listeners
+            crashListeners.forEach { listener ->
+                listener.onNonFatalReported(throwable, context)
+            }
+            
+            Timber.e(throwable, "Non-fatal error reported to Firebase Crashlytics")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error reporting non-fatal error to Firebase Crashlytics")
+        }
+    }
+    
+    /**
+     * Set user ID for crash reporting
+     */
+    fun setUserId(userId: String) {
+        if (!enableCrashlytics) return
+        
+        try {
+            crashlytics.setUserId(userId)
+            setCustomKey("user_id", userId)
+            
+            Timber.d("User ID set for Crashlytics: $userId")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error setting user ID for Crashlytics")
+        }
+    }
+    
+    /**
+     * Set custom key
+     */
+    fun setCustomKey(key: String, value: String) {
+        if (!enableCrashlytics) return
+        
+        try {
+            crashlytics.setCustomKey(key, value)
+            customKeys[key] = value
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error setting custom key for Crashlytics: $key")
+        }
+    }
+    
+    /**
+     * Log custom message
+     */
+    fun log(message: String, priority: LogPriority = LogPriority.INFO) {
+        if (!enableCustomLogging) return
+        
+        try {
+            totalCustomLogs.incrementAndGet()
+            
+            val logMessage = when (priority) {
+                LogPriority.DEBUG -> "DEBUG: $message"
+                LogPriority.INFO -> "INFO: $message"
+                LogPriority.WARNING -> "WARNING: $message"
+                LogPriority.ERROR -> "ERROR: $message"
+            }
+            
+            // Log to Crashlytics
+            crashlytics.log(logMessage)
+            
+            // Also log to Timber
+            when (priority) {
+                LogPriority.DEBUG -> Timber.d(message)
+                LogPriority.INFO -> Timber.i(message)
+                LogPriority.WARNING -> Timber.w(message)
+                LogPriority.ERROR -> Timber.e(message)
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error logging custom message to Crashlytics")
+        }
+    }
+    
+    /**
+     * Record breadcrumb for debugging
+     */
+    fun recordBreadcrumb(message: String, data: Map<String, Any> = emptyMap()) {
+        if (!enableCustomLogging) return
+        
+        try {
+            val breadcrumb = "Breadcrumb: $message"
+            crashlytics.log(breadcrumb)
+            
+            // Add breadcrumb data as custom keys
+            data.forEach { (key, value) ->
+                setCustomKey("breadcrumb_$key", value.toString())
+            }
+            
+            Timber.d("Breadcrumb recorded: $message")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error recording breadcrumb to Crashlytics")
+        }
+    }
+    
+    /**
+     * Set user attributes
+     */
+    fun setUserAttributes(attributes: Map<String, String>) {
+        if (!enableCrashlytics) return
+        
+        try {
+            attributes.forEach { (key, value) ->
+                setCustomKey("user_$key", value)
+            }
+            
+            Timber.d("User attributes set for Crashlytics: ${attributes.keys}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error setting user attributes for Crashlytics")
+        }
+    }
+    
+    /**
+     * Enable/disable Crashlytics
+     */
+    fun setCrashlyticsEnabled(enabled: Boolean) {
+        try {
+            crashlytics.setCrashlyticsCollectionEnabled(enabled)
+            Timber.d("Crashlytics collection enabled: $enabled")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error setting Crashlytics enabled state")
+        }
+    }
+    
+    /**
+     * Get crash statistics
+     */
+    fun getCrashStats(): CrashStats {
+        return CrashStats(
+            totalCrashes = totalCrashes.get(),
+            totalNonFatalErrors = totalNonFatalErrors.get(),
+            totalCustomLogs = totalCustomLogs.get(),
+            customKeysCount = customKeys.size,
+            crashlyticsEnabled = enableCrashlytics,
+            customLoggingEnabled = enableCustomLogging,
+            performanceMonitoringEnabled = enablePerformanceMonitoring
+        )
+    }
+    
+    /**
+     * Add crash listener
+     */
+    fun addCrashListener(listener: CrashListener) {
+        crashListeners.add(listener)
+    }
+    
+    /**
+     * Remove crash listener
+     */
+    fun removeCrashListener(listener: CrashListener) {
+        crashListeners.remove(listener)
+    }
+    
+    /**
+     * Test crash reporting
+     */
+    fun testCrashReporting() {
+        if (!enableCrashlytics) return
+        
+        try {
+            // Test crash with custom context
+            val testContext = mapOf(
+                "test_type" to "crash_test",
+                "test_time" to System.currentTimeMillis().toString(),
+                "test_device" to android.os.Build.MODEL
+            )
+            
+            reportCrash(RuntimeException("Test crash for validation"), testContext)
+            
+            Timber.d("Test crash reported for validation")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error testing crash reporting")
+        }
+    }
+    
+    /**
+     * Test non-fatal error reporting
+     */
+    fun testNonFatalReporting() {
+        if (!enableCrashlytics) return
+        
+        try {
+            // Test non-fatal error with custom context
+            val testContext = mapOf(
+                "test_type" to "non_fatal_test",
+                "test_time" to System.currentTimeMillis().toString(),
+                "test_component" to "test_module"
+            )
+            
+            reportNonFatal(RuntimeException("Test non-fatal error for validation"), testContext)
+            
+            Timber.d("Test non-fatal error reported for validation")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error testing non-fatal error reporting")
+        }
+    }
+    
+    /**
+     * Clear all custom keys
+     */
+    fun clearCustomKeys() {
+        try {
+            customKeys.clear()
+            Timber.d("Custom keys cleared for Crashlytics")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error clearing custom keys for Crashlytics")
+        }
+    }
+    
+    /**
+     * Get crash reporting recommendations
+     */
+    fun getCrashReportingRecommendations(): List<CrashReportingRecommendation> {
+        val recommendations = mutableListOf<CrashReportingRecommendation>()
+        val stats = getCrashStats()
+        
+        when {
+            stats.totalCrashes > 10 -> {
+                recommendations.add(
+                    CrashReportingRecommendation(
+                        priority = RecommendationPriority.CRITICAL,
+                        action = "INVESTIGATE_CRASHES",
+                        description = "High number of crashes. Investigate crash patterns and fix critical issues.",
+                        estimatedImpact = "High stability improvement"
+                    )
+                )
+            }
+            stats.totalNonFatalErrors > 50 -> {
+                recommendations.add(
+                    CrashReportingRecommendation(
+                        priority = RecommendationPriority.HIGH,
+                        action = "REDUCE_ERRORS",
+                        description = "High number of non-fatal errors. Improve error handling and validation.",
+                        estimatedImpact = "Medium stability improvement"
+                    )
+                )
+            }
+            stats.customKeysCount < 5 -> {
+                recommendations.add(
+                    CrashReportingRecommendation(
+                        priority = RecommendationPriority.MEDIUM,
+                        action = "ADD_MORE_CONTEXT",
+                        description = "Add more custom keys for better crash context and debugging.",
+                        estimatedImpact = "Improved debugging efficiency"
+                    )
+                )
+            }
+        }
+        
+        return recommendations
+    }
+    
+    // Private methods
+    
+    private fun initializeCrashlytics() {
+        try {
+            // Set default custom keys
+            setCustomKey("app_name", "Edham Logistics")
+            setCustomKey("app_version", getAppVersion())
+            setCustomKey("build_type", getBuildType())
+            setCustomKey("device_manufacturer", android.os.Build.MANUFACTURER)
+            setCustomKey("device_model", android.os.Build.MODEL)
+            setCustomKey("os_version", android.os.Build.VERSION.RELEASE)
+            setCustomKey("api_level", android.os.Build.VERSION.SDK_INT.toString())
+            
+            // Enable Crashlytics collection
+            setCrashlyticsEnabled(enableCrashlytics)
+            
+            Timber.d("Firebase Crashlytics initialized successfully")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error initializing Firebase Crashlytics")
+        }
+    }
+    
+    private fun getAppVersion(): String {
+        return try {
+            val packageManager = context.packageManager
+            val packageInfo = packageManager.getPackageInfo(context.packageName, 0)
+            packageInfo.versionName ?: "Unknown"
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    private fun getBuildType(): String {
+        return try {
+            val applicationInfo = context.applicationInfo
+            if ((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+                "Debug"
+            } else {
+                "Release"
+            }
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): CrashlyticsPerformanceMetrics {
+        val stats = getCrashStats()
+        
+        return CrashlyticsPerformanceMetrics(
+            totalCrashes = stats.totalCrashes,
+            totalNonFatalErrors = stats.totalNonFatalErrors,
+            totalCustomLogs = stats.totalCustomLogs,
+            customKeysCount = stats.customKeysCount,
+            crashRate = if (stats.totalCrashes > 0) {
+                stats.totalCrashes.toDouble() / (stats.totalCrashes + stats.totalNonFatalErrors)
+            } else 0.0,
+            errorRate = if (stats.totalCrashes + stats.totalNonFatalErrors > 0) {
+                (stats.totalCrashes + stats.totalNonFatalErrors).toDouble()
+            } else 0.0
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalCrashes.set(0)
+        totalNonFatalErrors.set(0)
+        totalCustomLogs.set(0)
+    }
+    
+    /**
+     * Stop Crashlytics manager
+     */
+    fun stop() {
+        crashlyticsScope.cancel()
+        crashListeners.clear()
+        customKeys.clear()
+    }
+}
+
+/**
+ * Crash Statistics
+ */
+data class CrashStats(
+    val totalCrashes: Long,
+    val totalNonFatalErrors: Long,
+    val totalCustomLogs: Long,
+    val customKeysCount: Int,
+    val crashlyticsEnabled: Boolean,
+    val customLoggingEnabled: Boolean,
+    val performanceMonitoringEnabled: Boolean
+)
+
+/**
+ * Crash Reporting Recommendation
+ */
+data class CrashReportingRecommendation(
+    val priority: RecommendationPriority,
+    val action: String,
+    val description: String,
+    val estimatedImpact: String
+)
+
+/**
+ * Crashlytics Performance Metrics
+ */
+data class CrashlyticsPerformanceMetrics(
+    val totalCrashes: Long,
+    val totalNonFatalErrors: Long,
+    val totalCustomLogs: Long,
+    val customKeysCount: Int,
+    val crashRate: Double,
+    val errorRate: Double
+) {
+    val stabilityScore: Double get() = (1.0 - crashRate) * 100
+    val loggingActivity: Double get() = totalCustomLogs.toDouble()
+}
+
+/**
+ * Log Priority
+ */
+enum class LogPriority {
+    DEBUG, INFO, WARNING, ERROR
+}
+
+/**
+ * Crash Listener Interface
+ */
+interface CrashListener {
+    fun onCrashReported(throwable: Throwable, context: Map<String, Any>) {}
+    fun onNonFatalReported(throwable: Throwable, context: Map<String, Any>) {}
+    fun onCustomLogLogged(message: String, priority: LogPriority) {}
+}
+
+/**
+ * Crash Analytics Manager
+ */
+class CrashAnalyticsManager @Inject constructor(
+    private val crashlyticsManager: FirebaseCrashlyticsManager
+) {
+    
+    private val crashPatterns = ConcurrentHashMap<String, CrashPattern>()
+    private val errorTrends = ConcurrentHashMap<String, ErrorTrend>()
+    
+    /**
+     * Analyze crash patterns
+     */
+    fun analyzeCrashPatterns(): CrashAnalysisResult {
+        val stats = crashlyticsManager.getCrashStats()
+        
+        return CrashAnalysisResult(
+            totalCrashes = stats.totalCrashes,
+            totalNonFatalErrors = stats.totalNonFatalErrors,
+            crashPatterns = crashPatterns.values.toList(),
+            errorTrends = errorTrends.values.toList(),
+            stabilityScore = calculateStabilityScore(stats),
+            recommendations = crashlyticsManager.getCrashReportingRecommendations()
+        )
+    }
+    
+    /**
+     * Add crash pattern
+     */
+    fun addCrashPattern(pattern: CrashPattern) {
+        crashPatterns[pattern.type] = pattern
+    }
+    
+    /**
+     * Add error trend
+     */
+    fun addErrorTrend(trend: ErrorTrend) {
+        errorTrends[trend.errorType] = trend
+    }
+    
+    private fun calculateStabilityScore(stats: CrashStats): Double {
+        val totalIssues = stats.totalCrashes + stats.totalNonFatalErrors
+        return if (totalIssues > 0) {
+            (stats.totalNonFatalErrors.toDouble() / totalIssues) * 100
+        } else {
+            100.0
+        }
+    }
+}
+
+/**
+ * Crash Pattern
+ */
+data class CrashPattern(
+    val type: String,
+    val frequency: Int,
+    val lastOccurrence: Long,
+    val affectedDevices: List<String>,
+    val severity: CrashSeverity
+)
+
+/**
+ * Error Trend
+ */
+data class ErrorTrend(
+    val errorType: String,
+    val occurrences: List<Long>,
+    val trendDirection: TrendDirection,
+    val severity: ErrorSeverity
+)
+
+/**
+ * Crash Analysis Result
+ */
+data class CrashAnalysisResult(
+    val totalCrashes: Long,
+    val totalNonFatalErrors: Long,
+    val crashPatterns: List<CrashPattern>,
+    val errorTrends: List<ErrorTrend>,
+    val stabilityScore: Double,
+    val recommendations: List<CrashReportingRecommendation>
+)
+
+/**
+ * Crash Severity
+ */
+enum class CrashSeverity {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+/**
+ * Error Severity
+ */
+enum class ErrorSeverity {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+/**
+ * Trend Direction
+ */
+enum class TrendDirection {
+    INCREASING, DECREASING, STABLE
+}

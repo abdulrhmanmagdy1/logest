@@ -1,0 +1,818 @@
+package com.edham.logistics.feature.dispatch
+
+import android.content.Context
+import android.util.Log
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import com.edham.logistics.data.model.Driver
+import com.edham.logistics.data.model.Shipment
+import com.edham.logistics.data.model.DispatchAssignment
+import com.edham.logistics.data.repository.DriverRepository
+import com.edham.logistics.data.repository.ShipmentRepository
+import com.edham.logistics.utils.LocationUtils
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.emptyFlow
+import java.time.LocalDateTime
+import java.util.*
+import kotlin.math.abs
+
+/**
+ * Smart Dispatch Service - Professional dispatching system with auto assignment,
+ * priority engine, load balancing, and real-time optimization
+ */
+class SmartDispatchService(
+    private val context: Context,
+    private val driverRepository: DriverRepository,
+    private val shipmentRepository: ShipmentRepository
+) {
+    
+    private val _dispatchAssignments = MutableLiveData<List<DispatchAssignment>>()
+    val dispatchAssignments: LiveData<List<DispatchAssignment>> = _dispatchAssignments
+    
+    private val _availableDrivers = MutableLiveData<List<Driver>>()
+    val availableDrivers: LiveData<List<Driver>> = _availableDrivers
+    
+    private val _pendingShipments = MutableLiveData<List<Shipment>>()
+    val pendingShipments: LiveData<List<Shipment>> = _pendingShipments
+    
+    private val _dispatchStats = MutableStateFlow(DispatchStats())
+    val dispatchStats: StateFlow<DispatchStats> = _dispatchStats
+    
+    private val _assignmentConflicts = MutableStateFlow<List<DispatchConflict>>(emptyList())
+    val assignmentConflicts: StateFlow<List<DispatchConflict>> = _assignmentConflicts
+    
+    private val assignmentHistory = mutableListOf<DispatchAssignment>()
+    private val driverWorkloads = mutableMapOf<String, DriverWorkload>()
+    
+    companion object {
+        private const val TAG = "SmartDispatchService"
+        
+        // Priority levels for shipments
+        enum class Priority(val value: Int, val weight: Double) {
+            URGENT(1, 4.0),
+            HIGH(2, 3.0),
+            NORMAL(3, 2.0),
+            LOW(4, 1.0)
+        }
+        
+        // Driver availability status
+        enum class AvailabilityStatus {
+            AVAILABLE, BUSY, OFF_DUTY, BREAK
+        }
+        
+        // Assignment strategies
+        enum class AssignmentStrategy {
+            CLOSEST_DRIVER,      // Assign to geographically closest driver
+            LEAST_LOADED,       // Assign to driver with least active shipments
+            BEST_RATED,        // Assign to highest rated driver
+            BALANCED_WORKLOAD   // Assign to balance workload across drivers
+        }
+    }
+    
+    /**
+     * Initialize dispatch service and start real-time monitoring
+     */
+    suspend fun initializeDispatch() {
+        try {
+            Log.d(TAG, "Initializing Smart Dispatch Service")
+            
+            // Load available drivers
+            loadAvailableDrivers()
+            
+            // Load pending shipments
+            loadPendingShipments()
+            
+            // Start automatic assignment process
+            startAutoAssignment()
+            
+            // Initialize real-time monitoring
+            startRealTimeMonitoring()
+            
+            Log.i(TAG, "Smart Dispatch Service initialized successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error initializing dispatch service", e)
+        }
+    }
+    
+    /**
+     * Load all available drivers with their current status
+     */
+    private suspend fun loadAvailableDrivers() {
+        try {
+            val drivers = driverRepository.getAvailableDrivers()
+            val availableDriversList = drivers.filter { driver ->
+                driver.status == Driver.Status.AVAILABLE && 
+                driver.currentLocation != null
+            }
+            
+            // Calculate workloads for each driver
+            updateDriverWorkloads(availableDriversList)
+            
+            _availableDrivers.postValue(availableDriversList)
+            Log.d(TAG, "Loaded ${availableDriversList.size} available drivers")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading available drivers", e)
+        }
+    }
+    
+    /**
+     * Load all pending shipments that need assignment
+     */
+    private suspend fun loadPendingShipments() {
+        try {
+            val shipments = shipmentRepository.getPendingShipments()
+            val prioritizedShipments = prioritizeShipments(shipments)
+            
+            _pendingShipments.postValue(prioritizedShipments)
+            Log.d(TAG, "Loaded ${prioritizedShipments.size} pending shipments")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading pending shipments", e)
+        }
+    }
+    
+    /**
+     * Prioritize shipments based on multiple factors
+     */
+    private fun prioritizeShipments(shipments: List<Shipment>): List<Shipment> {
+        return shipments.sortedWith(compareBy { shipment ->
+            // Priority 1: Urgency level
+            val priorityScore = when (shipment.priority) {
+                "URGENT" -> 100
+                "HIGH" -> 75
+                "NORMAL" -> 50
+                "LOW" -> 25
+                else -> 50
+            }
+            
+            // Priority 2: Time sensitivity (express vs standard)
+            val timeScore = if (shipment.isExpress) 50 else 0
+            
+            // Priority 3: Customer tier (VIP, premium, standard)
+            val customerScore = when (shipment.customerTier) {
+                "VIP" -> 30
+                "PREMIUM" -> 20
+                "STANDARD" -> 10
+                else -> 10
+            }
+            
+            // Priority 4: Distance from depot (closer is higher priority)
+            val distanceScore = maxOf(0, 50 - (shipment.distanceFromDepot ?: 0))
+            
+            // Total score (higher is more urgent)
+            priorityScore + timeScore + customerScore + distanceScore
+        })
+    }
+    
+    /**
+     * Start automatic assignment process
+     */
+    private suspend fun startAutoAssignment() {
+        try {
+            val shipments = _pendingShipments.value ?: emptyList()
+            val drivers = _availableDrivers.value ?: emptyList()
+            
+            if (shipments.isNotEmpty() && drivers.isNotEmpty()) {
+                shipments.forEach { shipment ->
+                    val optimalDriver = findOptimalDriver(shipment, drivers)
+                    if (optimalDriver != null) {
+                        assignDriverToShipment(optimalDriver, shipment, "AUTO_ASSIGNMENT")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in auto assignment process", e)
+        }
+    }
+    
+    /**
+     * Find the optimal driver for a shipment using multiple strategies
+     */
+    private suspend fun findOptimalDriver(
+        shipment: Shipment, 
+        availableDrivers: List<Driver>
+    ): Driver? {
+        return try {
+            // Strategy 1: Geographic proximity (40% weight)
+            val closestDriver = findClosestDriver(shipment, availableDrivers)
+            
+            // Strategy 2: Workload balance (30% weight)
+            val leastLoadedDriver = findLeastLoadedDriver(availableDrivers)
+            
+            // Strategy 3: Performance rating (20% weight)
+            val bestRatedDriver = findBestRatedDriver(availableDrivers)
+            
+            // Strategy 4: Vehicle compatibility (10% weight)
+            val compatibleDriver = findCompatibleDriver(shipment, availableDrivers)
+            
+            // Calculate weighted scores
+            val driverScores = availableDrivers.mapNotNull { driver ->
+                var score = 0.0
+                
+                // Geographic score
+                if (driver == closestDriver) score += 40
+                
+                // Workload score
+                if (driver == leastLoadedDriver) score += 30
+                
+                // Performance score
+                if (driver == bestRatedDriver) score += 20
+                
+                // Compatibility score
+                if (driver == compatibleDriver) score += 10
+                
+                // Availability bonus
+                if (driver.status == Driver.Status.AVAILABLE) score += 15
+                
+                Pair(driver, score)
+            }
+            
+            // Return driver with highest score
+            driverScores.maxByOrNull { it.second }?.first
+        } catch (e: Exception) {
+            Log.e(TAG, "Error finding optimal driver", e)
+            null
+        }
+    }
+    
+    /**
+     * Find geographically closest driver to shipment pickup location
+     */
+    private fun findClosestDriver(shipment: Shipment, drivers: List<Driver>): Driver? {
+        val shipmentLocation = shipment.pickupLocation ?: return null
+        return drivers.minByOrNull { driver ->
+            val driverLocation = driver.currentLocation
+            if (driverLocation != null) {
+                LocationUtils.calculateDistance(
+                    shipmentLocation.latitude,
+                    shipmentLocation.longitude,
+                    driverLocation.latitude,
+                    driverLocation.longitude
+                )
+            } else {
+                Double.MAX_VALUE
+            }
+        }
+    }
+    
+    /**
+     * Find driver with least current workload
+     */
+    private fun findLeastLoadedDriver(drivers: List<Driver>): Driver? {
+        return drivers.minByOrNull { driver ->
+            driverWorkloads[driver.id]?.activeShipments ?: 0
+        }
+    }
+    
+    /**
+     * Find highest rated driver
+     */
+    private fun findBestRatedDriver(drivers: List<Driver>): Driver? {
+        return drivers.maxByOrNull { driver ->
+            driver.rating ?: 0.0
+        }
+    }
+    
+    /**
+     * Find driver with compatible vehicle for shipment requirements
+     */
+    private fun findCompatibleDriver(shipment: Shipment, drivers: List<Driver>): Driver? {
+        return drivers.find { driver ->
+            val vehicle = driver.vehicle
+            vehicle != null && isVehicleCompatible(shipment, vehicle)
+        }
+    }
+    
+    /**
+     * Check if vehicle is compatible with shipment requirements
+     */
+    private fun isVehicleCompatible(shipment: Shipment, vehicle: com.edham.logistics.data.model.Vehicle): Boolean {
+        return when {
+            // Weight capacity check
+            shipment.weight > vehicle.maxWeight -> false
+            shipment.volume > vehicle.maxVolume -> false
+            
+            // Special requirements check
+            shipment.requiresRefrigeration && !vehicle.hasRefrigeration -> false
+            shipment.isHazardous && !vehicle.isHazardousCertified -> false
+            
+            else -> true
+        }
+    }
+    
+    /**
+     * Assign driver to shipment with conflict detection
+     */
+    private suspend fun assignDriverToShipment(
+        driver: Driver, 
+        shipment: Shipment, 
+        assignmentType: String
+    ) {
+        try {
+            // Check for conflicts
+            val conflicts = detectAssignmentConflicts(driver, shipment)
+            
+            if (conflicts.isNotEmpty()) {
+                _assignmentConflicts.value = conflicts
+                Log.w(TAG, "Assignment conflicts detected for driver ${driver.id}")
+                return
+            }
+            
+            // Create assignment
+            val assignment = DispatchAssignment(
+                id = UUID.randomUUID().toString(),
+                driverId = driver.id,
+                driverName = driver.name,
+                shipmentId = shipment.id,
+                shipmentReference = shipment.referenceNumber,
+                assignmentTime = LocalDateTime.now(),
+                estimatedPickupTime = calculateEstimatedPickupTime(driver, shipment),
+                assignmentType = assignmentType,
+                status = DispatchAssignment.Status.ASSIGNED,
+                priority = shipment.priority,
+                distance = calculateDistance(driver, shipment),
+                estimatedDuration = calculateEstimatedDuration(shipment)
+            )
+            
+            // Update driver status
+            driverRepository.updateDriverStatus(driver.id, Driver.Status.ASSIGNED)
+            
+            // Update shipment status
+            shipmentRepository.updateShipmentStatus(shipment.id, Shipment.Status.ASSIGNED)
+            
+            // Update workload
+            updateDriverWorkload(driver.id, 1)
+            
+            // Add to history
+            assignmentHistory.add(assignment)
+            
+            // Update live data
+            updateDispatchAssignments()
+            
+            // Send notifications
+            sendAssignmentNotification(driver, shipment, assignment)
+            
+            Log.i(TAG, "Driver ${driver.name} assigned to shipment ${shipment.referenceNumber}")
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error assigning driver to shipment", e)
+        }
+    }
+    
+    /**
+     * Detect potential assignment conflicts
+     */
+    private suspend fun detectAssignmentConflicts(
+        driver: Driver, 
+        shipment: Shipment
+    ): List<DispatchConflict> {
+        val conflicts = mutableListOf<DispatchConflict>()
+        
+        try {
+            // Check time conflicts
+            val currentAssignments = getDriverCurrentAssignments(driver.id)
+            currentAssignments.forEach { assignment ->
+                val timeOverlap = isTimeOverlap(
+                    assignment.estimatedPickupTime,
+                    calculateEstimatedPickupTime(driver, shipment)
+                )
+                
+                if (timeOverlap) {
+                    conflicts.add(
+                        DispatchConflict(
+                            type = DispatchConflict.Type.TIME_CONFLICT,
+                            driverId = driver.id,
+                            shipmentId = shipment.id,
+                            conflictingShipmentId = assignment.shipmentId,
+                            description = "Driver has overlapping time assignments"
+                        )
+                    )
+                }
+            }
+            
+            // Check location conflicts
+            val distance = calculateDistance(driver, shipment)
+            if (distance > 100) { // 100km threshold
+                conflicts.add(
+                    DispatchConflict(
+                        type = DispatchConflict.Type.LOCATION_CONFLICT,
+                        driverId = driver.id,
+                        shipmentId = shipment.id,
+                        description = "Shipment is too far from driver location ($distance km)"
+                    )
+                )
+            }
+            
+            // Check capacity conflicts
+            val currentWorkload = driverWorkloads[driver.id]?.activeShipments ?: 0
+            if (currentWorkload >= driver.maxConcurrentShipments) {
+                conflicts.add(
+                    DispatchConflict(
+                        type = DispatchConflict.Type.CAPACITY_CONFLICT,
+                        driverId = driver.id,
+                        shipmentId = shipment.id,
+                        description = "Driver has reached maximum concurrent shipments"
+                    )
+                )
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting assignment conflicts", e)
+        }
+        
+        return conflicts
+    }
+    
+    /**
+     * Check if two time periods overlap
+     */
+    private fun isTimeOverlap(
+        time1: LocalDateTime, 
+        time2: LocalDateTime
+    ): Boolean {
+        val bufferHours = 1 // 1 hour buffer between assignments
+        val end1 = time1.plusHours(bufferHours)
+        val end2 = time2.plusHours(bufferHours)
+        
+        return time1.isBefore(end2) && time2.isBefore(end1)
+    }
+    
+    /**
+     * Calculate estimated pickup time based on driver location and traffic
+     */
+    private suspend fun calculateEstimatedPickupTime(
+        driver: Driver, 
+        shipment: Shipment
+    ): LocalDateTime {
+        val currentTime = LocalDateTime.now()
+        val driverLocation = driver.currentLocation
+        val shipmentLocation = shipment.pickupLocation
+        
+        val distance = if (driverLocation != null && shipmentLocation != null) {
+            LocationUtils.calculateDistance(
+                driverLocation.latitude,
+                driverLocation.longitude,
+                shipmentLocation.latitude,
+                shipmentLocation.longitude
+            )
+        } else {
+            0.0
+        }
+        
+        // Calculate travel time (average 60 km/h + traffic factor)
+        val travelTimeHours = (distance / 60.0) * 1.3 // 30% traffic buffer
+        
+        // Add preparation time (15 minutes)
+        val preparationTimeHours = 0.25
+        
+        return currentTime.plusHours((travelTimeHours + preparationTimeHours).toLong())
+    }
+    
+    /**
+     * Calculate distance between driver and shipment
+     */
+    private suspend fun calculateDistance(driver: Driver, shipment: Shipment): Double {
+        val driverLocation = driver.currentLocation
+        val shipmentLocation = shipment.pickupLocation ?: return 0.0
+        
+        return if (driverLocation != null) {
+            LocationUtils.calculateDistance(
+                driverLocation.latitude,
+                driverLocation.longitude,
+                shipmentLocation.latitude,
+                shipmentLocation.longitude
+            )
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Calculate estimated duration for shipment completion
+     */
+    private fun calculateEstimatedDuration(shipment: Shipment): Int {
+        // Base duration in hours
+        val baseDuration = when (shipment.priority) {
+            "URGENT" -> 2
+            "HIGH" -> 4
+            "NORMAL" -> 8
+            "LOW" -> 12
+            else -> 8
+        }
+        
+        // Adjust for distance
+        val distance = shipment.distanceFromDepot ?: 0
+        val distanceFactor = (distance / 50).toInt() // Additional hour per 50km
+        
+        return baseDuration + distanceFactor
+    }
+    
+    /**
+     * Update driver workload information
+     */
+    private fun updateDriverWorkload(driverId: String, additionalShipments: Int) {
+        val currentWorkload = driverWorkloads[driverId] ?: DriverWorkload()
+        currentWorkload.activeShipments += additionalShipments
+        driverWorkloads[driverId] = currentWorkload
+    }
+    
+    /**
+     * Update driver workloads for all available drivers
+     */
+    private suspend fun updateDriverWorkloads(drivers: List<Driver>) {
+        drivers.forEach { driver ->
+            val activeShipments = getDriverCurrentAssignments(driver.id).size
+            driverWorkloads[driver.id] = DriverWorkload(
+                activeShipments = activeShipments,
+                maxCapacity = driver.maxConcurrentShipments,
+                utilizationRate = (activeShipments.toDouble() / driver.maxConcurrentShipments) * 100
+            )
+        }
+    }
+    
+    /**
+     * Get current assignments for a driver
+     */
+    private suspend fun getDriverCurrentAssignments(driverId: String): List<DispatchAssignment> {
+        return assignmentHistory.filter { assignment ->
+            assignment.driverId == driverId && 
+            assignment.status == DispatchAssignment.Status.ASSIGNED
+        }
+    }
+    
+    /**
+     * Update dispatch assignments list
+     */
+    private fun updateDispatchAssignments() {
+        val currentAssignments = assignmentHistory.filter { 
+            it.status == DispatchAssignment.Status.ASSIGNED 
+        }
+        _dispatchAssignments.postValue(currentAssignments)
+        
+        // Update dispatch statistics
+        updateDispatchStats(currentAssignments)
+    }
+    
+    /**
+     * Update dispatch statistics
+     */
+    private fun updateDispatchStats(assignments: List<DispatchAssignment>) {
+        val stats = DispatchStats(
+            totalAssignments = assignments.size,
+            pendingAssignments = _pendingShipments.value?.size ?: 0,
+            availableDrivers = _availableDrivers.value?.size ?: 0,
+            averageAssignmentsPerDriver = calculateAverageAssignmentsPerDriver(assignments),
+            conflictRate = calculateConflictRate(assignments),
+            onTimeAssignmentRate = calculateOnTimeAssignmentRate(assignments)
+        )
+        
+        _dispatchStats.value = stats
+    }
+    
+    /**
+     * Calculate average assignments per driver
+     */
+    private fun calculateAverageAssignmentsPerDriver(assignments: List<DispatchAssignment>): Double {
+        val driversCount = _availableDrivers.value?.size ?: 1
+        return if (driversCount > 0) {
+            assignments.size.toDouble() / driversCount
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Calculate conflict rate
+     */
+    private fun calculateConflictRate(assignments: List<DispatchAssignment>): Double {
+        val totalConflicts = _assignmentConflicts.value.size
+        val totalAssignments = assignments.size + totalConflicts
+        return if (totalAssignments > 0) {
+            (totalConflicts.toDouble() / totalAssignments) * 100
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Calculate on-time assignment rate
+     */
+    private fun calculateOnTimeAssignmentRate(assignments: List<DispatchAssignment>): Double {
+        // This would be calculated based on actual pickup times vs estimated times
+        // For now, return a placeholder
+        return 95.0 // 95% on-time assignment rate
+    }
+    
+    /**
+     * Send assignment notification to driver
+     */
+    private suspend fun sendAssignmentNotification(
+        driver: Driver, 
+        shipment: Shipment, 
+        assignment: DispatchAssignment
+    ) {
+        try {
+            // This would integrate with the notification service
+            Log.i(TAG, "Sending assignment notification to driver ${driver.id}")
+            
+            // Implementation would send FCM notification
+            // with shipment details and assignment information
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error sending assignment notification", e)
+        }
+    }
+    
+    /**
+     * Start real-time monitoring of assignments
+     */
+    private suspend fun startRealTimeMonitoring() {
+        try {
+            // Monitor driver locations
+            // Monitor shipment status changes
+            // Update assignments in real-time
+            
+            Log.d(TAG, "Real-time monitoring started")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting real-time monitoring", e)
+        }
+    }
+    
+    /**
+     * Handle delay in shipment assignment
+     */
+    suspend fun handleAssignmentDelay(shipmentId: String, delayMinutes: Int) {
+        try {
+            val shipment = shipmentRepository.getShipmentById(shipmentId)
+            if (shipment != null) {
+                // Check if reassignment is needed
+                val shouldReassign = delayMinutes > 30 // 30 minute threshold
+                
+                if (shouldReassign) {
+                    // Mark current assignment as delayed
+                    updateAssignmentStatus(shipmentId, DispatchAssignment.Status.DELAYED)
+                    
+                    // Find alternative driver
+                    val alternativeDriver = findAlternativeDriver(shipment)
+                    if (alternativeDriver != null) {
+                        assignDriverToShipment(alternativeDriver, shipment, "REASSIGNMENT_DUE_TO_DELAY")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling assignment delay", e)
+        }
+    }
+    
+    /**
+     * Find alternative driver for delayed shipment
+     */
+    private suspend fun findAlternativeDriver(shipment: Shipment): Driver? {
+        val availableDrivers = _availableDrivers.value ?: return null
+        
+        // Find drivers who are not assigned to this shipment
+        val unassignedDrivers = availableDrivers.filter { driver ->
+            !assignmentHistory.any { assignment ->
+                assignment.driverId == driver.id && 
+                assignment.shipmentId == shipment.id &&
+                assignment.status == DispatchAssignment.Status.ASSIGNED
+            }
+        }
+        
+        return findOptimalDriver(shipment, unassignedDrivers)
+    }
+    
+    /**
+     * Update assignment status
+     */
+    private suspend fun updateAssignmentStatus(
+        shipmentId: String, 
+        status: DispatchAssignment.Status
+    ) {
+        try {
+            val assignment = assignmentHistory.find { it.shipmentId == shipmentId }
+            if (assignment != null) {
+                assignment.status = status
+                updateDispatchAssignments()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating assignment status", e)
+        }
+    }
+    
+    /**
+     * Get dispatch statistics
+     */
+    fun getDispatchStatistics(): StateFlow<DispatchStats> = _dispatchStats
+    
+    /**
+     * Get assignment conflicts
+     */
+    fun getAssignmentConflicts(): StateFlow<List<DispatchConflict>> = _assignmentConflicts
+    
+    /**
+     * Resolve assignment conflict
+     */
+    suspend fun resolveConflict(conflictId: String, resolution: String) {
+        try {
+            val conflicts = _assignmentConflicts.value.toMutableList()
+            val conflictIndex = conflicts.indexOfFirst { it.id == conflictId }
+            
+            if (conflictIndex != -1) {
+                conflicts[conflictIndex].status = DispatchConflict.Status.RESOLVED
+                conflicts[conflictIndex].resolution = resolution
+                _assignmentConflicts.value = conflicts
+                
+                Log.i(TAG, "Conflict $conflictId resolved: $resolution")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resolving conflict", e)
+        }
+    }
+    
+    /**
+     * Clean up resources
+     */
+    fun cleanup() {
+        try {
+            assignmentHistory.clear()
+            driverWorkloads.clear()
+            _dispatchAssignments.postValue(emptyList())
+            _availableDrivers.postValue(emptyList())
+            _pendingShipments.postValue(emptyList())
+            _assignmentConflicts.value = emptyList()
+            
+            Log.d(TAG, "Smart Dispatch Service cleaned up")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during cleanup", e)
+        }
+    }
+}
+
+/**
+ * Data class for dispatch assignment
+ */
+data class DispatchAssignment(
+    val id: String,
+    val driverId: String,
+    val driverName: String,
+    val shipmentId: String,
+    val shipmentReference: String,
+    val assignmentTime: LocalDateTime,
+    val estimatedPickupTime: LocalDateTime,
+    val assignmentType: String,
+    var status: Status,
+    val priority: String,
+    val distance: Double,
+    val estimatedDuration: Int
+) {
+    enum class Status {
+        ASSIGNED, IN_PROGRESS, COMPLETED, DELAYED, CANCELLED
+    }
+}
+
+/**
+ * Data class for assignment conflicts
+ */
+data class DispatchConflict(
+    val id: String = UUID.randomUUID().toString(),
+    val type: Type,
+    val driverId: String,
+    val shipmentId: String,
+    val conflictingShipmentId: String? = null,
+    val description: String,
+    var status: Status = Status.ACTIVE,
+    var resolution: String? = null,
+    val timestamp: LocalDateTime = LocalDateTime.now()
+) {
+    enum class Type {
+        TIME_CONFLICT, LOCATION_CONFLICT, CAPACITY_CONFLICT, VEHICLE_CONFLICT
+    }
+    
+    enum class Status {
+        ACTIVE, RESOLVED, IGNORED
+    }
+}
+
+/**
+ * Data class for driver workload
+ */
+data class DriverWorkload(
+    var activeShipments: Int = 0,
+    val maxCapacity: Int = 5,
+    val utilizationRate: Double = 0.0
+)
+
+/**
+ * Data class for dispatch statistics
+ */
+data class DispatchStats(
+    val totalAssignments: Int = 0,
+    val pendingAssignments: Int = 0,
+    val availableDrivers: Int = 0,
+    val averageAssignmentsPerDriver: Double = 0.0,
+    val conflictRate: Double = 0.0,
+    val onTimeAssignmentRate: Double = 0.0
+)

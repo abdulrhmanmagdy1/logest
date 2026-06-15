@@ -1,0 +1,794 @@
+package com.edham.logistics.audit
+
+import android.content.Context
+import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
+
+/**
+ * Audit Log System - Comprehensive audit logging for tracking all operations
+ */
+@Database(
+    entities = [
+        AuditLogEntry::class,
+        AuditLogSession::class,
+        AuditLogConfig::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(AuditConverters::class)
+abstract class AuditLogDatabase : RoomDatabase() {
+    abstract fun auditLogDao(): AuditLogDao
+    abstract fun auditLogSessionDao(): AuditLogSessionDao
+    abstract fun auditLogConfigDao(): AuditLogConfigDao
+}
+
+/**
+ * Audit Log System Manager
+ */
+class AuditLogSystem private constructor(context: Context) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: AuditLogSystem? = null
+        
+        fun getInstance(context: Context): AuditLogSystem {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: AuditLogSystem(context).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val database = Room.databaseBuilder(
+        context.applicationContext,
+        AuditLogDatabase::class.java,
+        "edham_audit_log"
+    )
+        .fallbackToDestructiveMigration()
+        .build()
+    
+    private val auditLogDao = database.auditLogDao()
+    private val sessionDao = database.auditLogSessionDao()
+    private val configDao = database.auditLogConfigDao()
+    
+    private val gson = Gson()
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
+    
+    private val auditScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val logQueue = ConcurrentLinkedQueue<AuditLogEntry>()
+    
+    private var currentSession: AuditLogSession? = null
+    private var isLoggingEnabled = true
+    
+    init {
+        initializeSystem()
+    }
+    
+    /**
+     * Initialize audit log system
+     */
+    private fun initializeSystem() {
+        auditScope.launch {
+            // Load configuration
+            val config = configDao.getConfig()
+            if (config != null) {
+                isLoggingEnabled = config.enabled
+            } else {
+                // Create default configuration
+                val defaultConfig = AuditLogConfig(
+                    id = 1,
+                    enabled = true,
+                    retentionDays = 90,
+                    maxLogEntries = 100000,
+                    logLevel = AuditLogLevel.INFO,
+                    enableChangeTracking = true,
+                    enableSessionTracking = true,
+                    enablePerformanceTracking = true
+                )
+                configDao.insertConfig(defaultConfig)
+                isLoggingEnabled = true
+            }
+            
+            // Start log processor
+            startLogProcessor()
+        }
+    }
+    
+    /**
+     * Start log processor
+     */
+    private fun startLogProcessor() {
+        auditScope.launch {
+            while (true) {
+                try {
+                    if (logQueue.isNotEmpty()) {
+                        val batch = mutableListOf<AuditLogEntry>()
+                        
+                        // Process batch of logs
+                        repeat(100) {
+                            val log = logQueue.poll()
+                            if (log != null) {
+                                batch.add(log)
+                            } else {
+                                return@repeat
+                            }
+                        }
+                        
+                        if (batch.isNotEmpty()) {
+                            auditLogDao.insertAll(batch)
+                            
+                            // Clean up old logs if needed
+                            cleanupOldLogs()
+                        }
+                    }
+                    
+                    delay(1000) // Process every second
+                    
+                } catch (e: Exception) {
+                    // Handle error and continue
+                    delay(5000) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    /**
+     * Log an operation
+     */
+    fun logOperation(
+        userId: String,
+        entityType: String,
+        entityId: String,
+        operation: AuditOperation,
+        description: String,
+        beforeData: Map<String, Any>? = null,
+        afterData: Map<String, Any>? = null,
+        metadata: Map<String, Any>? = null,
+        logLevel: AuditLogLevel = AuditLogLevel.INFO
+    ) {
+        if (!isLoggingEnabled) return
+        
+        val entry = AuditLogEntry(
+            id = UUID.randomUUID().toString(),
+            userId = userId,
+            sessionId = currentSession?.id,
+            entityType = entityType,
+            entityId = entityId,
+            operation = operation,
+            description = description,
+            beforeData = beforeData,
+            afterData = afterData,
+            metadata = metadata,
+            timestamp = System.currentTimeMillis(),
+            logLevel = logLevel,
+            ipAddress = getCurrentIPAddress(),
+            userAgent = getCurrentUserAgent(),
+            deviceId = getCurrentDeviceId()
+        )
+        
+        logQueue.offer(entry)
+    }
+    
+    /**
+     * Log shipment operation
+     */
+    fun logShipmentOperation(
+        userId: String,
+        shipmentId: String,
+        operation: AuditOperation,
+        description: String,
+        beforeShipment: Map<String, Any>? = null,
+        afterShipment: Map<String, Any>? = null
+    ) {
+        logOperation(
+            userId = userId,
+            entityType = "SHIPMENT",
+            entityId = shipmentId,
+            operation = operation,
+            description = description,
+            beforeData = beforeShipment,
+            afterData = afterShipment,
+            metadata = mapOf(
+                "entityType" to "SHIPMENT",
+                "trackingNumber" to (beforeShipment?.get("trackingNumber") ?: afterShipment?.get("trackingNumber"))
+            )
+        )
+    }
+    
+    /**
+     * Log user operation
+     */
+    fun logUserOperation(
+        userId: String,
+        targetUserId: String,
+        operation: AuditOperation,
+        description: String,
+        beforeUser: Map<String, Any>? = null,
+        afterUser: Map<String, Any>? = null
+    ) {
+        logOperation(
+            userId = userId,
+            entityType = "USER",
+            entityId = targetUserId,
+            operation = operation,
+            description = description,
+            beforeData = beforeUser,
+            afterData = afterUser,
+            metadata = mapOf(
+                "entityType" to "USER",
+                "targetUserId" to targetUserId
+            )
+        )
+    }
+    
+    /**
+     * Log payment operation
+     */
+    fun logPaymentOperation(
+        userId: String,
+        paymentId: String,
+        operation: AuditOperation,
+        description: String,
+        beforePayment: Map<String, Any>? = null,
+        afterPayment: Map<String, Any>? = null
+    ) {
+        logOperation(
+            userId = userId,
+            entityType = "PAYMENT",
+            entityId = paymentId,
+            operation = operation,
+            description = description,
+            beforeData = beforePayment,
+            afterData = afterPayment,
+            metadata = mapOf(
+                "entityType" to "PAYMENT",
+                "paymentId" to paymentId,
+                "amount" to (beforePayment?.get("amount") ?: afterPayment?.get("amount"))
+            )
+        )
+    }
+    
+    /**
+     * Log status change
+     */
+    fun logStatusChange(
+        userId: String,
+        entityType: String,
+        entityId: String,
+        oldStatus: String,
+        newStatus: String,
+        reason: String? = null
+    ) {
+        logOperation(
+            userId = userId,
+            entityType = entityType,
+            entityId = entityId,
+            operation = AuditOperation.STATUS_CHANGE,
+            description = "Status changed from $oldStatus to $newStatus${reason?.let { " - $it" } ?: ""}",
+            beforeData = mapOf("status" to oldStatus),
+            afterData = mapOf("status" to newStatus),
+            metadata = mapOf(
+                "oldStatus" to oldStatus,
+                "newStatus" to newStatus,
+                "reason" to reason
+            )
+        )
+    }
+    
+    /**
+     * Start user session
+     */
+    fun startSession(userId: String, userType: String): String {
+        val session = AuditLogSession(
+            id = UUID.randomUUID().toString(),
+            userId = userId,
+            userType = userType,
+            startTime = System.currentTimeMillis(),
+            endTime = null,
+            ipAddress = getCurrentIPAddress(),
+            userAgent = getCurrentUserAgent(),
+            deviceId = getCurrentDeviceId(),
+            isActive = true
+        )
+        
+        auditScope.launch {
+            sessionDao.insertSession(session)
+        }
+        
+        currentSession = session
+        
+        // Log session start
+        logOperation(
+            userId = userId,
+            entityType = "SESSION",
+            entityId = session.id,
+            operation = AuditOperation.CREATE,
+            description = "User session started",
+            metadata = mapOf(
+                "sessionType" to "START",
+                "userType" to userType
+            )
+        )
+        
+        return session.id
+    }
+    
+    /**
+     * End user session
+     */
+    fun endSession(sessionId: String? = null) {
+        val session = sessionId?.let { 
+            auditScope.runBlocking { sessionDao.getSessionById(it) }
+        } ?: currentSession
+        
+        session?.let {
+            val endedSession = it.copy(
+                endTime = System.currentTimeMillis(),
+                isActive = false
+            )
+            
+            auditScope.launch {
+                sessionDao.updateSession(endedSession)
+            }
+            
+            // Log session end
+            logOperation(
+                userId = it.userId,
+                entityType = "SESSION",
+                entityId = it.id,
+                operation = AuditOperation.UPDATE,
+                description = "User session ended",
+                metadata = mapOf(
+                    "sessionType" to "END",
+                    "sessionDuration" to (endedSession.endTime!! - it.startTime)
+                )
+            )
+        }
+        
+        currentSession = null
+    }
+    
+    /**
+     * Get audit logs
+     */
+    suspend fun getAuditLogs(
+        entityType: String? = null,
+        entityId: String? = null,
+        userId: String? = null,
+        operation: AuditOperation? = null,
+        startDate: Long? = null,
+        endDate: Long? = null,
+        limit: Int = 100,
+        offset: Int = 0
+    ): List<AuditLogEntry> {
+        return auditLogDao.getAuditLogs(
+            entityType = entityType,
+            entityId = entityId,
+            userId = userId,
+            operation = operation,
+            startDate = startDate,
+            endDate = endDate,
+            limit = limit,
+            offset = offset
+        )
+    }
+    
+    /**
+     * Get audit logs by entity
+     */
+    suspend fun getEntityAuditHistory(
+        entityType: String,
+        entityId: String,
+        limit: Int = 50
+    ): List<AuditLogEntry> {
+        return auditLogDao.getEntityAuditHistory(entityType, entityId, limit)
+    }
+    
+    /**
+     * Get user audit history
+     */
+    suspend fun getUserAuditHistory(
+        userId: String,
+        limit: Int = 100
+    ): List<AuditLogEntry> {
+        return auditLogDao.getUserAuditHistory(userId, limit)
+    }
+    
+    /**
+     * Get audit statistics
+     */
+    suspend fun getAuditStatistics(): AuditStatistics {
+        val totalLogs = auditLogDao.getTotalLogCount()
+        val logsByType = auditLogDao.getLogsByEntityType()
+        val logsByOperation = auditLogDao.getLogsByOperation()
+        val logsByUser = auditLogDao.getLogsByUser()
+        val recentActivity = auditLogDao.getRecentActivity(24 * 60 * 60 * 1000L) // Last 24 hours
+        
+        return AuditStatistics(
+            totalLogs = totalLogs,
+            logsByEntityType = logsByType,
+            logsByOperation = logsByOperation,
+            logsByUser = logsByUser,
+            recentActivityCount = recentActivity.size,
+            oldestLogTimestamp = auditLogDao.getOldestLogTimestamp(),
+            newestLogTimestamp = auditLogDao.getNewestLogTimestamp()
+        )
+    }
+    
+    /**
+     * Search audit logs
+     */
+    suspend fun searchAuditLogs(
+        query: String,
+        limit: Int = 100
+    ): List<AuditLogEntry> {
+        return auditLogDao.searchAuditLogs(query, limit)
+    }
+    
+    /**
+     * Export audit logs
+     */
+    suspend fun exportAuditLogs(
+        startDate: Long,
+        endDate: Long,
+        format: ExportFormat = ExportFormat.JSON
+    ): String {
+        val logs = auditLogDao.getAuditLogsByDateRange(startDate, endDate)
+        
+        return when (format) {
+            ExportFormat.JSON -> gson.toJson(logs)
+            ExportFormat.CSV -> exportToCSV(logs)
+            ExportFormat.XML -> exportToXML(logs)
+        }
+    }
+    
+    /**
+     * Clean up old logs
+     */
+    private suspend fun cleanupOldLogs() {
+        val config = configDao.getConfig()
+        if (config != null && config.retentionDays > 0) {
+            val cutoffTime = System.currentTimeMillis() - (config.retentionDays * 24 * 60 * 60 * 1000L)
+            auditLogDao.deleteOldLogs(cutoffTime)
+        }
+    }
+    
+    /**
+     * Export to CSV
+     */
+    private fun exportToCSV(logs: List<AuditLogEntry>): String {
+        val csv = StringBuilder()
+        csv.appendLine("Timestamp,User ID,Entity Type,Entity ID,Operation,Description,IP Address")
+        
+        logs.forEach { log ->
+            csv.appendLine(
+                "${dateFormat.format(Date(log.timestamp))}," +
+                "${log.userId}," +
+                "${log.entityType}," +
+                "${log.entityId}," +
+                "${log.operation}," +
+                "\"${log.description.replace("\"", "\"\"")}\"," +
+                "${log.ipAddress}"
+            )
+        }
+        
+        return csv.toString()
+    }
+    
+    /**
+     * Export to XML
+     */
+    private fun exportToXML(logs: List<AuditLogEntry>): String {
+        val xml = StringBuilder()
+        xml.appendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+        xml.appendLine("<audit_logs>")
+        
+        logs.forEach { log ->
+            xml.appendLine("  <log>")
+            xml.appendLine("    <id>${log.id}</id>")
+            xml.appendLine("    <timestamp>${log.timestamp}</timestamp>")
+            xml.appendLine("    <userId>${log.userId}</userId>")
+            xml.appendLine("    <entityType>${log.entityType}</entityType>")
+            xml.appendLine("    <entityId>${log.entityId}</entityId>")
+            xml.appendLine("    <operation>${log.operation}</operation>")
+            xml.appendLine("    <description><![CDATA[${log.description}]]></description>")
+            xml.appendLine("    <ipAddress>${log.ipAddress}</ipAddress>")
+            xml.appendLine("  </log>")
+        }
+        
+        xml.appendLine("</audit_logs>")
+        return xml.toString()
+    }
+    
+    /**
+     * Update configuration
+     */
+    suspend fun updateConfiguration(config: AuditLogConfig) {
+        configDao.updateConfig(config)
+        isLoggingEnabled = config.enabled
+    }
+    
+    /**
+     * Get configuration
+     */
+    suspend fun getConfiguration(): AuditLogConfig? {
+        return configDao.getConfig()
+    }
+    
+    /**
+     * Enable/disable logging
+     */
+    fun setLoggingEnabled(enabled: Boolean) {
+        isLoggingEnabled = enabled
+        
+        auditScope.launch {
+            val config = configDao.getConfig()
+            config?.let {
+                val updatedConfig = it.copy(enabled = enabled)
+                configDao.updateConfig(updatedConfig)
+            }
+        }
+    }
+    
+    // Helper methods
+    private fun getCurrentIPAddress(): String {
+        // In a real implementation, this would get the actual IP address
+        return "127.0.0.1"
+    }
+    
+    private fun getCurrentUserAgent(): String {
+        // In a real implementation, this would get the actual user agent
+        return "Edham Logistics Android App"
+    }
+    
+    private fun getCurrentDeviceId(): String {
+        // In a real implementation, this would get the actual device ID
+        return "device_${System.currentTimeMillis()}"
+    }
+    
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        auditScope.cancel()
+        endSession()
+    }
+}
+
+/**
+ * Data Access Objects
+ */
+@Dao
+interface AuditLogDao {
+    @Query("SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT :limit OFFSET :offset")
+    suspend fun getAuditLogs(
+        entityType: String? = null,
+        entityId: String? = null,
+        userId: String? = null,
+        operation: AuditOperation? = null,
+        startDate: Long? = null,
+        endDate: Long? = null,
+        limit: Int,
+        offset: Int
+    ): List<AuditLogEntry>
+    
+    @Query("SELECT * FROM audit_logs WHERE entityType = :entityType AND entityId = :entityId ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getEntityAuditHistory(entityType: String, entityId: String, limit: Int): List<AuditLogEntry>
+    
+    @Query("SELECT * FROM audit_logs WHERE userId = :userId ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getUserAuditHistory(userId: String, limit: Int): List<AuditLogEntry>
+    
+    @Query("SELECT COUNT(*) FROM audit_logs")
+    suspend fun getTotalLogCount(): Int
+    
+    @Query("SELECT entityType, COUNT(*) as count FROM audit_logs GROUP BY entityType")
+    suspend fun getLogsByEntityType(): List<EntityTypeCount>
+    
+    @Query("SELECT operation, COUNT(*) as count FROM audit_logs GROUP BY operation")
+    suspend fun getLogsByOperation(): List<OperationCount>
+    
+    @Query("SELECT userId, COUNT(*) as count FROM audit_logs GROUP BY userId")
+    suspend fun getLogsByUser(): List<UserCount>
+    
+    @Query("SELECT * FROM audit_logs WHERE timestamp >= :startTime ORDER BY timestamp DESC")
+    suspend fun getRecentActivity(startTime: Long): List<AuditLogEntry>
+    
+    @Query("SELECT MIN(timestamp) FROM audit_logs")
+    suspend fun getOldestLogTimestamp(): Long?
+    
+    @Query("SELECT MAX(timestamp) FROM audit_logs")
+    suspend fun getNewestLogTimestamp(): Long?
+    
+    @Query("SELECT * FROM audit_logs WHERE description LIKE '%' || :query || '%' ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun searchAuditLogs(query: String, limit: Int): List<AuditLogEntry>
+    
+    @Query("SELECT * FROM audit_logs WHERE timestamp BETWEEN :startDate AND :endDate ORDER BY timestamp")
+    suspend fun getAuditLogsByDateRange(startDate: Long, endDate: Long): List<AuditLogEntry>
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(log: AuditLogEntry)
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(logs: List<AuditLogEntry>)
+    
+    @Query("DELETE FROM audit_logs WHERE timestamp < :cutoffTime")
+    suspend fun deleteOldLogs(cutoffTime: Long)
+}
+
+@Dao
+interface AuditLogSessionDao {
+    @Query("SELECT * FROM audit_sessions WHERE id = :id")
+    suspend fun getSessionById(id: String): AuditLogSession?
+    
+    @Query("SELECT * FROM audit_sessions WHERE userId = :userId AND isActive = 1")
+    suspend fun getActiveSession(userId: String): AuditLogSession?
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSession(session: AuditLogSession)
+    
+    @Update(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun updateSession(session: AuditLogSession)
+    
+    @Query("UPDATE audit_sessions SET isActive = 0 WHERE userId = :userId")
+    suspend fun endAllUserSessions(userId: String)
+}
+
+@Dao
+interface AuditLogConfigDao {
+    @Query("SELECT * FROM audit_log_config WHERE id = 1")
+    suspend fun getConfig(): AuditLogConfig?
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertConfig(config: AuditLogConfig)
+    
+    @Update(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun updateConfig(config: AuditLogConfig)
+}
+
+/**
+ * Type converters
+ */
+class AuditConverters {
+    @TypeConverter
+    fun fromStringMap(value: Map<String, Any>): String {
+        return Gson().toJson(value)
+    }
+    
+    @TypeConverter
+    fun toStringMap(value: String): Map<String, Any> {
+        val type = object : TypeToken<Map<String, Any>>() {}.type
+        return Gson().fromJson(value, type)
+    }
+    
+    @TypeConverter
+    fun fromAuditOperation(value: AuditOperation): String {
+        return value.name
+    }
+    
+    @TypeConverter
+    fun toAuditOperation(value: String): AuditOperation {
+        return AuditOperation.valueOf(value)
+    }
+    
+    @TypeConverter
+    fun fromAuditLogLevel(value: AuditLogLevel): String {
+        return value.name
+    }
+    
+    @TypeConverter
+    fun toAuditLogLevel(value: String): AuditLogLevel {
+        return AuditLogLevel.valueOf(value)
+    }
+}
+
+/**
+ * Data classes
+ */
+@Entity(tableName = "audit_logs")
+data class AuditLogEntry(
+    @PrimaryKey val id: String,
+    val userId: String,
+    val sessionId: String?,
+    val entityType: String,
+    val entityId: String,
+    val operation: AuditOperation,
+    val description: String,
+    val beforeData: Map<String, Any>?,
+    val afterData: Map<String, Any>?,
+    val metadata: Map<String, Any>?,
+    val timestamp: Long,
+    val logLevel: AuditLogLevel,
+    val ipAddress: String,
+    val userAgent: String,
+    val deviceId: String
+)
+
+@Entity(tableName = "audit_sessions")
+data class AuditLogSession(
+    @PrimaryKey val id: String,
+    val userId: String,
+    val userType: String,
+    val startTime: Long,
+    val endTime: Long?,
+    val ipAddress: String,
+    val userAgent: String,
+    val deviceId: String,
+    val isActive: Boolean
+)
+
+@Entity(tableName = "audit_log_config")
+data class AuditLogConfig(
+    @PrimaryKey val id: Int,
+    val enabled: Boolean,
+    val retentionDays: Int,
+    val maxLogEntries: Int,
+    val logLevel: AuditLogLevel,
+    val enableChangeTracking: Boolean,
+    val enableSessionTracking: Boolean,
+    val enablePerformanceTracking: Boolean
+)
+
+data class AuditStatistics(
+    val totalLogs: Int,
+    val logsByEntityType: List<EntityTypeCount>,
+    val logsByOperation: List<OperationCount>,
+    val logsByUser: List<UserCount>,
+    val recentActivityCount: Int,
+    val oldestLogTimestamp: Long?,
+    val newestLogTimestamp: Long?
+)
+
+data class EntityTypeCount(
+    val entityType: String,
+    val count: Int
+)
+
+data class OperationCount(
+    val operation: AuditOperation,
+    val count: Int
+)
+
+data class UserCount(
+    val userId: String,
+    val count: Int
+)
+
+enum class AuditOperation {
+    CREATE,
+    UPDATE,
+    DELETE,
+    VIEW,
+    LOGIN,
+    LOGOUT,
+    STATUS_CHANGE,
+    PAYMENT,
+    SHIPMENT_CREATE,
+    SHIPMENT_UPDATE,
+    SHIPMENT_DELETE,
+    USER_CREATE,
+    USER_UPDATE,
+    USER_DELETE,
+    SYSTEM_CONFIG_CHANGE
+}
+
+enum class AuditLogLevel {
+    DEBUG,
+    INFO,
+    WARNING,
+    ERROR,
+    CRITICAL
+}
+
+enum class ExportFormat {
+    JSON,
+    CSV,
+    XML
+}

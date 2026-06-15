@@ -21,7 +21,7 @@ class DebtAgingAdapter(
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val view = LayoutInflater.from(parent.context)
-            .inflate(R.layout.item_debt_aging, parent, false)
+            .inflate(R.layout.item_debt_aging_premium, parent, false)
         return ViewHolder(view)
     }
 

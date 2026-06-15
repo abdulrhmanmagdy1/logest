@@ -1,0 +1,672 @@
+package com.edham.logistics.auth
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.UserEntity
+import com.edham.logistics.data.remote.api.AuthApi
+import com.edham.logistics.data.remote.dto.request.LoginRequest
+import com.edham.logistics.data.remote.dto.request.RegisterRequest
+import com.edham.logistics.data.remote.dto.response.AuthResponse
+import com.edham.logistics.data.remote.dto.response.UserResponse
+import com.edham.logistics.security.SecureStorageManager
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.DeviceUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import java.util.Date
+import java.util.concurrent.Executor
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Authentication Manager - Centralized authentication system
+ * 
+ * Handles:
+ * - Login/Registration
+ * - JWT token management
+ * - Session management
+ * - Biometric authentication
+ * - Device management
+ * - Role-based permissions
+ */
+@Singleton
+class AuthenticationManager @Inject constructor(
+    private val context: Context,
+    private val authApi: AuthApi,
+    private val database: EdhamDatabase,
+    private val secureStorage: SecureStorageManager,
+    private val networkUtils: NetworkUtils,
+    private val deviceUtils: DeviceUtils
+) {
+    
+    private val _authState = MutableStateFlow<AuthState>(AuthState.Initial)
+    val authState: StateFlow<AuthState> = _authState.asStateFlow()
+    
+    private val _currentUser = MutableStateFlow<UserEntity?>(null)
+    val currentUser: StateFlow<UserEntity?> = _currentUser.asStateFlow()
+    
+    private val encryptedPrefs: SharedPreferences by lazy {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .setBlockModes(B arrayOf(MasterKey.BlockMode.GCM))
+            .setEncryptionPaddings(B arrayOf(MasterKey.EncryptionPadding.PKCS7_PADDING))
+            .setUserAuthenticationRequired(false)
+            .build()
+        
+        EncryptedSharedPreferences.create(
+            context,
+            "auth_prefs",
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+    
+    private val regularPrefs: SharedPreferences by lazy {
+        context.getSharedPreferences("auth_regular_prefs", Context.MODE_PRIVATE)
+    }
+    
+    // JWT Token Management
+    private var accessToken: String?
+        get() = encryptedPrefs.getString("access_token", null)
+        set(value) = encryptedPrefs.edit().putString("access_token", value).apply()
+    
+    private var refreshToken: String?
+        get() = encryptedPrefs.getString("refresh_token", null)
+        set(value) = encryptedPrefs.edit().putString("refresh_token", value).apply()
+    
+    private var tokenExpiry: Long
+        get() = encryptedPrefs.getLong("token_expiry", 0)
+        set(value) = encryptedPrefs.edit().putLong("token_expiry", value).apply()
+    
+    // Session Management
+    private var sessionId: String?
+        get() = encryptedPrefs.getString("session_id", null)
+        set(value) = encryptedPrefs.edit().putString("session_id", value).apply()
+    
+    private var lastActivity: Long
+        get() = encryptedPrefs.getLong("last_activity", 0)
+        set(value) = encryptedPrefs.edit().putLong("last_activity", value).apply()
+    
+    // Remember Me
+    private var rememberMe: Boolean
+        get() = regularPrefs.getBoolean("remember_me", false)
+        set(value) = regularPrefs.edit().putBoolean("remember_me", value).apply()
+    
+    // Device Management
+    private var deviceId: String
+        get() = encryptedPrefs.getString("device_id", "") ?: deviceUtils.getDeviceId()
+        set(value) = encryptedPrefs.edit().putString("device_id", value).apply()
+    
+    init {
+        initializeAuthState()
+    }
+    
+    private fun initializeAuthState() {
+        if (hasValidToken()) {
+            _authState.value = AuthState.Authenticated
+            loadCurrentUser()
+        } else {
+            _authState.value = AuthState.Unauthenticated
+        }
+    }
+    
+    /**
+     * Login with email and password
+     */
+    suspend fun login(email: String, password: String, remember: Boolean): Result<AuthResponse> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _authState.value = AuthState.Loading
+                
+                if (!networkUtils.isNetworkAvailable()) {
+                    _authState.value = AuthState.Error("No internet connection")
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val deviceInfo = deviceUtils.getDeviceInfo()
+                val request = LoginRequest(
+                    email = email,
+                    password = password,
+                    deviceId = deviceId,
+                    deviceInfo = deviceInfo,
+                    rememberMe = remember
+                )
+                
+                val response = authApi.login(request)
+                
+                if (response.isSuccessful) {
+                    val authResponse = response.body()!!
+                    handleAuthSuccess(authResponse, remember)
+                    Result.success(authResponse)
+                } else {
+                    val error = response.errorBody()?.string() ?: "Login failed"
+                    _authState.value = AuthState.Error(error)
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                _authState.value = AuthState.Error(e.message ?: "Login failed")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Register new user
+     */
+    suspend fun register(
+        name: String,
+        email: String,
+        password: String,
+        phone: String,
+        role: UserRole
+    ): Result<AuthResponse> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _authState.value = AuthState.Loading
+                
+                if (!networkUtils.isNetworkAvailable()) {
+                    _authState.value = AuthState.Error("No internet connection")
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val deviceInfo = deviceUtils.getDeviceInfo()
+                val request = RegisterRequest(
+                    name = name,
+                    email = email,
+                    password = password,
+                    phone = phone,
+                    role = role,
+                    deviceId = deviceId,
+                    deviceInfo = deviceInfo
+                )
+                
+                val response = authApi.register(request)
+                
+                if (response.isSuccessful) {
+                    val authResponse = response.body()!!
+                    handleAuthSuccess(authResponse, false)
+                    Result.success(authResponse)
+                } else {
+                    val error = response.errorBody()?.string() ?: "Registration failed"
+                    _authState.value = AuthState.Error(error)
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                _authState.value = AuthState.Error(e.message ?: "Registration failed")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Logout user
+     */
+    suspend fun logout(logoutAllDevices: Boolean = false): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _authState.value = AuthState.Loading
+                
+                if (networkUtils.isNetworkAvailable()) {
+                    val response = authApi.logout(
+                        deviceId = if (logoutAllDevices) null else deviceId,
+                        sessionId = sessionId
+                    )
+                    // Don't fail if logout API fails, continue with local cleanup
+                }
+                
+                clearAuthData()
+                _authState.value = AuthState.Unauthenticated
+                _currentUser.value = null
+                
+                Result.success(Unit)
+                
+            } catch (e: Exception) {
+                // Still clear local data even if API call fails
+                clearAuthData()
+                _authState.value = AuthState.Unauthenticated
+                _currentUser.value = null
+                Result.success(Unit)
+            }
+        }
+    }
+    
+    /**
+     * Refresh access token
+     */
+    suspend fun refreshToken(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val currentRefreshToken = refreshToken ?: return@withContext Result.failure(Exception("No refresh token"))
+                
+                if (!networkUtils.isNetworkAvailable()) {
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val response = authApi.refreshToken(currentRefreshToken)
+                
+                if (response.isSuccessful) {
+                    val authResponse = response.body()!!
+                    updateTokens(authResponse.accessToken, authResponse.refreshToken, authResponse.expiresIn)
+                    Result.success(true)
+                } else {
+                    // Refresh token invalid, logout
+                    logout()
+                    Result.failure(Exception("Session expired"))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Send OTP for verification
+     */
+    suspend fun sendOTP(phone: String): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!networkUtils.isNetworkAvailable()) {
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val response = authApi.sendOTP(phone)
+                
+                if (response.isSuccessful) {
+                    val otpResponse = response.body()!!
+                    Result.success(otpResponse.otpId)
+                } else {
+                    val error = response.errorBody()?.string() ?: "Failed to send OTP"
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Verify OTP
+     */
+    suspend fun verifyOTP(otpId: String, code: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!networkUtils.isNetworkAvailable()) {
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val response = authApi.verifyOTP(otpId, code)
+                
+                if (response.isSuccessful) {
+                    val verifyResponse = response.body()!!
+                    Result.success(verifyResponse.verified)
+                } else {
+                    val error = response.errorBody()?.string() ?: "OTP verification failed"
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Forgot password
+     */
+    suspend fun forgotPassword(email: String): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!networkUtils.isNetworkAvailable()) {
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val response = authApi.forgotPassword(email)
+                
+                if (response.isSuccessful) {
+                    val forgotResponse = response.body()!!
+                    Result.success(forgotResponse.resetToken)
+                } else {
+                    val error = response.errorBody()?.string() ?: "Failed to send reset email"
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Reset password
+     */
+    suspend fun resetPassword(token: String, newPassword: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!networkUtils.isNetworkAvailable()) {
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val response = authApi.resetPassword(token, newPassword)
+                
+                if (response.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    val error = response.errorBody()?.string() ?: "Password reset failed"
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Biometric authentication
+     */
+    fun authenticateWithBiometric(
+        activity: FragmentActivity,
+        title: String = "Biometric Authentication",
+        subtitle: String = "Confirm your identity",
+        negativeButtonText: String = "Cancel",
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        val executor = ContextCompat.getMainExecutor(activity)
+        val biometricPrompt = BiometricPrompt(
+            activity,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    super.onAuthenticationSucceeded(result)
+                    onSuccess()
+                }
+                
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+                    onError("Authentication failed")
+                }
+                
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    super.onAuthenticationError(errorCode, errString)
+                    onError(errString.toString())
+                }
+            }
+        )
+        
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle(title)
+            .setSubtitle(subtitle)
+            .setNegativeButtonText(negativeButtonText)
+            .build()
+        
+        biometricPrompt.authenticate(promptInfo)
+    }
+    
+    /**
+     * Check if user has specific permission
+     */
+    fun hasPermission(permission: Permission): Boolean {
+        val user = _currentUser.value ?: return false
+        return user.role.permissions.contains(permission)
+    }
+    
+    /**
+     * Check if user has any of the specified roles
+     */
+    fun hasRole(vararg roles: UserRole): Boolean {
+        val user = _currentUser.value ?: return false
+        return roles.contains(user.role)
+    }
+    
+    /**
+     * Get current user's role
+     */
+    fun getCurrentRole(): UserRole? {
+        return _currentUser.value?.role
+    }
+    
+    /**
+     * Check if token is valid
+     */
+    fun hasValidToken(): Boolean {
+        val token = accessToken ?: return false
+        val expiry = tokenExpiry
+        return token.isNotEmpty() && System.currentTimeMillis() < expiry
+    }
+    
+    /**
+     * Get access token for API calls
+     */
+    fun getAccessToken(): String? {
+        return if (hasValidToken()) accessToken else null
+    }
+    
+    /**
+     * Handle successful authentication
+     */
+    private fun handleAuthSuccess(authResponse: AuthResponse, remember: Boolean) {
+        updateTokens(authResponse.accessToken, authResponse.refreshToken, authResponse.expiresIn)
+        sessionId = authResponse.sessionId
+        rememberMe = remember
+        lastActivity = System.currentTimeMillis()
+        
+        // Save user data
+        val userEntity = authResponse.user.toEntity()
+        database.userDao().insertUser(userEntity)
+        _currentUser.value = userEntity
+        
+        _authState.value = AuthState.Authenticated
+    }
+    
+    /**
+     * Update tokens
+     */
+    private fun updateTokens(accessToken: String, refreshToken: String, expiresIn: Long) {
+        this.accessToken = accessToken
+        this.refreshToken = refreshToken
+        this.tokenExpiry = System.currentTimeMillis() + (expiresIn * 1000)
+    }
+    
+    /**
+     * Clear all authentication data
+     */
+    private fun clearAuthData() {
+        encryptedPrefs.edit().clear().apply()
+        regularPrefs.edit().clear().apply()
+    }
+    
+    /**
+     * Load current user from database
+     */
+    private suspend fun loadCurrentUser() {
+        try {
+            val user = database.userDao().getCurrentUser()
+            _currentUser.value = user
+        } catch (e: Exception) {
+            // User not found, logout
+            logout()
+        }
+    }
+    
+    /**
+     * Update last activity timestamp
+     */
+    fun updateLastActivity() {
+        lastActivity = System.currentTimeMillis()
+    }
+    
+    /**
+     * Check if session is still valid
+     */
+    fun isSessionValid(): Boolean {
+        val last = lastActivity
+        val sessionTimeout = 30 * 60 * 1000L // 30 minutes
+        return System.currentTimeMillis() - last < sessionTimeout
+    }
+    
+    /**
+     * Get all devices for current user
+     */
+    suspend fun getUserDevices(): Result<List<DeviceInfo>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!networkUtils.isNetworkAvailable()) {
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val response = authApi.getUserDevices()
+                
+                if (response.isSuccessful) {
+                    val devices = response.body() ?: emptyList()
+                    Result.success(devices)
+                } else {
+                    val error = response.errorBody()?.string() ?: "Failed to get devices"
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Revoke device access
+     */
+    suspend fun revokeDevice(deviceId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!networkUtils.isNetworkAvailable()) {
+                    return@withContext Result.failure(Exception("No internet connection"))
+                }
+                
+                val response = authApi.revokeDevice(deviceId)
+                
+                if (response.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    val error = response.errorBody()?.string() ?: "Failed to revoke device"
+                    Result.failure(Exception(error))
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+}
+
+/**
+ * Authentication state
+ */
+sealed class AuthState {
+    object Initial : AuthState()
+    object Loading : AuthState()
+    object Authenticated : AuthState()
+    object Unauthenticated : AuthState()
+    data class Error(val message: String) : AuthState()
+}
+
+/**
+ * User roles with permissions
+ */
+enum class UserRole(val displayName: String, val permissions: Set<Permission>) {
+    ADMIN("Administrator", Permission.values().toSet()),
+    DISPATCHER("Dispatcher", setOf(
+        Permission.VIEW_SHIPMENTS,
+        Permission.CREATE_SHIPMENT,
+        Permission.EDIT_SHIPMENT,
+        Permission.ASSIGN_DRIVER,
+        Permission.VIEW_DRIVERS,
+        Permission.VIEW_VEHICLES,
+        Permission.TRACK_SHIPMENT
+    )),
+    DRIVER("Driver", setOf(
+        Permission.VIEW_ASSIGNED_SHIPMENTS,
+        Permission.UPDATE_SHIPMENT_STATUS,
+        Permission.VIEW_VEHICLE_INFO,
+        Permission.NAVIGATION,
+        Permission.REPORT_ISSUE
+    )),
+    ACCOUNTANT("Accountant", setOf(
+        Permission.VIEW_FINANCIAL_REPORTS,
+        Permission.VIEW_INVOICES,
+        Permission.CREATE_INVOICE,
+        Permission.EDIT_INVOICE,
+        Permission.VIEW_PAYMENT_HISTORY
+    )),
+    FLEET_MANAGER("Fleet Manager", setOf(
+        Permission.VIEW_VEHICLES,
+        Permission.ADD_VEHICLE,
+        Permission.EDIT_VEHICLE,
+        Permission.DELETE_VEHICLE,
+        Permission.VIEW_DRIVERS,
+        Permission.ADD_DRIVER,
+        Permission.EDIT_DRIVER,
+        Permission.VIEW_MAINTENANCE,
+        Permission.SCHEDULE_MAINTENANCE
+    ))
+}
+
+/**
+ * System permissions
+ */
+enum class Permission {
+    // Shipment permissions
+    VIEW_SHIPMENTS,
+    CREATE_SHIPMENT,
+    EDIT_SHIPMENT,
+    DELETE_SHIPMENT,
+    ASSIGN_DRIVER,
+    TRACK_SHIPMENT,
+    VIEW_ASSIGNED_SHIPMENTS,
+    UPDATE_SHIPMENT_STATUS,
+    
+    // Driver permissions
+    VIEW_DRIVERS,
+    ADD_DRIVER,
+    EDIT_DRIVER,
+    DELETE_DRIVER,
+    
+    // Vehicle permissions
+    VIEW_VEHICLES,
+    ADD_VEHICLE,
+    EDIT_VEHICLE,
+    DELETE_VEHICLE,
+    VIEW_VEHICLE_INFO,
+    
+    // Fleet permissions
+    VIEW_MAINTENANCE,
+    SCHEDULE_MAINTENANCE,
+    
+    // Financial permissions
+    VIEW_FINANCIAL_REPORTS,
+    VIEW_INVOICES,
+    CREATE_INVOICE,
+    EDIT_INVOICE,
+    VIEW_PAYMENT_HISTORY,
+    
+    // System permissions
+    NAVIGATION,
+    REPORT_ISSUE,
+    MANAGE_USERS,
+    VIEW_ANALYTICS,
+    EXPORT_DATA
+}

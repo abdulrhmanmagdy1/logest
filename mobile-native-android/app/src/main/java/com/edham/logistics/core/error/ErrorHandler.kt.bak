@@ -1,0 +1,348 @@
+package com.edham.logistics.core.error
+
+import android.content.Context
+import android.util.Log
+import com.edham.logistics.core.network.NetworkException
+import com.edham.logistics.core.network.ServerException
+import com.edham.logistics.core.network.TimeoutException
+import com.edham.logistics.core.network.UnknownHostException
+import com.edham.logistics.core.utils.Result
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flow
+import retrofit2.HttpException
+import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Comprehensive error handling system for production readiness
+ */
+@Singleton
+class ErrorHandler @Inject constructor(
+    private val context: Context,
+    private val crashReporter: CrashReporter
+) {
+
+    companion object {
+        private const val TAG = "ErrorHandler"
+    }
+
+    /**
+     * Global coroutine exception handler
+     */
+    val globalExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        handleError(throwable, "GlobalCoroutineException")
+    }
+
+    /**
+     * Handle and categorize errors
+     */
+    fun handleError(throwable: Throwable, context: String = "Unknown"): ErrorResult {
+        Log.e(TAG, "Error in $context", throwable)
+        
+        val errorResult = when (throwable) {
+            is NetworkException -> ErrorResult.NetworkError(
+                message = getNetworkErrorMessage(throwable),
+                isRecoverable = throwable.isRecoverable,
+                shouldRetry = throwable.shouldRetry
+            )
+            
+            is ServerException -> ErrorResult.ServerError(
+                message = getServerErrorMessage(throwable),
+                errorCode = throwable.errorCode,
+                isRecoverable = throwable.isRecoverable
+            )
+            
+            is TimeoutException -> ErrorResult.TimeoutError(
+                message = "انتهت مهلة الاتصال. يرجى المحاولة مرة أخرى",
+                shouldRetry = true
+            )
+            
+            is UnknownHostException -> ErrorResult.NetworkError(
+                message = "لا يمكن الاتصال بالخادم. يرجى التحقق من اتصال الإنترنت",
+                isRecoverable = true,
+                shouldRetry = true
+            )
+            
+            is SocketTimeoutException -> ErrorResult.TimeoutError(
+                message = "انتهت مهلة الاتصال. يرجى المحاولة مرة أخرى",
+                shouldRetry = true
+            )
+            
+            is IOException -> ErrorResult.NetworkError(
+                message = "خطأ في الاتصال. يرجى التحقق من اتصال الإنترنت",
+                isRecoverable = true,
+                shouldRetry = true
+            )
+            
+            is HttpException -> handleHttpException(throwable)
+            
+            is SecurityException -> ErrorResult.SecurityError(
+                message = "خطأ أمني. يرجى تسجيل الدخول مرة أخرى",
+                shouldLogout = true
+            )
+            
+            is IllegalArgumentException -> ErrorResult.ValidationError(
+                message = "بيانات غير صالحة: ${throwable.message}"
+            )
+            
+            is IllegalStateException -> ErrorResult.StateError(
+                message = "حالة غير صالحة: ${throwable.message}"
+            )
+            
+            else -> ErrorResult.UnknownError(
+                message = "حدث خطأ غير متوقع. يرجى المحاولة مرة أخرى",
+                shouldReport = true
+            )
+        }
+
+        // Report critical errors
+        if (errorResult.shouldReport) {
+            crashReporter.reportError(throwable, context, errorResult)
+        }
+
+        return errorResult
+    }
+
+    /**
+     * Handle HTTP exceptions with proper categorization
+     */
+    private fun handleHttpException(exception: HttpException): ErrorResult {
+        val statusCode = exception.code()
+        val errorBody = exception.response()?.errorBody()?.string()
+        
+        return when (statusCode) {
+            in 400..499 -> ErrorResult.ClientError(
+                message = getClientErrorMessage(statusCode, errorBody),
+                errorCode = statusCode,
+                shouldLogout = statusCode == 401
+            )
+            
+            in 500..599 -> ErrorResult.ServerError(
+                message = getServerErrorMessage(statusCode, errorBody),
+                errorCode = statusCode,
+                isRecoverable = true
+            )
+            
+            else -> ErrorResult.UnknownError(
+                message = "خطأ في الاتصال: $statusCode",
+                shouldReport = true
+            )
+        }
+    }
+
+    /**
+     * Safe wrapper for API calls with error handling
+     */
+    suspend fun <T> safeApiCall(
+        apiCall: suspend () -> T,
+        context: String = "API Call"
+    ): Result<T> {
+        return try {
+            val result = apiCall()
+            Result.Success(result)
+        } catch (e: Exception) {
+            val errorResult = handleError(e, context)
+            Result.Error(errorResult.toException())
+        }
+    }
+
+    /**
+     * Safe wrapper for Flow operations with error handling
+     */
+    fun <T> safeFlow(
+        context: String = "Flow Operation",
+        operation: suspend () -> Flow<T>
+    ): Flow<Result<T>> = flow {
+        try {
+            operation().collect { value ->
+                emit(Result.Success(value))
+            }
+        } catch (e: Exception) {
+            val errorResult = handleError(e, context)
+            emit(Result.Error(errorResult.toException()))
+        }
+    }.catch { e ->
+        val errorResult = handleError(e, context)
+        emit(Result.Error(errorResult.toException()))
+    }
+
+    /**
+     * Get user-friendly error messages
+     */
+    private fun getNetworkErrorMessage(exception: NetworkException): String {
+        return when (exception.type) {
+            NetworkException.Type.NO_INTERNET -> "لا يوجد اتصال بالإنترنت"
+            NetworkException.Type.SLOW_CONNECTION -> "اتصال الإنترنت بطيء"
+            NetworkException.Type.TIMEOUT -> "انتهت مهلة الاتصال"
+            NetworkException.Type.UNKNOWN -> "خطأ في الاتصال بالإنترنت"
+        }
+    }
+
+    private fun getServerErrorMessage(exception: ServerException): String {
+        return when (exception.errorCode) {
+            401 -> "انتهت صلاحية الدخول. يرجى تسجيل الدخول مرة أخرى"
+            403 -> "ليس لديك صلاحية للوصول إلى هذه البيانات"
+            404 -> "البيانات المطلوبة غير موجودة"
+            429 -> "تجاوزت عدد المحاولات المسموح بها. يرجى المحاولة لاحقاً"
+            500 -> "خطأ داخلي في الخادم. يرجى المحاولة مرة أخرى"
+            502 -> "الخادم غير متاحر حالياً"
+            503 -> "الخدمة غير متاحة للصيانة"
+            else -> exception.message ?: "خطأ في الخادم"
+        }
+    }
+
+    private fun getClientErrorMessage(statusCode: Int, errorBody: String?): String {
+        return when (statusCode) {
+            400 -> "بيانات الطلب غير صالحة"
+            401 -> "انتهت صلاحية الدخول. يرجى تسجيل الدخول مرة أخرى"
+            403 -> "ليس لديك صلاحية للوصول إلى هذه البيانات"
+            404 -> "البيانات المطلوبة غير موجودة"
+            409 -> "تعارض في البيانات"
+            422 -> "البيانات المرسلة غير صالحة"
+            429 -> "تجاوزت عدد المحاولات المسموح بها"
+            else -> "خطأ في الطلب: $statusCode"
+        }
+    }
+
+    private fun getServerErrorMessage(statusCode: Int, errorBody: String?): String {
+        return when (statusCode) {
+            500 -> "خطأ داخلي في الخادم"
+            502 -> "الخادم غير متاحر حالياً"
+            503 -> "الخدمة غير متاحة للصيانة"
+            504 -> "انتهت مهلة الخادم"
+            else -> "خطأ في الخادم: $statusCode"
+        }
+    }
+
+    /**
+     * Check if error is recoverable
+     */
+    fun isRecoverableError(throwable: Throwable): Boolean {
+        return when (val errorResult = handleError(throwable)) {
+            is ErrorResult.NetworkError -> errorResult.isRecoverable
+            is ErrorResult.ServerError -> errorResult.isRecoverable
+            is ErrorResult.TimeoutError -> errorResult.shouldRetry
+            else -> false
+        }
+    }
+
+    /**
+     * Check if user should be logged out
+     */
+    fun shouldLogout(throwable: Throwable): Boolean {
+        return when (val errorResult = handleError(throwable)) {
+            is ErrorResult.SecurityError -> errorResult.shouldLogout
+            is ErrorResult.ClientError -> errorResult.shouldLogout
+            else -> false
+        }
+    }
+
+    /**
+     * Get retry delay in milliseconds
+     */
+    fun getRetryDelay(throwable: Throwable, attemptCount: Int): Long {
+        val baseDelay = 1000L // 1 second
+        val maxDelay = 30000L // 30 seconds
+        val delay = baseDelay * (1 shl attemptCount.coerceAtMost(5))
+        return delay.coerceAtMost(maxDelay)
+    }
+}
+
+/**
+ * Sealed class for different error types
+ */
+sealed class ErrorResult {
+    abstract val message: String
+    abstract val shouldReport: Boolean
+
+    data class NetworkError(
+        override val message: String,
+        val isRecoverable: Boolean = true,
+        val shouldRetry: Boolean = true,
+        override val shouldReport: Boolean = false
+    ) : ErrorResult()
+
+    data class ServerError(
+        override val message: String,
+        val errorCode: Int? = null,
+        val isRecoverable: Boolean = false,
+        override val shouldReport: Boolean = true
+    ) : ErrorResult()
+
+    data class ClientError(
+        override val message: String,
+        val errorCode: Int,
+        val shouldLogout: Boolean = false,
+        override val shouldReport: Boolean = false
+    ) : ErrorResult()
+
+    data class TimeoutError(
+        override val message: String,
+        val shouldRetry: Boolean = true,
+        override val shouldReport: Boolean = false
+    ) : ErrorResult()
+
+    data class SecurityError(
+        override val message: String,
+        val shouldLogout: Boolean = true,
+        override val shouldReport: Boolean = true
+    ) : ErrorResult()
+
+    data class ValidationError(
+        override val message: String,
+        override val shouldReport: Boolean = false
+    ) : ErrorResult()
+
+    data class StateError(
+        override val message: String,
+        override val shouldReport: Boolean = false
+    ) : ErrorResult()
+
+    data class UnknownError(
+        override val message: String,
+        override val shouldReport: Boolean = true
+    ) : ErrorResult()
+
+    /**
+     * Convert to Exception for Result wrapper
+     */
+    fun toException(): Exception {
+        return when (this) {
+            is NetworkError -> NetworkException(message, isRecoverable, shouldRetry)
+            is ServerError -> ServerException(message, errorCode ?: 0, isRecoverable)
+            is ClientError -> ServerException(message, errorCode, false)
+            is TimeoutError -> TimeoutException(message)
+            is SecurityError -> SecurityException(message)
+            is ValidationError -> IllegalArgumentException(message)
+            is StateError -> IllegalStateException(message)
+            is UnknownError -> RuntimeException(message)
+        }
+    }
+}
+
+/**
+ * Custom exception classes
+ */
+class NetworkException(
+    message: String,
+    val isRecoverable: Boolean = true,
+    val shouldRetry: Boolean = true,
+    val type: Type = Type.UNKNOWN
+) : Exception(message) {
+    enum class Type {
+        NO_INTERNET, SLOW_CONNECTION, TIMEOUT, UNKNOWN
+    }
+}
+
+class ServerException(
+    message: String,
+    val errorCode: Int,
+    val isRecoverable: Boolean = false
+) : Exception(message)
+
+class TimeoutException(message: String) : Exception(message)

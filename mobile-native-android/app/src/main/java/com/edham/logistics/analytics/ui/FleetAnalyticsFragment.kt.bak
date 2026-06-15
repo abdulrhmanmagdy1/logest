@@ -1,0 +1,865 @@
+package com.edham.logistics.analytics.ui
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.edham.logistics.analytics.AnalyticsEngineService
+import com.edham.logistics.analytics.FleetAnalytics
+import com.edham.logistics.core.ui.OverviewMetric
+import com.edham.logistics.ui.theme.*
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Fleet Analytics Fragment - Comprehensive fleet analytics and insights
+ * 
+ * Features:
+ * - Fleet overview statistics
+ * - Vehicle utilization metrics
+ * - Performance analytics
+ * - Cost analysis
+ * - Maintenance insights
+ * - Interactive charts
+ * - Filtering and date ranges
+ */
+@AndroidEntryPoint
+class FleetAnalyticsFragment : Fragment() {
+    
+    @Inject
+    lateinit var analyticsEngineService: AnalyticsEngineService
+    
+    private val viewModel: FleetAnalyticsViewModel by viewModels()
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        return ComposeView(requireContext()).apply {
+            setContent {
+                EdhamLogisticsTheme {
+                    FleetAnalyticsScreen(
+                        viewModel = viewModel,
+                        analyticsEngineService = analyticsEngineService
+                    )
+                }
+            }
+        }
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        // Initialize analytics engine
+        lifecycleScope.launch {
+            analyticsEngineService.initialize()
+        }
+        
+        // Load fleet analytics
+        viewModel.loadFleetAnalytics()
+    }
+}
+
+@Composable
+fun FleetAnalyticsScreen(
+    viewModel: FleetAnalyticsViewModel,
+    analyticsEngineService: AnalyticsEngineService
+) {
+    val fleetAnalytics by viewModel.fleetAnalytics.collectAsStateWithLifecycle()
+    val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
+    val selectedTimeRange by viewModel.selectedTimeRange.collectAsStateWithLifecycle()
+    
+    LaunchedEffect(selectedTimeRange) {
+        viewModel.loadFleetAnalytics()
+    }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Header with time range selector
+        FleetAnalyticsHeader(
+            selectedTimeRange = selectedTimeRange,
+            onTimeRangeChanged = viewModel::setTimeRange,
+            onRefresh = viewModel::refreshAnalytics,
+            isLoading = isLoading
+        )
+        
+        // Error message
+        errorMessage?.let { error ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = ErrorRed.copy(alpha = 0.1f)
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            ) {
+                Text(
+                    text = error,
+                    modifier = Modifier.padding(16.dp),
+                    color = ErrorRed,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+        }
+        
+        // Fleet Overview
+        fleetAnalytics?.let { analytics ->
+            FleetOverviewSection(analytics = analytics)
+            
+            // Vehicle Utilization
+            VehicleUtilizationSection(analytics = analytics)
+            
+            // Performance Metrics
+            PerformanceMetricsSection(analytics = analytics)
+            
+            // Cost Analysis
+            CostAnalysisSection(analytics = analytics)
+            
+            // Maintenance Insights
+            MaintenanceInsightsSection(analytics = analytics)
+            
+            // Fleet Status Breakdown
+            FleetStatusBreakdownSection(analytics = analytics)
+        }
+        
+        // Loading indicator
+        if (isLoading) {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(
+                    color = EdhamOrange,
+                    strokeWidth = 3.dp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun FleetAnalyticsHeader(
+    selectedTimeRange: TimeRange,
+    onTimeRangeChanged: (TimeRange) -> Unit,
+    onRefresh: () -> Unit,
+    isLoading: Boolean
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Fleet Analytics",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = EdhamOrange,
+                    fontWeight = FontWeight.Bold
+                )
+                
+                Row {
+                    // Time range selector
+                    TimeRangeSelector(
+                        selectedTimeRange = selectedTimeRange,
+                        onTimeRangeChanged = onTimeRangeChanged
+                    )
+                    
+                    Spacer(modifier = Modifier.width(8.dp))
+                    
+                    // Refresh button
+                    IconButton(
+                        onClick = onRefresh,
+                        enabled = !isLoading
+                    ) {
+                        Icon(
+                            painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_rotate),
+                            contentDescription = "Refresh",
+                            tint = EdhamOrange
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TimeRangeSelector(
+    selectedTimeRange: TimeRange,
+    onTimeRangeChanged: (TimeRange) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    
+    OutlinedButton(
+        onClick = { expanded = true },
+        colors = ButtonDefaults.outlinedButtonColors(
+            contentColor = EdhamOrange,
+            borderColor = EdhamOrange
+        )
+    ) {
+        Text(
+            text = selectedTimeRange.displayName,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium
+        )
+        
+        Icon(
+            painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.arrow_down_float),
+            contentDescription = "Dropdown",
+            tint = EdhamOrange
+        )
+        
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            TimeRange.values().forEach { timeRange ->
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = timeRange.displayName,
+                            color = if (timeRange == selectedTimeRange) EdhamOrange 
+                            else MaterialTheme.colorScheme.onSurface
+                        )
+                    },
+                    onClick = {
+                        onTimeRangeChanged(timeRange)
+                        expanded = false
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun FleetOverviewSection(analytics: FleetAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Fleet Overview",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    OverviewMetric(
+                        title = "Total Vehicles",
+                        value = analytics.totalVehicles.toString(),
+                        subtitle = "In fleet",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_camera),
+                        color = IceBlue
+                    )
+                }
+                
+                item {
+                    OverviewMetric(
+                        title = "Active Vehicles",
+                        value = analytics.activeVehicles.toString(),
+                        subtitle = "Currently operational",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_play),
+                        color = SuccessGreen
+                    )
+                }
+                
+                item {
+                    OverviewMetric(
+                        title = "Fleet Utilization",
+                        value = "${String.format("%.1f", analytics.fleetUtilization)}%",
+                        subtitle = "Average utilization rate",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_more),
+                        color = EdhamOrange
+                    )
+                }
+                
+                item {
+                    OverviewMetric(
+                        title = "Average Age",
+                        value = "${analytics.averageVehicleAge} years",
+                        subtitle = "Fleet average",
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_recent_history),
+                        color = WarningYellow
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun VehicleUtilizationSection(analytics: FleetAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Vehicle Utilization",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            // Utilization chart placeholder
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(200.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        painter = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_gallery),
+                        contentDescription = "Chart",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Text(
+                        text = "Utilization Chart",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    
+                    Text(
+                        text = "Interactive chart coming soon",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    )
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            // Utilization metrics
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                item {
+                    UtilizationMetric(
+                        title = "Most Utilized",
+                        value = analytics.mostUtilizedVehicleType,
+                        percentage = analytics.mostUtilizedPercentage
+                    )
+                }
+                
+                item {
+                    UtilizationMetric(
+                        title = "Least Utilized",
+                        value = analytics.leastUtilizedVehicleType,
+                        percentage = analytics.leastUtilizedPercentage
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun UtilizationMetric(
+    title: String,
+    value: String,
+    percentage: Float
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+                color = EdhamOrange
+            )
+            
+            Spacer(modifier = Modifier.width(8.dp))
+            
+            Text(
+                text = "(${String.format("%.1f", percentage)}%)",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+            )
+        }
+    }
+}
+
+@Composable
+fun PerformanceMetricsSection(analytics: FleetAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Performance Metrics",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    PerformanceMetric(
+                        title = "Average Daily Distance",
+                        value = "${String.format("%.0f", analytics.averageDailyDistance)} km",
+                        change = analytics.dailyDistanceChange,
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_directions),
+                        color = IceBlue
+                    )
+                }
+                
+                item {
+                    PerformanceMetric(
+                        title = "Fuel Efficiency",
+                        value = "${String.format("%.1f", analytics.averageFuelEfficiency)} km/L",
+                        change = analytics.fuelEfficiencyChange,
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_save),
+                        color = SuccessGreen
+                    )
+                }
+                
+                item {
+                    PerformanceMetric(
+                        title = "Maintenance Cost/km",
+                        value = "SAR ${String.format("%.2f", analytics.maintenanceCostPerKm)}",
+                        change = analytics.maintenanceCostChange,
+                        icon = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_info_details),
+                        color = WarningYellow
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PerformanceMetric(
+    title: String,
+    value: String,
+    change: Float,
+    icon: androidx.compose.ui.graphics.painter.Painter,
+    color: Color
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Card(
+            modifier = Modifier.size(40.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = color.copy(alpha = 0.1f)
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    painter = icon,
+                    contentDescription = null,
+                    tint = color,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
+        
+        Spacer(modifier = Modifier.width(12.dp))
+        
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+            )
+            
+            Text(
+                text = value,
+                style = MaterialTheme.typography.titleMedium,
+                color = color,
+                fontWeight = FontWeight.Bold
+            )
+        }
+        
+        // Change indicator
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                painter = androidx.compose.ui.res.painterResource(
+                    id = if (change > 0) android.R.drawable.arrow_up_float 
+                    else android.R.drawable.arrow_down_float
+                ),
+                contentDescription = null,
+                tint = if (change > 0) SuccessGreen else ErrorRed,
+                modifier = Modifier.size(16.dp)
+            )
+            
+            Spacer(modifier = Modifier.width(4.dp))
+            
+            Text(
+                text = "${String.format("%.1f", kotlin.math.abs(change))}%",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (change > 0) SuccessGreen else ErrorRed,
+                fontWeight = FontWeight.Medium
+            )
+        }
+    }
+}
+
+@Composable
+fun CostAnalysisSection(analytics: FleetAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Cost Analysis",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    CostMetric(
+                        title = "Total Operating Cost",
+                        value = "SAR ${String.format("%,.2f", analytics.totalOperatingCost)}",
+                        period = selectedTimeRange.displayName.lowercase()
+                    )
+                }
+                
+                item {
+                    CostMetric(
+                        title = "Fuel Cost",
+                        value = "SAR ${String.format("%,.2f", analytics.fuelCost)}",
+                        period = selectedTimeRange.displayName.lowercase()
+                    )
+                }
+                
+                item {
+                    CostMetric(
+                        title = "Maintenance Cost",
+                        value = "SAR ${String.format("%,.2f", analytics.maintenanceCost)}",
+                        period = selectedTimeRange.displayName.lowercase()
+                    )
+                }
+                
+                item {
+                    CostMetric(
+                        title = "Insurance Cost",
+                        value = "SAR ${String.format("%,.2f", analytics.insuranceCost)}",
+                        period = selectedTimeRange.displayName.lowercase()
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CostMetric(
+    title: String,
+    value: String,
+    period: String
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        
+        Column(
+            horizontalAlignment = Alignment.End
+        ) {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Text(
+                text = "per $period",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+            )
+        }
+    }
+}
+
+@Composable
+fun MaintenanceInsightsSection(analytics: FleetAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Maintenance Insights",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    MaintenanceMetric(
+                        title = "Vehicles Due for Service",
+                        value = analytics.vehiclesDueForService.toString(),
+                        subtitle = "Within next 30 days"
+                    )
+                }
+                
+                item {
+                    MaintenanceMetric(
+                        title = "Overdue Maintenance",
+                        value = analytics.overdueMaintenanceCount.toString(),
+                        subtitle = "Requires immediate attention"
+                    )
+                }
+                
+                item {
+                    MaintenanceMetric(
+                        title = "Average Downtime",
+                        value = "${analytics.averageDowntimeHours} hours",
+                        subtitle = "Per maintenance event"
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MaintenanceMetric(
+    title: String,
+    value: String,
+    subtitle: String
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+            )
+        }
+        
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleMedium,
+            color = if (title.contains("Overdue")) ErrorRed else EdhamOrange,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+fun FleetStatusBreakdownSection(analytics: FleetAnalytics) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Fleet Status Breakdown",
+                style = MaterialTheme.typography.titleMedium,
+                color = EdhamOrange,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(analytics.vehicleStatusBreakdown) { status ->
+                    FleetStatusItem(status = status)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FleetStatusItem(status: VehicleStatusData) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(12.dp)
+                    .background(
+                        color = status.color,
+                        shape = androidx.compose.foundation.shape.CircleShape
+                    )
+            )
+            
+            Spacer(modifier = Modifier.width(12.dp))
+            
+            Text(
+                text = status.status,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+        }
+        
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "${status.count}",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            
+            Spacer(modifier = Modifier.width(8.dp))
+            
+            Text(
+                text = "(${String.format("%.1f", status.percentage)}%)",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+            )
+        }
+    }
+}
+
+// Data classes
+data class VehicleStatusData(
+    val status: String,
+    val count: Int,
+    val percentage: Float,
+    val color: Color
+)
+
+enum class TimeRange(val displayName: String) {
+    TODAY("Today"),
+    LAST_7_DAYS("Last 7 Days"),
+    LAST_30_DAYS("Last 30 Days"),
+    LAST_3_MONTHS("Last 3 Months"),
+    LAST_YEAR("Last Year")
+}

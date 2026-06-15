@@ -1,0 +1,449 @@
+package com.edham.logistics.feature.users.presentation.ui
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.users.domain.model.*
+import com.edham.logistics.feature.users.domain.usecase.*
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * ViewModel for user management operations
+ */
+@HiltViewModel
+class UserManagementViewModel @Inject constructor(
+    private val createUserUseCase: CreateUserUseCase,
+    private val updateUserUseCase: UpdateUserUseCase,
+    private val disableUserUseCase: DisableUserUseCase,
+    private val enableUserUseCase: EnableUserUseCase,
+    private val changeUserRoleUseCase: ChangeUserRoleUseCase,
+    private val getUserUseCase: GetUserUseCase,
+    private val getUsersUseCase: GetUsersUseCase,
+    private val getUserStatisticsUseCase: GetUserStatisticsUseCase,
+    private val getUserActivityLogsUseCase: GetUserActivityLogsUseCase,
+    private val getLoginHistoryUseCase: GetLoginHistoryUseCase,
+    private val bulkUserOperationUseCase: BulkUserOperationUseCase,
+    private val getUserPermissionsUseCase: GetUserPermissionsUseCase,
+    private val grantUserPermissionsUseCase: GrantUserPermissionsUseCase,
+    private val revokeUserPermissionsUseCase: RevokeUserPermissionsUseCase,
+    private val observeUserActivityUseCase: ObserveUserActivityUseCase,
+    private val observeLoginHistoryUseCase: ObserveLoginHistoryUseCase
+) : ViewModel() {
+
+    // UI State
+    private val _uiState = MutableStateFlow<UserManagementUiState>(UserManagementUiState.Idle)
+    val uiState: StateFlow<UserManagementUiState> = _uiState.asStateFlow()
+
+    // Users List
+    private val _users = MutableStateFlow<List<User>>(emptyList())
+    val users: StateFlow<List<User>> = _users.asStateFlow()
+
+    // User Details
+    private val _selectedUser = MutableStateFlow<User?>(null)
+    val selectedUser: StateFlow<User?> = _selectedUser.asStateFlow()
+
+    // User Statistics
+    private val _userStatistics = MutableStateFlow<UserStatistics?>(null)
+    val userStatistics: StateFlow<UserStatistics?> = _userStatistics.asStateFlow()
+
+    // User Activity Logs
+    private val _userActivityLogs = MutableStateFlow<List<UserActivityLog>>(emptyList())
+    val userActivityLogs: StateFlow<List<UserActivityLog>> = _userActivityLogs.asStateFlow()
+
+    // Login History
+    private val _loginHistory = MutableStateFlow<List<LoginHistory>>(emptyList())
+    val loginHistory: StateFlow<List<LoginHistory>> = _loginHistory.asStateFlow()
+
+    // Search Filters
+    private val _searchFilters = MutableStateFlow(UserSearchFilters())
+    val searchFilters: StateFlow<UserSearchFilters> = _searchFilters.asStateFlow()
+
+    // Pagination
+    private val _pagination = MutableStateFlow(PaginationState())
+    val pagination: StateFlow<PaginationState> = _pagination.asStateFlow()
+
+    // User Permissions
+    private val _userPermissions = MutableStateFlow<Set<Permission>>(emptySet())
+    val userPermissions: StateFlow<Set<Permission>> = _userPermissions.asStateFlow()
+
+    // Bulk Operation Result
+    private val _bulkOperationResult = MutableStateFlow<BulkOperationResult?>(null)
+    val bulkOperationResult: StateFlow<BulkOperationResult?> = _bulkOperationResult.asStateFlow()
+
+    init {
+        loadUsers()
+        loadUserStatistics()
+    }
+
+    // Load Users
+    fun loadUsers(refresh: Boolean = false) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            if (refresh) {
+                _pagination.value = _pagination.value.copy(currentPage = 1)
+            }
+            
+            val filters = _searchFilters.value.copy(
+                page = _pagination.value.currentPage,
+                limit = _pagination.value.pageSize
+            )
+            
+            when (val result = getUsersUseCase(filters)) {
+                is Result.Success -> {
+                    _users.value = result.data.users
+                    _pagination.value = _pagination.value.copy(
+                        totalCount = result.data.totalCount,
+                        totalPages = result.data.totalPages,
+                        hasNextPage = result.data.hasNextPage,
+                        hasPreviousPage = result.data.hasPreviousPage
+                    )
+                    _uiState.value = UserManagementUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to load users")
+                }
+            }
+        }
+    }
+
+    // Load User Details
+    fun loadUserDetails(userId: String) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = getUserUseCase(userId)) {
+                is Result.Success -> {
+                    _selectedUser.value = result.data
+                    loadUserPermissions(userId)
+                    _uiState.value = UserManagementUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to load user details")
+                }
+            }
+        }
+    }
+
+    // Create User
+    fun createUser(request: CreateUserRequest) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = createUserUseCase(request)) {
+                is Result.Success -> {
+                    _uiState.value = UserManagementUiState.UserCreated(result.data)
+                    loadUsers(refresh = true)
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to create user")
+                }
+            }
+        }
+    }
+
+    // Update User
+    fun updateUser(request: UpdateUserRequest) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = updateUserUseCase(request)) {
+                is Result.Success -> {
+                    _selectedUser.value = result.data
+                    _uiState.value = UserManagementUiState.UserUpdated(result.data)
+                    loadUsers(refresh = true)
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to update user")
+                }
+            }
+        }
+    }
+
+    // Disable User
+    fun disableUser(userId: String, reason: String) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = disableUserUseCase(userId, reason)) {
+                is Result.Success -> {
+                    _uiState.value = UserManagementUiState.UserDisabled(result.data)
+                    loadUsers(refresh = true)
+                    
+                    // Update selected user if it's the same
+                    if (_selectedUser.value?.id == userId) {
+                        _selectedUser.value = result.data
+                    }
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to disable user")
+                }
+            }
+        }
+    }
+
+    // Enable User
+    fun enableUser(userId: String, reason: String) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = enableUserUseCase(userId, reason)) {
+                is Result.Success -> {
+                    _uiState.value = UserManagementUiState.UserEnabled(result.data)
+                    loadUsers(refresh = true)
+                    
+                    // Update selected user if it's the same
+                    if (_selectedUser.value?.id == userId) {
+                        _selectedUser.value = result.data
+                    }
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to enable user")
+                }
+            }
+        }
+    }
+
+    // Change User Role
+    fun changeUserRole(userId: String, newRole: UserRole, reason: String) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = changeUserRoleUseCase(userId, newRole, reason)) {
+                is Result.Success -> {
+                    _uiState.value = UserManagementUiState.UserRoleChanged(result.data)
+                    loadUsers(refresh = true)
+                    
+                    // Update selected user if it's the same
+                    if (_selectedUser.value?.id == userId) {
+                        _selectedUser.value = result.data
+                        loadUserPermissions(userId)
+                    }
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to change user role")
+                }
+            }
+        }
+    }
+
+    // Load User Statistics
+    private fun loadUserStatistics() {
+        viewModelScope.launch {
+            when (val result = getUserStatisticsUseCase()) {
+                is Result.Success -> {
+                    _userStatistics.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for statistics
+                }
+            }
+        }
+    }
+
+    // Load User Activity Logs
+    fun loadUserActivityLogs(userId: String, limit: Int = 50) {
+        viewModelScope.launch {
+            when (val result = getUserActivityLogsUseCase(userId, limit)) {
+                is Result.Success -> {
+                    _userActivityLogs.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently
+                }
+            }
+        }
+    }
+
+    // Load Login History
+    fun loadLoginHistory(userId: String, limit: Int = 50) {
+        viewModelScope.launch {
+            when (val result = getLoginHistoryUseCase(userId, limit)) {
+                is Result.Success -> {
+                    _loginHistory.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently
+                }
+            }
+        }
+    }
+
+    // Load User Permissions
+    private fun loadUserPermissions(userId: String) {
+        viewModelScope.launch {
+            when (val result = getUserPermissionsUseCase(userId)) {
+                is Result.Success -> {
+                    _userPermissions.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently
+                }
+            }
+        }
+    }
+
+    // Grant User Permissions
+    fun grantUserPermissions(userId: String, permissions: Set<Permission>, reason: String) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = grantUserPermissionsUseCase(userId, permissions, reason)) {
+                is Result.Success -> {
+                    _uiState.value = UserManagementUiState.PermissionsGranted(result.data)
+                    loadUserPermissions(userId)
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to grant permissions")
+                }
+            }
+        }
+    }
+
+    // Revoke User Permissions
+    fun revokeUserPermissions(userId: String, permissions: Set<Permission>, reason: String) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = revokeUserPermissionsUseCase(userId, permissions, reason)) {
+                is Result.Success -> {
+                    _uiState.value = UserManagementUiState.PermissionsRevoked(result.data)
+                    loadUserPermissions(userId)
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Failed to revoke permissions")
+                }
+            }
+        }
+    }
+
+    // Bulk User Operation
+    fun performBulkOperation(operation: BulkUserOperation) {
+        viewModelScope.launch {
+            _uiState.value = UserManagementUiState.Loading
+            
+            when (val result = bulkUserOperationUseCase(operation)) {
+                is Result.Success -> {
+                    _bulkOperationResult.value = result.data
+                    _uiState.value = UserManagementUiState.BulkOperationCompleted(result.data)
+                    loadUsers(refresh = true)
+                }
+                is Result.Error -> {
+                    _uiState.value = UserManagementUiState.Error(result.exception.message ?: "Bulk operation failed")
+                }
+            }
+        }
+    }
+
+    // Update Search Filters
+    fun updateSearchFilters(filters: UserSearchFilters) {
+        _searchFilters.value = filters
+        loadUsers(refresh = true)
+    }
+
+    // Search Users
+    fun searchUsers(query: String) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(query = query))
+    }
+
+    // Filter by Role
+    fun filterByRole(role: UserRole?) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(role = role))
+    }
+
+    // Filter by Status
+    fun filterByStatus(status: UserStatus?) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(status = status))
+    }
+
+    // Sort Users
+    fun sortUsers(sortBy: UserSortField, sortOrder: SortOrder) {
+        val currentFilters = _searchFilters.value
+        updateSearchFilters(currentFilters.copy(sortBy = sortBy, sortOrder = sortOrder))
+    }
+
+    // Load Next Page
+    fun loadNextPage() {
+        val currentPagination = _pagination.value
+        if (currentPagination.hasNextPage) {
+            _pagination.value = currentPagination.copy(currentPage = currentPagination.currentPage + 1)
+            loadUsers()
+        }
+    }
+
+    // Load Previous Page
+    fun loadPreviousPage() {
+        val currentPagination = _pagination.value
+        if (currentPagination.hasPreviousPage) {
+            _pagination.value = currentPagination.copy(currentPage = currentPagination.currentPage - 1)
+            loadUsers()
+        }
+    }
+
+    // Refresh Data
+    fun refresh() {
+        loadUsers(refresh = true)
+        loadUserStatistics()
+        _selectedUser.value?.let { user ->
+            loadUserDetails(user.id)
+            loadUserActivityLogs(user.id)
+            loadLoginHistory(user.id)
+        }
+    }
+
+    // Clear Selected User
+    fun clearSelectedUser() {
+        _selectedUser.value = null
+        _userActivityLogs.value = emptyList()
+        _loginHistory.value = emptyList()
+        _userPermissions.value = emptySet()
+    }
+
+    // Clear Bulk Operation Result
+    fun clearBulkOperationResult() {
+        _bulkOperationResult.value = null
+    }
+
+    // Reset UI State
+    fun resetUiState() {
+        _uiState.value = UserManagementUiState.Idle
+    }
+}
+
+/**
+ * UI State for User Management
+ */
+sealed class UserManagementUiState {
+    object Idle : UserManagementUiState()
+    object Loading : UserManagementUiState()
+    object Success : UserManagementUiState()
+    data class Error(val message: String) : UserManagementUiState()
+    data class UserCreated(val user: User) : UserManagementUiState()
+    data class UserUpdated(val user: User) : UserManagementUiState()
+    data class UserDisabled(val user: User) : UserManagementUiState()
+    data class UserEnabled(val user: User) : UserManagementUiState()
+    data class UserRoleChanged(val user: User) : UserManagementUiState()
+    data class PermissionsGranted(val user: User) : UserManagementUiState()
+    data class PermissionsRevoked(val user: User) : UserManagementUiState()
+    data class BulkOperationCompleted(val result: BulkOperationResult) : UserManagementUiState()
+}
+
+/**
+ * Pagination State
+ */
+data class PaginationState(
+    val currentPage: Int = 1,
+    val pageSize: Int = 20,
+    val totalCount: Int = 0,
+    val totalPages: Int = 0,
+    val hasNextPage: Boolean = false,
+    val hasPreviousPage: Boolean = false
+)

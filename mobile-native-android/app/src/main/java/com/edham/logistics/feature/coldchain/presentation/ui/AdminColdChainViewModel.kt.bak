@@ -1,0 +1,311 @@
+package com.edham.logistics.feature.coldchain.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.coldchain.domain.usecase.*
+import com.edham.logistics.feature.coldchain.domain.model.*
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import com.google.android.gms.maps.model.LatLng
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class AdminColdChainViewModel @Inject constructor(
+    private val getColdChainStatusUseCase: GetColdChainStatusUseCase,
+    private val getTemperatureHistoryUseCase: GetTemperatureHistoryUseCase,
+    private val createTemperatureAlertUseCase: CreateTemperatureAlertUseCase,
+    private val resolveTemperatureAlertUseCase: ResolveTemperatureAlertUseCase
+) : BaseViewModel<AdminColdChainViewModel.AdminColdChainUiState>() {
+
+    private val _uiState = MutableStateFlow(AdminColdChainUiState())
+    val uiState: StateFlow<AdminColdChainUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): AdminColdChainUiState = AdminColdChainUiState()
+
+    fun initialize() {
+        loadColdChainStatus()
+        startRealTimeUpdates()
+    }
+
+    fun loadColdChainStatus() {
+        viewModelScope.launch {
+            val request = GetColdChainStatusRequest(
+                shipmentIds = null,
+                cargoTypes = null,
+                alertLevels = null,
+                status = null
+            )
+            
+            when (val result = getColdChainStatusUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        coldChainShipments = result.data,
+                        isLoading = false,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(
+                        isLoading = false,
+                        error = result.exception.message ?: "فشل تحميل حالة سلسلة التبريد"
+                    )}
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    fun startRealTimeUpdates() {
+        viewModelScope.launch {
+            // Start observing all shipments with active monitoring
+            _uiState.value.coldChainShipments.forEach { shipment ->
+                getColdChainStatusUseCase.observeShipmentColdChainStatus(shipment.id).collect { result ->
+                    when (result) {
+                        is Result.Success -> {
+                            updateShipmentInList(result.data)
+                        }
+                        is Result.Error -> {
+                            updateUiState { copy(error = result.exception.message ?: "خطأ في التحديثات المباشرة") }
+                        }
+                        is Result.Loading -> {
+                            // Handle loading state if needed
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateShipmentInList(updatedShipment: ColdChainShipment) {
+        val currentList = _uiState.value.coldChainShipments.toMutableList()
+        val index = currentList.indexOfFirst { it.id == updatedShipment.id }
+        if (index >= 0) {
+            currentList[index] = updatedShipment
+            updateUiState { copy(coldChainShipments = currentList) }
+        }
+    }
+
+    fun selectShipment(shipmentId: String) {
+        viewModelScope.launch {
+            when (val result = getColdChainStatusUseCase.getShipmentColdChainStatus(shipmentId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        selectedShipment = result.data,
+                        error = null
+                    )}
+                    loadTemperatureHistory(shipmentId)
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل بيانات الشحنة") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun loadTemperatureHistory(shipmentId: String) {
+        viewModelScope.launch {
+            val request = GetTemperatureHistoryRequest(
+                shipmentId = shipmentId,
+                startTime = null,
+                endTime = null,
+                includeAlerts = true
+            )
+            
+            when (val result = getTemperatureHistoryUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        temperatureHistory = result.data,
+                        error = null
+                    )}
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل تحميل سجل درجات الحرارة") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun filterByCargoType(cargoType: CargoType?) {
+        val allShipments = _uiState.value.allShipments
+        val filtered = if (cargoType != null) {
+            allShipments.filter { it.cargoType == cargoType }
+        } else {
+            allShipments
+        }
+        
+        updateUiState { copy(
+            coldChainShipments = filtered,
+            selectedCargoType = cargoType
+        )}
+    }
+
+    fun filterByAlertLevel(alertLevel: AlertLevel?) {
+        val allShipments = _uiState.value.allShipments
+        val filtered = if (alertLevel != null) {
+            allShipments.filter { shipment ->
+                // Check if shipment has alerts of this level
+                shipment.alertCount > 0 && shipment.status == when (alertLevel) {
+                    AlertLevel.WARNING -> ColdChainStatus.WARNING
+                    AlertLevel.CRITICAL -> ColdChainStatus.CRITICAL
+                    AlertLevel.EMERGENCY -> ColdChainStatus.CRITICAL
+                    else -> ColdChainStatus.NORMAL
+                }
+            }
+        } else {
+            allShipments
+        }
+        
+        updateUiState { copy(
+            coldChainShipments = filtered,
+            selectedAlertLevel = alertLevel
+        )}
+    }
+
+    fun filterByStatus(status: ColdChainStatus?) {
+        val allShipments = _uiState.value.allShipments
+        val filtered = if (status != null) {
+            allShipments.filter { it.status == status }
+        } else {
+            allShipments
+        }
+        
+        updateUiState { copy(
+            coldChainShipments = filtered,
+            selectedStatus = status
+        )}
+    }
+
+    fun searchShipments(query: String) {
+        val allShipments = _uiState.value.allShipments
+        val filtered = if (query.isNotEmpty()) {
+            allShipments.filter { shipment ->
+                shipment.id.contains(query, ignoreCase = true) ||
+                shipment.cargoType.name.contains(query, ignoreCase = true) ||
+                shipment.sensorInfo.model.contains(query, ignoreCase = true)
+            }
+        } else {
+            allShipments
+        }
+        
+        updateUiState { copy(
+            coldChainShipments = filtered,
+            searchQuery = query
+        )}
+    }
+
+    fun createManualAlert(shipmentId: String, alertType: AlertType, notes: String?) {
+        viewModelScope.launch {
+            val shipment = _uiState.value.coldChainShipments.find { it.id == shipmentId }
+            if (shipment != null) {
+                val request = CreateAlertRequest(
+                    shipmentId = shipmentId,
+                    sensorId = shipment.sensorInfo.id,
+                    alertType = alertType,
+                    alertLevel = AlertLevel.WARNING,
+                    temperature = shipment.currentTemperature,
+                    threshold = shipment.temperatureThreshold.maxTemperature,
+                    notes = notes
+                )
+                
+                when (val result = createTemperatureAlertUseCase(request)) {
+                    is Result.Success -> {
+                        updateUiState { copy(
+                            actionSuccess = "تم إنشاء إنذار يدوي بنجاح"
+                        )}
+                        loadColdChainStatus() // Refresh data
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(error = result.exception.message ?: "فشل إنشاء الإنذار") }
+                    }
+                    is Result.Loading -> {
+                        // Handle loading state
+                    }
+                }
+            }
+        }
+    }
+
+    fun resolveAlert(alertId: String, notes: String?) {
+        viewModelScope.launch {
+            val request = ResolveAlertRequest(
+                alertId = alertId,
+                resolvedBy = "admin", // In real app, this would be current user ID
+                notes = notes
+            )
+            
+            when (val result = resolveTemperatureAlertUseCase(request)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        actionSuccess = "تم حل الإنذار بنجاح"
+                    )}
+                    loadColdChainStatus() // Refresh data
+                }
+                is Result.Error -> {
+                    updateUiState { copy(error = result.exception.message ?: "فشل حل الإنذار") }
+                }
+                is Result.Loading -> {
+                    // Handle loading state
+                }
+            }
+        }
+    }
+
+    fun clearSelection() {
+        updateUiState { copy(
+            selectedShipment = null,
+            temperatureHistory = null
+        )}
+    }
+
+    fun refresh() {
+        loadColdChainStatus()
+    }
+
+    fun clearSuccess() {
+        updateUiState { copy(actionSuccess = null) }
+    }
+
+    fun exportReport(shipmentId: String, format: ReportFormat) {
+        // This would integrate with the repository to generate reports
+        updateUiState { copy(
+            actionSuccess = "تم بدء توليد التقرير بتنسيق $format"
+        )}
+    }
+
+    fun calibrateSensor(sensorId: String) {
+        // This would integrate with sensor calibration
+        updateUiState { copy(
+            actionSuccess = "تم بدء معايرة المستشعر $sensorId"
+        )}
+    }
+
+    data class AdminColdChainUiState(
+        val isLoading: Boolean = false,
+        val coldChainShipments: List<ColdChainShipment> = emptyList(),
+        val allShipments: List<ColdChainShipment> = emptyList(),
+        val selectedShipment: ColdChainShipment? = null,
+        val temperatureHistory: TemperatureHistory? = null,
+        val selectedCargoType: CargoType? = null,
+        val selectedAlertLevel: AlertLevel? = null,
+        val selectedStatus: ColdChainStatus? = null,
+        val searchQuery: String = "",
+        val error: String? = null,
+        val actionSuccess: String? = null
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = copy(actionSuccess = message)
+    }
+}

@@ -9,12 +9,15 @@ import androidx.fragment.app.viewModels
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.edham.logistics.R
+import com.edham.logistics.ui.home.workshop.adapter.PredictiveAlert
+import com.edham.logistics.ui.home.workshop.adapter.PredictiveAlertAdapter
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
 class WorkshopPredictiveFragment : Fragment() {
 
     private val viewModel: WorkshopViewModel by viewModels()
+    private lateinit var adapter: PredictiveAlertAdapter
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -29,5 +32,17 @@ class WorkshopPredictiveFragment : Fragment() {
         
         val rv = view.findViewById<RecyclerView>(R.id.rvPredictiveAlerts)
         rv.layoutManager = LinearLayoutManager(requireContext())
+        adapter = PredictiveAlertAdapter(emptyList())
+        rv.adapter = adapter
+
+        loadMockAlerts()
+    }
+
+    private fun loadMockAlerts() {
+        val list = listOf(
+            PredictiveAlert("شاحنة كريم عبدالله — تغيير سير", "اقتربت من عتبة 100,000 كم", "99,180 كم", "WARNING"),
+            PredictiveAlert("شاحنة T-088 — فحص فرامل", "تجاوزت الموعد بـ 15 يوماً", "متأخر 15 يوم", "CRITICAL")
+        )
+        adapter.updateData(list)
     }
 }

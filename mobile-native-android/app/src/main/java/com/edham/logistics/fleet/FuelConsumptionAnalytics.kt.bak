@@ -1,0 +1,980 @@
+package com.edham.logistics.fleet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.local.entity.FuelTransactionEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Fuel Consumption Analytics - Advanced fuel consumption analysis and reporting system
+ * 
+ * Features:
+ * - Fuel consumption trends
+ * - Efficiency analysis
+ * - Cost optimization
+ * - Predictive analytics
+ * - Benchmarking
+ * - Anomaly detection
+ * - Performance metrics
+ */
+@Singleton
+class FuelConsumptionAnalytics @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fleetApi: FleetApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _analyticsState = MutableStateFlow<AnalyticsState>(AnalyticsState.Idle)
+    val analyticsState: StateFlow<AnalyticsState> = _analyticsState.asStateFlow()
+    
+    private val _consumptionTrends = MutableStateFlow<ConsumptionTrends?>(null)
+    val consumptionTrends: StateFlow<ConsumptionTrends?> = _consumptionTrends.asStateFlow()
+    
+    private val _efficiencyMetrics = MutableStateFlow<EfficiencyMetrics?>(null)
+    val efficiencyMetrics: StateFlow<EfficiencyMetrics?> = _efficiencyMetrics.asStateFlow()
+    
+    private val _costAnalysis = MutableStateFlow<CostAnalysis?>(null)
+    val costAnalysis: StateFlow<CostAnalysis?> = _costAnalysis.asStateFlow()
+    
+    private val _benchmarking = MutableStateFlow<BenchmarkingReport?>(null)
+    val benchmarking: StateFlow<BenchmarkingReport?> = _benchmarking.asStateFlow()
+    
+    private val _anomalyDetection = MutableStateFlow<List<ConsumptionAnomaly>>(emptyList())
+    val anomalyDetection: StateFlow<List<ConsumptionAnomaly>> = _anomalyDetection.asStateFlow()
+    
+    private val _predictiveAnalytics = MutableStateFlow<PredictiveAnalytics?>(null)
+    val predictiveAnalytics: StateFlow<PredictiveAnalytics?> = _predictiveAnalytics.asStateFlow()
+    
+    companion object {
+        private const val TAG = "FuelConsumptionAnalytics"
+        private const val ANALYTICS_RETENTION_DAYS = 365
+        private const val TREND_ANALYSIS_WINDOW = 30 // days
+        private const val EFFICIENCY_BENCHMARK = 12.0 // km per liter
+        private const val ANOMALY_THRESHOLD = 2.5 // standard deviations
+    }
+    
+    /**
+     * Generate comprehensive fuel consumption analytics
+     */
+    suspend fun generateAnalytics(dateRange: DateRange = DateRange.last30Days()): Result<FuelConsumptionReport> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _analyticsState.value = AnalyticsState.Generating
+                
+                // Get data
+                val transactions = database.fuelTransactionDao()
+                    .getTransactionsByDateRange(dateRange.startDate, dateRange.endDate)
+                val vehicles = database.vehicleDao().getAllVehicles()
+                
+                // Generate consumption trends
+                val trends = generateConsumptionTrends(transactions, dateRange)
+                _consumptionTrends.value = trends
+                
+                // Generate efficiency metrics
+                val efficiency = generateEfficiencyMetrics(transactions, vehicles, dateRange)
+                _efficiencyMetrics.value = efficiency
+                
+                // Generate cost analysis
+                val cost = generateCostAnalysis(transactions, dateRange)
+                _costAnalysis.value = cost
+                
+                // Generate benchmarking report
+                val benchmarking = generateBenchmarkingReport(efficiency, cost)
+                _benchmarking.value = benchmarking
+                
+                // Detect anomalies
+                val anomalies = detectConsumptionAnomalies(transactions, vehicles)
+                _anomalyDetection.value = anomalies
+                
+                // Generate predictive analytics
+                val predictive = generatePredictiveAnalytics(transactions, vehicles)
+                _predictiveAnalytics.value = predictive
+                
+                // Create comprehensive report
+                val report = FuelConsumptionReport(
+                    dateRange = dateRange,
+                    consumptionTrends = trends,
+                    efficiencyMetrics = efficiency,
+                    costAnalysis = cost,
+                    benchmarking = benchmarking,
+                    anomalies = anomalies,
+                    predictiveAnalytics = predictive,
+                    generatedAt = Date()
+                )
+                
+                _analyticsState.value = AnalyticsState.Completed
+                Result.success(report)
+                
+            } catch (e: Exception) {
+                _analyticsState.value = AnalyticsState.Error("Failed to generate analytics: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get vehicle consumption trends
+     */
+    suspend fun getVehicleConsumptionTrends(
+        vehicleId: Long,
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<VehicleConsumptionTrends> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = database.fuelTransactionDao()
+                    .getTransactionsByVehicleAndDateRange(vehicleId, dateRange.startDate, dateRange.endDate)
+                val vehicle = database.vehicleDao().getVehicleById(vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                val dailyConsumption = calculateDailyConsumption(transactions)
+                val weeklyConsumption = calculateWeeklyConsumption(transactions)
+                val monthlyConsumption = calculateMonthlyConsumption(transactions)
+                
+                val trendAnalysis = analyzeConsumptionTrend(dailyConsumption)
+                val seasonality = analyzeSeasonality(transactions)
+                val efficiency = calculateVehicleEfficiency(transactions, vehicle)
+                
+                val trends = VehicleConsumptionTrends(
+                    vehicleId = vehicleId,
+                    vehicleIdString = vehicle.vehicleId,
+                    dateRange = dateRange,
+                    dailyConsumption = dailyConsumption,
+                    weeklyConsumption = weeklyConsumption,
+                    monthlyConsumption = monthlyConsumption,
+                    trendAnalysis = trendAnalysis,
+                    seasonality = seasonality,
+                    efficiency = efficiency
+                )
+                
+                Result.success(trends)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fleet efficiency comparison
+     */
+    suspend fun getFleetEfficiencyComparison(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<FleetEfficiencyComparison> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicles = database.vehicleDao().getAllVehicles()
+                val vehicleEfficiencies = mutableListOf<VehicleEfficiency>()
+                
+                vehicles.forEach { vehicle ->
+                    val efficiency = calculateVehicleEfficiency(
+                        database.fuelTransactionDao()
+                            .getTransactionsByVehicleAndDateRange(vehicle.id, dateRange.startDate, dateRange.endDate),
+                        vehicle
+                    )
+                    vehicleEfficiencies.add(efficiency)
+                }
+                
+                // Sort by efficiency (best first)
+                val sortedEfficiencies = vehicleEfficiencies.sortedByDescending { it.kmPerLiter }
+                
+                val topPerformers = sortedEfficiencies.take(5)
+                val bottomPerformers = sortedEfficiencies.takeLast(5)
+                
+                val fleetAverage = if (sortedEfficiencies.isNotEmpty()) {
+                    sortedEfficiencies.map { it.kmPerLiter }.average().toFloat()
+                } else 0f
+                
+                val efficiencyDistribution = calculateEfficiencyDistribution(sortedEfficiencies)
+                val improvementOpportunities = identifyImprovementOpportunities(sortedEfficiencies)
+                
+                val comparison = FleetEfficiencyComparison(
+                    dateRange = dateRange,
+                    fleetAverage = fleetAverage,
+                    topPerformers = topPerformers,
+                    bottomPerformers = bottomPerformers,
+                    allVehicles = sortedEfficiencies,
+                    efficiencyDistribution = efficiencyDistribution,
+                    improvementOpportunities = improvementOpportunities
+                )
+                
+                Result.success(comparison)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fuel cost optimization recommendations
+     */
+    suspend fun getCostOptimizationRecommendations(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<List<CostOptimizationRecommendation>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = database.fuelTransactionDao()
+                    .getTransactionsByDateRange(dateRange.startDate, dateRange.endDate)
+                val vehicles = database.vehicleDao().getAllVehicles()
+                
+                val recommendations = mutableListOf<CostOptimizationRecommendation>()
+                
+                // Analyze fuel prices
+                val priceAnalysis = analyzeFuelPrices(transactions)
+                if (priceAnalysis.hasPriceVariation) {
+                    recommendations.add(CostOptimizationRecommendation(
+                        type = OptimizationType.FUEL_PRICE_OPTIMIZATION,
+                        title = "Optimize Fuel Purchase Timing",
+                        description = "Fuel prices vary significantly between stations. Consider purchasing from cheaper stations.",
+                        potentialSavings = priceAnalysis.potentialSavings,
+                        priority = RecommendationPriority.HIGH,
+                        actions = listOf(
+                            "Create preferred station list",
+                            "Implement price monitoring",
+                            "Schedule bulk purchases during low price periods"
+                        )
+                    ))
+                }
+                
+                // Analyze inefficient vehicles
+                val inefficientVehicles = identifyInefficientVehicles(transactions, vehicles)
+                inefficientVehicles.forEach { vehicle ->
+                    recommendations.add(CostOptimizationRecommendation(
+                        type = OptimizationType.VEHICLE_EFFICIENCY,
+                        title = "Improve ${vehicle.vehicleId} Efficiency",
+                        description = "Vehicle ${vehicle.vehicleId} has low fuel efficiency (${vehicle.kmPerLiter} km/L)",
+                        potentialSavings = calculateEfficiencySavings(vehicle),
+                        priority = RecommendationPriority.MEDIUM,
+                        actions = listOf(
+                            "Schedule maintenance check",
+                            "Review driver behavior",
+                            "Consider route optimization",
+                            "Check tire pressure"
+                        )
+                    ))
+                }
+                
+                // Analyze refueling patterns
+                val refuelingAnalysis = analyzeRefuelingPatterns(transactions)
+                if (refuelingAnalysis.hasInefficientPatterns) {
+                    recommendations.add(CostOptimizationRecommendation(
+                        type = OptimizationType.REFUELING_OPTIMIZATION,
+                        title = "Optimize Refueling Patterns",
+                        description = "Refueling patterns show opportunities for cost reduction",
+                        potentialSavings = refuelingAnalysis.potentialSavings,
+                        priority = RecommendationPriority.MEDIUM,
+                        actions = refuelingAnalysis.recommendations
+                    ))
+                }
+                
+                // Analyze route efficiency
+                val routeAnalysis = analyzeRouteEfficiency(transactions, vehicles)
+                if (routeAnalysis.hasInefficientRoutes) {
+                    recommendations.add(CostOptimizationRecommendation(
+                        type = OptimizationType.ROUTE_OPTIMIZATION,
+                        title = "Optimize Route Planning",
+                        description = "Route analysis shows potential for fuel savings",
+                        potentialSavings = routeAnalysis.potentialSavings,
+                        priority = RecommendationPriority.HIGH,
+                        actions = routeAnalysis.recommendations
+                    ))
+                }
+                
+                Result.success(recommendations)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fuel consumption forecast
+     */
+    suspend fun getConsumptionForecast(
+        forecastDays: Int = 30,
+        historicalDays: Int = 90
+    ): Result<ConsumptionForecast> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val endDate = Date()
+                val startDate = Date(endDate.time - historicalDays * 24L * 60 * 60 * 1000)
+                
+                val transactions = database.fuelTransactionDao()
+                    .getTransactionsByDateRange(startDate, endDate)
+                
+                val historicalConsumption = calculateHistoricalConsumption(transactions)
+                val forecastModel = buildForecastModel(historicalConsumption)
+                val forecast = generateForecast(forecastModel, forecastDays)
+                
+                val confidence = calculateForecastConfidence(historicalConsumption, forecastModel)
+                val seasonalAdjustment = calculateSeasonalAdjustment(transactions)
+                
+                val forecastResult = ConsumptionForecast(
+                    forecastPeriod = DateRange(
+                        startDate = endDate,
+                        endDate = Date(endDate.time + forecastDays * 24L * 60 * 60 * 1000)
+                    ),
+                    dailyForecast = forecast,
+                    totalForecastedConsumption = forecast.sum(),
+                    confidence = confidence,
+                    seasonalAdjustment = seasonalAdjustment,
+                    modelAccuracy = forecastModel.accuracy,
+                    generatedAt = Date()
+                )
+                
+                Result.success(forecastResult)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private fun generateConsumptionTrends(
+        transactions: List<FuelTransactionEntity>,
+        dateRange: DateRange
+    ): ConsumptionTrends {
+        val dailyConsumption = calculateDailyConsumption(transactions)
+        val weeklyConsumption = calculateWeeklyConsumption(transactions)
+        val monthlyConsumption = calculateMonthlyConsumption(transactions)
+        
+        val trendAnalysis = analyzeConsumptionTrend(dailyConsumption)
+        val seasonality = analyzeSeasonality(transactions)
+        val volatility = calculateVolatility(dailyConsumption)
+        
+        return ConsumptionTrends(
+            dateRange = dateRange,
+            dailyConsumption = dailyConsumption,
+            weeklyConsumption = weeklyConsumption,
+            monthlyConsumption = monthlyConsumption,
+            trendAnalysis = trendAnalysis,
+            seasonality = seasonality,
+            volatility = volatility
+        )
+    }
+    
+    private fun generateEfficiencyMetrics(
+        transactions: List<FuelTransactionEntity>,
+        vehicles: List<VehicleEntity>,
+        dateRange: DateRange
+    ): EfficiencyMetrics {
+        val vehicleEfficiencies = mutableListOf<VehicleEfficiency>()
+        
+        vehicles.forEach { vehicle ->
+            val efficiency = calculateVehicleEfficiency(
+                transactions.filter { it.vehicleId == vehicle.id },
+                vehicle
+            )
+            vehicleEfficiencies.add(efficiency)
+        }
+        
+        val fleetAverage = if (vehicleEfficiencies.isNotEmpty()) {
+            vehicleEfficiencies.map { it.kmPerLiter }.average().toFloat()
+        } else 0f
+        
+        val efficiencyByType = vehicleEfficiencies.groupBy { it.vehicleType }
+            .mapValues { it.value.map { eff -> eff.kmPerLiter }.average().toFloat() }
+        
+        val efficiencyTrend = analyzeEfficiencyTrend(vehicleEfficiencies)
+        val benchmarkComparison = compareWithBenchmark(vehicleEfficiencies)
+        
+        return EfficiencyMetrics(
+            dateRange = dateRange,
+            fleetAverage = fleetAverage,
+            vehicleEfficiencies = vehicleEfficiencies,
+            efficiencyByType = efficiencyByType,
+            efficiencyTrend = efficiencyTrend,
+            benchmarkComparison = benchmarkComparison
+        )
+    }
+    
+    private fun generateCostAnalysis(
+        transactions: List<FuelTransactionEntity>,
+        dateRange: DateRange
+    ): CostAnalysis {
+        val totalCost = transactions.sumOf { it.totalPrice.toDouble() }.toFloat()
+        val totalFuel = transactions.sumOf { it.quantity.toDouble() }.toFloat()
+        val averagePrice = if (totalFuel > 0) totalCost / totalFuel else 0f
+        
+        val costByFuelType = transactions.groupBy { it.fuelType }
+            .mapValues { it.value.sumOf { it.totalPrice.toDouble() }.toFloat() }
+        
+        val costByVehicle = transactions.groupBy { it.vehicleId }
+            .mapValues { it.value.sumOf { it.totalPrice.toDouble() }.toFloat() }
+        
+        val priceTrend = analyzePriceTrend(transactions)
+        val costProjection = projectCosts(transactions)
+        
+        return CostAnalysis(
+            dateRange = dateRange,
+            totalCost = totalCost,
+            totalFuel = totalFuel,
+            averagePrice = averagePrice,
+            costByFuelType = costByFuelType,
+            costByVehicle = costByVehicle,
+            priceTrend = priceTrend,
+            costProjection = costProjection
+        )
+    }
+    
+    private fun generateBenchmarkingReport(
+        efficiency: EfficiencyMetrics,
+        cost: CostAnalysis
+    ): BenchmarkingReport {
+        val industryBenchmarks = getIndustryBenchmarks()
+        
+        val efficiencyBenchmark = BenchmarkComparison(
+            actual = efficiency.fleetAverage,
+            benchmark = industryBenchmarks.fuelEfficiency,
+            performance = determinePerformance(efficiency.fleetAverage, industryBenchmarks.fuelEfficiency),
+            percentile = calculatePercentile(efficiency.fleetAverage, industryBenchmarks.fuelEfficiency)
+        )
+        
+        val costBenchmark = BenchmarkComparison(
+            actual = cost.averagePrice,
+            benchmark = industryBenchmarks.fuelCost,
+            performance = determinePerformance(cost.averagePrice, industryBenchmarks.fuelCost),
+            percentile = calculatePercentile(cost.averagePrice, industryBenchmarks.fuelCost)
+        )
+        
+        val overallScore = (efficiencyBenchmark.percentile + (100 - costBenchmark.percentile)) / 2f
+        
+        return BenchmarkingReport(
+            efficiencyBenchmark = efficiencyBenchmark,
+            costBenchmark = costBenchmark,
+            overallScore = overallScore,
+            industryAverages = industryBenchmarks,
+            recommendations = generateBenchmarkRecommendations(efficiencyBenchmark, costBenchmark)
+        )
+    }
+    
+    private fun detectConsumptionAnomalies(
+        transactions: List<FuelTransactionEntity>,
+        vehicles: List<VehicleEntity>
+    ): List<ConsumptionAnomaly> {
+        val anomalies = mutableListOf<ConsumptionAnomaly>()
+        
+        vehicles.forEach { vehicle ->
+            val vehicleTransactions = transactions.filter { it.vehicleId == vehicle.id }
+            val anomaliesForVehicle = detectVehicleAnomalies(vehicle, vehicleTransactions)
+            anomalies.addAll(anomaliesForVehicle)
+        }
+        
+        return anomalies
+    }
+    
+    private fun generatePredictiveAnalytics(
+        transactions: List<FuelTransactionEntity>,
+        vehicles: List<VehicleEntity>
+    ): PredictiveAnalytics {
+        val consumptionForecast = predictConsumption(transactions)
+        val costForecast = predictCosts(transactions)
+        val maintenancePredictions = predictMaintenanceNeeds(vehicles, transactions)
+        val riskAssessment = assessFuelRisks(transactions)
+        
+        return PredictiveAnalytics(
+            consumptionForecast = consumptionForecast,
+            costForecast = costForecast,
+            maintenancePredictions = maintenancePredictions,
+            riskAssessment = riskAssessment,
+            confidence = calculatePredictionConfidence(),
+            generatedAt = Date()
+        )
+    }
+    
+    private fun calculateDailyConsumption(transactions: List<FuelTransactionEntity>): Map<String, Float> {
+        return transactions.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.timestamp
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}-${String.format("%02d", calendar.get(Calendar.DAY_OF_MONTH))}"
+        }.mapValues { it.value.sumOf { transaction -> transaction.quantity.toDouble() }.toFloat() }
+    }
+    
+    private fun calculateWeeklyConsumption(transactions: List<FuelTransactionEntity>): Map<String, Float> {
+        return transactions.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.timestamp
+            calendar.set(Calendar.DAY_OF_WEEK, Calendar.MONDAY)
+            "${calendar.get(Calendar.YEAR)}-W${calendar.get(Calendar.WEEK_OF_YEAR)}"
+        }.mapValues { it.value.sumOf { transaction -> transaction.quantity.toDouble() }.toFloat() }
+    }
+    
+    private fun calculateMonthlyConsumption(transactions: List<FuelTransactionEntity>): Map<String, Float> {
+        return transactions.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.timestamp
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { it.value.sumOf { transaction -> transaction.quantity.toDouble() }.toFloat() }
+    }
+    
+    private fun analyzeConsumptionTrend(dailyConsumption: Map<String, Float>): TrendAnalysis {
+        if (dailyConsumption.size < 7) {
+            return TrendAnalysis(TrendDirection.STABLE, 0f, 0f)
+        }
+        
+        val values = dailyConsumption.values.toList()
+        val recentAverage = values.takeLast(7).average()
+        val previousAverage = values.dropLast(7).takeLast(7).average()
+        
+        val change = (recentAverage - previousAverage) / previousAverage * 100
+        val direction = when {
+            change > 5 -> TrendDirection.INCREASING
+            change < -5 -> TrendDirection.DECREASING
+            else -> TrendDirection.STABLE
+        }
+        
+        return TrendAnalysis(direction, change.toFloat(), calculateTrendStrength(values))
+    }
+    
+    private fun analyzeSeasonality(transactions: List<FuelTransactionEntity>): SeasonalityAnalysis {
+        // Implementation would analyze seasonal patterns
+        return SeasonalityAnalysis(
+            hasSeasonality = false,
+            seasonalPattern = emptyMap(),
+            peakSeason = null,
+            offPeakSeason = null
+        )
+    }
+    
+    private fun calculateVolatility(dailyConsumption: Map<String, Float>): Float {
+        if (dailyConsumption.size < 2) return 0f
+        
+        val values = dailyConsumption.values.toList()
+        val mean = values.average()
+        val variance = values.map { (it - mean).pow(2).toDouble() }.average()
+        
+        return variance.toFloat().pow(0.5f)
+    }
+    
+    private fun calculateVehicleEfficiency(
+        transactions: List<FuelTransactionEntity>,
+        vehicle: VehicleEntity
+    ): VehicleEfficiency {
+        val refuelingTransactions = transactions.filter { it.transactionType == FuelTransactionType.REFUELING }
+        
+        if (refuelingTransactions.isEmpty()) {
+            return VehicleEfficiency(
+                vehicleId = vehicle.id,
+                vehicleIdString = vehicle.vehicleId,
+                vehicleType = vehicle.vehicleType,
+                kmPerLiter = 0f,
+                litersPer100km = 0f,
+                costPerKm = 0f,
+                totalDistance = 0f,
+                totalFuel = 0f,
+                totalCost = 0f
+            )
+        }
+        
+        val totalFuel = refuelingTransactions.sumOf { it.quantity.toDouble() }.toFloat()
+        val totalCost = refuelingTransactions.sumOf { it.totalPrice.toDouble() }.toFloat()
+        val totalDistance = calculateTotalDistance(refuelingTransactions)
+        
+        val kmPerLiter = if (totalFuel > 0) totalDistance / totalFuel else 0f
+        val litersPer100km = if (totalDistance > 0) (totalFuel / totalDistance) * 100f else 0f
+        val costPerKm = if (totalDistance > 0) totalCost / totalDistance else 0f
+        
+        return VehicleEfficiency(
+            vehicleId = vehicle.id,
+            vehicleIdString = vehicle.vehicleId,
+            vehicleType = vehicle.vehicleType,
+            kmPerLiter = kmPerLiter,
+            litersPer100km = litersPer100km,
+            costPerKm = costPerKm,
+            totalDistance = totalDistance,
+            totalFuel = totalFuel,
+            totalCost = totalCost
+        )
+    }
+    
+    private fun calculateTotalDistance(transactions: List<FuelTransactionEntity>): Float {
+        // Implementation would calculate distance between refueling points
+        return 0f // Placeholder
+    }
+    
+    private fun calculateTrendStrength(values: List<Float>): Float {
+        // Implementation would calculate trend strength using statistical methods
+        return 0.5f // Placeholder
+    }
+    
+    private fun determinePerformance(actual: Float, benchmark: Float): PerformanceLevel {
+        val ratio = actual / benchmark
+        return when {
+            ratio >= 1.1 -> PerformanceLevel.EXCELLENT
+            ratio >= 0.95 -> PerformanceLevel.GOOD
+            ratio >= 0.85 -> PerformanceLevel.AVERAGE
+            ratio >= 0.75 -> PerformanceLevel.BELOW_AVERAGE
+            else -> PerformanceLevel.POOR
+        }
+    }
+    
+    private fun calculatePercentile(actual: Float, benchmark: Float): Float {
+        // Implementation would calculate percentile rank
+        return 75f // Placeholder
+    }
+    
+    private fun getIndustryBenchmarks(): IndustryBenchmarks {
+        return IndustryBenchmarks(
+            fuelEfficiency = 12.0f,
+            fuelCost = 1.5f,
+            maintenanceInterval = 10000f,
+            tireLife = 50000f
+        )
+    }
+    
+    private fun generateBenchmarkRecommendations(
+        efficiency: BenchmarkComparison,
+        cost: BenchmarkComparison
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (efficiency.performance == PerformanceLevel.POOR) {
+            recommendations.add("Focus on improving fuel efficiency through driver training and vehicle maintenance")
+        }
+        
+        if (cost.performance == PerformanceLevel.POOR) {
+            recommendations.add("Negotiate better fuel prices and optimize purchasing strategy")
+        }
+        
+        return recommendations
+    }
+    
+    private fun detectVehicleAnomalies(
+        vehicle: VehicleEntity,
+        transactions: List<FuelTransactionEntity>
+    ): List<ConsumptionAnomaly> {
+        val anomalies = mutableListOf<ConsumptionAnomaly>()
+        
+        // Check for unusual consumption patterns
+        val efficiency = calculateVehicleEfficiency(transactions, vehicle)
+        if (efficiency.kmPerLiter < EFFICIENCY_BENCHMARK * 0.7) {
+            anomalies.add(ConsumptionAnomaly(
+                id = 0,
+                vehicleId = vehicle.id,
+                type = AnomalyType.LOW_EFFICIENCY,
+                description = "Vehicle efficiency is 30% below benchmark",
+                severity = AnomalySeverity.HIGH,
+                detectedAt = Date(),
+                recommendation = "Schedule maintenance check and review driving habits"
+            ))
+        }
+        
+        return anomalies
+    }
+    
+    private fun predictConsumption(transactions: List<FuelTransactionEntity>): ConsumptionPrediction {
+        // Implementation would use time series forecasting
+        return ConsumptionPrediction(
+            nextPeriod = 1000f,
+            confidence = 0.85f,
+            factors = listOf("Historical trend", "Seasonal pattern", "Vehicle usage")
+        )
+    }
+    
+    private fun predictCosts(transactions: List<FuelTransactionEntity>): CostPrediction {
+        // Implementation would predict future costs
+        return CostPrediction(
+            nextPeriod = 1500f,
+            confidence = 0.80f,
+            factors = listOf("Price trend", "Consumption forecast", "Market conditions")
+        )
+    }
+    
+    private fun predictMaintenanceNeeds(
+        vehicles: List<VehicleEntity>,
+        transactions: List<FuelTransactionEntity>
+    ): List<MaintenancePrediction> {
+        // Implementation would predict maintenance needs
+        return emptyList()
+    }
+    
+    private fun assessFuelRisks(transactions: List<FuelTransactionEntity>): RiskAssessment {
+        // Implementation would assess fuel-related risks
+        return RiskAssessment(
+            overallRisk = RiskLevel.LOW,
+            riskFactors = emptyList(),
+            mitigationStrategies = emptyList()
+        )
+    }
+    
+    private fun calculatePredictionConfidence(): Float {
+        // Implementation would calculate confidence in predictions
+        return 0.85f
+    }
+    
+    /**
+     * Get analytics state
+     */
+    fun getAnalyticsState(): AnalyticsState = _analyticsState.value
+}
+
+/**
+ * Data classes
+ */
+data class FuelConsumptionReport(
+    val dateRange: DateRange,
+    val consumptionTrends: ConsumptionTrends,
+    val efficiencyMetrics: EfficiencyMetrics,
+    val costAnalysis: CostAnalysis,
+    val benchmarking: BenchmarkingReport,
+    val anomalies: List<ConsumptionAnomaly>,
+    val predictiveAnalytics: PredictiveAnalytics,
+    val generatedAt: Date
+)
+
+data class ConsumptionTrends(
+    val dateRange: DateRange,
+    val dailyConsumption: Map<String, Float>,
+    val weeklyConsumption: Map<String, Float>,
+    val monthlyConsumption: Map<String, Float>,
+    val trendAnalysis: TrendAnalysis,
+    val seasonality: SeasonalityAnalysis,
+    val volatility: Float
+)
+
+data class VehicleConsumptionTrends(
+    val vehicleId: Long,
+    val vehicleIdString: String,
+    val dateRange: DateRange,
+    val dailyConsumption: Map<String, Float>,
+    val weeklyConsumption: Map<String, Float>,
+    val monthlyConsumption: Map<String, Float>,
+    val trendAnalysis: TrendAnalysis,
+    val seasonality: SeasonalityAnalysis,
+    val efficiency: VehicleEfficiency
+)
+
+data class FleetEfficiencyComparison(
+    val dateRange: DateRange,
+    val fleetAverage: Float,
+    val topPerformers: List<VehicleEfficiency>,
+    val bottomPerformers: List<VehicleEfficiency>,
+    val allVehicles: List<VehicleEfficiency>,
+    val efficiencyDistribution: Map<String, Int>,
+    val improvementOpportunities: List<ImprovementOpportunity>
+)
+
+data class CostOptimizationRecommendation(
+    val type: OptimizationType,
+    val title: String,
+    val description: String,
+    val potentialSavings: Float,
+    val priority: RecommendationPriority,
+    val actions: List<String>
+)
+
+data class ConsumptionForecast(
+    val forecastPeriod: DateRange,
+    val dailyForecast: List<Float>,
+    val totalForecastedConsumption: Float,
+    val confidence: Float,
+    val seasonalAdjustment: Float,
+    val modelAccuracy: Float,
+    val generatedAt: Date
+)
+
+data class EfficiencyMetrics(
+    val dateRange: DateRange,
+    val fleetAverage: Float,
+    val vehicleEfficiencies: List<VehicleEfficiency>,
+    val efficiencyByType: Map<VehicleType, Float>,
+    val efficiencyTrend: TrendAnalysis,
+    val benchmarkComparison: BenchmarkComparison
+)
+
+data class CostAnalysis(
+    val dateRange: DateRange,
+    val totalCost: Float,
+    val totalFuel: Float,
+    val averagePrice: Float,
+    val costByFuelType: Map<FuelType, Float>,
+    val costByVehicle: Map<Long, Float>,
+    val priceTrend: TrendAnalysis,
+    val costProjection: CostProjection
+)
+
+data class BenchmarkingReport(
+    val efficiencyBenchmark: BenchmarkComparison,
+    val costBenchmark: BenchmarkComparison,
+    val overallScore: Float,
+    val industryAverages: IndustryBenchmarks,
+    val recommendations: List<String>
+)
+
+data class PredictiveAnalytics(
+    val consumptionForecast: ConsumptionPrediction,
+    val costForecast: CostPrediction,
+    val maintenancePredictions: List<MaintenancePrediction>,
+    val riskAssessment: RiskAssessment,
+    val confidence: Float,
+    val generatedAt: Date
+)
+
+data class ConsumptionAnomaly(
+    val id: Long,
+    val vehicleId: Long,
+    val type: AnomalyType,
+    val description: String,
+    val severity: AnomalySeverity,
+    val detectedAt: Date,
+    val recommendation: String
+)
+
+data class TrendAnalysis(
+    val direction: TrendDirection,
+    val changePercentage: Float,
+    val strength: Float
+)
+
+data class SeasonalityAnalysis(
+    val hasSeasonality: Boolean,
+    val seasonalPattern: Map<String, Float>,
+    val peakSeason: String?,
+    val offPeakSeason: String?
+)
+
+data class BenchmarkComparison(
+    val actual: Float,
+    val benchmark: Float,
+    val performance: PerformanceLevel,
+    val percentile: Float
+)
+
+data class IndustryBenchmarks(
+    val fuelEfficiency: Float,
+    val fuelCost: Float,
+    val maintenanceInterval: Float,
+    val tireLife: Float
+)
+
+data class ConsumptionPrediction(
+    val nextPeriod: Float,
+    val confidence: Float,
+    val factors: List<String>
+)
+
+data class CostPrediction(
+    val nextPeriod: Float,
+    val confidence: Float,
+    val factors: List<String>
+)
+
+data class MaintenancePrediction(
+    val vehicleId: Long,
+    val predictedMileage: Float,
+    val predictedDate: Date,
+    val confidence: Float
+)
+
+data class RiskAssessment(
+    val overallRisk: RiskLevel,
+    val riskFactors: List<RiskFactor>,
+    val mitigationStrategies: List<String>
+)
+
+data class CostProjection(
+    val nextMonth: Float,
+    val nextQuarter: Float,
+    val nextYear: Float,
+    val confidence: Float
+)
+
+data class ImprovementOpportunity(
+    val vehicleId: Long,
+    val type: OpportunityType,
+    val description: String,
+    val potentialSavings: Float,
+    val priority: RecommendationPriority
+)
+
+/**
+ * Enums
+ */
+enum class AnalyticsState {
+    Idle,
+    Generating,
+    Completed,
+    Error
+}
+
+enum class TrendDirection {
+    INCREASING,
+    DECREASING,
+    STABLE
+}
+
+enum class PerformanceLevel {
+    EXCELLENT,
+    GOOD,
+    AVERAGE,
+    BELOW_AVERAGE,
+    POOR
+}
+
+enum class AnomalyType {
+    LOW_EFFICIENCY,
+    HIGH_CONSUMPTION,
+    ABNORMAL_PATTERN,
+    FUEL_THEFT,
+    MAINTENANCE_ISSUE
+}
+
+enum class AnomalySeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class OptimizationType {
+    FUEL_PRICE_OPTIMIZATION,
+    VEHICLE_EFFICIENCY,
+    REFUELING_OPTIMIZATION,
+    ROUTE_OPTIMIZATION,
+    MAINTENANCE_OPTIMIZATION
+}
+
+enum class RecommendationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class OpportunityType {
+    EFFICIENCY_IMPROVEMENT,
+    COST_REDUCTION,
+    MAINTENANCE_OPTIMIZATION,
+    DRIVER_TRAINING
+}
+
+enum class RiskLevel {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+data class RiskFactor(
+    val type: String,
+    val description: String,
+    val impact: String,
+    val probability: Float
+)

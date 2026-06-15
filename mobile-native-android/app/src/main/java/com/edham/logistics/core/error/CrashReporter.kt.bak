@@ -1,0 +1,376 @@
+package com.edham.logistics.core.error
+
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import com.google.firebase.crashlytics.FirebaseCrashlytics
+import com.edham.logistics.core.utils.DeviceInfo
+import com.edham.logistics.core.utils.NetworkUtils
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.text.SimpleDateFormat
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Centralized crash reporting system for production monitoring
+ */
+@Singleton
+class CrashReporter @Inject constructor(
+    private val context: Context,
+    private val deviceInfo: DeviceInfo,
+    private val networkUtils: NetworkUtils
+) {
+    
+    companion object {
+        private const val TAG = "CrashReporter"
+        private const val MAX_LOG_ENTRIES = 1000
+        private const val MAX_STACK_TRACE_LENGTH = 5000
+    }
+    
+    private val crashlytics = FirebaseCrashlytics.getInstance()
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+    private val crashLogs = mutableListOf<CrashLogEntry>()
+    private var userId: String? = null
+    private var userEmail: String? = null
+    private var userRole: String? = null
+    
+    /**
+     * Initialize crash reporter with user information
+     */
+    fun initialize(userId: String?, userEmail: String?, userRole: String?) {
+        this.userId = userId
+        this.userEmail = userEmail
+        this.userRole = userRole
+        
+        // Set user information in Crashlytics
+        userId?.let { crashlytics.setUserId(it) }
+        userEmail?.let { crashlytics.setUserEmail(it) }
+        userRole?.let { crashlytics.setCustomKey("user_role", it) }
+        
+        // Set device information
+        setDeviceInformation()
+        
+        // Set global exception handler
+        setGlobalExceptionHandler()
+        
+        Log.i(TAG, "CrashReporter initialized for user: $userId")
+    }
+    
+    /**
+     * Report an error with context
+     */
+    fun reportError(
+        throwable: Throwable,
+        context: String = "Unknown",
+        errorResult: ErrorResult? = null,
+        additionalData: Map<String, Any> = emptyMap()
+    ) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // Create crash log entry
+                val crashLog = createCrashLogEntry(throwable, context, errorResult, additionalData)
+                
+                // Add to local logs
+                addToLocalLogs(crashLog)
+                
+                // Report to Crashlytics
+                reportToCrashlytics(throwable, context, errorResult, additionalData)
+                
+                // Log locally
+                Log.e(TAG, "Error reported: $context", throwable)
+                
+            } catch (e: Exception) {
+                // Don't crash the crash reporter
+                Log.e(TAG, "Failed to report error", e)
+            }
+        }
+    }
+    
+    /**
+     * Report a non-fatal error
+     */
+    fun reportNonFatalError(
+        message: String,
+        context: String = "Unknown",
+        additionalData: Map<String, Any> = emptyMap()
+    ) {
+        val exception = RuntimeException(message)
+        reportError(exception, context, null, additionalData)
+    }
+    
+    /**
+     * Log user action for debugging
+     */
+    fun logUserAction(
+        action: String,
+        context: String = "User Action",
+        additionalData: Map<String, Any> = emptyMap()
+    ) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val logEntry = CrashLogEntry(
+                    timestamp = System.currentTimeMillis(),
+                    type = CrashLogType.USER_ACTION,
+                    message = action,
+                    context = context,
+                    stackTrace = "",
+                    deviceInfo = deviceInfo.getDeviceInfo(),
+                    networkInfo = networkUtils.getNetworkInfo(),
+                    additionalData = additionalData
+                )
+                
+                addToLocalLogs(logEntry)
+                
+                // Set custom key in Crashlytics
+                crashlytics.setCustomKey("last_user_action", action)
+                crashlytics.setCustomKey("last_action_context", context)
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to log user action", e)
+            }
+        }
+    }
+    
+    /**
+     * Log performance metrics
+     */
+    fun logPerformanceMetric(
+        metric: String,
+        value: Number,
+        context: String = "Performance",
+        additionalData: Map<String, Any> = emptyMap()
+    ) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val logEntry = CrashLogEntry(
+                    timestamp = System.currentTimeMillis(),
+                    type = CrashLogType.PERFORMANCE,
+                    message = "$metric: $value",
+                    context = context,
+                    stackTrace = "",
+                    deviceInfo = deviceInfo.getDeviceInfo(),
+                    networkInfo = networkUtils.getNetworkInfo(),
+                    additionalData = additionalData + ("metric_value" to value)
+                )
+                
+                addToLocalLogs(logEntry)
+                
+                // Set performance metric in Crashlytics
+                crashlytics.setCustomKey("perf_$metric", value)
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to log performance metric", e)
+            }
+        }
+    }
+    
+    /**
+     * Get crash logs for debugging
+     */
+    suspend fun getCrashLogs(limit: Int = 100): List<CrashLogEntry> = withContext(Dispatchers.IO) {
+        crashLogs.takeLast(limit)
+    }
+    
+    /**
+     * Clear crash logs
+     */
+    suspend fun clearCrashLogs() = withContext(Dispatchers.IO) {
+        crashLogs.clear()
+    }
+    
+    /**
+     * Create crash log entry
+     */
+    private fun createCrashLogEntry(
+        throwable: Throwable,
+        context: String,
+        errorResult: ErrorResult?,
+        additionalData: Map<String, Any>
+    ): CrashLogEntry {
+        val stackTrace = getStackTrace(throwable)
+        val type = when (errorResult) {
+            is ErrorResult.NetworkError -> CrashLogType.NETWORK_ERROR
+            is ErrorResult.ServerError -> CrashLogType.SERVER_ERROR
+            is ErrorResult.ClientError -> CrashLogType.CLIENT_ERROR
+            is ErrorResult.TimeoutError -> CrashLogType.TIMEOUT_ERROR
+            is ErrorResult.SecurityError -> CrashLogType.SECURITY_ERROR
+            is ErrorResult.ValidationError -> CrashLogType.VALIDATION_ERROR
+            is ErrorResult.StateError -> CrashLogType.STATE_ERROR
+            is ErrorResult.UnknownError -> CrashLogType.UNKNOWN_ERROR
+            null -> CrashLogType.UNKNOWN_ERROR
+        }
+        
+        return CrashLogEntry(
+            timestamp = System.currentTimeMillis(),
+            type = type,
+            message = throwable.message ?: "Unknown error",
+            context = context,
+            stackTrace = stackTrace,
+            deviceInfo = deviceInfo.getDeviceInfo(),
+            networkInfo = networkUtils.getNetworkInfo(),
+            additionalData = additionalData + mapOf(
+                "error_type" to errorResult?.let { it::class.simpleName },
+                "is_recoverable" to (errorResult?.let {
+                    when (it) {
+                        is ErrorResult.NetworkError -> it.isRecoverable
+                        is ErrorResult.ServerError -> it.isRecoverable
+                        is ErrorResult.TimeoutError -> it.shouldRetry
+                        else -> false
+                    }
+                } ?: false),
+                "should_retry" to (errorResult?.let {
+                    when (it) {
+                        is ErrorResult.NetworkError -> it.shouldRetry
+                        is ErrorResult.TimeoutError -> it.shouldRetry
+                        else -> false
+                    }
+                } ?: false)
+            )
+        )
+    }
+    
+    /**
+     * Get stack trace as string
+     */
+    private fun getStackTrace(throwable: Throwable): String {
+        val stringWriter = StringWriter()
+        val printWriter = PrintWriter(stringWriter)
+        throwable.printStackTrace(printWriter)
+        val stackTrace = stringWriter.toString()
+        
+        // Limit stack trace length
+        return if (stackTrace.length > MAX_STACK_TRACE_LENGTH) {
+            stackTrace.take(MAX_STACK_TRACE_LENGTH) + "\n... (truncated)"
+        } else {
+            stackTrace
+        }
+    }
+    
+    /**
+     * Add to local logs
+     */
+    private fun addToLocalLogs(logEntry: CrashLogEntry) {
+        synchronized(crashLogs) {
+            crashLogs.add(logEntry)
+            
+            // Keep only recent logs
+            if (crashLogs.size > MAX_LOG_ENTRIES) {
+                crashLogs.removeAt(0)
+            }
+        }
+    }
+    
+    /**
+     * Report to Crashlytics
+     */
+    private fun reportToCrashlytics(
+        throwable: Throwable,
+        context: String,
+        errorResult: ErrorResult?,
+        additionalData: Map<String, Any>
+    ) {
+        // Set custom keys
+        crashlytics.setCustomKey("error_context", context)
+        crashlytics.setCustomKey("error_type", errorResult?.let { it::class.simpleName } ?: "Unknown")
+        crashlytics.setCustomKey("timestamp", System.currentTimeMillis())
+        
+        // Add additional data
+        additionalData.forEach { (key, value) ->
+            crashlytics.setCustomKey(key, value.toString())
+        }
+        
+        // Add device and network info
+        val deviceInfo = deviceInfo.getDeviceInfo()
+        deviceInfo.forEach { (key, value) ->
+            crashlytics.setCustomKey("device_$key", value.toString())
+        }
+        
+        val networkInfo = networkUtils.getNetworkInfo()
+        networkInfo.forEach { (key, value) ->
+            crashlytics.setCustomKey("network_$key", value.toString())
+        }
+        
+        // Report the exception
+        crashlytics.recordException(throwable)
+    }
+    
+    /**
+     * Set device information in Crashlytics
+     */
+    private fun setDeviceInformation() {
+        val deviceInfo = deviceInfo.getDeviceInfo()
+        deviceInfo.forEach { (key, value) ->
+            crashlytics.setCustomKey("device_$key", value.toString())
+        }
+        
+        // Set app version
+        try {
+            val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            crashlytics.setCustomKey("app_version", packageInfo.versionName ?: "Unknown")
+            crashlytics.setCustomKey("app_version_code", packageInfo.longVersionCode)
+        } catch (e: PackageManager.NameNotFoundException) {
+            crashlytics.setCustomKey("app_version", "Unknown")
+        }
+        
+        // Set OS version
+        crashlytics.setCustomKey("os_version", "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+        crashlytics.setCustomKey("device_model", "${Build.MANUFACTURER} ${Build.MODEL}")
+    }
+    
+    /**
+     * Set global exception handler
+     */
+    private fun setGlobalExceptionHandler() {
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            // Log the crash
+            Log.e(TAG, "Uncaught exception in thread: ${thread.name}", throwable)
+            
+            // Report to Crashlytics
+            crashlytics.setCustomKey("crash_thread", thread.name)
+            crashlytics.setCustomKey("crash_time", dateFormat.format(Date()))
+            crashlytics.recordException(throwable)
+            
+            // Call default handler
+            defaultHandler?.uncaughtException(thread, throwable)
+        }
+    }
+}
+
+/**
+ * Crash log entry data class
+ */
+data class CrashLogEntry(
+    val timestamp: Long,
+    val type: CrashLogType,
+    val message: String,
+    val context: String,
+    val stackTrace: String,
+    val deviceInfo: Map<String, Any>,
+    val networkInfo: Map<String, Any>,
+    val additionalData: Map<String, Any>
+)
+
+/**
+ * Types of crash logs
+ */
+enum class CrashLogType {
+    NETWORK_ERROR,
+    SERVER_ERROR,
+    CLIENT_ERROR,
+    TIMEOUT_ERROR,
+    SECURITY_ERROR,
+    VALIDATION_ERROR,
+    STATE_ERROR,
+    UNKNOWN_ERROR,
+    USER_ACTION,
+    PERFORMANCE
+}

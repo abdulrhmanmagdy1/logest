@@ -1,0 +1,492 @@
+package com.edham.logistics.audit
+
+import com.google.gson.Gson
+import kotlinx.coroutines.runBlocking
+
+/**
+ * Shipment Audit Logger - Specialized audit logging for shipment operations
+ */
+class ShipmentAuditLogger private constructor() {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: ShipmentAuditLogger? = null
+        
+        fun getInstance(): ShipmentAuditLogger {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: ShipmentAuditLogger().also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val gson = Gson()
+    private var auditSystem: AuditLogSystem? = null
+    
+    /**
+     * Initialize with audit system
+     */
+    fun initialize(auditSystem: AuditLogSystem) {
+        this.auditSystem = auditSystem
+    }
+    
+    /**
+     * Log shipment creation
+     */
+    fun logShipmentCreation(
+        userId: String,
+        shipment: Map<String, Any>
+    ) {
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipment["id"].toString(),
+            operation = AuditOperation.SHIPMENT_CREATE,
+            description = "Shipment created: ${shipment["trackingNumber"]}",
+            beforeShipment = null,
+            afterShipment = shipment
+        )
+    }
+    
+    /**
+     * Log shipment update
+     */
+    fun logShipmentUpdate(
+        userId: String,
+        shipmentId: String,
+        beforeShipment: Map<String, Any>,
+        afterShipment: Map<String, Any>,
+        changedFields: List<String>
+    ) {
+        val description = buildString {
+            append("Shipment updated: ${afterShipment["trackingNumber"]}")
+            if (changedFields.isNotEmpty()) {
+                append(" - Changed fields: ${changedFields.joinToString(", ")}")
+            }
+        }
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.SHIPMENT_UPDATE,
+            description = description,
+            beforeShipment = beforeShipment,
+            afterShipment = afterShipment,
+            metadata = mapOf(
+                "changedFields" to changedFields,
+                "trackingNumber" to afterShipment["trackingNumber"]
+            )
+        )
+    }
+    
+    /**
+     * Log shipment deletion
+     */
+    fun logShipmentDeletion(
+        userId: String,
+        shipment: Map<String, Any>
+    ) {
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipment["id"].toString(),
+            operation = AuditOperation.SHIPMENT_DELETE,
+            description = "Shipment deleted: ${shipment["trackingNumber"]}",
+            beforeShipment = shipment,
+            afterShipment = null,
+            metadata = mapOf(
+                "trackingNumber" to shipment["trackingNumber"],
+                "deletionReason" to shipment["deletionReason"]
+            )
+        )
+    }
+    
+    /**
+     * Log shipment status change
+     */
+    fun logShipmentStatusChange(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        oldStatus: String,
+        newStatus: String,
+        reason: String? = null
+    ) {
+        auditSystem?.logStatusChange(
+            userId = userId,
+            entityType = "SHIPMENT",
+            entityId = shipmentId,
+            oldStatus = oldStatus,
+            newStatus = newStatus,
+            reason = reason
+        )
+        
+        // Also log detailed shipment operation
+        val description = buildString {
+            append("Shipment status changed: $trackingNumber")
+            append(" from $oldStatus to $newStatus")
+            if (reason != null) {
+                append(" - Reason: $reason")
+            }
+        }
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.STATUS_CHANGE,
+            description = description,
+            beforeShipment = mapOf("status" to oldStatus),
+            afterShipment = mapOf("status" to newStatus),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "oldStatus" to oldStatus,
+                "newStatus" to newStatus,
+                "reason" to reason
+            )
+        )
+    }
+    
+    /**
+     * Log shipment assignment
+     */
+    fun logShipmentAssignment(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        driverId: String?,
+        vehicleId: String?,
+        oldDriverId: String?,
+        oldVehicleId: String?
+    ) {
+        val description = buildString {
+            append("Shipment assigned: $trackingNumber")
+            if (driverId != oldDriverId) {
+                append(" - Driver changed: ${oldDriverId ?: "None"} → ${driverId ?: "None"}")
+            }
+            if (vehicleId != oldVehicleId) {
+                append(" - Vehicle changed: ${oldVehicleId ?: "None"} → ${vehicleId ?: "None"}")
+            }
+        }
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.UPDATE,
+            description = description,
+            beforeShipment = mapOf(
+                "driverId" to (oldDriverId ?: ""),
+                "vehicleId" to (oldVehicleId ?: "")
+            ),
+            afterShipment = mapOf(
+                "driverId" to (driverId ?: ""),
+                "vehicleId" to (vehicleId ?: "")
+            ),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "assignmentType" to "DRIVER_VEHICLE",
+                "oldDriverId" to oldDriverId,
+                "newDriverId" to driverId,
+                "oldVehicleId" to oldVehicleId,
+                "newVehicleId" to vehicleId
+            )
+        )
+    }
+    
+    /**
+     * Log shipment location update
+     */
+    fun logShipmentLocationUpdate(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        oldLocation: String?,
+        newLocation: String,
+        timestamp: Long
+    ) {
+        val description = "Shipment location updated: $trackingNumber to $newLocation"
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.UPDATE,
+            description = description,
+            beforeShipment = oldLocation?.let { mapOf("location" to it) },
+            afterShipment = mapOf("location" to newLocation),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "locationUpdateType" to "GPS",
+                "oldLocation" to oldLocation,
+                "newLocation" to newLocation,
+                "locationTimestamp" to timestamp
+            )
+        )
+    }
+    
+    /**
+     * Log shipment delivery
+     */
+    fun logShipmentDelivery(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        deliveryData: Map<String, Any>
+    ) {
+        val description = "Shipment delivered: $trackingNumber"
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.UPDATE,
+            description = description,
+            beforeShipment = mapOf("status" to "IN_TRANSIT"),
+            afterShipment = mapOf(
+                "status" to "DELIVERED",
+                "actualDelivery" to System.currentTimeMillis()
+            ),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "deliveryType" to deliveryData["deliveryType"],
+                "deliveryTime" to System.currentTimeMillis(),
+                "recipient" to deliveryData["recipient"],
+                "signature" to deliveryData["signature"],
+                "proofOfDelivery" to deliveryData["proofOfDelivery"]
+            )
+        )
+    }
+    
+    /**
+     * Log shipment delay
+     */
+    fun logShipmentDelay(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        delayReason: String,
+        estimatedDelay: Long,
+        newEstimatedDelivery: Long
+    ) {
+        val description = "Shipment delayed: $trackingNumber - $delayReason"
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.UPDATE,
+            description = description,
+            beforeShipment = mapOf(
+                "estimatedDelivery" to (newEstimatedDelivery - estimatedDelay)
+            ),
+            afterShipment = mapOf(
+                "estimatedDelivery" to newEstimatedDelivery,
+                "delayReason" to delayReason,
+                "estimatedDelay" to estimatedDelay
+            ),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "delayType" to "SCHEDULED",
+                "delayReason" to delayReason,
+                "estimatedDelayHours" to (estimatedDelay / (1000 * 60 * 60)),
+                "originalDeliveryDate" to (newEstimatedDelivery - estimatedDelay),
+                "newDeliveryDate" to newEstimatedDelivery
+            )
+        )
+    }
+    
+    /**
+     * Log shipment route change
+     */
+    fun logShipmentRouteChange(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        oldRoute: String,
+        newRoute: String,
+        reason: String
+    ) {
+        val description = "Shipment route changed: $trackingNumber - $reason"
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.UPDATE,
+            description = description,
+            beforeShipment = mapOf("route" to oldRoute),
+            afterShipment = mapOf("route" to newRoute),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "routeChangeType" to "MODIFIED",
+                "oldRoute" to oldRoute,
+                "newRoute" to newRoute,
+                "changeReason" to reason
+            )
+        )
+    }
+    
+    /**
+     * Log shipment cost update
+     */
+    fun logShipmentCostUpdate(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        oldCost: Double,
+        newCost: Double,
+        reason: String
+    ) {
+        val description = "Shipment cost updated: $trackingNumber from $oldCost to $newCost"
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.UPDATE,
+            description = description,
+            beforeShipment = mapOf("cost" to oldCost),
+            afterShipment = mapOf("cost" to newCost),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "costUpdateType" to "PRICE_CHANGE",
+                "oldCost" to oldCost,
+                "newCost" to newCost,
+                "costDifference" to (newCost - oldCost),
+                "changeReason" to reason
+            )
+        )
+    }
+    
+    /**
+     * Log shipment document upload
+     */
+    fun logShipmentDocumentUpload(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        documentType: String,
+        documentName: String,
+        documentSize: Long
+    ) {
+        val description = "Document uploaded for shipment: $trackingNumber - $documentType"
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.UPDATE,
+            description = description,
+            beforeShipment = null,
+            afterShipment = mapOf(
+                "documentUploaded" to true,
+                "documentType" to documentType,
+                "documentName" to documentName
+            ),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "documentType" to documentType,
+                "documentName" to documentName,
+                "documentSize" to documentSize,
+                "uploadTimestamp" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    /**
+     * Log shipment exception
+     */
+    fun logShipmentException(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        exceptionType: String,
+        exceptionReason: String,
+        resolution: String?
+    ) {
+        val description = "Shipment exception: $trackingNumber - $exceptionType"
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.UPDATE,
+            description = description,
+            beforeShipment = mapOf("status" to "NORMAL"),
+            afterShipment = mapOf(
+                "status" to "EXCEPTION",
+                "exceptionType" to exceptionType,
+                "exceptionReason" to exceptionReason
+            ),
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "exceptionType" to exceptionType,
+                "exceptionReason" to exceptionReason,
+                "resolution" to resolution,
+                "exceptionTimestamp" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    /**
+     * Log shipment view/access
+     */
+    fun logShipmentView(
+        userId: String,
+        shipmentId: String,
+        trackingNumber: String,
+        accessType: String
+    ) {
+        val description = "Shipment accessed: $trackingNumber - $accessType"
+        
+        auditSystem?.logShipmentOperation(
+            userId = userId,
+            shipmentId = shipmentId,
+            operation = AuditOperation.VIEW,
+            description = description,
+            beforeShipment = null,
+            afterShipment = null,
+            metadata = mapOf(
+                "trackingNumber" to trackingNumber,
+                "accessType" to accessType,
+                "viewTimestamp" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    /**
+     * Get shipment audit history
+     */
+    fun getShipmentAuditHistory(shipmentId: String): List<Map<String, Any>> {
+        return runBlocking {
+            auditSystem?.getEntityAuditHistory("SHIPMENT", shipmentId)?.map { log ->
+                mapOf(
+                    "id" to log.id,
+                    "userId" to log.userId,
+                    "operation" to log.operation.name,
+                    "description" to log.description,
+                    "timestamp" to log.timestamp,
+                    "beforeData" to log.beforeData,
+                    "afterData" to log.afterData,
+                    "metadata" to log.metadata,
+                    "ipAddress" to log.ipAddress
+                )
+            } ?: emptyList()
+        }
+    }
+    
+    /**
+     * Get shipment statistics
+     */
+    fun getShipmentStatistics(): Map<String, Any> {
+        return runBlocking {
+            val allLogs = auditSystem?.getAuditLogs(
+                entityType = "SHIPMENT",
+                limit = 10000
+            ) ?: emptyList()
+            
+            val totalOperations = allLogs.size
+            val operationsByType = allLogs.groupBy { it.operation }.mapValues { it.value.size }
+            val recentActivity = allLogs.filter { 
+                System.currentTimeMillis() - it.timestamp < 24 * 60 * 60 * 1000L 
+            }.size
+            
+            mapOf(
+                "totalOperations" to totalOperations,
+                "operationsByType" to operationsByType,
+                "recentActivity24h" to recentActivity,
+                "mostActiveUsers" to allLogs.groupBy { it.userId }.mapValues { it.value.size }
+                    .toList().sortedByDescending { it.second }.take(10)
+            )
+        }
+    }
+}

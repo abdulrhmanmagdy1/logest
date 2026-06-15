@@ -1,0 +1,850 @@
+package com.edham.logistics.sync
+
+import android.content.Context
+import com.edham.logistics.offline.LocalCacheManager
+import com.edham.logistics.offline.OfflineActionQueue
+import com.google.gson.Gson
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.system.measureTimeMillis
+
+/**
+ * Sync Engine - Core synchronization engine between local and server data
+ */
+class SyncEngine private constructor(context: Context) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: SyncEngine? = null
+        
+        fun getInstance(context: Context): SyncEngine {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: SyncEngine(context).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val cacheManager = LocalCacheManager.getInstance(context)
+    private val offlineActionQueue = OfflineActionQueue.getInstance(context)
+    private val conflictResolver = ConflictResolver.getInstance(context)
+    private val batchProcessor = BatchProcessor.getInstance(context)
+    private val backgroundSyncService = BackgroundSyncService.getInstance(context)
+    
+    private val syncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val processingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    private val _syncState = MutableStateFlow<SyncState>(SyncState.IDLE)
+    val syncState = _syncState.asStateFlow()
+    
+    private val _syncProgress = MutableStateFlow<SyncProgress>(SyncProgress())
+    val syncProgress = _syncProgress.asStateFlow()
+    
+    private val _conflictList = MutableStateFlow<List<SyncConflict>>(emptyList())
+    val conflictList = _conflictList.asStateFlow()
+    
+    private val _syncResults = MutableStateFlow<List<SyncResult>>(emptyList())
+    val syncResults = _syncResults.asStateFlow()
+    
+    private val syncQueue = ConcurrentLinkedQueue<SyncTask>()
+    private var isSyncing = false
+    private var syncJob: Job? = null
+    
+    private val gson = Gson()
+    private val batchSize = 50
+    private val maxRetryAttempts = 3
+    private val syncTimeout = 30000L // 30 seconds per batch
+    
+    init {
+        initializeSyncEngine()
+    }
+    
+    /**
+     * Initialize sync engine
+     */
+    private fun initializeSyncEngine() {
+        syncScope.launch {
+            // Start background sync service
+            backgroundSyncService.start()
+            
+            // Monitor sync queue and process tasks
+            processSyncQueue()
+        }
+    }
+    
+    /**
+     * Add sync task to queue
+     */
+    fun addSyncTask(task: SyncTask) {
+        syncQueue.offer(task)
+        triggerSync()
+    }
+    
+    /**
+     * Trigger sync process
+     */
+    fun triggerSync() {
+        if (isSyncing) return
+        
+        syncJob?.cancel()
+        syncJob = syncScope.launch {
+            try {
+                startSyncProcess()
+            } catch (e: Exception) {
+                _syncState.value = SyncState.ERROR
+                _syncResults.value = listOf(
+                    SyncResult(
+                        type = SyncType.FULL_SYNC,
+                        success = false,
+                        error = e.message,
+                        itemsProcessed = 0,
+                        itemsTotal = 0
+                    )
+                )
+            }
+        }
+    }
+    
+    /**
+     * Start sync process
+     */
+    private suspend fun startSyncProcess() {
+        if (isSyncing) return
+        
+        isSyncing = true
+        _syncState.value = SyncState.SYNCING
+        _syncResults.value = emptyList()
+        
+        try {
+            // Step 1: Process offline actions
+            processOfflineActions()
+            
+            // Step 2: Sync local changes to server
+            syncLocalToServer()
+            
+            // Step 3: Pull server changes to local
+            syncServerToLocal()
+            
+            // Step 4: Resolve conflicts
+            resolveConflicts()
+            
+            // Step 5: Finalize sync
+            finalizeSync()
+            
+            _syncState.value = SyncState.SUCCESS
+            
+        } catch (e: Exception) {
+            _syncState.value = SyncState.ERROR
+            _syncResults.value = listOf(
+                SyncResult(
+                    type = SyncType.FULL_SYNC,
+                    success = false,
+                    error = e.message,
+                    itemsProcessed = 0,
+                    itemsTotal = 0
+                )
+            )
+        } finally {
+            isSyncing = false
+        }
+    }
+    
+    /**
+     * Process offline actions
+     */
+    private suspend fun processOfflineActions() {
+        val pendingActions = offlineActionQueue.getPendingActions()
+        if (pendingActions.isEmpty()) return
+        
+        _syncProgress.value = _syncProgress.value.copy(
+            currentStep = "معالجة الإجراءات المعلقة",
+            totalSteps = pendingActions.size,
+            currentStepProgress = 0
+        )
+        
+        val results = mutableListOf<SyncResult>()
+        var processedCount = 0
+        
+        pendingActions.chunked(batchSize).forEach { batch ->
+            val batchResults = processBatch(batch)
+            results.addAll(batchResults)
+            
+            processedCount += batch.size
+            _syncProgress.value = _syncProgress.value.copy(
+                currentStepProgress = processedCount
+            )
+            
+            // Small delay between batches
+            delay(1000)
+        }
+        
+        _syncResults.value = _syncResults.value + results
+    }
+    
+    /**
+     * Process batch of actions
+     */
+    private suspend fun processBatch(actions: List<com.edham.logistics.offline.OfflineAction>): List<SyncResult> {
+        val results = mutableListOf<SyncResult>()
+        
+        actions.forEach { action ->
+            try {
+                val success = processOfflineAction(action)
+                results.add(
+                    SyncResult(
+                        type = SyncType.OFFLINE_ACTION,
+                        success = success,
+                        actionId = action.id,
+                        actionType = action.type,
+                        itemsProcessed = 1,
+                        itemsTotal = 1
+                    )
+                )
+                
+                if (success) {
+                    offlineActionQueue.markActionCompleted(action.id, true)
+                } else {
+                    offlineActionQueue.markActionCompleted(action.id, false, "Failed to process")
+                }
+                
+            } catch (e: Exception) {
+                results.add(
+                    SyncResult(
+                        type = SyncType.OFFLINE_ACTION,
+                        success = false,
+                        error = e.message,
+                        actionId = action.id,
+                        actionType = action.type,
+                        itemsProcessed = 0,
+                        itemsTotal = 1
+                    )
+                )
+            }
+        }
+        
+        return results
+    }
+    
+    /**
+     * Process individual offline action
+     */
+    private suspend fun processOfflineAction(action: com.edham.logistics.offline.OfflineAction): Boolean {
+        return try {
+            when (com.edham.logistics.offline.ActionType.valueOf(action.type)) {
+                com.edham.logistics.offline.ActionType.CREATE_UPDATE -> processCreateUpdateAction(action)
+                com.edham.logistics.offline.ActionType.DELETE -> processDeleteAction(action)
+                com.edham.logistics.offline.ActionType.UPDATE_LOCATION -> processLocationUpdateAction(action)
+                com.edham.logistics.offline.ActionType.UPDATE_STATUS -> processStatusUpdateAction(action)
+                com.edham.logistics.offline.ActionType.UPLOAD_PROOF -> processProofUploadAction(action)
+                com.edham.logistics.offline.ActionType.SYNC_DATA -> processDataSyncAction(action)
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    /**
+     * Process create/update action
+     */
+    private suspend fun processCreateUpdateAction(action: com.edham.logistics.offline.OfflineAction): Boolean {
+        return withTimeout(syncTimeout) {
+            // Simulate API call
+            delay(200)
+            
+            // Check for conflicts
+            val localData = action.data
+            val serverData = getServerData(action.entityType, action.entityId)
+            
+            if (serverData != null) {
+                val conflict = conflictResolver.detectConflict(
+                    entityType = action.entityType,
+                    entityId = action.entityId,
+                    localData = localData,
+                    serverData = serverData
+                )
+                
+                if (conflict != null) {
+                    _conflictList.value = _conflictList.value + conflict
+                    return@withTimeout false
+                }
+            }
+            
+            // Apply changes to server
+            applyChangesToServer(action.entityType, action.entityId, localData)
+            true
+        }
+    }
+    
+    /**
+     * Process delete action
+     */
+    private suspend fun processDeleteAction(action: com.edham.logistics.offline.OfflineAction): Boolean {
+        return withTimeout(syncTimeout) {
+            delay(150)
+            deleteFromServer(action.entityType, action.entityId)
+            true
+        }
+    }
+    
+    /**
+     * Process location update action
+     */
+    private suspend fun processLocationUpdateAction(action: com.edham.logistics.offline.OfflineAction): Boolean {
+        return withTimeout(syncTimeout) {
+            delay(100)
+            updateLocationOnServer(action.entityId, action.data)
+            true
+        }
+    }
+    
+    /**
+     * Process status update action
+     */
+    private suspend fun processStatusUpdateAction(action: com.edham.logistics.offline.OfflineAction): Boolean {
+        return withTimeout(syncTimeout) {
+            delay(150)
+            updateStatusOnServer(action.entityId, action.data)
+            true
+        }
+    }
+    
+    /**
+     * Process proof upload action
+     */
+    private suspend fun processProofUploadAction(action: com.edham.logistics.offline.OfflineAction): Boolean {
+        return withTimeout(syncTimeout) {
+            delay(500)
+            uploadProofToServer(action.entityId, action.data)
+            true
+        }
+    }
+    
+    /**
+     * Process data sync action
+     */
+    private suspend fun processDataSyncAction(action: com.edham.logistics.offline.OfflineAction): Boolean {
+        return withTimeout(syncTimeout) {
+            delay(300)
+            syncDataWithServer(action.entityType, action.data)
+            true
+        }
+    }
+    
+    /**
+     * Sync local changes to server
+     */
+    private suspend fun syncLocalToServer() {
+        _syncProgress.value = _syncProgress.value.copy(
+            currentStep = "مزامنة التغييرات المحلية",
+            totalSteps = 4,
+            currentStepProgress = 0
+        )
+        
+        val entityTypes = listOf("shipments", "drivers", "vehicles", "users")
+        
+        entityTypes.forEachIndexed { index, entityType ->
+            try {
+                val result = syncEntityTypeToServer(entityType)
+                _syncResults.value = _syncResults.value + listOf(result)
+                
+                _syncProgress.value = _syncProgress.value.copy(
+                    currentStepProgress = index + 1
+                )
+                
+                delay(1000)
+                
+            } catch (e: Exception) {
+                _syncResults.value = _syncResults.value + listOf(
+                    SyncResult(
+                        type = SyncType.LOCAL_TO_SERVER,
+                        success = false,
+                        error = e.message,
+                        itemsProcessed = 0,
+                        itemsTotal = 0
+                    )
+                )
+            }
+        }
+    }
+    
+    /**
+     * Sync entity type to server
+     */
+    private suspend fun syncEntityTypeToServer(entityType: String): SyncResult {
+        return try {
+            val localData = getLocalData(entityType)
+            val serverData = getServerDataList(entityType)
+            
+            var processedCount = 0
+            val totalCount = localData.size
+            
+            localData.chunked(batchSize).forEach { batch ->
+                val batchResult = batchProcessor.processBatchToServer(entityType, batch)
+                processedCount += batch.size
+                
+                delay(500)
+            }
+            
+            SyncResult(
+                type = SyncType.LOCAL_TO_SERVER,
+                success = true,
+                itemsProcessed = processedCount,
+                itemsTotal = totalCount
+            )
+            
+        } catch (e: Exception) {
+            SyncResult(
+                type = SyncType.LOCAL_TO_SERVER,
+                success = false,
+                error = e.message,
+                itemsProcessed = 0,
+                itemsTotal = 0
+            )
+        }
+    }
+    
+    /**
+     * Sync server changes to local
+     */
+    private suspend fun syncServerToLocal() {
+        _syncProgress.value = _syncProgress.value.copy(
+            currentStep = "سحب التغييرات من الخادم",
+            totalSteps = 4,
+            currentStepProgress = 0
+        )
+        
+        val entityTypes = listOf("shipments", "drivers", "vehicles", "users")
+        
+        entityTypes.forEachIndexed { index, entityType ->
+            try {
+                val result = syncEntityTypeFromServer(entityType)
+                _syncResults.value = _syncResults.value + listOf(result)
+                
+                _syncProgress.value = _syncProgress.value.copy(
+                    currentStepProgress = index + 1
+                )
+                
+                delay(1000)
+                
+            } catch (e: Exception) {
+                _syncResults.value = _syncResults.value + listOf(
+                    SyncResult(
+                        type = SyncType.SERVER_TO_LOCAL,
+                        success = false,
+                        error = e.message,
+                        itemsProcessed = 0,
+                        itemsTotal = 0
+                    )
+                )
+            }
+        }
+    }
+    
+    /**
+     * Sync entity type from server
+     */
+    private suspend fun syncEntityTypeFromServer(entityType: String): SyncResult {
+        return try {
+            val serverData = getServerDataList(entityType)
+            val localData = getLocalData(entityType)
+            
+            var processedCount = 0
+            val totalCount = serverData.size
+            
+            serverData.chunked(batchSize).forEach { batch ->
+                val batchResult = batchProcessor.processBatchFromServer(entityType, batch)
+                processedCount += batch.size
+                
+                delay(500)
+            }
+            
+            SyncResult(
+                type = SyncType.SERVER_TO_LOCAL,
+                success = true,
+                itemsProcessed = processedCount,
+                itemsTotal = totalCount
+            )
+            
+        } catch (e: Exception) {
+            SyncResult(
+                type = SyncType.SERVER_TO_LOCAL,
+                success = false,
+                error = e.message,
+                itemsProcessed = 0,
+                itemsTotal = 0
+            )
+        }
+    }
+    
+    /**
+     * Resolve conflicts
+     */
+    private suspend fun resolveConflicts() {
+        val conflicts = _conflictList.value
+        if (conflicts.isEmpty()) return
+        
+        _syncProgress.value = _syncProgress.value.copy(
+            currentStep = "حل التعارضات",
+            totalSteps = conflicts.size,
+            currentStepProgress = 0
+        )
+        
+        val results = mutableListOf<SyncResult>()
+        
+        conflicts.forEachIndexed { index, conflict ->
+            try {
+                val resolution = conflictResolver.resolveConflict(conflict)
+                applyConflictResolution(resolution)
+                
+                results.add(
+                    SyncResult(
+                        type = SyncType.CONFLICT_RESOLUTION,
+                        success = true,
+                        conflictId = conflict.id,
+                        resolution = resolution.type.name,
+                        itemsProcessed = 1,
+                        itemsTotal = 1
+                    )
+                )
+                
+                _syncProgress.value = _syncProgress.value.copy(
+                    currentStepProgress = index + 1
+                )
+                
+                delay(200)
+                
+            } catch (e: Exception) {
+                results.add(
+                    SyncResult(
+                        type = SyncType.CONFLICT_RESOLUTION,
+                        success = false,
+                        error = e.message,
+                        conflictId = conflict.id,
+                        itemsProcessed = 0,
+                        itemsTotal = 1
+                    )
+                )
+            }
+        }
+        
+        _syncResults.value = _syncResults.value + results
+        _conflictList.value = emptyList()
+    }
+    
+    /**
+     * Finalize sync
+     */
+    private suspend fun finalizeSync() {
+        _syncProgress.value = _syncProgress.value.copy(
+            currentStep = "الانتهاء من المزامنة",
+            totalSteps = 1,
+            currentStepProgress = 0
+        )
+        
+        try {
+            // Update last sync timestamp
+            updateLastSyncTimestamp()
+            
+            // Clean up old data
+            cleanupOldData()
+            
+            // Update sync statistics
+            updateSyncStatistics()
+            
+            _syncProgress.value = _syncProgress.value.copy(
+                currentStepProgress = 1
+            )
+            
+            _syncResults.value = _syncResults.value + listOf(
+                SyncResult(
+                    type = SyncType.FINALIZATION,
+                    success = true,
+                    itemsProcessed = 1,
+                    itemsTotal = 1
+                )
+            )
+            
+        } catch (e: Exception) {
+            _syncResults.value = _syncResults.value + listOf(
+                SyncResult(
+                    type = SyncType.FINALIZATION,
+                    success = false,
+                    error = e.message,
+                    itemsProcessed = 0,
+                    itemsTotal = 1
+                )
+            )
+        }
+    }
+    
+    /**
+     * Process sync queue continuously
+     */
+    private suspend fun processSyncQueue() {
+        while (true) {
+            try {
+                if (!isSyncing && syncQueue.isNotEmpty()) {
+                    val task = syncQueue.poll()
+                    if (task != null) {
+                        processSyncTask(task)
+                    }
+                }
+                
+                delay(5000) // Check every 5 seconds
+                
+            } catch (e: Exception) {
+                // Handle error and continue
+                delay(10000) // Wait longer on error
+            }
+        }
+    }
+    
+    /**
+     * Process individual sync task
+     */
+    private suspend fun processSyncTask(task: SyncTask) {
+        try {
+            when (task.type) {
+                SyncType.FULL_SYNC -> triggerSync()
+                SyncType.ENTITY_SYNC -> syncSingleEntity(task.entityType!!, task.entityId!!)
+                SyncType.CONFLICT_RESOLUTION -> resolveSingleConflict(task.conflictId!!)
+                else -> {
+                    // Handle other task types
+                }
+            }
+        } catch (e: Exception) {
+            // Handle task processing error
+        }
+    }
+    
+    /**
+     * Sync single entity
+     */
+    private suspend fun syncSingleEntity(entityType: String, entityId: String) {
+        try {
+            val localData = getLocalEntity(entityType, entityId)
+            val serverData = getServerEntity(entityType, entityId)
+            
+            if (localData != null && serverData != null) {
+                val conflict = conflictResolver.detectConflict(entityType, entityId, localData, serverData)
+                if (conflict != null) {
+                    _conflictList.value = _conflictList.value + conflict
+                } else {
+                    // No conflict, sync data
+                    syncEntityData(entityType, entityId, localData, serverData)
+                }
+            } else if (localData != null && serverData == null) {
+                // Local only, push to server
+                pushEntityToServer(entityType, entityId, localData)
+            } else if (localData == null && serverData != null) {
+                // Server only, pull to local
+                pullEntityFromServer(entityType, entityId, serverData)
+            }
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    /**
+     * Resolve single conflict
+     */
+    private suspend fun resolveSingleConflict(conflictId: String) {
+        try {
+            val conflict = _conflictList.value.find { it.id == conflictId }
+            if (conflict != null) {
+                val resolution = conflictResolver.resolveConflict(conflict)
+                applyConflictResolution(resolution)
+                
+                _conflictList.value = _conflictList.value.filter { it.id != conflictId }
+            }
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    // Helper methods (simulated implementations)
+    private suspend fun getServerData(entityType: String, entityId: String): String? {
+        delay(100) // Simulate network call
+        return null // Return null for demo
+    }
+    
+    private suspend fun getServerDataList(entityType: String): List<String> {
+        delay(200) // Simulate network call
+        return emptyList() // Return empty for demo
+    }
+    
+    private suspend fun getLocalData(entityType: String): List<String> {
+        return when (entityType) {
+            "shipments" -> cacheManager.getCachedShipments().map { gson.toJson(it) }
+            "drivers" -> cacheManager.getCachedDrivers().map { gson.toJson(it) }
+            "vehicles" -> cacheManager.getCachedVehicles().map { gson.toJson(it) }
+            else -> emptyList()
+        }
+    }
+    
+    private suspend fun getLocalEntity(entityType: String, entityId: String): String? {
+        return when (entityType) {
+            "shipments" -> cacheManager.getCachedShipment(entityId)?.let { gson.toJson(it) }
+            "drivers" -> cacheManager.getCachedDriver(entityId)?.let { gson.toJson(it) }
+            "vehicles" -> cacheManager.getCachedVehicle(entityId)?.let { gson.toJson(it) }
+            else -> null
+        }
+    }
+    
+    private suspend fun getServerEntity(entityType: String, entityId: String): String? {
+        delay(100) // Simulate network call
+        return null // Return null for demo
+    }
+    
+    private suspend fun applyChangesToServer(entityType: String, entityId: String, data: String) {
+        delay(200) // Simulate API call
+    }
+    
+    private suspend fun deleteFromServer(entityType: String, entityId: String) {
+        delay(150) // Simulate API call
+    }
+    
+    private suspend fun updateLocationOnServer(entityId: String, data: String) {
+        delay(100) // Simulate API call
+    }
+    
+    private suspend fun updateStatusOnServer(entityId: String, data: String) {
+        delay(150) // Simulate API call
+    }
+    
+    private suspend fun uploadProofToServer(entityId: String, data: String) {
+        delay(500) // Simulate file upload
+    }
+    
+    private suspend fun syncDataWithServer(entityType: String, data: String) {
+        delay(300) // Simulate sync operation
+    }
+    
+    private suspend fun syncEntityData(entityType: String, entityId: String, localData: String, serverData: String) {
+        delay(200) // Simulate sync operation
+    }
+    
+    private suspend fun pushEntityToServer(entityType: String, entityId: String, data: String) {
+        delay(250) // Simulate push operation
+    }
+    
+    private suspend fun pullEntityFromServer(entityType: String, entityId: String, data: String) {
+        delay(200) // Simulate pull operation
+    }
+    
+    private suspend fun applyConflictResolution(resolution: ConflictResolution) {
+        delay(100) // Simulate resolution application
+    }
+    
+    private suspend fun updateLastSyncTimestamp() {
+        delay(50) // Simulate update
+    }
+    
+    private suspend fun cleanupOldData() {
+        delay(100) // Simulate cleanup
+    }
+    
+    private suspend fun updateSyncStatistics() {
+        delay(50) // Simulate statistics update
+    }
+    
+    /**
+     * Get sync statistics
+     */
+    suspend fun getSyncStatistics(): SyncStatistics {
+        val pendingActions = offlineActionQueue.getPendingActions()
+        val conflicts = _conflictList.value
+        val results = _syncResults.value
+        
+        return SyncStatistics(
+            pendingActionsCount = pendingActions.size,
+            conflictsCount = conflicts.size,
+            lastSyncTime = System.currentTimeMillis(),
+            currentSyncState = _syncState.value,
+            successfulSyncsToday = results.count { it.success },
+            failedSyncsToday = results.count { !it.success },
+            totalSyncOperations = results.size
+        )
+    }
+    
+    /**
+     * Stop sync engine
+     */
+    fun stop() {
+        syncScope.cancel()
+        processingScope.cancel()
+        syncJob?.cancel()
+        backgroundSyncService.stop()
+    }
+}
+
+/**
+ * Data classes
+ */
+data class SyncTask(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val type: SyncType,
+    val entityType: String? = null,
+    val entityId: String? = null,
+    val conflictId: String? = null,
+    val priority: SyncPriority = SyncPriority.NORMAL,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+data class SyncProgress(
+    val currentStep: String = "",
+    val totalSteps: Int = 0,
+    val currentStepProgress: Int = 0,
+    val overallProgress: Float = 0f
+) {
+    val progressPercentage: Float
+        get() = if (totalSteps > 0) (currentStepProgress.toFloat() / totalSteps) * 100 else 0f
+}
+
+data class SyncResult(
+    val type: SyncType,
+    val success: Boolean,
+    val error: String? = null,
+    val actionId: String? = null,
+    val actionType: String? = null,
+    val conflictId: String? = null,
+    val resolution: String? = null,
+    val itemsProcessed: Int = 0,
+    val itemsTotal: Int = 0
+)
+
+data class SyncStatistics(
+    val pendingActionsCount: Int,
+    val conflictsCount: Int,
+    val lastSyncTime: Long,
+    val currentSyncState: SyncState,
+    val successfulSyncsToday: Int,
+    val failedSyncsToday: Int,
+    val totalSyncOperations: Int
+)
+
+enum class SyncType {
+    FULL_SYNC,
+    OFFLINE_ACTION,
+    LOCAL_TO_SERVER,
+    SERVER_TO_LOCAL,
+    CONFLICT_RESOLUTION,
+    ENTITY_SYNC,
+    FINALIZATION
+}
+
+enum class SyncState {
+    IDLE,
+    SYNCING,
+    SUCCESS,
+    ERROR,
+    CANCELLED
+}
+
+enum class SyncPriority {
+    CRITICAL,
+    HIGH,
+    NORMAL,
+    LOW
+}

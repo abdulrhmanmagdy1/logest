@@ -16,8 +16,9 @@ class CargoPickupFragment : Fragment() {
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
         val view = inflater.inflate(R.layout.fragment_cargo_pickup, container, false)
         
-        view.findViewById<EditText>(R.id.etCity).doAfterTextChanged {
-            viewModel.pickupCity.value = it.toString()
+        val etCity = view.findViewById<EditText>(R.id.etCity)
+        etCity.setOnClickListener {
+            showCityPicker(etCity)
         }
         
         view.findViewById<EditText>(R.id.etAddress).doAfterTextChanged {
@@ -33,5 +34,17 @@ class CargoPickupFragment : Fragment() {
         }
         
         return view
+    }
+
+    private fun showCityPicker(editText: EditText) {
+        val cities = arrayOf("الرياض", "جدة", "الدمام", "مكة المكرمة", "المدينة المنورة", "القصيم", "تبوك", "دبي (الإمارات)", "المنامة (البحرين)", "الكويت", "مسقط (عمان)", "الدوحة (قطر)")
+        androidx.appcompat.app.AlertDialog.Builder(requireContext())
+            .setTitle("اختر المدينة")
+            .setItems(cities) { _, which ->
+                val selected = cities[which]
+                editText.setText(selected)
+                viewModel.pickupCity.value = selected
+            }
+            .show()
     }
 }

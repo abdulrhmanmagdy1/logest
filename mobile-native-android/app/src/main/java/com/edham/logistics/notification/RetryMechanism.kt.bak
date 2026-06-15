@@ -1,0 +1,559 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.NotificationApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Retry Mechanism - Handles retry logic for failed notifications
+ * 
+ * Features:
+ * - Exponential backoff retry strategy
+ * - Configurable retry policies
+ * - Retry analytics and monitoring
+ * - Circuit breaker pattern
+ * - Retry queue management
+ * - Network-aware retry logic
+ * - Priority-based retry scheduling
+ */
+@Singleton
+class RetryMechanism @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val notificationApi: NotificationApi,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _retryState = MutableStateFlow<RetryState>(RetryState.Idle)
+    val retryState: StateFlow<RetryState> = _retryState.asStateFlow()
+    
+    private val _retryStats = MutableStateFlow<RetryStats>(RetryStats())
+    val retryStats: StateFlow<RetryStats> = _retryStats.asStateFlow()
+    
+    private val _activeRetries = MutableStateFlow<List<RetryAttempt>>(emptyList())
+    val activeRetries: StateFlow<List<RetryAttempt>> = _activeRetries.asStateFlow()
+    
+    private var isInitialized = false
+    private val retryScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var retryJob: Job? = null
+    
+    companion object {
+        private const val TAG = "RetryMechanism"
+        private const val DEFAULT_MAX_RETRIES = 3
+        private const val INITIAL_RETRY_DELAY_MS = 1000L
+        private const val MAX_RETRY_DELAY_MS = 30000L
+        private const val RETRY_BACKOFF_MULTIPLIER = 2.0
+        private const val CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+        private const val CIRCUIT_BREAKER_RECOVERY_TIMEOUT_MS = 60000L
+        private const val RETRY_CHECK_INTERVAL_MS = 5000L
+    }
+    
+    /**
+     * Initialize retry mechanism
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _retryState.value = RetryState.Initializing
+                
+                // Load retry configuration
+                loadRetryConfiguration()
+                
+                // Load active retry attempts
+                loadActiveRetryAttempts()
+                
+                // Start retry monitoring
+                startRetryMonitoring()
+                
+                isInitialized = true
+                _retryState.value = RetryState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _retryState.value = RetryState.Error("Failed to initialize retry mechanism: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Schedule retry attempt
+     */
+    suspend fun scheduleRetry(
+        notificationId: String,
+        request: NotificationRequest,
+        failureReason: String,
+        priority: NotificationPriority = NotificationPriority.NORMAL,
+        maxRetries: Int = DEFAULT_MAX_RETRIES
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Retry mechanism not initialized")
+                }
+                
+                val retryId = UUID.randomUUID().toString()
+                val initialDelay = calculateRetryDelay(0, priority)
+                
+                val retryAttempt = RetryAttempt(
+                    id = retryId,
+                    notificationId = notificationId,
+                    request = request,
+                    priority = priority,
+                    attemptCount = 0,
+                    maxRetries = maxRetries,
+                    failureReason = failureReason,
+                    status = RetryStatus.SCHEDULED,
+                    scheduledAt = Date(System.currentTimeMillis() + initialDelay),
+                    lastAttemptAt = null,
+                    nextRetryAt = Date(System.currentTimeMillis() + initialDelay),
+                    retryDelay = initialDelay,
+                    circuitBreakerState = CircuitBreakerState.CLOSED
+                )
+                
+                // Save to database
+                saveRetryAttempt(retryAttempt)
+                
+                // Add to active retries
+                addToActiveRetries(retryAttempt)
+                
+                // Update stats
+                updateRetryStats()
+                
+                Result.success(retryId)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Execute retry attempt
+     */
+    suspend fun executeRetry(retryId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val retryAttempt = _activeRetries.value.find { it.id == retryId }
+                    ?: throw Exception("Retry attempt not found")
+                
+                // Check if retry should be executed
+                if (!shouldExecuteRetry(retryAttempt)) {
+                    return@withContext Result.failure(Exception("Retry conditions not met"))
+                }
+                
+                // Update retry attempt
+                val updatedRetry = retryAttempt.copy(
+                    status = RetryStatus.EXECUTING,
+                    lastAttemptAt = Date(),
+                    attemptCount = retryAttempt.attemptCount + 1
+                )
+                
+                updateRetryAttemptInActiveList(updatedRetry)
+                
+                // Execute notification
+                val success = executeNotification(updatedRetry.request)
+                
+                if (success) {
+                    // Mark as completed
+                    val completedRetry = updatedRetry.copy(
+                        status = RetryStatus.COMPLETED,
+                        completedAt = Date()
+                    )
+                    
+                    updateRetryAttemptInActiveList(completedRetry)
+                    removeFromActiveRetries(retryId)
+                    
+                    // Update circuit breaker
+                    updateCircuitBreaker(retryId, true)
+                    
+                    // Update stats
+                    updateRetryStats()
+                    
+                    Result.success(true)
+                    
+                } else {
+                    // Handle failure
+                    val failedRetry = handleRetryFailure(updatedRetry)
+                    
+                    if (failedRetry.attemptCount >= failedRetry.maxRetries) {
+                        // Max retries reached
+                        val exhaustedRetry = failedRetry.copy(
+                            status = RetryStatus.EXHAUSTED,
+                            exhaustedAt = Date()
+                        )
+                        
+                        updateRetryAttemptInActiveList(exhaustedRetry)
+                        removeFromActiveRetries(retryId)
+                        
+                        // Update circuit breaker
+                        updateCircuitBreaker(retryId, false)
+                        
+                    } else {
+                        // Schedule next retry
+                        val nextDelay = calculateRetryDelay(failedRetry.attemptCount, failedRetry.priority)
+                        val scheduledRetry = failedRetry.copy(
+                            status = RetryStatus.SCHEDULED,
+                            nextRetryAt = Date(System.currentTimeMillis() + nextDelay),
+                            retryDelay = nextDelay
+                        )
+                        
+                        updateRetryAttemptInActiveList(scheduledRetry)
+                    }
+                    
+                    // Update stats
+                    updateRetryStats()
+                    
+                    Result.success(false)
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Cancel retry attempt
+     */
+    suspend fun cancelRetry(retryId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val retryAttempt = _activeRetries.value.find { it.id == retryId }
+                    ?: throw Exception("Retry attempt not found")
+                
+                // Update status
+                val cancelledRetry = retryAttempt.copy(
+                    status = RetryStatus.CANCELLED,
+                    cancelledAt = Date()
+                )
+                
+                updateRetryAttemptInActiveList(cancelledRetry)
+                removeFromActiveRetries(retryId)
+                
+                // Update stats
+                updateRetryStats()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get retry statistics
+     */
+    suspend fun getRetryStats(dateRange: DateRange = DateRange.last30Days()): Result<RetryStats> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val stats = database.retryAttemptDao().getRetryStats(dateRange.startDate, dateRange.endDate)
+                Result.success(stats)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Reset circuit breaker
+     */
+    suspend fun resetCircuitBreaker(notificationId: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Reset circuit breaker for all retry attempts of this notification
+                val affectedRetries = _activeRetries.value.filter { it.notificationId == notificationId }
+                
+                affectedRetries.forEach { retry ->
+                    val resetRetry = retry.copy(
+                        circuitBreakerState = CircuitBreakerState.CLOSED
+                    )
+                    updateRetryAttemptInActiveList(resetRetry)
+                }
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadRetryConfiguration() {
+        // Load retry configuration from database or remote config
+    }
+    
+    private suspend fun loadActiveRetryAttempts() {
+        try {
+            val retryAttempts = database.retryAttemptDao().getActiveRetryAttempts()
+                .map { it.toDomainModel() }
+            
+            _activeRetries.value = retryAttempts
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun startRetryMonitoring() {
+        retryJob = retryScope.launch {
+            while (true) {
+                try {
+                    checkScheduledRetries()
+                    delay(RETRY_CHECK_INTERVAL_MS)
+                } catch (e: Exception) {
+                    delay(1000) // Brief pause before retry
+                }
+            }
+        }
+    }
+    
+    private suspend fun checkScheduledRetries() {
+        val now = Date()
+        val scheduledRetries = _activeRetries.value.filter { 
+            it.status == RetryStatus.SCHEDULED && it.nextRetryAt != null && it.nextRetryAt <= now 
+        }
+        
+        scheduledRetries.forEach { retry ->
+            retryScope.launch {
+                executeRetry(retry.id)
+            }
+        }
+    }
+    
+    private fun shouldExecuteRetry(retryAttempt: RetryAttempt): Boolean {
+        // Check network connectivity
+        if (!networkUtils.isNetworkAvailable()) {
+            return false
+        }
+        
+        // Check circuit breaker
+        if (retryAttempt.circuitBreakerState == CircuitBreakerState.OPEN) {
+            return false
+        }
+        
+        // Check if scheduled time has passed
+        if (retryAttempt.nextRetryAt != null && retryAttempt.nextRetryAt > Date()) {
+            return false
+        }
+        
+        return true
+    }
+    
+    private suspend fun executeNotification(request: NotificationRequest): Boolean {
+        return try {
+            val result = notificationApi.sendNotification(request)
+            result.success
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    private fun handleRetryFailure(retryAttempt: RetryAttempt): RetryAttempt {
+        return retryAttempt.copy(
+            failureReason = "Retry ${retryAttempt.attemptCount} failed",
+            circuitBreakerState = updateCircuitBreakerState(retryAttempt)
+        )
+    }
+    
+    private fun updateCircuitBreakerState(retryAttempt: RetryAttempt): CircuitBreakerState {
+        return when (retryAttempt.circuitBreakerState) {
+            CircuitBreakerState.CLOSED -> {
+                if (retryAttempt.attemptCount >= CIRCUIT_BREAKER_FAILURE_THRESHOLD) {
+                    CircuitBreakerState.OPEN
+                } else {
+                    CircuitBreakerState.CLOSED
+                }
+            }
+            CircuitBreakerState.HALF_OPEN -> {
+                if (retryAttempt.attemptCount >= CIRCUIT_BREAKER_FAILURE_THRESHOLD) {
+                    CircuitBreakerState.OPEN
+                } else {
+                    CircuitBreakerState.HALF_OPEN
+                }
+            }
+            CircuitBreakerState.OPEN -> {
+                CircuitBreakerState.OPEN
+            }
+        }
+    }
+    
+    private fun updateCircuitBreaker(retryId: String, success: Boolean) {
+        val retryAttempt = _activeRetries.value.find { it.id == retryId }
+        retryAttempt?.let { retry ->
+            val newState = when {
+                success -> CircuitBreakerState.CLOSED
+                retry.circuitBreakerState == CircuitBreakerState.HALF_OPEN -> CircuitBreakerState.OPEN
+                else -> retry.circuitBreakerState
+            }
+            
+            val updatedRetry = retry.copy(circuitBreakerState = newState)
+            updateRetryAttemptInActiveList(updatedRetry)
+        }
+    }
+    
+    private fun calculateRetryDelay(attemptCount: Int, priority: NotificationPriority): Long {
+        val baseDelay = INITIAL_RETRY_DELAY_MS * Math.pow(RETRY_BACKOFF_MULTIPLIER, attemptCount.toDouble()).toLong()
+        val priorityMultiplier = when (priority) {
+            NotificationPriority.EMERGENCY -> 0.5
+            NotificationPriority.HIGH -> 0.75
+            NotificationPriority.NORMAL -> 1.0
+            NotificationPriority.LOW -> 1.5
+        }
+        
+        val calculatedDelay = (baseDelay * priorityMultiplier).toLong()
+        return calculatedDelay.coerceAtMost(MAX_RETRY_DELAY_MS)
+    }
+    
+    private suspend fun saveRetryAttempt(retryAttempt: RetryAttempt) {
+        try {
+            database.retryAttemptDao().insertRetryAttempt(retryAttempt.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun updateRetryAttempt(retryAttempt: RetryAttempt) {
+        try {
+            database.retryAttemptDao().updateRetryAttempt(retryAttempt.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun updateRetryAttemptInActiveList(retryAttempt: RetryAttempt) {
+        val currentRetries = _activeRetries.value.toMutableList()
+        val index = currentRetries.indexOfFirst { it.id == retryAttempt.id }
+        
+        if (index != -1) {
+            currentRetries[index] = retryAttempt
+            _activeRetries.value = currentRetries
+        }
+        
+        // Update in database (async)
+        retryScope.launch {
+            updateRetryAttempt(retryAttempt)
+        }
+    }
+    
+    private fun addToActiveRetries(retryAttempt: RetryAttempt) {
+        val currentRetries = _activeRetries.value.toMutableList()
+        currentRetries.add(retryAttempt)
+        _activeRetries.value = currentRetries
+    }
+    
+    private fun removeFromActiveRetries(retryId: String) {
+        val currentRetries = _activeRetries.value.toMutableList()
+        currentRetries.removeAll { it.id == retryId }
+        _activeRetries.value = currentRetries
+    }
+    
+    private suspend fun updateRetryStats() {
+        try {
+            val retries = _activeRetries.value
+            val stats = RetryStats(
+                totalRetries = retries.size,
+                scheduled = retries.count { it.status == RetryStatus.SCHEDULED },
+                executing = retries.count { it.status == RetryStatus.EXECUTING },
+                completed = retries.count { it.status == RetryStatus.COMPLETED },
+                failed = retries.count { it.status == RetryStatus.EXHAUSTED },
+                cancelled = retries.count { it.status == RetryStatus.CANCELLED },
+                averageRetryCount = if (retries.isNotEmpty()) retries.map { it.attemptCount }.average().toFloat() else 0f,
+                priorityStats = retries.groupBy { it.priority }
+                    .mapValues { it.value.size },
+                circuitBreakerStats = retries.groupBy { it.circuitBreakerState }
+                    .mapValues { it.value.size }
+            )
+            
+            _retryStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+    
+    /**
+     * Stop retry monitoring
+     */
+    fun stop() {
+        retryJob?.cancel()
+        retryScope.cancel()
+    }
+}
+
+/**
+ * Data classes
+ */
+data class RetryAttempt(
+    val id: String,
+    val notificationId: String,
+    val request: NotificationRequest,
+    val priority: NotificationPriority,
+    val attemptCount: Int,
+    val maxRetries: Int,
+    val failureReason: String,
+    val status: RetryStatus,
+    val scheduledAt: Date,
+    val lastAttemptAt: Date?,
+    val nextRetryAt: Date?,
+    val retryDelay: Long,
+    val circuitBreakerState: CircuitBreakerState,
+    val completedAt: Date? = null,
+    val exhaustedAt: Date? = null,
+    val cancelledAt: Date? = null
+)
+
+data class RetryStats(
+    val totalRetries: Int = 0,
+    val scheduled: Int = 0,
+    val executing: Int = 0,
+    val completed: Int = 0,
+    val failed: Int = 0,
+    val cancelled: Int = 0,
+    val averageRetryCount: Float = 0f,
+    val priorityStats: Map<NotificationPriority, Int> = emptyMap(),
+    val circuitBreakerStats: Map<CircuitBreakerState, Int> = emptyMap()
+)
+
+/**
+ * Enums
+ */
+enum class RetryState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class RetryStatus {
+    SCHEDULED,
+    EXECUTING,
+    COMPLETED,
+    EXHAUSTED,
+    CANCELLED
+}
+
+enum class CircuitBreakerState {
+    CLOSED,
+    OPEN,
+    HALF_OPEN
+}

@@ -1,0 +1,703 @@
+package com.edham.logistics.finance.invoice
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.InvoiceApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Invoice Service - Manages invoice generation and processing
+ * 
+ * Features:
+ * - Invoice creation and management
+ * - Invoice templates and customization
+ * - Invoice numbering and tracking
+ * - Payment status tracking
+ * - Invoice analytics
+ * - Multi-currency support
+ * - Tax calculation integration
+ * - PDF generation integration
+ */
+@Singleton
+class InvoiceService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val invoiceApi: InvoiceApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _invoiceState = MutableStateFlow<InvoiceState>(InvoiceState.Idle)
+    val invoiceState: StateFlow<InvoiceState> = _invoiceState.asStateFlow()
+    
+    private val _invoices = MutableStateFlow<List<Invoice>>(emptyList())
+    val invoices: StateFlow<List<Invoice>> = _invoices.asStateFlow()
+    
+    private val _invoiceStats = MutableStateFlow<InvoiceStats>(InvoiceStats())
+    val invoiceStats: StateFlow<InvoiceStats> = _invoiceStats.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "InvoiceService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val DEFAULT_TAX_RATE = 0.15f // 15% VAT
+        private const val INVOICE_NUMBER_PREFIX = "INV"
+        private const val INVOICE_NUMBER_LENGTH = 8
+    }
+    
+    /**
+     * Initialize invoice service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _invoiceState.value = InvoiceState.Initializing
+                
+                // Load invoice configuration
+                loadInvoiceConfiguration()
+                
+                // Load recent invoices
+                loadRecentInvoices()
+                
+                // Initialize invoice numbering
+                initializeInvoiceNumbering()
+                
+                isInitialized = true
+                _invoiceState.value = InvoiceState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _invoiceState.value = InvoiceState.Error("Failed to initialize invoice service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create invoice
+     */
+    suspend fun createInvoice(
+        invoice: Invoice
+    ): Result<Invoice> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Invoice service not initialized")
+                }
+                
+                _invoiceState.value = InvoiceState.Processing
+                
+                // Validate invoice
+                validateInvoice(invoice)
+                
+                // Generate invoice number if not provided
+                val invoiceWithNumber = if (invoice.invoiceNumber.isBlank()) {
+                    invoice.copy(invoiceNumber = generateInvoiceNumber())
+                } else {
+                    invoice
+                }
+                
+                // Calculate totals if not provided
+                val calculatedInvoice = calculateInvoiceTotals(invoiceWithNumber)
+                
+                // Save to database
+                val savedInvoice = database.invoiceDao().insertInvoice(calculatedInvoice.toEntity())
+                    .let { id -> calculatedInvoice.copy(id = id.toString()) }
+                
+                // Add to invoices list
+                addToInvoices(savedInvoice)
+                
+                // Update stats
+                updateInvoiceStats()
+                
+                _invoiceState.value = InvoiceState.Ready
+                Result.success(savedInvoice)
+                
+            } catch (e: Exception) {
+                _invoiceState.value = InvoiceState.Error("Invoice creation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update invoice
+     */
+    suspend fun updateInvoice(
+        invoice: Invoice
+    ): Result<Invoice> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Invoice service not initialized")
+                }
+                
+                _invoiceState.value = InvoiceState.Processing
+                
+                // Validate invoice
+                validateInvoice(invoice)
+                
+                // Calculate totals
+                val calculatedInvoice = calculateInvoiceTotals(invoice)
+                
+                // Update in database
+                database.invoiceDao().updateInvoice(calculatedInvoice.toEntity())
+                
+                // Update in list
+                updateInvoiceInList(calculatedInvoice)
+                
+                // Update stats
+                updateInvoiceStats()
+                
+                _invoiceState.value = InvoiceState.Ready
+                Result.success(calculatedInvoice)
+                
+            } catch (e: Exception) {
+                _invoiceState.value = InvoiceState.Error("Invoice update failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update invoice payment
+     */
+    suspend fun updateInvoicePayment(
+        invoiceId: String,
+        paymentAmount: Float,
+        transactionId: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val invoice = _invoices.value.find { it.id == invoiceId }
+                    ?: throw Exception("Invoice not found")
+                
+                // Update payment status
+                val updatedInvoice = invoice.copy(
+                    paidAmount = (invoice.paidAmount ?: 0f) + paymentAmount,
+                    status = if ((invoice.paidAmount ?: 0f) + paymentAmount >= invoice.totalAmount) {
+                        InvoiceStatus.PAID
+                    } else {
+                        InvoiceStatus.PARTIALLY_PAID
+                    },
+                    lastPaymentDate = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.invoiceDao().updateInvoice(updatedInvoice.toEntity())
+                
+                // Update in list
+                updateInvoiceInList(updatedInvoice)
+                
+                // Update stats
+                updateInvoiceStats()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update invoice refund
+     */
+    suspend fun updateInvoiceRefund(
+        invoiceId: String,
+        refundAmount: Float,
+        refundId: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val invoice = _invoices.value.find { it.id == invoiceId }
+                    ?: throw Exception("Invoice not found")
+                
+                // Update refund status
+                val updatedInvoice = invoice.copy(
+                    refundedAmount = (invoice.refundedAmount ?: 0f) + refundAmount,
+                    status = InvoiceStatus.REFUNDED,
+                    lastRefundDate = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.invoiceDao().updateInvoice(updatedInvoice.toEntity())
+                
+                // Update in list
+                updateInvoiceInList(updatedInvoice)
+                
+                // Update stats
+                updateInvoiceStats()
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update invoice PDF path
+     */
+    suspend fun updateInvoicePdf(
+        invoiceId: String,
+        pdfPath: String
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val invoice = _invoices.value.find { it.id == invoiceId }
+                    ?: throw Exception("Invoice not found")
+                
+                // Update PDF path
+                val updatedInvoice = invoice.copy(
+                    pdfPath = pdfPath,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.invoiceDao().updateInvoice(updatedInvoice.toEntity())
+                
+                // Update in list
+                updateInvoiceInList(updatedInvoice)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get invoice by ID
+     */
+    suspend fun getInvoice(invoiceId: String): Invoice? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _invoices.value.find { it.id == invoiceId }
+                    ?: database.invoiceDao().getInvoiceById(invoiceId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get invoice by number
+     */
+    suspend fun getInvoiceByNumber(invoiceNumber: String): Invoice? {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.invoiceDao().getInvoiceByNumber(invoiceNumber)?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get invoice history
+     */
+    suspend fun getInvoiceHistory(
+        customerId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        status: InvoiceStatus? = null
+    ): Result<List<Invoice>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val invoices = database.invoiceDao().getInvoiceHistory(
+                    customerId = customerId?.toLong(),
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    status = status
+                ).map { it.toDomainModel() }
+                
+                Result.success(invoices)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get pending invoices count
+     */
+    suspend fun getPendingInvoicesCount(): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.invoiceDao().getInvoicesCountByStatus(InvoiceStatus.PENDING)
+            } catch (e: Exception) {
+                0
+            }
+        }
+    }
+    
+    /**
+     * Get overdue invoices count
+     */
+    suspend fun getOverdueInvoicesCount(): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                database.invoiceDao().getOverdueInvoicesCount(Date())
+            } catch (e: Exception) {
+                0
+            }
+        }
+    }
+    
+    /**
+     * Get invoice analytics
+     */
+    suspend fun getInvoiceAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<InvoiceAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val invoices = getInvoiceHistory(null, dateRange).getOrThrow()
+                
+                val analytics = InvoiceAnalytics(
+                    totalInvoices = invoices.size,
+                    totalAmount = invoices.sumOf { it.totalAmount.toDouble() }.toFloat(),
+                    paidInvoices = invoices.count { it.status == InvoiceStatus.PAID },
+                    pendingInvoices = invoices.count { it.status == InvoiceStatus.PENDING },
+                    overdueInvoices = invoices.count { it.status == InvoiceStatus.OVERDUE },
+                    partiallyPaidInvoices = invoices.count { it.status == InvoiceStatus.PARTIALLY_PAID },
+                    refundedInvoices = invoices.count { it.status == InvoiceStatus.REFUNDED },
+                    averageInvoiceAmount = if (invoices.isNotEmpty()) invoices.map { it.totalAmount }.average().toFloat() else 0f,
+                    totalTaxAmount = invoices.sumOf { (it.taxAmount ?: 0f).toDouble() }.toFloat(),
+                    statusStats = invoices.groupBy { it.status }.mapValues { it.value.size },
+                    monthlyStats = calculateMonthlyInvoiceStats(invoices),
+                    customerStats = invoices.groupBy { it.customerId }.mapValues { it.value.size }
+                )
+                
+                Result.success(analytics)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Send invoice to customer
+     */
+    suspend fun sendInvoiceToCustomer(
+        invoiceId: String,
+        deliveryMethod: InvoiceDeliveryMethod
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val invoice = getInvoice(invoiceId) ?: throw Exception("Invoice not found")
+                
+                // Mark as sent
+                val updatedInvoice = invoice.copy(
+                    status = InvoiceStatus.SENT,
+                    sentDate = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.invoiceDao().updateInvoice(updatedInvoice.toEntity())
+                
+                // Update in list
+                updateInvoiceInList(updatedInvoice)
+                
+                // Send through appropriate method
+                when (deliveryMethod) {
+                    InvoiceDeliveryMethod.EMAIL -> sendInvoiceByEmail(invoice)
+                    InvoiceDeliveryMethod.SMS -> sendInvoiceBySms(invoice)
+                    InvoiceDeliveryMethod.WHATSAPP -> sendInvoiceByWhatsApp(invoice)
+                    InvoiceDeliveryMethod.PUSH -> sendInvoiceByPush(invoice)
+                }
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadInvoiceConfiguration() {
+        // Load invoice configuration from API or local storage
+    }
+    
+    private suspend fun loadRecentInvoices() {
+        try {
+            val invoices = database.invoiceDao().getRecentInvoices(50)
+                .map { it.toDomainModel() }
+            
+            _invoices.value = invoices
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun initializeInvoiceNumbering() {
+        // Initialize invoice numbering system
+    }
+    
+    private fun validateInvoice(invoice: Invoice) {
+        if (invoice.customerId.isBlank()) throw Exception("Customer ID cannot be empty")
+        if (invoice.items.isEmpty()) throw Exception("Invoice must have at least one item")
+        if (invoice.issueDate == null) throw Exception("Issue date is required")
+        if (invoice.dueDate == null) throw Exception("Due date is required")
+        
+        // Validate items
+        invoice.items.forEach { item ->
+            if (item.description.isBlank()) throw Exception("Item description cannot be empty")
+            if (item.quantity <= 0) throw Exception("Item quantity must be positive")
+            if (item.unitPrice <= 0) throw Exception("Item unit price must be positive")
+        }
+    }
+    
+    private fun generateInvoiceNumber(): String {
+        val timestamp = System.currentTimeMillis()
+        val random = (1000..9999).random()
+        return "$INVOICE_NUMBER_PREFIX-$timestamp-$random"
+    }
+    
+    private fun calculateInvoiceTotals(invoice: Invoice): Invoice {
+        val subtotal = invoice.items.sumOf { (it.quantity * it.unitPrice).toDouble() }.toFloat()
+        val taxAmount = (invoice.taxRate ?: DEFAULT_TAX_RATE) * subtotal
+        val totalAmount = subtotal + taxAmount
+        
+        return invoice.copy(
+            subtotal = subtotal,
+            taxAmount = taxAmount,
+            totalAmount = totalAmount,
+            currency = invoice.currency ?: DEFAULT_CURRENCY
+        )
+    }
+    
+    private suspend fun sendInvoiceByEmail(invoice: Invoice): Result<Boolean> {
+        return try {
+            // Implementation would use email service
+            invoiceApi.sendInvoiceByEmail(invoice.id)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    private suspend fun sendInvoiceBySms(invoice: Invoice): Result<Boolean> {
+        return try {
+            // Implementation would use SMS service
+            invoiceApi.sendInvoiceBySms(invoice.id)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    private suspend fun sendInvoiceByWhatsApp(invoice: Invoice): Result<Boolean> {
+        return try {
+            // Implementation would use WhatsApp service
+            invoiceApi.sendInvoiceByWhatsApp(invoice.id)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    private suspend fun sendInvoiceByPush(invoice: Invoice): Result<Boolean> {
+        return try {
+            // Implementation would use push notification service
+            invoiceApi.sendInvoiceByPush(invoice.id)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    private fun addToInvoices(invoice: Invoice) {
+        val currentInvoices = _invoices.value.toMutableList()
+        currentInvoices.add(0, invoice) // Add to beginning
+        
+        // Keep only last 100 invoices in cache
+        if (currentInvoices.size > 100) {
+            currentInvoices.removeAt(currentInvoices.size - 1)
+        }
+        
+        _invoices.value = currentInvoices
+    }
+    
+    private fun updateInvoiceInList(invoice: Invoice) {
+        val currentInvoices = _invoices.value.toMutableList()
+        val index = currentInvoices.indexOfFirst { it.id == invoice.id }
+        
+        if (index != -1) {
+            currentInvoices[index] = invoice
+            _invoices.value = currentInvoices
+        }
+    }
+    
+    private suspend fun updateInvoiceStats() {
+        try {
+            val invoices = _invoices.value
+            val stats = InvoiceStats(
+                totalInvoices = invoices.size,
+                pendingInvoices = invoices.count { it.status == InvoiceStatus.PENDING },
+                sentInvoices = invoices.count { it.status == InvoiceStatus.SENT },
+                paidInvoices = invoices.count { it.status == InvoiceStatus.PAID },
+                overdueInvoices = invoices.count { it.status == InvoiceStatus.OVERDUE },
+                partiallyPaidInvoices = invoices.count { it.status == InvoiceStatus.PARTIALLY_PAID },
+                refundedInvoices = invoices.count { it.status == InvoiceStatus.REFUNDED },
+                totalAmount = invoices.sumOf { it.totalAmount.toDouble() }.toFloat(),
+                averageAmount = if (invoices.isNotEmpty()) invoices.map { it.totalAmount }.average().toFloat() else 0f
+            )
+            
+            _invoiceStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun calculateMonthlyInvoiceStats(invoices: List<Invoice>): Map<String, MonthlyInvoiceStats> {
+        return invoices.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.issueDate ?: Date()
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { (_, monthInvoices) ->
+            MonthlyInvoiceStats(
+                invoiceCount = monthInvoices.size,
+                totalAmount = monthInvoices.sumOf { it.totalAmount.toDouble() }.toFloat(),
+                averageAmount = if (monthInvoices.isNotEmpty()) monthInvoices.map { it.totalAmount }.average().toFloat() else 0f,
+                paidInvoices = monthInvoices.count { it.status == InvoiceStatus.PAID }
+            )
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class Invoice(
+    val id: String = "",
+    val customerId: String,
+    val invoiceNumber: String,
+    val issueDate: Date?,
+    val dueDate: Date?,
+    val subtotal: Float,
+    val taxRate: Float? = null,
+    val taxAmount: Float? = null,
+    val totalAmount: Float,
+    val status: InvoiceStatus,
+    val items: List<InvoiceItem>,
+    val customerInfo: CustomerInfo,
+    val currency: String = "SAR",
+    val notes: String? = null,
+    val pdfPath: String? = null,
+    val paidAmount: Float? = null,
+    val refundedAmount: Float? = null,
+    val sentDate: Date? = null,
+    val lastPaymentDate: Date? = null,
+    val lastRefundDate: Date? = null,
+    val createdAt: Date = Date(),
+    val updatedAt: Date = Date()
+)
+
+data class InvoiceItem(
+    val id: String = UUID.randomUUID().toString(),
+    val description: String,
+    val quantity: Float,
+    val unitPrice: Float,
+    val discount: Float = 0f,
+    val taxRate: Float = 0f,
+    val totalPrice: Float = quantity * unitPrice,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class CustomerInfo(
+    val id: String,
+    val name: String,
+    val email: String,
+    val phone: String,
+    val address: String,
+    val taxNumber: String? = null,
+    val commercialRegistration: String? = null
+)
+
+data class InvoiceAnalytics(
+    val totalInvoices: Int,
+    val totalAmount: Float,
+    val paidInvoices: Int,
+    val pendingInvoices: Int,
+    val overdueInvoices: Int,
+    val partiallyPaidInvoices: Int,
+    val refundedInvoices: Int,
+    val averageInvoiceAmount: Float,
+    val totalTaxAmount: Float,
+    val statusStats: Map<InvoiceStatus, Int>,
+    val monthlyStats: Map<String, MonthlyInvoiceStats>,
+    val customerStats: Map<String, Int>
+)
+
+data class InvoiceStats(
+    val totalInvoices: Int = 0,
+    val pendingInvoices: Int = 0,
+    val sentInvoices: Int = 0,
+    val paidInvoices: Int = 0,
+    val overdueInvoices: Int = 0,
+    val partiallyPaidInvoices: Int = 0,
+    val refundedInvoices: Int = 0,
+    val totalAmount: Float = 0f,
+    val averageAmount: Float = 0f
+)
+
+data class MonthlyInvoiceStats(
+    val invoiceCount: Int,
+    val totalAmount: Float,
+    val averageAmount: Float,
+    val paidInvoices: Int
+)
+
+/**
+ * Enums
+ */
+enum class InvoiceState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class InvoiceStatus {
+    DRAFT,
+    PENDING,
+    SENT,
+    PARTIALLY_PAID,
+    PAID,
+    OVERDUE,
+    REFUNDED,
+    CANCELLED
+}
+
+enum class InvoiceDeliveryMethod {
+    EMAIL,
+    SMS,
+    WHATSAPP,
+    PUSH
+}

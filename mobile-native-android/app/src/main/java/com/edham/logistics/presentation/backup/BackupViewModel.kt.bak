@@ -1,0 +1,370 @@
+package com.edham.logistics.presentation.backup
+
+import androidx.lifecycle.*
+import com.edham.logistics.core.backup.*
+import com.edham.logistics.domain.backup.*
+import com.edham.logistics.data.backup.*
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Backup ViewModel - ViewModel for backup operations
+ * Manages backup state and operations for the admin backup interface
+ */
+@HiltViewModel
+class BackupViewModel @Inject constructor(
+    private val backupUseCases: BackupUseCases,
+    private val backupRepository: BackupRepository
+) : ViewModel() {
+
+    // Backup state
+    private val _backupState = MutableStateFlow<BackupState>(BackupState.IDLE)
+    val backupState: StateFlow<BackupState> = _backupState.asStateFlow()
+
+    // Backup history
+    private val _backupHistory = MutableStateFlow<List<BackupInfo>>(emptyList())
+    val backupHistory: StateFlow<List<BackupInfo>> = _backupHistory.asStateFlow()
+
+    // Backup statistics
+    private val _backupStatistics = MutableStateFlow<BackupStatistics?>(null)
+    val backupStatistics: StateFlow<BackupStatistics?> = _backupStatistics.asStateFlow()
+
+    // Loading states
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    // Error states
+    private val _errorMessage = MutableStateFlow<String?>(null)
+    val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+
+    // Success messages
+    private val _successMessage = MutableStateFlow<String?>(null)
+    val successMessage: StateFlow<String?> = _successMessage.asStateFlow()
+
+    init {
+        loadBackupHistory()
+        loadBackupStatistics()
+    }
+
+    /**
+     * Load backup history
+     */
+    fun loadBackupHistory() {
+        viewModelScope.launch {
+            backupRepository.getAllBackups().collect { backups ->
+                _backupHistory.value = backups
+            }
+        }
+    }
+
+    /**
+     * Load backup statistics
+     */
+    fun loadBackupStatistics() {
+        viewModelScope.launch {
+            backupRepository.getBackupStatistics().collect { stats ->
+                _backupStatistics.value = stats
+            }
+        }
+    }
+
+    /**
+     * Create manual backup
+     */
+    fun createManualBackup(
+        name: String? = null,
+        includeFiles: Boolean = true,
+        includeDatabase: Boolean = true,
+        encryptionEnabled: Boolean = true
+    ) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+            _backupState.value = BackupState.BACKING_UP
+
+            val result = backupUseCases.createManualBackup(
+                name = name,
+                includeFiles = includeFiles,
+                includeDatabase = includeDatabase,
+                encryptionEnabled = encryptionEnabled
+            )
+
+            _isLoading.value = false
+            _backupState.value = BackupState.IDLE
+
+            result.onSuccess { backupInfo ->
+                _successMessage.value = "تم إنشاء نسخة احتياطية بنجاح: ${backupInfo.name}"
+                loadBackupHistory()
+                loadBackupStatistics()
+            }.onFailure { error ->
+                _errorMessage.value = "فشل في إنشاء النسخة الاحتياطية: ${error.message}"
+            }
+        }
+    }
+
+    /**
+     * Create automatic backup
+     */
+    fun createAutoBackup() {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+            _backupState.value = BackupState.AUTO_BACKING_UP
+
+            val result = backupUseCases.createAutoBackup()
+
+            _isLoading.value = false
+            _backupState.value = BackupState.IDLE
+
+            result.onSuccess { backupInfo ->
+                _successMessage.value = "تم إنشاء نسخة احتياطية تلقائية بنجاح: ${backupInfo.name}"
+                loadBackupHistory()
+                loadBackupStatistics()
+            }.onFailure { error ->
+                _errorMessage.value = "فشل في إنشاء النسخة الاحتياطية التلقائية: ${error.message}"
+            }
+        }
+    }
+
+    /**
+     * Restore backup
+     */
+    fun restoreBackup(
+        backupId: String,
+        restoreOptions: RestoreOptions = RestoreOptions()
+    ) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+            _backupState.value = BackupState.RESTORING
+
+            val result = backupUseCases.restoreBackup(backupId, restoreOptions)
+
+            _isLoading.value = false
+            _backupState.value = BackupState.IDLE
+
+            result.onSuccess { restoreResult ->
+                if (restoreResult.success) {
+                    _successMessage.value = "تم استعادة النسخة الاحتياطية بنجاح"
+                } else {
+                    _errorMessage.value = "فشل في استعادة النسخة الاحتياطية"
+                }
+            }.onFailure { error ->
+                _errorMessage.value = "فشل في استعادة النسخة الاحتياطية: ${error.message}"
+            }
+        }
+    }
+
+    /**
+     * Delete backup
+     */
+    fun deleteBackup(backupId: String) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+
+            val result = backupUseCases.deleteBackup(backupId)
+
+            _isLoading.value = false
+
+            result.onSuccess { deleted ->
+                if (deleted) {
+                    _successMessage.value = "تم حذف النسخة الاحتياطية بنجاح"
+                    loadBackupHistory()
+                    loadBackupStatistics()
+                } else {
+                    _errorMessage.value = "فشل في حذف النسخة الاحتياطية"
+                }
+            }.onFailure { error ->
+                _errorMessage.value = "فشل في حذف النسخة الاحتياطية: ${error.message}"
+            }
+        }
+    }
+
+    /**
+     * Export system data
+     */
+    fun exportSystemData(
+        exportType: ExportType,
+        dateRange: DateRange? = null,
+        includeFiles: Boolean = true
+    ) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+            _backupState.value = BackupState.EXPORTING
+
+            val result = backupUseCases.exportSystemData(
+                exportType = exportType,
+                dateRange = dateRange,
+                includeFiles = includeFiles
+            )
+
+            _isLoading.value = false
+            _backupState.value = BackupState.IDLE
+
+            result.onSuccess { exportResult ->
+                _successMessage.value = "تم تصدير البيانات بنجاح: ${exportResult.filePath}"
+            }.onFailure { error ->
+                _errorMessage.value = "فشل في تصدير البيانات: ${error.message}"
+            }
+        }
+    }
+
+    /**
+     * Schedule backup
+     */
+    fun scheduleBackup(backupTime: String) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+
+            val result = backupUseCases.scheduleBackup(backupTime)
+
+            _isLoading.value = false
+
+            result.onSuccess {
+                _successMessage.value = "تم جدولة النسخة الاحتياطية بنجاح"
+                loadBackupStatistics()
+            }.onFailure { error ->
+                _errorMessage.value = "فشل في جدولة النسخة الاحتياطية: ${error.message}"
+            }
+        }
+    }
+
+    /**
+     * Cancel scheduled backup
+     */
+    fun cancelScheduledBackup() {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+
+            val result = backupUseCases.cancelScheduledBackup()
+
+            _isLoading.value = false
+
+            result.onSuccess {
+                _successMessage.value = "تم إلغاء جدولة النسخة الاحتياطية بنجاح"
+                loadBackupStatistics()
+            }.onFailure { error ->
+                _errorMessage.value = "فشل في إلغاء جدولة النسخة الاحتياطية: ${error.message}"
+            }
+        }
+    }
+
+    /**
+     * Toggle auto backup
+     */
+    fun toggleAutoBackup(enabled: Boolean) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+
+            val result = if (enabled) {
+                scheduleBackup("02:00")
+            } else {
+                cancelScheduledBackup()
+            }
+
+            _isLoading.value = false
+        }
+    }
+
+    /**
+     * Cleanup old backups
+     */
+    fun cleanupOldBackups(retentionDays: Int = 30) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            _successMessage.value = null
+
+            val result = backupRepository.cleanupOldBackups(retentionDays)
+
+            _isLoading.value = false
+
+            result.onSuccess { deletedCount ->
+                _successMessage.value = "تم حذف $deletedCount نسخة احتياطية قديمة بنجاح"
+                loadBackupHistory()
+                loadBackupStatistics()
+            }.onFailure { error ->
+                _errorMessage.value = "فشل في تنظيف النسخ الاحتياطية القديمة: ${error.message}"
+            }
+        }
+    }
+
+    /**
+     * Get backup by ID
+     */
+    fun getBackupById(backupId: String): Flow<BackupInfo?> {
+        return backupRepository.getBackupById(backupId)
+    }
+
+    /**
+     * Get backups by type
+     */
+    fun getBackupsByType(type: BackupType): Flow<List<BackupInfo>> {
+        return backupRepository.getBackupsByType(type)
+    }
+
+    /**
+     * Get recent backups
+     */
+    fun getRecentBackups(days: Int = 30): Flow<List<BackupInfo>> {
+        return backupRepository.getRecentBackups(days)
+    }
+
+    /**
+     * Search backups
+     */
+    fun searchBackups(query: String): Flow<List<BackupInfo>> {
+        return backupRepository.searchBackups(query)
+    }
+
+    /**
+     * Get backup health status
+     */
+    fun getBackupHealthStatus() {
+        viewModelScope.launch {
+            val healthStatus = backupUseCases.getBackupHealthStatus()
+            // Update UI with health status
+        }
+    }
+
+    /**
+     * Get backup recommendations
+     */
+    fun getBackupRecommendations() {
+        viewModelScope.launch {
+            val recommendations = backupUseCases.getBackupRecommendations()
+            // Update UI with recommendations
+        }
+    }
+
+    /**
+     * Clear messages
+     */
+    fun clearMessages() {
+        _errorMessage.value = null
+        _successMessage.value = null
+    }
+
+    /**
+     * Refresh data
+     */
+    fun refresh() {
+        loadBackupHistory()
+        loadBackupStatistics()
+    }
+}

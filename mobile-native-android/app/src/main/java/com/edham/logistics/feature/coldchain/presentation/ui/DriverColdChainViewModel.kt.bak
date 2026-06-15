@@ -1,0 +1,119 @@
+package com.edham.logistics.feature.coldchain.presentation.ui
+
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.coldchain.domain.usecase.*
+import com.edham.logistics.feature.coldchain.domain.model.*
+import com.edham.logistics.presentation.ui.base.BaseViewModel
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class DriverColdChainViewModel @Inject constructor(
+    private val getColdChainStatusUseCase: GetColdChainStatusUseCase
+) : BaseViewModel<DriverColdChainViewModel.DriverColdChainUiState>() {
+
+    private val _uiState = MutableStateFlow(DriverColdChainUiState())
+    val uiState: StateFlow<DriverColdChainUiState> = _uiState.asStateFlow()
+
+    override fun createInitialState(): DriverColdChainUiState = DriverColdChainUiState()
+
+    fun initialize(driverId: String) {
+        _uiState.value = _uiState.value.copy(driverId = driverId)
+        loadDriverColdChainStatus(driverId)
+    }
+
+    fun loadDriverColdChainStatus(driverId: String) {
+        viewModelScope.launch {
+            when (val result = getColdChainStatusUseCase.getDriverColdChainStatus(driverId)) {
+                is Result.Success -> {
+                    updateUiState { copy(
+                        coldChainShipments = result.data,
+                        isLoading = false,
+                        error = null
+                    )}
+                    // Start real-time updates for active shipments
+                    result.data.forEach { shipment ->
+                        observeShipmentStatus(shipment.id)
+                    }
+                }
+                is Result.Error -> {
+                    updateUiState { copy(
+                        isLoading = false,
+                        error = result.exception.message ?: "فشل تحميل حالة سلسلة التبريد"
+                    )}
+                }
+                is Result.Loading -> {
+                    updateUiState { copy(isLoading = true) }
+                }
+            }
+        }
+    }
+
+    private fun observeShipmentStatus(shipmentId: String) {
+        viewModelScope.launch {
+            getColdChainStatusUseCase.observeShipmentColdChainStatus(shipmentId).collect { result ->
+                when (result) {
+                    is Result.Success -> {
+                        updateShipmentInList(result.data)
+                    }
+                    is Result.Error -> {
+                        updateUiState { copy(error = result.exception.message ?: "خطأ في التحديثات المباشرة") }
+                    }
+                    is Result.Loading -> {
+                        // Handle loading state if needed
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateShipmentInList(updatedShipment: ColdChainShipment) {
+        val currentList = _uiState.value.coldChainShipments.toMutableList()
+        val index = currentList.indexOfFirst { it.id == updatedShipment.id }
+        if (index >= 0) {
+            currentList[index] = updatedShipment
+            updateUiState { copy(coldChainShipments = currentList) }
+        }
+    }
+
+    fun selectShipment(shipmentId: String) {
+        val shipment = _uiState.value.coldChainShipments.find { it.id == shipmentId }
+        if (shipment != null) {
+            updateUiState { copy(
+                selectedShipment = shipment,
+                error = null
+            )}
+        }
+    }
+
+    fun refresh() {
+        _uiState.value.driverId?.let { driverId ->
+            loadDriverColdChainStatus(driverId)
+        }
+    }
+
+    fun clearSelection() {
+        updateUiState { copy(selectedShipment = null) }
+    }
+
+    fun clearError() {
+        updateUiState { copy(error = null) }
+    }
+
+    data class DriverColdChainUiState(
+        val isLoading: Boolean = false,
+        val driverId: String? = null,
+        val coldChainShipments: List<ColdChainShipment> = emptyList(),
+        val selectedShipment: ColdChainShipment? = null,
+        val error: String? = null
+    ) : com.edham.logistics.presentation.ui.base.UiState {
+        override fun copyLoading(isLoading: Boolean): UiState = copy(isLoading = isLoading)
+        override fun copyError(error: String?): UiState = copy(error = error)
+        override fun copySuccess(message: String?): UiState = this
+    }
+}

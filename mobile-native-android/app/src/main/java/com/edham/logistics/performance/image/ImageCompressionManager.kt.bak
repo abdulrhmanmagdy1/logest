@@ -1,0 +1,631 @@
+package com.edham.logistics.performance.image
+
+import android.graphics.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.io.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Image Compression Manager - Advanced image optimization and compression
+ * Implements intelligent compression, caching, and performance optimization
+ */
+
+@Singleton
+class ImageCompressionManager @Inject constructor() {
+
+    private val compressionScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val compressionCache = ConcurrentHashMap<String, CompressionCacheEntry>()
+    
+    // Performance metrics
+    private val totalCompressions = AtomicLong(0)
+    private val totalOriginalSize = AtomicLong(0)
+    private val totalCompressedSize = AtomicLong(0)
+    private val averageCompressionTime = AtomicLong(0)
+    private val compressionRatio = AtomicLong(0)
+    
+    // Configuration
+    private val defaultQuality = 0.8f
+    private val defaultMaxWidth = 1024
+    private val defaultMaxHeight = 1024
+    private val maxCacheSize = 50
+    private val cacheExpiryTime = 30 * 60 * 1000L // 30 minutes
+    
+    /**
+     * Compress image from byte array
+     */
+    suspend fun compressImage(
+        imageBytes: ByteArray,
+        quality: Float = defaultQuality,
+        maxWidth: Int = defaultMaxWidth,
+        maxHeight: Int = defaultMaxHeight,
+        format: ImageFormat = ImageFormat.JPEG
+    ): Result<ImageCompressionResult> {
+        val startTime = System.currentTimeMillis()
+        totalCompressions.incrementAndGet()
+        
+        return try {
+            // Generate cache key
+            val cacheKey = generateCacheKey(imageBytes, quality, maxWidth, maxHeight, format)
+            
+            // Check cache first
+            val cached = compressionCache[cacheKey]
+            if (cached != null && !cached.isExpired()) {
+                return Result.success(cached.result)
+            }
+            
+            // Decode bitmap
+            val options = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
+            
+            // Calculate inSampleSize
+            options.inSampleSize = calculateInSampleSize(options, maxWidth, maxHeight)
+            options.inJustDecodeBounds = false
+            
+            val originalBitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
+                ?: return Result.failure(Exception("Failed to decode image"))
+            
+            // Compress and resize
+            val result = compressBitmap(originalBitmap, quality, maxWidth, maxHeight, format)
+            
+            // Cache the result
+            compressionCache[cacheKey] = CompressionCacheEntry(
+                result = result,
+                timestamp = System.currentTimeMillis()
+            )
+            
+            // Update metrics
+            updateMetrics(imageBytes.size.toLong(), result.compressedSize, System.currentTimeMillis() - startTime)
+            
+            // Clean up cache if needed
+            manageCacheSize()
+            
+            Result.success(result)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error compressing image")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Compress bitmap directly
+     */
+    suspend fun compressBitmap(
+        bitmap: Bitmap,
+        quality: Float = defaultQuality,
+        maxWidth: Int = defaultMaxWidth,
+        maxHeight: Int = defaultMaxHeight,
+        format: ImageFormat = ImageFormat.JPEG
+    ): ImageCompressionResult {
+        val startTime = System.currentTimeMillis()
+        
+        try {
+            // Calculate target dimensions
+            val (targetWidth, targetHeight) = calculateTargetDimensions(bitmap, maxWidth, maxHeight)
+            
+            // Resize if needed
+            val resizedBitmap = if (bitmap.width != targetWidth || bitmap.height != targetHeight) {
+                resizeBitmap(bitmap, targetWidth, targetHeight)
+            } else {
+                bitmap
+            }
+            
+            // Compress to byte array
+            val outputStream = ByteArrayOutputStream()
+            val compressionSuccess = when (format) {
+                ImageFormat.JPEG -> resizedBitmap.compress(Bitmap.CompressFormat.JPEG, (quality * 100).toInt(), outputStream)
+                ImageFormat.PNG -> resizedBitmap.compress(Bitmap.CompressFormat.PNG, (quality * 100).toInt(), outputStream)
+                ImageFormat.WEBP -> resizedBitmap.compress(Bitmap.CompressFormat.WEBP, (quality * 100).toInt(), outputStream)
+            }
+            
+            if (!compressionSuccess) {
+                throw Exception("Failed to compress bitmap")
+            }
+            
+            val compressedBytes = outputStream.toByteArray()
+            val compressedSize = compressedBytes.size.toLong()
+            
+            // Clean up if we created a new bitmap
+            if (resizedBitmap != bitmap) {
+                resizedBitmap.recycle()
+            }
+            
+            val compressionTime = System.currentTimeMillis() - startTime
+            val originalSize = bitmap.byteCount.toLong()
+            val ratio = (1.0 - compressedSize.toDouble() / originalSize) * 100
+            
+            return ImageCompressionResult(
+                compressedBytes = compressedBytes,
+                compressedBitmap = if (resizedBitmap != bitmap) null else bitmap,
+                originalSize = originalSize,
+                compressedSize = compressedSize,
+                compressionRatio = ratio,
+                compressionTime = compressionTime,
+                format = format,
+                dimensions = ImageDimensions(targetWidth, targetHeight)
+            )
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error compressing bitmap")
+            throw e
+        }
+    }
+    
+    /**
+     * Resize bitmap to specific dimensions
+     */
+    suspend fun resizeBitmap(
+        bitmap: Bitmap,
+        targetWidth: Int,
+        targetHeight: Int
+    ): Bitmap {
+        return try {
+            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+            
+            // Ensure the scaled bitmap is valid
+            if (scaledBitmap == null || scaledBitmap.isRecycled) {
+                throw Exception("Failed to create scaled bitmap")
+            }
+            
+            scaledBitmap
+        } catch (e: Exception) {
+            Timber.e(e, "Error resizing bitmap")
+            throw e
+        }
+    }
+    
+    /**
+     * Create thumbnail from image
+     */
+    suspend fun createThumbnail(
+        imageBytes: ByteArray,
+        thumbnailSize: Int = 200
+    ): Result<ImageCompressionResult> {
+        return try {
+            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                ?: return Result.failure(Exception("Failed to decode image"))
+            
+            // Calculate thumbnail dimensions maintaining aspect ratio
+            val ratio = minOf(
+                thumbnailSize.toFloat() / bitmap.width,
+                thumbnailSize.toFloat() / bitmap.height
+            )
+            
+            val targetWidth = (bitmap.width * ratio).toInt()
+            val targetHeight = (bitmap.height * ratio).toInt()
+            
+            val result = compressBitmap(bitmap, 0.8f, targetWidth, targetHeight, ImageFormat.JPEG)
+            bitmap.recycle()
+            
+            Result.success(result)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error creating thumbnail")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Batch compress multiple images
+     */
+    suspend fun compressBatch(
+        images: List<BatchImageItem>,
+        maxConcurrency: Int = 3
+    ): Result<List<ImageCompressionResult>> {
+        return try {
+            val results = images.chunked(maxConcurrency).map { batch ->
+                batch.map { item ->
+                    compressionScope.async {
+                        compressImage(item.bytes, item.quality, item.maxWidth, item.maxHeight, item.format)
+                            .getOrThrow()
+                    }
+                }.awaitAll()
+            }.flatten()
+            
+            Result.success(results)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error compressing batch images")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Optimize image for specific use case
+     */
+    suspend fun optimizeForUseCase(
+        imageBytes: ByteArray,
+        useCase: ImageUseCase
+    ): Result<ImageCompressionResult> {
+        val config = when (useCase) {
+            ImageUseCase.PROFILE_PICTURE -> ImageCompressionConfig(
+                quality = 0.9f,
+                maxWidth = 400,
+                maxHeight = 400,
+                format = ImageFormat.JPEG
+            )
+            ImageUseCase.THUMBNAIL -> ImageCompressionConfig(
+                quality = 0.8f,
+                maxWidth = 200,
+                maxHeight = 200,
+                format = ImageFormat.JPEG
+            )
+            ImageUseCase.BANNER -> ImageCompressionConfig(
+                quality = 0.85f,
+                maxWidth = 1200,
+                maxHeight = 600,
+                format = ImageFormat.JPEG
+            )
+            ImageUseCase.DOCUMENT -> ImageCompressionConfig(
+                quality = 0.95f,
+                maxWidth = 2048,
+                maxHeight = 2048,
+                format = ImageFormat.PNG
+            )
+            ImageUseCase.MAP_MARKER -> ImageCompressionConfig(
+                quality = 0.8f,
+                maxWidth = 64,
+                maxHeight = 64,
+                format = ImageFormat.PNG
+            )
+        }
+        
+        return compressImage(
+            imageBytes,
+            config.quality,
+            config.maxWidth,
+            config.maxHeight,
+            config.format
+        )
+    }
+    
+    /**
+     * Get compression statistics
+     */
+    fun getCompressionStats(): ImageCompressionStats {
+        val totalCompressed = totalCompressions.get()
+        val totalOriginal = totalOriginalSize.get()
+        val totalCompressed = totalCompressedSize.get()
+        
+        return ImageCompressionStats(
+            totalCompressions = totalCompressed,
+            totalOriginalSize = totalOriginal,
+            totalCompressedSize = totalCompressed,
+            averageCompressionTime = averageCompressionTime.get(),
+            averageCompressionRatio = if (totalCompressed > 0) {
+                ((totalOriginal - totalCompressed).toDouble() / totalOriginal) * 100
+            } else 0.0,
+            cacheSize = compressionCache.size,
+            memorySavings = totalOriginal - totalCompressed
+        )
+    }
+    
+    /**
+     * Clear compression cache
+     */
+    fun clearCache() {
+        compressionCache.clear()
+        Timber.d("Image compression cache cleared")
+    }
+    
+    /**
+     * Clean up expired cache entries
+     */
+    suspend fun cleanupExpiredCache() {
+        val currentTime = System.currentTimeMillis()
+        val expiredKeys = compressionCache.filter { 
+            currentTime - it.value.timestamp > cacheExpiryTime 
+        }.keys
+        
+        expiredKeys.forEach { key ->
+            compressionCache.remove(key)
+        }
+        
+        if (expiredKeys.isNotEmpty()) {
+            Timber.d("Cleaned up ${expiredKeys.size} expired cache entries")
+        }
+    }
+    
+    // Private methods
+    
+    private fun calculateInSampleSize(
+        options: BitmapFactory.Options,
+        reqWidth: Int,
+        reqHeight: Int
+    ): Int {
+        val height = options.outHeight
+        val width = options.outWidth
+        var inSampleSize = 1
+        
+        if (height > reqHeight || width > reqWidth) {
+            val halfHeight = height / 2
+            val halfWidth = width / 2
+            
+            while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
+                inSampleSize *= 2
+            }
+        }
+        
+        return inSampleSize
+    }
+    
+    private fun calculateTargetDimensions(
+        bitmap: Bitmap,
+        maxWidth: Int,
+        maxHeight: Int
+    ): Pair<Int, Int> {
+        val originalWidth = bitmap.width
+        val originalHeight = bitmap.height
+        
+        // Calculate the ratio to maintain aspect ratio
+        val widthRatio = maxWidth.toFloat() / originalWidth
+        val heightRatio = maxHeight.toFloat() / originalHeight
+        val ratio = minOf(widthRatio, heightRatio)
+        
+        val targetWidth = (originalWidth * ratio).toInt()
+        val targetHeight = (originalHeight * ratio).toInt()
+        
+        return Pair(targetWidth, targetHeight)
+    }
+    
+    private fun generateCacheKey(
+        imageBytes: ByteArray,
+        quality: Float,
+        maxWidth: Int,
+        maxHeight: Int,
+        format: ImageFormat
+    ): String {
+        val hash = imageBytes.contentHashCode()
+        return "${hash}_${quality}_${maxWidth}x${maxHeight}_${format.name}"
+    }
+    
+    private fun updateMetrics(originalSize: Long, compressedSize: Long, compressionTime: Long) {
+        totalOriginalSize.addAndGet(originalSize)
+        totalCompressedSize.addAndGet(compressedSize)
+        
+        // Update average compression time
+        val currentAverage = averageCompressionTime.get()
+        val newAverage = (currentAverage + compressionTime) / 2
+        averageCompressionTime.set(newAverage)
+        
+        // Update compression ratio
+        val currentRatio = compressionRatio.get()
+        val newRatio = ((originalSize - compressedSize).toDouble() / originalSize * 100).toLong()
+        compressionRatio.set(newRatio)
+    }
+    
+    private fun manageCacheSize() {
+        if (compressionCache.size > maxCacheSize) {
+            // Remove oldest entries
+            val sortedEntries = compressionCache.entries.sortedBy { it.value.timestamp }
+            val entriesToRemove = sortedEntries.take(compressionCache.size - maxCacheSize)
+            
+            entriesToRemove.forEach { (key, _) ->
+                compressionCache.remove(key)
+            }
+        }
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): ImageCompressionPerformanceMetrics {
+        val stats = getCompressionStats()
+        
+        return ImageCompressionPerformanceMetrics(
+            totalCompressions = stats.totalCompressions,
+            averageCompressionTime = stats.averageCompressionTime,
+            averageCompressionRatio = stats.averageCompressionRatio,
+            totalMemorySavings = stats.memorySavings,
+            cacheHitRate = if (stats.totalCompressions > 0) {
+                (stats.totalCompressions - stats.cacheSize).toDouble() / stats.totalCompressions
+            } else 0.0,
+            cacheSize = stats.cacheSize
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalCompressions.set(0)
+        totalOriginalSize.set(0)
+        totalCompressedSize.set(0)
+        averageCompressionTime.set(0)
+        compressionRatio.set(0)
+    }
+    
+    /**
+     * Stop compression manager
+     */
+    fun stop() {
+        compressionScope.cancel()
+        clearCache()
+    }
+}
+
+/**
+ * Image Compression Result
+ */
+data class ImageCompressionResult(
+    val compressedBytes: ByteArray,
+    val compressedBitmap: Bitmap?,
+    val originalSize: Long,
+    val compressedSize: Long,
+    val compressionRatio: Double,
+    val compressionTime: Long,
+    val format: ImageFormat,
+    val dimensions: ImageDimensions
+)
+
+/**
+ * Image Dimensions
+ */
+data class ImageDimensions(
+    val width: Int,
+    val height: Int
+)
+
+/**
+ * Image Format
+ */
+enum class ImageFormat {
+    JPEG, PNG, WEBP
+}
+
+/**
+ * Image Use Case
+ */
+enum class ImageUseCase {
+    PROFILE_PICTURE,
+    THUMBNAIL,
+    BANNER,
+    DOCUMENT,
+    MAP_MARKER
+}
+
+/**
+ * Image Compression Configuration
+ */
+data class ImageCompressionConfig(
+    val quality: Float,
+    val maxWidth: Int,
+    val maxHeight: Int,
+    val format: ImageFormat
+)
+
+/**
+ * Batch Image Item
+ */
+data class BatchImageItem(
+    val bytes: ByteArray,
+    val quality: Float = 0.8f,
+    val maxWidth: Int = 1024,
+    val maxHeight: Int = 1024,
+    val format: ImageFormat = ImageFormat.JPEG
+)
+
+/**
+ * Compression Cache Entry
+ */
+data class CompressionCacheEntry(
+    val result: ImageCompressionResult,
+    val timestamp: Long
+) {
+    fun isExpired(): Boolean {
+        return System.currentTimeMillis() - timestamp > 30 * 60 * 1000L // 30 minutes
+    }
+}
+
+/**
+ * Image Compression Statistics
+ */
+data class ImageCompressionStats(
+    val totalCompressions: Long,
+    val totalOriginalSize: Long,
+    val totalCompressedSize: Long,
+    val averageCompressionTime: Long,
+    val averageCompressionRatio: Double,
+    val cacheSize: Int,
+    val memorySavings: Long
+)
+
+/**
+ * Image Compression Performance Metrics
+ */
+data class ImageCompressionPerformanceMetrics(
+    val totalCompressions: Long,
+    val averageCompressionTime: Long,
+    val averageCompressionRatio: Double,
+    val totalMemorySavings: Long,
+    val cacheHitRate: Double,
+    val cacheSize: Int
+) {
+    val compressionEfficiency: Double get() = averageCompressionRatio
+    val memoryEfficiency: Double get() = if (totalCompressions > 0) totalMemorySavings.toDouble() / totalCompressions else 0.0
+}
+
+/**
+ * Image Loading Optimizer
+ */
+class ImageLoadingOptimizer @Inject constructor(
+    private val compressionManager: ImageCompressionManager
+) {
+    
+    /**
+     * Load and optimize image for display
+     */
+    suspend fun loadOptimizedImage(
+        imageBytes: ByteArray,
+        targetWidth: Int,
+        targetHeight: Int,
+        useCase: ImageUseCase = ImageUseCase.THUMBNAIL
+    ): Result<ImageCompressionResult> {
+        return try {
+            // First optimize for use case
+            val optimizedResult = compressionManager.optimizeForUseCase(imageBytes, useCase)
+            
+            if (optimizedResult.isSuccess) {
+                val result = optimizedResult.getOrThrow()
+                
+                // Further optimize if needed for specific dimensions
+                if (result.dimensions.width > targetWidth || result.dimensions.height > targetHeight) {
+                    val furtherOptimized = compressionManager.compressBitmap(
+                        result.compressedBitmap ?: return Result.failure(Exception("No bitmap available")),
+                        0.8f,
+                        targetWidth,
+                        targetHeight,
+                        result.format
+                    )
+                    
+                    Result.success(furtherOptimized)
+                } else {
+                    Result.success(result)
+                }
+            } else {
+                optimizedResult
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error loading optimized image")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Preload optimized images
+     */
+    suspend fun preloadOptimizedImages(
+        images: List<PreloadImageItem>,
+        maxConcurrency: Int = 3
+    ) {
+        try {
+            images.chunked(maxConcurrency).forEach { batch ->
+                batch.map { item ->
+                    CoroutineScope(Dispatchers.IO).async {
+                        loadOptimizedImage(item.bytes, item.targetWidth, item.targetHeight, item.useCase)
+                    }
+                }.awaitAll()
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error preloading optimized images")
+        }
+    }
+}
+
+/**
+ * Preload Image Item
+ */
+data class PreloadImageItem(
+    val bytes: ByteArray,
+    val targetWidth: Int,
+    val targetHeight: Int,
+    val useCase: ImageUseCase
+)

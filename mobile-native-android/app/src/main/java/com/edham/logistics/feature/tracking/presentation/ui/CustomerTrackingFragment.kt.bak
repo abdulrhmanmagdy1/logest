@@ -1,0 +1,489 @@
+package com.edham.logistics.feature.tracking.presentation.ui
+
+import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.pm.PackageManager
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import androidx.navigation.fragment.navArgs
+import com.edham.logistics.R
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.databinding.FragmentCustomerTrackingBinding
+import com.edham.logistics.feature.tracking.presentation.ui.CustomerTrackingViewModel
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.OnMapReadyCallback
+import com.google.android.gms.maps.SupportMapFragment
+import com.google.android.gms.maps.model.*
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class CustomerTrackingFragment : Fragment(), OnMapReadyCallback {
+
+    private var _binding: FragmentCustomerTrackingBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: CustomerTrackingViewModel by viewModels()
+    private val args: CustomerTrackingFragmentArgs by navArgs()
+    
+    private var googleMap: GoogleMap? = null
+    private var vehicleMarker: Marker? = null
+    private var pickupMarker: Marker? = null
+    private var destinationMarker: Marker? = null
+    private var routePolyline: Polyline? = null
+    
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        when {
+            permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true -> {
+                enableLocation()
+            }
+            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true -> {
+                enableLocation()
+            }
+            else -> {
+                showSnackbar("GPS permission denied")
+            }
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentCustomerTrackingBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupMap()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize tracking with shipment ID from arguments
+        viewModel.initialize(args.shipmentId)
+    }
+
+    private fun setupMap() {
+        val mapFragment = childFragmentManager.findFragmentById(R.id.map) as SupportMapFragment
+        mapFragment.getMapAsync(this)
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refreshTracking()
+        }
+        
+        binding.buttonShare.setOnClickListener {
+            viewModel.shareTracking(args.shipmentId)
+        }
+        
+        binding.buttonContactDriver.setOnClickListener {
+            viewModel.contactDriver()
+        }
+        
+        binding.buttonReportIssue.setOnClickListener {
+            viewModel.reportIssue()
+        }
+        
+        binding.buttonToggleMapStyle.setOnClickListener {
+            viewModel.toggleMapStyle()
+        }
+        
+        binding.buttonToggleTraffic.setOnClickListener {
+            viewModel.toggleTrafficLayer()
+        }
+        
+        binding.buttonCenterOnVehicle.setOnClickListener {
+            viewModel.centerMapOnVehicle()
+        }
+        
+        binding.buttonCenterOnDestination.setOnClickListener {
+            viewModel.centerMapOnDestination()
+        }
+        
+        binding.buttonShowRoute.setOnClickListener {
+            viewModel.showFullRoute()
+        }
+        
+        binding.buttonHideRoute.setOnClickListener {
+            viewModel.hideFullRoute()
+        }
+    }
+
+    private fun updateUI(uiState: CustomerTrackingViewModel.CustomerTrackingUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+        
+        // Show success messages
+        uiState.actionSuccess?.let { message ->
+            showSnackbar(message)
+            viewModel.clearSuccess()
+        }
+        
+        // Handle share URL
+        uiState.shareUrl?.let { url ->
+            shareTrackingLink(url)
+            viewModel.clearShareUrl()
+        }
+        
+        // Handle driver phone
+        uiState.driverPhone?.let { phone ->
+            callDriver(phone)
+        }
+        
+        // Update map
+        updateMap(uiState)
+        
+        // Update tracking info
+        updateTrackingInfo(uiState)
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.contentLayout.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refreshTracking()
+        }
+    }
+
+    private fun showContent(uiState: CustomerTrackingViewModel.CustomerTrackingUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        
+        // Update tracking info
+        uiState.shipmentTracking?.let { tracking ->
+            binding.textTrackingNumber.text = tracking.trackingNumber
+            binding.textDriverName.text = tracking.driverName
+            binding.textVehicleInfo.text = "${tracking.vehicleLicensePlate} - ${tracking.vehicleType}"
+            binding.textStatus.text = formatTrackingStatus(tracking.status)
+            binding.textSpeed.text = "${tracking.speed.toInt()} كم/س"
+            binding.textDistance.text = "${tracking.distanceRemaining.toInt()} كم"
+            binding.textDuration.text = formatDuration(tracking.durationRemaining)
+            
+            // Update status color
+            binding.textStatus.setTextColor(getTrackingStatusColor(tracking.status))
+            
+            // Show ETA
+            val eta = uiState.estimatedArrivalTime ?: tracking.estimatedArrivalTime
+            if (eta != null) {
+                binding.textETA.text = formatTimestamp(eta)
+                binding.layoutETA.visible()
+            } else {
+                binding.layoutETA.gone()
+            }
+            
+            // Show temperature if available
+            tracking.temperature?.let { temp ->
+                binding.textTemperature.text = "${temp}°C"
+                binding.layoutTemperature.visible()
+            } ?: run {
+                binding.layoutTemperature.gone()
+            }
+            
+            // Show address
+            tracking.address?.let { address ->
+                binding.textCurrentAddress.text = address
+                binding.layoutAddress.visible()
+            } ?: run {
+                binding.layoutAddress.gone()
+            }
+        }
+        
+        // Update route buttons
+        if (uiState.showFullRoute) {
+            binding.buttonShowRoute.gone()
+            binding.buttonHideRoute.visible()
+        } else {
+            binding.buttonShowRoute.visible()
+            binding.buttonHideRoute.gone()
+        }
+    }
+
+    private fun updateMap(uiState: CustomerTrackingViewModel.CustomerTrackingUiState) {
+        googleMap?.let { map ->
+            uiState.shipmentTracking?.let { tracking ->
+                // Update vehicle marker
+                updateVehicleMarker(tracking)
+                
+                // Update pickup and destination markers
+                updateLocationMarkers(tracking)
+                
+                // Update route
+                if (uiState.showFullRoute && uiState.routePoints.isNotEmpty()) {
+                    drawFullRoute(uiState.routePoints)
+                } else {
+                    drawRoute(tracking.routePoints)
+                }
+                
+                // Center map if needed
+                uiState.mapCenter?.let { center ->
+                    uiState.mapZoom.let { zoom ->
+                        map.moveCamera(CameraUpdateFactory.newLatLngZoom(center, zoom))
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateVehicleMarker(tracking: com.edham.logistics.feature.tracking.domain.model.ShipmentTracking) {
+        googleMap?.let { map ->
+            vehicleMarker?.remove()
+            
+            val markerOptions = MarkerOptions()
+                .position(tracking.currentLocation)
+                .title("المركبة الحالية")
+                .snippet("السائق: ${tracking.driverName}")
+                .icon(BitmapDescriptorFactory.fromResource(R.drawable.ic_vehicle_marker))
+                .rotation(tracking.heading)
+            
+            vehicleMarker = map.addMarker(markerOptions)
+        }
+    }
+
+    private fun updateLocationMarkers(tracking: com.edham.logistics.feature.tracking.domain.model.ShipmentTracking) {
+        googleMap?.let { map ->
+            // Pickup marker
+            pickupMarker?.remove()
+            val pickupOptions = MarkerOptions()
+                .position(tracking.pickupLocation)
+                .title("نقطة الالتقاط")
+                .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN))
+            pickupMarker = map.addMarker(pickupOptions)
+            
+            // Destination marker
+            destinationMarker?.remove()
+            val destinationOptions = MarkerOptions()
+                .position(tracking.destinationLocation)
+                .title("الوجهة")
+                .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_RED))
+            destinationMarker = map.addMarker(destinationOptions)
+        }
+    }
+
+    private fun drawRoute(routePoints: List<LatLng>) {
+        googleMap?.let { map ->
+            routePolyline?.remove()
+            
+            if (routePoints.isNotEmpty()) {
+                val polylineOptions = PolylineOptions()
+                    .addAll(routePoints)
+                    .width(8f)
+                    .color(ContextCompat.getColor(requireContext(), R.color.primary))
+                    .geodesic(true)
+                
+                routePolyline = map.addPolyline(polylineOptions)
+            }
+        }
+    }
+
+    private fun drawFullRoute(routePoints: List<LatLng>) {
+        googleMap?.let { map ->
+            routePolyline?.remove()
+            
+            if (routePoints.isNotEmpty()) {
+                val polylineOptions = PolylineOptions()
+                    .addAll(routePoints)
+                    .width(10f)
+                    .color(ContextCompat.getColor(requireContext(), R.color.blue_500))
+                    .geodesic(true)
+                    .pattern(listOf(Dash(20f), Gap(10f)))
+                
+                routePolyline = map.addPolyline(polylineOptions)
+            }
+        }
+    }
+
+    private fun updateTrackingInfo(uiState: CustomerTrackingViewModel.CustomerTrackingUiState) {
+        // Update progress
+        uiState.shipmentTracking?.let { tracking ->
+            val progress = calculateProgress(tracking)
+            binding.progressBarTracking.progress = progress
+            binding.textProgress.text = "$progress%"
+        }
+    }
+
+    private fun calculateProgress(tracking: com.edham.logistics.feature.tracking.domain.model.ShipmentTracking): Int {
+        // Simple progress calculation based on distance
+        val totalDistance = calculateDistance(tracking.pickupLocation, tracking.destinationLocation)
+        val remainingDistance = tracking.distanceRemaining
+        return if (totalDistance > 0) {
+            ((totalDistance - remainingDistance) / totalDistance * 100).toInt()
+        } else 0
+    }
+
+    private fun calculateDistance(start: LatLng, end: LatLng): Double {
+        val results = FloatArray(1)
+        Location.distanceBetween(
+            start.latitude, start.longitude,
+            end.latitude, end.longitude,
+            results
+        )
+        return results[0].toDouble() / 1000.0 // Convert to km
+    }
+
+    private fun formatTrackingStatus(status: com.edham.logistics.feature.tracking.domain.model.TrackingStatus): String {
+        return when (status) {
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.NOT_STARTED -> "لم يبدأ"
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.EN_ROUTE_TO_PICKUP -> "في الطريق للاستلام"
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.AT_PICKUP -> "في نقطة الاستلام"
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.EN_ROUTE_TO_DESTINATION -> "في الطريق للوجهة"
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.AT_DESTINATION -> "في الوجهة"
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.DELIVERED -> "تم التسليم"
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.DELAYED -> "متأخر"
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.CANCELLED -> "ملغي"
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.ERROR -> "خطأ"
+        }
+    }
+
+    private fun getTrackingStatusColor(status: com.edham.logistics.feature.tracking.domain.model.TrackingStatus): Int {
+        return when (status) {
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.NOT_STARTED -> android.graphics.Color.parseColor("#9E9E9E")
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.EN_ROUTE_TO_PICKUP -> android.graphics.Color.parseColor("#2196F3")
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.AT_PICKUP -> android.graphics.Color.parseColor("#FF9800")
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.EN_ROUTE_TO_DESTINATION -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.AT_DESTINATION -> android.graphics.Color.parseColor("#9C27B0")
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.DELIVERED -> android.graphics.Color.parseColor("#4CAF50")
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.DELAYED -> android.graphics.Color.parseColor("#F44336")
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.CANCELLED -> android.graphics.Color.parseColor("#9E9E9E")
+            com.edham.logistics.feature.tracking.domain.model.TrackingStatus.ERROR -> android.graphics.Color.parseColor("#F44336")
+        }
+    }
+
+    private fun formatTimestamp(timestamp: Long): String {
+        return java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date(timestamp))
+    }
+
+    private fun formatDuration(duration: Long): String {
+        val hours = duration / 3600000
+        val minutes = (duration % 3600000) / 60000
+        return when {
+            hours > 0 -> "${hours}س ${minutes}د"
+            minutes > 0 -> "${minutes}د"
+            else -> "أقل من دقيقة"
+        }
+    }
+
+    private fun shareTrackingLink(url: String) {
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, "تتبع شحنتك: $url")
+            putExtra(Intent.EXTRA_SUBJECT, "رابط تتبع الشحنة")
+        }
+        startActivity(Intent.createChooser(shareIntent, "مشاركة رابط التتبع"))
+    }
+
+    private fun callDriver(phone: String) {
+        val intent = Intent(Intent.ACTION_DIAL).apply {
+            data = Uri.parse("tel:$phone")
+        }
+        startActivity(intent)
+    }
+
+    private fun enableLocation() {
+        if (ContextCompat.checkSelfPermission(
+                requireContext(),
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            googleMap?.isMyLocationEnabled = true
+        }
+    }
+
+    private fun checkLocationPermission() {
+        when {
+            ContextCompat.checkSelfPermission(
+                requireContext(),
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED -> {
+                enableLocation()
+            }
+            else -> {
+                locationPermissionLauncher.launch(
+                    arrayOf(
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
+                )
+            }
+        }
+    }
+
+    override fun onMapReady(map: GoogleMap) {
+        googleMap = map
+        
+        // Setup map settings
+        map.uiSettings.apply {
+            isZoomControlsEnabled = true
+            isCompassEnabled = true
+            isMyLocationButtonEnabled = true
+            isMapToolbarEnabled = false
+        }
+        
+        // Check location permission
+        checkLocationPermission()
+        
+        // Set initial map style
+        val style = com.edham.logistics.R.raw.map_style_light
+        map.setMapStyle(com.google.android.gms.maps.model.MapStyleOptions.loadRawResourceStyle(requireContext(), style))
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+        googleMap = null
+        vehicleMarker = null
+        pickupMarker = null
+        destinationMarker = null
+        routePolyline = null
+    }
+}

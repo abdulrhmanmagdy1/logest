@@ -1,0 +1,593 @@
+package com.edham.logistics.sync
+
+import android.content.Context
+import com.edham.logistics.offline.LocalCacheManager
+import com.google.gson.Gson
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.ConcurrentLinkedQueue
+
+/**
+ * Batch Processor - Handles batch updates to reduce API calls
+ */
+class BatchProcessor private constructor(context: Context) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: BatchProcessor? = null
+        
+        fun getInstance(context: Context): BatchProcessor {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: BatchProcessor(context).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val cacheManager = LocalCacheManager.getInstance(context)
+    private val processorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    private val _batchQueue = MutableStateFlow<ConcurrentLinkedQueue<BatchTask>>(ConcurrentLinkedQueue())
+    val batchQueue = _batchQueue.asStateFlow()
+    
+    private val _processingStatus = MutableStateFlow<BatchProcessingStatus>(BatchProcessingStatus.IDLE)
+    val processingStatus = _processingStatus.asStateFlow()
+    
+    private val _batchProgress = MutableStateFlow<BatchProgress>(BatchProgress())
+    val batchProgress = _batchProgress.asStateFlow()
+    
+    private val _batchResults = MutableStateFlow<List<BatchResult>>(emptyList())
+    val batchResults = _batchResults.asStateFlow()
+    
+    private val _batchStatistics = MutableStateFlow<BatchStatistics>(BatchStatistics())
+    val batchStatistics = _batchStatistics.asStateFlow()
+    
+    private var processingJob: Job? = null
+    private val gson = Gson()
+    
+    // Configuration
+    private val defaultBatchSize = 50
+    private val maxBatchSize = 100
+    private val batchTimeout = 30000L // 30 seconds
+    private val processingInterval = 5000L // 5 seconds
+    
+    init {
+        startBatchProcessor()
+    }
+    
+    /**
+     * Start batch processor
+     */
+    private fun startBatchProcessor() {
+        processingJob = processorScope.launch {
+            while (true) {
+                try {
+                    processBatchQueue()
+                    delay(processingInterval)
+                } catch (e: Exception) {
+                    _processingStatus.value = BatchProcessingStatus.ERROR
+                    delay(10000) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    /**
+     * Process batch queue
+     */
+    private suspend fun processBatchQueue() {
+        val queue = _batchQueue.value
+        if (queue.isEmpty() || _processingStatus.value == BatchProcessingStatus.PROCESSING) {
+            return
+        }
+        
+        _processingStatus.value = BatchProcessingStatus.PROCESSING
+        
+        try {
+            // Collect tasks for batch processing
+            val batchTasks = mutableListOf<BatchTask>()
+            var totalSize = 0
+            
+            while (queue.isNotEmpty() && batchTasks.size < maxBatchSize && totalSize < defaultBatchSize) {
+                val task = queue.poll()
+                if (task != null) {
+                    batchTasks.add(task)
+                    totalSize += task.size
+                }
+            }
+            
+            if (batchTasks.isNotEmpty()) {
+                // Group tasks by entity type and operation
+                val groupedTasks = batchTasks.groupBy { "${it.entityType}_${it.operation}" }
+                
+                var processedCount = 0
+                val totalTasks = batchTasks.size
+                
+                groupedTasks.forEach { (groupKey, tasks) ->
+                    try {
+                        val result = processBatchGroup(groupKey, tasks)
+                        _batchResults.value = _batchResults.value + result
+                        
+                        processedCount += tasks.size
+                        _batchProgress.value = _batchProgress.value.copy(
+                            currentBatch = processedCount,
+                            totalBatches = totalTasks,
+                            progressPercentage = (processedCount.toFloat() / totalTasks) * 100
+                        )
+                        
+                        updateStatistics(result)
+                        
+                    } catch (e: Exception) {
+                        val errorResult = BatchResult(
+                            batchId = java.util.UUID.randomUUID().toString(),
+                            entityType = tasks.first().entityType,
+                            operation = tasks.first().operation,
+                            success = false,
+                            error = e.message,
+                            itemsProcessed = 0,
+                            itemsTotal = tasks.size,
+                            processingTime = 0L
+                        )
+                        _batchResults.value = _batchResults.value + errorResult
+                    }
+                }
+            }
+            
+            _processingStatus.value = BatchProcessingStatus.IDLE
+            
+        } catch (e: Exception) {
+            _processingStatus.value = BatchProcessingStatus.ERROR
+        }
+    }
+    
+    /**
+     * Process batch group
+     */
+    private suspend fun processBatchGroup(groupKey: String, tasks: List<BatchTask>): BatchResult {
+        val startTime = System.currentTimeMillis()
+        val entityType = tasks.first().entityType
+        val operation = tasks.first().operation
+        
+        return withTimeout(batchTimeout) {
+            when (operation) {
+                BatchOperation.CREATE -> processCreateBatch(entityType, tasks)
+                BatchOperation.UPDATE -> processUpdateBatch(entityType, tasks)
+                BatchOperation.DELETE -> processDeleteBatch(entityType, tasks)
+                BatchOperation.SYNC -> processSyncBatch(entityType, tasks)
+            }
+        }.also {
+            it.processingTime = System.currentTimeMillis() - startTime
+        }
+    }
+    
+    /**
+     * Process create batch
+     */
+    private suspend fun processCreateBatch(entityType: String, tasks: List<BatchTask>): BatchResult {
+        val items = tasks.map { gson.fromJson(it.data, getEntityClass(entityType)) }
+        
+        return try {
+            // Simulate batch API call
+            kotlinx.coroutines.delay(((1000 + (items.size * 50))).toLong())
+            
+            // Cache the created items
+            items.forEach { item ->
+                when (entityType) {
+                    "shipment" -> {
+                        val shipment = convertToCachedShipment(item)
+                        cacheManager.cacheShipment(shipment)
+                    }
+                    "driver" -> {
+                        val driver = convertToCachedDriver(item)
+                        cacheManager.cacheDriver(driver)
+                    }
+                    "vehicle" -> {
+                        val vehicle = convertToCachedVehicle(item)
+                        cacheManager.cacheVehicle(vehicle)
+                    }
+                }
+            }
+            
+            BatchResult(
+                batchId = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.CREATE,
+                success = true,
+                itemsProcessed = items.size,
+                itemsTotal = tasks.size,
+                processingTime = 0L
+            )
+            
+        } catch (e: Exception) {
+            BatchResult(
+                batchId = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.CREATE,
+                success = false,
+                error = e.message,
+                itemsProcessed = 0,
+                itemsTotal = tasks.size,
+                processingTime = 0L
+            )
+        }
+    }
+    
+    /**
+     * Process update batch
+     */
+    private suspend fun processUpdateBatch(entityType: String, tasks: List<BatchTask>): BatchResult {
+        val items = tasks.map { gson.fromJson(it.data, getEntityClass(entityType)) }
+        
+        return try {
+            // Simulate batch API call
+            delay(800 + (items.size * 30))
+            
+            // Update cached items
+            items.forEach { item ->
+                when (entityType) {
+                    "shipment" -> {
+                        val shipment = convertToCachedShipment(item)
+                        cacheManager.cacheShipment(shipment)
+                    }
+                    "driver" -> {
+                        val driver = convertToCachedDriver(item)
+                        cacheManager.cacheDriver(driver)
+                    }
+                    "vehicle" -> {
+                        val vehicle = convertToCachedVehicle(item)
+                        cacheManager.cacheVehicle(vehicle)
+                    }
+                }
+            }
+            
+            BatchResult(
+                batchId = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.UPDATE,
+                success = true,
+                itemsProcessed = items.size,
+                itemsTotal = tasks.size,
+                processingTime = 0L
+            )
+            
+        } catch (e: Exception) {
+            BatchResult(
+                batchId = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.UPDATE,
+                success = false,
+                error = e.message,
+                itemsProcessed = 0,
+                itemsTotal = tasks.size,
+                processingTime = 0L
+            )
+        }
+    }
+    
+    /**
+     * Process delete batch
+     */
+    private suspend fun processDeleteBatch(entityType: String, tasks: List<BatchTask>): BatchResult {
+        return try {
+            // Simulate batch API call
+            delay(500 + (tasks.size * 20))
+            
+            // Remove from cache (in a real implementation, this would be handled by the sync engine)
+            tasks.forEach { task ->
+                // This would remove the item from cache
+            }
+            
+            BatchResult(
+                batchId = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.DELETE,
+                success = true,
+                itemsProcessed = tasks.size,
+                itemsTotal = tasks.size,
+                processingTime = 0L
+            )
+            
+        } catch (e: Exception) {
+            BatchResult(
+                batchId = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.DELETE,
+                success = false,
+                error = e.message,
+                itemsProcessed = 0,
+                itemsTotal = tasks.size,
+                processingTime = 0L
+            )
+        }
+    }
+    
+    /**
+     * Process sync batch
+     */
+    private suspend fun processSyncBatch(entityType: String, tasks: List<BatchTask>): BatchResult {
+        return try {
+            // Simulate batch sync operation
+            kotlinx.coroutines.delay((1500 + (tasks.size * 100)).toLong())
+            
+            // This would sync data with server
+            tasks.forEach { task ->
+                // Sync individual item
+            }
+            
+            BatchResult(
+                batchId = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.SYNC,
+                success = true,
+                itemsProcessed = tasks.size,
+                itemsTotal = tasks.size,
+                processingTime = 0L
+            )
+            
+        } catch (e: Exception) {
+            BatchResult(
+                batchId = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.SYNC,
+                success = false,
+                error = e.message,
+                itemsProcessed = 0,
+                itemsTotal = tasks.size,
+                processingTime = 0L
+            )
+        }
+    }
+    
+    /**
+     * Add batch task
+     */
+    fun addBatchTask(task: BatchTask) {
+        val queue = _batchQueue.value
+        queue.offer(task)
+        _batchQueue.value = queue
+    }
+    
+    /**
+     * Add multiple batch tasks
+     */
+    fun addBatchTasks(tasks: List<BatchTask>) {
+        val queue = _batchQueue.value
+        tasks.forEach { queue.offer(it) }
+        _batchQueue.value = queue
+    }
+    
+    /**
+     * Process batch to server
+     */
+    suspend fun processBatchToServer(entityType: String, data: List<String>): BatchResult {
+        val tasks = data.map { 
+            BatchTask(
+                id = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.SYNC,
+                data = it,
+                size = 1,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+        
+        return processBatchGroup("server_sync_${entityType}", tasks)
+    }
+    
+    /**
+     * Process batch from server
+     */
+    suspend fun processBatchFromServer(entityType: String, data: List<String>): BatchResult {
+        val tasks = data.map { 
+            BatchTask(
+                id = java.util.UUID.randomUUID().toString(),
+                entityType = entityType,
+                operation = BatchOperation.UPDATE,
+                data = it,
+                size = 1,
+                timestamp = System.currentTimeMillis()
+            )
+        }
+        
+        return processBatchGroup("server_update_${entityType}", tasks)
+    }
+    
+    /**
+     * Force process all pending batches
+     */
+    suspend fun forceProcessAllBatches() {
+        _processingStatus.value = BatchProcessingStatus.PROCESSING
+        
+        try {
+            while (_batchQueue.value.isNotEmpty()) {
+                processBatchQueue()
+                kotlinx.coroutines.delay(1000)
+            }
+            
+            _processingStatus.value = BatchProcessingStatus.IDLE
+            
+        } catch (e: Exception) {
+            _processingStatus.value = BatchProcessingStatus.ERROR
+        }
+    }
+    
+    /**
+     * Clear batch queue
+     */
+    fun clearBatchQueue() {
+        _batchQueue.value.clear()
+        _batchResults.value = emptyList()
+    }
+    
+    /**
+     * Get batch statistics
+     */
+    suspend fun getBatchStatistics(): BatchStatistics {
+        val currentStats = _batchStatistics.value
+        val queue = _batchQueue.value
+        val results = _batchResults.value
+        
+        return currentStats.copy(
+            pendingBatches = queue.size,
+            totalProcessed = results.count { it.success },
+            totalFailed = results.count { !it.success },
+            averageProcessingTime = if (results.isNotEmpty()) {
+                results.map { it.processingTime }.average()
+            } else 0.0
+        )
+    }
+    
+    /**
+     * Update statistics
+     */
+    private fun updateStatistics(result: BatchResult) {
+        val currentStats = _batchStatistics.value
+        val queue = _batchQueue.value
+        val results = _batchResults.value
+        
+        _batchStatistics.value = currentStats.copy(
+            totalBatches = results.size,
+            pendingBatches = queue.size,
+            totalProcessed = results.count { it.success },
+            totalFailed = results.count { !it.success },
+            averageProcessingTime = if (results.isNotEmpty()) {
+                results.map { it.processingTime }.average()
+            } else 0.0,
+            lastBatchTime = System.currentTimeMillis()
+        )
+    }
+    
+    /**
+     * Stop batch processor
+     */
+    fun stop() {
+        processingJob?.cancel()
+        processorScope.cancel()
+    }
+    
+    // Helper methods
+    private fun getEntityClass(entityType: String): Class<*> {
+        return when (entityType) {
+            "shipment" -> com.edham.logistics.data.remote.model.Shipment::class.java
+            "driver" -> com.edham.logistics.data.remote.model.Driver::class.java
+            "vehicle" -> com.edham.logistics.data.remote.model.Vehicle::class.java
+            else -> Any::class.java
+        }
+    }
+    
+    private fun convertToCachedShipment(item: Any): com.edham.logistics.offline.CachedShipment {
+        // This would convert the remote model to cached model
+        // For now, return a mock object
+        return com.edham.logistics.offline.CachedShipment(
+            id = "mock-id",
+            trackingNumber = "mock-tracking",
+            origin = "mock-origin",
+            destination = "mock-destination",
+            status = "PENDING",
+            estimatedDelivery = System.currentTimeMillis() + 86400000,
+            actualDelivery = null,
+            weight = 10.0,
+            dimensions = "30x20x15",
+            specialInstructions = null,
+            customerId = "mock-customer",
+            driverId = null,
+            vehicleId = null,
+            createdAt = System.currentTimeMillis(),
+            updatedAt = System.currentTimeMillis()
+        )
+    }
+    
+    private fun convertToCachedDriver(item: Any): com.edham.logistics.offline.CachedDriver {
+        return com.edham.logistics.offline.CachedDriver(
+            id = "mock-driver-id",
+            name = "Mock Driver",
+            email = "driver@example.com",
+            phone = "+1234567890",
+            licenseNumber = "DL123456",
+            status = "ACTIVE",
+            currentLocation = null,
+            currentShipmentId = null,
+            totalDeliveries = 0,
+            rating = 5.0,
+            vehicleId = null,
+            lastUpdated = System.currentTimeMillis()
+        )
+    }
+    
+    private fun convertToCachedVehicle(item: Any): com.edham.logistics.offline.CachedVehicle {
+        return com.edham.logistics.offline.CachedVehicle(
+            id = "mock-vehicle-id",
+            plateNumber = "ABC123",
+            make = "Toyota",
+            model = "Camry",
+            year = 2023,
+            type = "Sedan",
+            capacity = 500.0,
+            status = "ACTIVE",
+            currentDriverId = null,
+            location = null,
+            fuelLevel = 80.0,
+            mileage = 10000L,
+            lastUpdated = System.currentTimeMillis()
+        )
+    }
+}
+
+/**
+ * Data classes
+ */
+data class BatchTask(
+    val id: String,
+    val entityType: String,
+    val operation: BatchOperation,
+    val data: String,
+    val size: Int = 1,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+data class BatchResult(
+    val batchId: String,
+    val entityType: String,
+    val operation: BatchOperation,
+    val success: Boolean,
+    val error: String? = null,
+    val itemsProcessed: Int,
+    val itemsTotal: Int,
+    val processingTime: Long = 0L
+)
+
+data class BatchProgress(
+    val currentBatch: Int = 0,
+    val totalBatches: Int = 0,
+    val progressPercentage: Float = 0f,
+    val currentOperation: String = ""
+)
+
+data class BatchStatistics(
+    val totalBatches: Int = 0,
+    val pendingBatches: Int = 0,
+    val totalProcessed: Int = 0,
+    val totalFailed: Int = 0,
+    val averageProcessingTime: Double = 0.0,
+    val lastBatchTime: Long = 0L
+) {
+    val successRate: Double
+        get() = if (totalBatches > 0) (totalProcessed.toDouble() / totalBatches) * 100 else 0.0
+    
+    val failureRate: Double
+        get() = if (totalBatches > 0) (totalFailed.toDouble() / totalBatches) * 100 else 0.0
+}
+
+enum class BatchOperation {
+    CREATE,
+    UPDATE,
+    DELETE,
+    SYNC
+}
+
+enum class BatchProcessingStatus {
+    IDLE,
+    PROCESSING,
+    ERROR,
+    COMPLETED
+}

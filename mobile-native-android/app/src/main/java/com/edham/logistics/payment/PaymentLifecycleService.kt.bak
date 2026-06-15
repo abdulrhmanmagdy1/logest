@@ -1,0 +1,700 @@
+package com.edham.logistics.payment
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import com.edham.logistics.payment.PaymentLifecycleService.*
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Android Payment Lifecycle Service - Full Payment Management System
+ */
+class PaymentLifecycleService {
+    
+    private val _payments = MutableStateFlow<List<PaymentTransaction>>(emptyList())
+    val payments: StateFlow<List<PaymentTransaction>> = _payments.asStateFlow()
+    
+    private val _paymentStatistics = MutableStateFlow<PaymentStatistics>(PaymentStatistics())
+    val paymentStatistics: StateFlow<PaymentStatistics> = _paymentStatistics.asStateFlow()
+    
+    private val _pendingApprovals = MutableStateFlow<List<PaymentTransaction>>(emptyList())
+    val pendingApprovals: StateFlow<List<PaymentTransaction>> = _pendingApprovals.asStateFlow()
+    
+    private val _overduePayments = MutableStateFlow<List<PaymentTransaction>>(emptyList())
+    val overduePayments: StateFlow<List<PaymentTransaction>> = _overduePayments.asStateFlow()
+    
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val paymentsMap = ConcurrentHashMap<String, PaymentTransaction>()
+    
+    /**
+     * Payment Status Enum
+     */
+    enum class PaymentStatus(val arabicName: String, val color: String) {
+        PENDING("قيد الانتظار", "#F59E0B"),
+        PROCESSING("قيد المعالجة", "#3B82F6"),
+        COMPLETED("مكتمل", "#10B981"),
+        PARTIALLY_PAID("مدفوع جزئياً", "#8B5CF6"),
+        FAILED("فشل", "#EF4444"),
+        REFUNDED("مسترد", "#6B7280"),
+        CANCELLED("ملغي", "#DC2626"),
+        AWAITING_APPROVAL("في انتظار الموافقة", "#F97316"),
+        APPROVED("موافق عليه", "#10B981"),
+        REJECTED("مرفوض", "#EF4444")
+    }
+    
+    /**
+     * Payment Method Enum
+     */
+    enum class PaymentMethod(val arabicName: String) {
+        CASH("نقدي"),
+        CREDIT_CARD("بطاقة ائتمان"),
+        BANK_TRANSFER("تحويل بنكي"),
+        DIGITAL_WALLET("محفظة رقمية"),
+        CHECK("شيك"),
+        CRYPTOCURRENCY("عملة مشفرة")
+    }
+    
+    /**
+     * Payment Transaction data class
+     */
+    data class PaymentTransaction(
+        val paymentId: String,
+        val invoiceId: String,
+        val shipmentId: String,
+        val customerId: String,
+        val amount: Double,
+        var paidAmount: Double = 0.0,
+        var status: PaymentStatus = PaymentStatus.PENDING,
+        val method: PaymentMethod,
+        val createdAt: LocalDateTime = LocalDateTime.now(),
+        var updatedAt: LocalDateTime = LocalDateTime.now(),
+        var dueDate: LocalDateTime? = null,
+        var transactionReference: String? = null,
+        var description: String = "",
+        val partialPayments: MutableList<PartialPayment> = mutableListOf(),
+        val refunds: MutableList<Refund> = mutableListOf(),
+        var approvalInfo: ApprovalInfo? = null,
+        var reconciliationInfo: ReconciliationInfo? = null,
+        val metadata: MutableMap<String, Any> = mutableMapOf()
+    ) {
+        val remainingAmount: Double
+            get() = amount - paidAmount
+        
+        val isFullyPaid: Boolean
+            get() = paidAmount >= amount
+        
+        val isOverdue: Boolean
+            get() = dueDate != null && LocalDateTime.now().isAfter(dueDate) && !isFullyPaid
+    }
+    
+    /**
+     * Partial Payment data class
+     */
+    data class PartialPayment(
+        val partialPaymentId: String,
+        val amount: Double,
+        val paymentDate: LocalDateTime = LocalDateTime.now(),
+        val method: PaymentMethod,
+        var transactionReference: String? = null,
+        var description: String = ""
+    )
+    
+    /**
+     * Refund data class
+     */
+    data class Refund(
+        val refundId: String,
+        val amount: Double,
+        val reason: String,
+        val refundDate: LocalDateTime = LocalDateTime.now(),
+        var status: RefundStatus = RefundStatus.PENDING,
+        var processedBy: String? = null,
+        var processedDate: LocalDateTime? = null,
+        var transactionReference: String? = null
+    ) {
+        enum class RefundStatus(val arabicName: String) {
+            PENDING("قيد الانتظار"),
+            PROCESSING("قيد المعالجة"),
+            COMPLETED("مكتمل"),
+            FAILED("فشل"),
+            CANCELLED("ملغي")
+        }
+    }
+    
+    /**
+     * Approval Info data class
+     */
+    data class ApprovalInfo(
+        val approvalId: String,
+        val approverId: String,
+        var approverName: String = "",
+        var status: ApprovalStatus = ApprovalStatus.PENDING,
+        val requestedAt: LocalDateTime = LocalDateTime.now(),
+        var reviewedAt: LocalDateTime? = null,
+        var comments: String = "",
+        var rejectionReason: String = ""
+    ) {
+        enum class ApprovalStatus(val arabicName: String) {
+            PENDING("قيد الانتظار"),
+            APPROVED("موافق عليه"),
+            REJECTED("مرفوض")
+        }
+    }
+    
+    /**
+     * Reconciliation Info data class
+     */
+    data class ReconciliationInfo(
+        val reconciliationId: String,
+        var status: ReconciliationStatus = ReconciliationStatus.NOT_RECONCILED,
+        var reconciledAt: LocalDateTime? = null,
+        var reconciledBy: String? = null,
+        var discrepancyAmount: Double? = null,
+        var discrepancyReason: String = "",
+        val matchedTransactions: MutableList<String> = mutableListOf(),
+        val unmatchedTransactions: MutableList<String> = mutableListOf()
+    ) {
+        enum class ReconciliationStatus(val arabicName: String) {
+            NOT_RECONCILED("غير موافق"),
+            PARTIALLY_RECONCILED("موافق جزئياً"),
+            FULLY_RECONCILED("موافق بالكامل"),
+            DISCREPANCY_FOUND("تم العثور على اختلاف")
+        }
+    }
+    
+    /**
+     * Payment Statistics data class
+     */
+    data class PaymentStatistics(
+        val totalPayments: Int = 0,
+        val totalAmount: Double = 0.0,
+        val totalPaid: Double = 0.0,
+        val totalOutstanding: Double = 0.0,
+        val statusDistribution: Map<PaymentStatus, Int> = emptyMap(),
+        val overdueCount: Int = 0,
+        val pendingApprovalCount: Int = 0,
+        val methodDistribution: Map<PaymentMethod, Int> = emptyMap()
+    )
+    
+    /**
+     * Create new payment transaction
+     */
+    fun createPayment(
+        invoiceId: String,
+        shipmentId: String,
+        customerId: String,
+        amount: Double,
+        method: PaymentMethod,
+        description: String = "",
+        dueDate: LocalDateTime? = null
+    ): PaymentTransaction {
+        return serviceScope.async {
+            val payment = PaymentTransaction(
+                paymentId = java.util.UUID.randomUUID().toString(),
+                invoiceId = invoiceId,
+                shipmentId = shipmentId,
+                customerId = customerId,
+                amount = amount,
+                method = method,
+                description = description,
+                dueDate = dueDate
+            )
+            
+            paymentsMap[payment.paymentId] = payment
+            updateFlows()
+            
+            // Log creation
+            logPaymentCreation(payment)
+            
+            payment
+        }.await()
+    }
+    
+    /**
+     * Process payment transaction
+     */
+    fun processPayment(
+        paymentId: String,
+        amount: Double,
+        method: PaymentMethod,
+        transactionReference: String? = null
+    ): PaymentTransaction {
+        return serviceScope.async {
+            val payment = paymentsMap[paymentId] 
+                ?: throw IllegalArgumentException("Payment not found: $paymentId")
+            
+            // Update payment
+            payment.status = PaymentStatus.PROCESSING
+            payment.updatedAt = LocalDateTime.now()
+            payment.transactionReference = transactionReference
+            
+            // Add partial payment
+            val partialPayment = PartialPayment(
+                partialPaymentId = java.util.UUID.randomUUID().toString(),
+                amount = amount,
+                method = method,
+                transactionReference = transactionReference
+            )
+            payment.partialPayments.add(partialPayment)
+            
+            // Update paid amount
+            payment.paidAmount += amount
+            
+            // Check if fully paid
+            if (payment.isFullyPaid) {
+                payment.status = PaymentStatus.COMPLETED
+                
+                // Check if approval is needed
+                if (requiresAccountantApproval(payment)) {
+                    requestAccountantApproval(payment)
+                }
+            } else {
+                payment.status = PaymentStatus.PARTIALLY_PAID
+            }
+            
+            // Update flows
+            updateFlows()
+            
+            // Log processing
+            logPaymentProcessing(payment, amount, method)
+            
+            payment
+        }.await()
+    }
+    
+    /**
+     * Process refund
+     */
+    fun processRefund(
+        paymentId: String,
+        amount: Double,
+        reason: String,
+        processedBy: String
+    ): Refund {
+        return serviceScope.async {
+            val payment = paymentsMap[paymentId] 
+                ?: throw IllegalArgumentException("Payment not found: $paymentId")
+            
+            // Create refund
+            val refund = Refund(
+                refundId = java.util.UUID.randomUUID().toString(),
+                amount = amount,
+                reason = reason,
+                processedBy = processedBy,
+                status = Refund.RefundStatus.PENDING
+            )
+            
+            // Add to payment
+            payment.refunds.add(refund)
+            
+            // Update payment status if fully refunded
+            val totalRefunded = payment.refunds.sumOf { it.amount }
+            if (totalRefunded >= payment.paidAmount) {
+                payment.status = PaymentStatus.REFUNDED
+            }
+            
+            // Update flows
+            updateFlows()
+            
+            // Log refund
+            logRefundProcessing(payment, refund)
+            
+            refund
+        }.await()
+    }
+    
+    /**
+     * Request accountant approval
+     */
+    fun requestAccountantApproval(payment: PaymentTransaction) {
+        serviceScope.launch {
+            // Create approval info
+            val approvalInfo = ApprovalInfo(
+                approvalId = java.util.UUID.randomUUID().toString(),
+                approverId = "ACCOUNTANT_001" // In real app, find available accountant
+            )
+            
+            payment.approvalInfo = approvalInfo
+            payment.status = PaymentStatus.AWAITING_APPROVAL
+            
+            // Update flows
+            updateFlows()
+            
+            // Log approval request
+            logApprovalRequest(payment, approvalInfo)
+        }
+    }
+    
+    /**
+     * Approve payment
+     */
+    fun approvePayment(paymentId: String, approverId: String, comments: String = ""): PaymentTransaction {
+        return serviceScope.async {
+            val payment = paymentsMap[paymentId] 
+                ?: throw IllegalArgumentException("Payment not found: $paymentId")
+            
+            val approvalInfo = payment.approvalInfo 
+                ?: throw IllegalArgumentException("No approval request found for payment: $paymentId")
+            
+            if (approvalInfo.approverId != approverId) {
+                throw IllegalArgumentException("Invalid approver")
+            }
+            
+            // Update approval
+            approvalInfo.status = ApprovalInfo.ApprovalStatus.APPROVED
+            approvalInfo.reviewedAt = LocalDateTime.now()
+            approvalInfo.comments = comments
+            
+            // Update payment status
+            payment.status = PaymentStatus.APPROVED
+            payment.updatedAt = LocalDateTime.now()
+            
+            // Update flows
+            updateFlows()
+            
+            // Log approval
+            logPaymentApproval(payment, approverId, comments)
+            
+            payment
+        }.await()
+    }
+    
+    /**
+     * Reject payment
+     */
+    fun rejectPayment(paymentId: String, approverId: String, rejectionReason: String): PaymentTransaction {
+        return serviceScope.async {
+            val payment = paymentsMap[paymentId] 
+                ?: throw IllegalArgumentException("Payment not found: $paymentId")
+            
+            val approvalInfo = payment.approvalInfo 
+                ?: throw IllegalArgumentException("No approval request found for payment: $paymentId")
+            
+            if (approvalInfo.approverId != approverId) {
+                throw IllegalArgumentException("Invalid approver")
+            }
+            
+            // Update approval
+            approvalInfo.status = ApprovalInfo.ApprovalStatus.REJECTED
+            approvalInfo.reviewedAt = LocalDateTime.now()
+            approvalInfo.rejectionReason = rejectionReason
+            
+            // Update payment status
+            payment.status = PaymentStatus.REJECTED
+            payment.updatedAt = LocalDateTime.now()
+            
+            // Update flows
+            updateFlows()
+            
+            // Log rejection
+            logPaymentRejection(payment, approverId, rejectionReason)
+            
+            payment
+        }.await()
+    }
+    
+    /**
+     * Reconcile payment with invoice
+     */
+    fun reconcilePayment(paymentId: String, reconciledBy: String): PaymentTransaction {
+        return serviceScope.async {
+            val payment = paymentsMap[paymentId] 
+                ?: throw IllegalArgumentException("Payment not found: $paymentId")
+            
+            // Create reconciliation info
+            val reconciliationInfo = ReconciliationInfo(
+                reconciliationId = java.util.UUID.randomUUID().toString(),
+                reconciledBy = reconciledBy,
+                reconciledAt = LocalDateTime.now()
+            )
+            
+            // Check for discrepancies (simplified - in real app would compare with actual invoice)
+            if (payment.paidAmount != payment.amount) {
+                reconciliationInfo.status = ReconciliationInfo.ReconciliationStatus.DISCREPANCY_FOUND
+                reconciliationInfo.discrepancyAmount = kotlin.math.abs(payment.paidAmount - payment.amount)
+                reconciliationInfo.discrepancyReason = "Payment amount doesn't match invoice amount"
+            } else {
+                reconciliationInfo.status = ReconciliationInfo.ReconciliationStatus.FULLY_RECONCILED
+            }
+            
+            // Add matched transactions
+            payment.transactionReference?.let { 
+                reconciliationInfo.matchedTransactions.add(it)
+            }
+            
+            payment.reconciliationInfo = reconciliationInfo
+            
+            // Update flows
+            updateFlows()
+            
+            // Log reconciliation
+            logPaymentReconciliation(payment, reconciliationInfo)
+            
+            payment
+        }.await()
+    }
+    
+    /**
+     * Cancel payment
+     */
+    fun cancelPayment(paymentId: String, reason: String): PaymentTransaction {
+        return serviceScope.async {
+            val payment = paymentsMap[paymentId] 
+                ?: throw IllegalArgumentException("Payment not found: $paymentId")
+            
+            if (payment.status == PaymentStatus.COMPLETED || 
+                payment.status == PaymentStatus.REFUNDED) {
+                throw IllegalArgumentException("Cannot cancel completed or refunded payment")
+            }
+            
+            payment.status = PaymentStatus.CANCELLED
+            payment.updatedAt = LocalDateTime.now()
+            payment.metadata["cancellationReason"] = reason
+            
+            // Update flows
+            updateFlows()
+            
+            // Log cancellation
+            logPaymentCancellation(payment, reason)
+            
+            payment
+        }.await()
+    }
+    
+    /**
+     * Get payment by ID
+     */
+    fun getPayment(paymentId: String): PaymentTransaction? {
+        return paymentsMap[paymentId]
+    }
+    
+    /**
+     * Get all payments for customer
+     */
+    fun getCustomerPayments(customerId: String): List<PaymentTransaction> {
+        return paymentsMap.values.filter { it.customerId == customerId }
+            .sortedByDescending { it.createdAt }
+    }
+    
+    /**
+     * Get payments pending approval
+     */
+    fun getPaymentsPendingApproval(): List<PaymentTransaction> {
+        return paymentsMap.values.filter { it.status == PaymentStatus.AWAITING_APPROVAL }
+            .sortedBy { it.approvalInfo?.requestedAt }
+    }
+    
+    /**
+     * Get overdue payments
+     */
+    fun getOverduePayments(): List<PaymentTransaction> {
+        return paymentsMap.values.filter { it.isOverdue }
+            .sortedBy { it.dueDate }
+    }
+    
+    /**
+     * Update payment due date
+     */
+    fun updateDueDate(paymentId: String, newDueDate: LocalDateTime): PaymentTransaction {
+        return serviceScope.async {
+            val payment = paymentsMap[paymentId] 
+                ?: throw IllegalArgumentException("Payment not found: $paymentId")
+            
+            val oldDueDate = payment.dueDate
+            payment.dueDate = newDueDate
+            payment.updatedAt = LocalDateTime.now()
+            
+            // Update flows
+            updateFlows()
+            
+            // Log due date update
+            logDueDateUpdate(payment, oldDueDate, newDueDate)
+            
+            payment
+        }.await()
+    }
+    
+    /**
+     * Update all StateFlows
+     */
+    private fun updateFlows() {
+        _payments.value = paymentsMap.values.toList()
+        _paymentStatistics.value = calculateStatistics()
+        _pendingApprovals.value = getPaymentsPendingApproval()
+        _overduePayments.value = getOverduePayments()
+    }
+    
+    /**
+     * Calculate payment statistics
+     */
+    private fun calculateStatistics(): PaymentStatistics {
+        val allPayments = paymentsMap.values.toList()
+        
+        val statusDistribution = allPayments.groupBy { it.status }
+            .mapValues { it.value.size }
+        
+        val methodDistribution = allPayments.groupBy { it.method }
+            .mapValues { it.value.size }
+        
+        val totalAmount = allPayments.sumOf { it.amount }
+        val totalPaid = allPayments.sumOf { it.paidAmount }
+        
+        return PaymentStatistics(
+            totalPayments = allPayments.size,
+            totalAmount = totalAmount,
+            totalPaid = totalPaid,
+            totalOutstanding = totalAmount - totalPaid,
+            statusDistribution = statusDistribution,
+            overdueCount = allPayments.count { it.isOverdue },
+            pendingApprovalCount = allPayments.count { it.status == PaymentStatus.AWAITING_APPROVAL },
+            methodDistribution = methodDistribution
+        )
+    }
+    
+    /**
+     * Check if payment requires accountant approval
+     */
+    private fun requiresAccountantApproval(payment: PaymentTransaction): Boolean {
+        return payment.amount > 10000.0 || // Large amounts
+               payment.method == PaymentMethod.CHECK || // Check payments
+               payment.partialPayments.size > 3 // Many partial payments
+    }
+    
+    /**
+     * Logging methods (simplified - in real app would use proper logging service)
+     */
+    private fun logPaymentCreation(payment: PaymentTransaction) {
+        println("PAYMENT_CREATED: ${payment.paymentId} - Amount: ${payment.amount}")
+    }
+    
+    private fun logPaymentProcessing(payment: PaymentTransaction, amount: Double, method: PaymentMethod) {
+        println("PAYMENT_PROCESSED: ${payment.paymentId} - Amount: $amount, Method: $method")
+    }
+    
+    private fun logRefundProcessing(payment: PaymentTransaction, refund: Refund) {
+        println("REFUND_PROCESSED: ${payment.paymentId} - Refund: ${refund.refundId}, Amount: ${refund.amount}")
+    }
+    
+    private fun logApprovalRequest(payment: PaymentTransaction, approvalInfo: ApprovalInfo) {
+        println("APPROVAL_REQUESTED: ${payment.paymentId} - Approval: ${approvalInfo.approvalId}")
+    }
+    
+    private fun logPaymentApproval(payment: PaymentTransaction, approverId: String, comments: String) {
+        println("PAYMENT_APPROVED: ${payment.paymentId} - By: $approverId")
+    }
+    
+    private fun logPaymentRejection(payment: PaymentTransaction, approverId: String, reason: String) {
+        println("PAYMENT_REJECTED: ${payment.paymentId} - By: $approverId, Reason: $reason")
+    }
+    
+    private fun logPaymentReconciliation(payment: PaymentTransaction, reconciliationInfo: ReconciliationInfo) {
+        println("PAYMENT_RECONCILED: ${payment.paymentId} - Status: ${reconciliationInfo.status}")
+    }
+    
+    private fun logPaymentCancellation(payment: PaymentTransaction, reason: String) {
+        println("PAYMENT_CANCELLED: ${payment.paymentId} - Reason: $reason")
+    }
+    
+    private fun logDueDateUpdate(payment: PaymentTransaction, oldDate: LocalDateTime?, newDate: LocalDateTime) {
+        println("DUE_DATE_UPDATED: ${payment.paymentId} - From: $oldDate, To: $newDate")
+    }
+    
+    /**
+     * Clear all data (for testing)
+     */
+    fun clearAllData() {
+        paymentsMap.clear()
+        updateFlows()
+    }
+    
+    /**
+     * Get payment status information
+     */
+    fun getPaymentStatusInfo(): Map<String, Map<String, Any>> {
+        return mapOf(
+            "PENDING" to mapOf(
+                "name" to "قيد الانتظار",
+                "color" to "#F59E0B",
+                "description" to "تم إنشاء الدفع ولكن لم تتم معالجته بعد"
+            ),
+            "PROCESSING" to mapOf(
+                "name" to "قيد المعالجة",
+                "color" to "#3B82F6",
+                "description" to "الدفع قيد المعالجة حالياً"
+            ),
+            "COMPLETED" to mapOf(
+                "name" to "مكتمل",
+                "color" to "#10B981",
+                "description" to "تم الدفع بنجاح"
+            ),
+            "PARTIALLY_PAID" to mapOf(
+                "name" to "مدفوع جزئياً",
+                "color" to "#8B5CF6",
+                "description" to "تم دفع جزء من المبلغ المطلوب"
+            ),
+            "FAILED" to mapOf(
+                "name" to "فشل",
+                "color" to "#EF4444",
+                "description" to "فشلت عملية الدفع"
+            ),
+            "REFUNDED" to mapOf(
+                "name" to "مسترد",
+                "color" to "#6B7280",
+                "description" to "تم استرداد الدفع"
+            ),
+            "CANCELLED" to mapOf(
+                "name" to "ملغي",
+                "color" to "#DC2626",
+                "description" to "تم إلغاء الدفع"
+            ),
+            "AWAITING_APPROVAL" to mapOf(
+                "name" to "في انتظار الموافقة",
+                "color" to "#F97316",
+                "description" to "الدفع في انتظار موافقة المحاسب"
+            ),
+            "APPROVED" to mapOf(
+                "name" to "موافق عليه",
+                "color" to "#10B981",
+                "description" to "تمت الموافقة على الدفع من قبل المحاسب"
+            ),
+            "REJECTED" to mapOf(
+                "name" to "مرفوض",
+                "color" to "#EF4444",
+                "description" to "تم رفض الدفع من قبل المحاسب"
+            )
+        )
+    }
+    
+    /**
+     * Get payment method information
+     */
+    fun getPaymentMethodInfo(): Map<String, Map<String, String>> {
+        return mapOf(
+            "CASH" to mapOf(
+                "name" to "نقدي",
+                "description" to "الدفع النقدي المباشر"
+            ),
+            "CREDIT_CARD" to mapOf(
+                "name" to "بطاقة ائتمان",
+                "description" to "الدفع باستخدام بطاقة ائتمان"
+            ),
+            "BANK_TRANSFER" to mapOf(
+                "name" to "تحويل بنكي",
+                "description" to "التحويل البنكي المباشر"
+            ),
+            "DIGITAL_WALLET" to mapOf(
+                "name" to "محفظة رقمية",
+                "description" to "الدفع باستخدام المحافظ الرقمية"
+            ),
+            "CHECK" to mapOf(
+                "name" to "شيك",
+                "description" to "الدفع بالشيك"
+            ),
+            "CRYPTOCURRENCY" to mapOf(
+                "name" to "عملة مشفرة",
+                "description" to "الدفع باستخدام العملات المشفرة"
+            )
+        )
+    }
+}

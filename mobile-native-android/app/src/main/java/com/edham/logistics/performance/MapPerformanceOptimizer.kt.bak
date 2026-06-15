@@ -1,0 +1,495 @@
+package com.edham.logistics.performance
+
+import android.content.Context
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.model.*
+import kotlinx.coroutines.*
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Map Performance Optimizer
+ * Optimizes map rendering, marker management, and data loading
+ */
+class MapPerformanceOptimizer(private val context: Context) {
+
+    companion object {
+        private const val MAX_VISIBLE_MARKERS = 100
+        private const val MARKER_CLUSTERING_THRESHOLD = 10
+        private const val MAP_UPDATE_INTERVAL = 5000L // 5 seconds
+        private const val TILE_CACHE_SIZE = 50
+        private const val POLYLINE_SMOOTHING = true
+    }
+
+    private val mapScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val markerCache = ConcurrentHashMap<String, MarkerOptions>()
+    private val polylineCache = ConcurrentHashMap<String, PolylineOptions>()
+    private var googleMap: GoogleMap? = null
+    private var isMapReady = false
+    private var updateJob: Job? = null
+
+    // Performance settings
+    private var enableClustering = true
+    private var enableLazyLoading = true
+    private var enableMarkerBatching = true
+    private var enableTileCaching = true
+
+    /**
+     * Initialize map optimizations
+     */
+    fun initializeMap(map: GoogleMap) {
+        this.googleMap = map
+        this.isMapReady = true
+
+        // Apply performance optimizations
+        applyMapOptimizations(map)
+
+        // Start performance monitoring
+        startMapPerformanceMonitoring()
+    }
+
+    /**
+     * Apply performance optimizations to map
+     */
+    private fun applyMapOptimizations(map: GoogleMap) {
+        // Enable lite mode for better performance (if applicable)
+        // map.mapType = GoogleMap.MAP_TYPE_NORMAL
+
+        // Set map preferences for performance
+        map.uiSettings.apply {
+            isRotateGesturesEnabled = false
+            isTiltGesturesEnabled = false
+            isCompassEnabled = false
+            isMapToolbarEnabled = false
+            isIndoorLevelPickerEnabled = false
+        }
+
+        // Configure map for performance
+        map.setMinZoomPreference(10f)
+        map.setMaxZoomPreference(18f)
+
+        // Enable clustering if needed
+        if (enableClustering) {
+            setupMarkerClustering(map)
+        }
+
+        // Set up tile caching
+        if (enableTileCaching) {
+            setupTileCaching(map)
+        }
+    }
+
+    /**
+     * Add markers with performance optimizations
+     */
+    fun addMarkers(markers: List<MarkerData>) {
+        val map = googleMap ?: return
+
+        mapScope.launch {
+            try {
+                if (enableClustering && markers.size > MARKER_CLUSTERING_THRESHOLD) {
+                    addClusteredMarkers(map, markers)
+                } else {
+                    addIndividualMarkers(map, markers)
+                }
+            } catch (e: Exception) {
+                // Handle error gracefully
+            }
+        }
+    }
+
+    /**
+     * Add individual markers
+     */
+    private suspend fun addIndividualMarkers(map: GoogleMap, markers: List<MarkerData>) {
+        val visibleMarkers = markers.take(MAX_VISIBLE_MARKERS)
+        
+        if (enableMarkerBatching) {
+            // Batch marker additions
+            visibleMarkers.chunked(20).forEach { chunk ->
+                chunk.forEach { markerData ->
+                    val markerOptions = createMarkerOptions(markerData)
+                    map.addMarker(markerOptions)
+                }
+                delay(16) // Small delay between batches (~60fps)
+            }
+        } else {
+            // Add all markers at once
+            visibleMarkers.forEach { markerData ->
+                val markerOptions = createMarkerOptions(markerData)
+                map.addMarker(markerOptions)
+            }
+        }
+    }
+
+    /**
+     * Add clustered markers
+     */
+    private suspend fun addClusteredMarkers(map: GoogleMap, markers: List<MarkerData>) {
+        // Group markers by area
+        val clusters = clusterMarkers(markers)
+        
+        clusters.forEach { cluster ->
+            val markerOptions = if (cluster.markers.size == 1) {
+                createMarkerOptions(cluster.markers.first())
+            } else {
+                createClusterMarkerOptions(cluster)
+            }
+            map.addMarker(markerOptions)
+        }
+    }
+
+    /**
+     * Update markers efficiently
+     */
+    fun updateMarkers(newMarkers: List<MarkerData>) {
+        val map = googleMap ?: return
+
+        mapScope.launch {
+            try {
+                // Clear existing markers
+                map.clear()
+
+                // Add new markers
+                addMarkers(newMarkers)
+            } catch (e: Exception) {
+                // Handle error gracefully
+            }
+        }
+    }
+
+    /**
+     * Add polylines with optimizations
+     */
+    fun addPolylines(polylines: List<PolylineData>) {
+        val map = googleMap ?: return
+
+        mapScope.launch {
+            polylines.forEach { polylineData ->
+                val polylineOptions = createPolylineOptions(polylineData)
+                map.addPolyline(polylineOptions)
+            }
+        }
+    }
+
+    /**
+     * Optimize camera movement
+     */
+    fun animateCameraToLocation(location: LatLng, zoom: Float = 15f) {
+        val map = googleMap ?: return
+
+        val cameraUpdate = CameraUpdateFactory.newLatLngZoom(location, zoom)
+        map.animateCamera(cameraUpdate, 1000, null)
+    }
+
+    /**
+     * Optimize camera bounds
+     */
+    fun fitMarkersInBounds(markers: List<MarkerData>) {
+        val map = googleMap ?: return
+
+        if (markers.isEmpty()) return
+
+        val builder = LatLngBounds.Builder()
+        markers.forEach { markerData ->
+            builder.include(markerData.position)
+        }
+
+        val bounds = builder.build()
+        val cameraUpdate = CameraUpdateFactory.newLatLngBounds(bounds, 100)
+        map.animateCamera(cameraUpdate, 1000, null)
+    }
+
+    /**
+     * Start periodic map updates
+     */
+    fun startPeriodicUpdates(updateCallback: () -> Unit) {
+        stopPeriodicUpdates()
+        
+        updateJob = mapScope.launch {
+            while (isActive) {
+                try {
+                    updateCallback()
+                    delay(MAP_UPDATE_INTERVAL)
+                } catch (e: Exception) {
+                    // Handle error and continue
+                }
+            }
+        }
+    }
+
+    /**
+     * Stop periodic map updates
+     */
+    fun stopPeriodicUpdates() {
+        updateJob?.cancel()
+        updateJob = null
+    }
+
+    /**
+     * Enable/disable features
+     */
+    fun setClusteringEnabled(enabled: Boolean) {
+        this.enableClustering = enabled
+    }
+
+    fun setLazyLoadingEnabled(enabled: Boolean) {
+        this.enableLazyLoading = enabled
+    }
+
+    fun setMarkerBatchingEnabled(enabled: Boolean) {
+        this.enableMarkerBatching = enabled
+    }
+
+    fun setTileCachingEnabled(enabled: Boolean) {
+        this.enableTileCaching = enabled
+    }
+
+    /**
+     * Get map performance metrics
+     */
+    fun getPerformanceMetrics(): MapPerformanceMetrics {
+        return MapPerformanceMetrics(
+            markerCount = markerCache.size,
+            polylineCount = polylineCache.size,
+            isClusteringEnabled = enableClustering,
+            isLazyLoadingEnabled = enableLazyLoading,
+            isMarkerBatchingEnabled = enableMarkerBatching,
+            isTileCachingEnabled = enableTileCaching,
+            isMapReady = isMapReady
+        )
+    }
+
+    /**
+     * Clear map data
+     */
+    fun clearMap() {
+        val map = googleMap ?: return
+        map.clear()
+        markerCache.clear()
+        polylineCache.clear()
+    }
+
+    /**
+     * Cleanup resources
+     */
+    fun cleanup() {
+        stopPeriodicUpdates()
+        clearMap()
+        mapScope.cancel()
+    }
+
+    // Private helper methods
+    private fun createMarkerOptions(markerData: MarkerData): MarkerOptions {
+        return MarkerOptions()
+            .position(markerData.position)
+            .title(markerData.title)
+            .snippet(markerData.snippet)
+            .icon(markerData.icon ?: BitmapDescriptorFactory.defaultMarker())
+            .anchor(0.5f, 0.5f)
+    }
+
+    private fun createClusterMarkerOptions(cluster: MarkerCluster): MarkerOptions {
+        return MarkerOptions()
+            .position(cluster.center)
+            .title("${cluster.markers.size} items")
+            .snippet("Cluster of ${cluster.markers.size} markers")
+            .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE))
+            .anchor(0.5f, 0.5f)
+    }
+
+    private fun createPolylineOptions(polylineData: PolylineData): PolylineOptions {
+        val options = PolylineOptions()
+            .addAll(polylineData.points)
+            .color(polylineData.color)
+            .width(polylineData.width)
+            .visible(polylineData.visible)
+
+        if (POLYLINE_SMOOTHING && polylineData.points.size > 2) {
+            // Apply smoothing if enabled
+            val smoothedPoints = smoothPolyline(polylineData.points)
+            options.points(smoothedPoints)
+        }
+
+        return options
+    }
+
+    private fun smoothPolyline(points: List<LatLng>): List<LatLng> {
+        // Simple smoothing algorithm
+        if (points.size < 3) return points
+
+        val smoothedPoints = mutableListOf<LatLng>()
+        smoothedPoints.add(points.first())
+
+        for (i in 1 until points.size - 1) {
+            val prev = points[i - 1]
+            val current = points[i]
+            val next = points[i + 1]
+
+            val smoothed = LatLng(
+                (prev.latitude + current.latitude + next.latitude) / 3,
+                (prev.longitude + current.longitude + next.longitude) / 3
+            )
+            smoothedPoints.add(smoothed)
+        }
+
+        smoothedPoints.add(points.last())
+        return smoothedPoints
+    }
+
+    private fun clusterMarkers(markers: List<MarkerData>): List<MarkerCluster> {
+        // Simple clustering algorithm
+        val clusters = mutableListOf<MarkerCluster>()
+        val unprocessed = markers.toMutableList()
+
+        while (unprocessed.isNotEmpty()) {
+            val seed = unprocessed.removeAt(0)
+            val cluster = mutableListOf<MarkerData>(seed)
+            val clusterCenter = seed.position
+
+            // Find nearby markers
+            val iterator = unprocessed.iterator()
+            while (iterator.hasNext()) {
+                val marker = iterator.next()
+                val distance = calculateDistance(clusterCenter, marker.position)
+                
+                if (distance < 0.01) { // ~1km clustering radius
+                    cluster.add(marker)
+                    iterator.remove()
+                }
+            }
+
+            clusters.add(MarkerCluster(cluster, clusterCenter))
+        }
+
+        return clusters
+    }
+
+    private fun calculateDistance(point1: LatLng, point2: LatLng): Double {
+        val R = 6371 // Earth radius in km
+        val latDistance = Math.toRadians(point2.latitude - point1.latitude)
+        val lonDistance = Math.toRadians(point2.longitude - point1.longitude)
+        val a = Math.sin(latDistance / 2).pow(2) +
+                Math.cos(Math.toRadians(point1.latitude)) *
+                Math.cos(Math.toRadians(point2.latitude)) *
+                Math.sin(lonDistance / 2).pow(2)
+        val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+        return R * c
+    }
+
+    private fun setupMarkerClustering(map: GoogleMap) {
+        // Setup marker clustering library integration
+        // This would integrate with a clustering library like ClusterKraf
+    }
+
+    private fun setupTileCaching(map: GoogleMap) {
+        // Setup tile caching for better performance
+        // This would implement custom tile caching
+    }
+
+    private fun startMapPerformanceMonitoring() {
+        mapScope.launch {
+            while (isActive) {
+                delay(10000) // Monitor every 10 seconds
+                
+                val metrics = getPerformanceMetrics()
+                
+                // Log performance metrics if needed
+                if (metrics.markerCount > MAX_VISIBLE_MARKERS * 2) {
+                    // Log warning about too many markers
+                }
+            }
+        }
+    }
+
+    // Data classes
+    data class MarkerData(
+        val position: LatLng,
+        val title: String? = null,
+        val snippet: String? = null,
+        val icon: BitmapDescriptor? = null,
+        val tag: String? = null
+    )
+
+    data class PolylineData(
+        val points: List<LatLng>,
+        val color: Int = -16777216, // Black
+        val width: Float = 5f,
+        val visible: Boolean = true,
+        val tag: String? = null
+    )
+
+    data class MarkerCluster(
+        val markers: List<MarkerData>,
+        val center: LatLng
+    )
+
+    data class MapPerformanceMetrics(
+        val markerCount: Int,
+        val polylineCount: Int,
+        val isClusteringEnabled: Boolean,
+        val isLazyLoadingEnabled: Boolean,
+        val isMarkerBatchingEnabled: Boolean,
+        val isTileCachingEnabled: Boolean,
+        val isMapReady: Boolean
+    )
+
+    /**
+     * Map performance configuration
+     */
+    data class MapPerformanceConfig(
+        val enableClustering: Boolean = true,
+        val enableLazyLoading: Boolean = true,
+        val enableMarkerBatching: Boolean = true,
+        val enableTileCaching: Boolean = true,
+        val maxVisibleMarkers: Int = MAX_VISIBLE_MARKERS,
+        val clusteringThreshold: Int = MARKER_CLUSTERING_THRESHOLD,
+        val updateInterval: Long = MAP_UPDATE_INTERVAL,
+        val tileCacheSize: Int = TILE_CACHE_SIZE,
+        val enablePolylineSmoothing: Boolean = POLYLINE_SMOOTHING
+    )
+
+    /**
+     * Map performance builder
+     */
+    class Builder {
+        private var config = MapPerformanceConfig()
+
+        fun enableClustering(enable: Boolean) = apply {
+            config = config.copy(enableClustering = enable)
+        }
+
+        fun enableLazyLoading(enable: Boolean) = apply {
+            config = config.copy(enableLazyLoading = enable)
+        }
+
+        fun enableMarkerBatching(enable: Boolean) = apply {
+            config = config.copy(enableMarkerBatching = enable)
+        }
+
+        fun enableTileCaching(enable: Boolean) = apply {
+            config = config.copy(enableTileCaching = enable)
+        }
+
+        fun maxVisibleMarkers(max: Int) = apply {
+            config = config.copy(maxVisibleMarkers = max)
+        }
+
+        fun clusteringThreshold(threshold: Int) = apply {
+            config = config.copy(clusteringThreshold = threshold)
+        }
+
+        fun updateInterval(interval: Long) = apply {
+            config = config.copy(updateInterval = interval)
+        }
+
+        fun build(): MapPerformanceOptimizer {
+            return MapPerformanceOptimizer(context).apply {
+                setClusteringEnabled(config.enableClustering)
+                setLazyLoadingEnabled(config.enableLazyLoading)
+                setMarkerBatchingEnabled(config.enableMarkerBatching)
+                setTileCachingEnabled(config.enableTileCaching)
+            }
+        }
+    }
+}

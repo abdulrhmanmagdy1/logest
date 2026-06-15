@@ -1,0 +1,349 @@
+package com.edham.logistics.core.auth
+
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.auth.AuthenticationManager
+import com.edham.logistics.core.model.UserRole
+import com.edham.logistics.core.navigation.RoleDashboardFactory
+import com.edham.logistics.data.local.database.UserEntity
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Centralized Navigation Controller
+ * Separates navigation logic from authentication logic
+ * Handles role-based navigation with state protection
+ */
+@Singleton
+class NavigationController @Inject constructor(
+    private val authenticationManager: AuthenticationManager,
+    private val roleDashboardFactory: RoleDashboardFactory,
+    private val authStateManager: AuthStateManager,
+    private val sessionManager: SessionManager
+) {
+
+    private val coroutineScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    private val _navigationState = MutableStateFlow<NavigationControllerState>(NavigationControllerState.Idle)
+    val navigationState: StateFlow<NavigationControllerState> = _navigationState.asStateFlow()
+
+    private val _currentDestination = MutableStateFlow<NavigationDestination?>(null)
+    val currentDestination: StateFlow<NavigationDestination?> = _currentDestination.asStateFlow()
+
+    private val _navigationHistory = MutableStateFlow<List<NavigationDestination>>(emptyList())
+    val navigationHistory: StateFlow<List<NavigationDestination>> = _navigationHistory.asStateFlow()
+    
+    init {
+        Timber.d("NavigationController initialized")
+        observeAuthStateChanges()
+        observeNavigationRequests()
+    }
+    
+    /**
+     * Observe authentication state changes and trigger navigation
+     */
+    private fun observeAuthStateChanges() {
+        authStateManager.authState
+            .onEach { authState ->
+                when (authState) {
+                    is AuthUiState.Authenticated -> {
+                        handleAuthenticationSuccess()
+                    }
+                    is AuthUiState.Unauthenticated -> {
+                        handleAuthenticationFailure()
+                    }
+                    is AuthUiState.SessionExpired -> {
+                        handleSessionExpiration()
+                    }
+                    else -> {
+                        // Don't navigate for other states
+                        Timber.d("Auth state: ${authState::class.simpleName} - no navigation needed")
+                    }
+                }
+            }
+            .catch { e ->
+                _navigationState.value = NavControllerState.Error("Navigation error: ${e.message}")
+                Timber.e(e, "Error observing auth state changes")
+            }
+            .launchIn(coroutineScope)
+    }
+    
+    /**
+     * Observe navigation requests from AuthStateManager
+     */
+    private fun observeNavigationRequests() {
+        authStateManager.navigationState
+            .onEach { navState ->
+                when (navState) {
+                    is NavigationState.NavigateToDashboard -> {
+                        navigateToDashboard(navState.destination)
+                    }
+                    is NavigationState.NavigateToLogin -> {
+                        navigateToLogin()
+                    }
+                    else -> {
+                        // Clear navigation state for other states
+                        _navigationState.value = NavControllerState.Idle
+                    }
+                }
+            }
+            .catch { e ->
+                _navigationState.value = NavControllerState.Error("Navigation request error: ${e.message}")
+                Timber.e(e, "Error observing navigation requests")
+            }
+            .launchIn(coroutineScope)
+    }
+    
+    /**
+     * Handle successful authentication
+     */
+    private fun handleAuthenticationSuccess() {
+        coroutineScope.launch {
+            try {
+                val currentUser = authenticationManager.currentUser.value
+                if (currentUser != null) {
+                    val destination = getDestinationForRole(currentUser.role)
+                    navigateToDashboard(destination)
+                    Timber.d("Authentication successful, navigating to ${currentUser.role.displayName} dashboard")
+                } else {
+                    _navigationState.value = NavControllerState.Error("No user found after authentication")
+                }
+            } catch (e: Exception) {
+                _navigationState.value = NavControllerState.Error("Navigation failed: ${e.message}")
+                Timber.e(e, "Failed to handle authentication success")
+            }
+        }
+    }
+    
+    /**
+     * Handle authentication failure
+     */
+    private fun handleAuthenticationFailure() {
+        coroutineScope.launch {
+            _navigationState.value = NavControllerState.NavigateToLogin
+            _currentDestination.value = null
+            clearNavigationHistory()
+            Timber.d("Authentication failed, navigating to login")
+        }
+    }
+    
+    /**
+     * Handle session expiration
+     */
+    private fun handleSessionExpiration() {
+        coroutineScope.launch {
+            _navigationState.value = NavControllerState.NavigateToLogin
+            _currentDestination.value = null
+            clearNavigationHistory()
+            Timber.d("Session expired, navigating to login")
+        }
+    }
+    
+    /**
+     * Navigate to appropriate dashboard based on user role
+     */
+    private fun navigateToDashboard(destination: NavigationDestination) {
+        coroutineScope.launch {
+            try {
+                // Check if UI is protected during operations
+                if (sessionManager.shouldProtectUI()) {
+                    _navigationState.value = NavControllerState.Protected("UI is protected during session operations")
+                    Timber.d("Navigation blocked - UI is protected")
+                    return@launch
+                }
+
+                _navigationState.value = NavControllerState.Navigating
+                _currentDestination.value = destination
+
+                // Add to navigation history
+                val currentHistory = _navigationHistory.value.toMutableList()
+                currentHistory.add(destination)
+                _navigationHistory.value = currentHistory
+
+                // Create appropriate fragment
+                val fragment = roleDashboardFactory.create(destination.role)
+
+                _navigationState.value = NavControllerState.NavigateToFragment(fragment, destination)
+                Timber.d("Navigating to ${destination.role.displayName} dashboard")
+
+                // Clear navigation state after successful navigation
+                kotlinx.coroutines.delay(500)
+                authStateManager.clearNavigationState()
+                _navigationState.value = NavControllerState.Idle
+
+            } catch (e: Exception) {
+                _navigationState.value = NavControllerState.Error("Dashboard navigation failed: ${e.message}")
+                Timber.e(e, "Failed to navigate to dashboard")
+            }
+        }
+    }
+    
+    /**
+     * Navigate to login screen
+     */
+    private fun navigateToLogin() {
+        viewModelScope.launch {
+            try {
+                _navigationState.value = NavControllerState.NavigateToLogin
+                _currentDestination.value = null
+                clearNavigationHistory()
+                Timber.d("Navigating to login screen")
+                
+                // Clear navigation state after successful navigation
+                kotlinx.coroutines.delay(500)
+                _navigationState.value = NavControllerState.Idle
+                
+            } catch (e: Exception) {
+                _navigationState.value = NavControllerState.Error("Login navigation failed: ${e.message}")
+                Timber.e(e, "Failed to navigate to login")
+            }
+        }
+    }
+    
+    /**
+     * Get navigation destination for user role
+     */
+    private fun getDestinationForRole(role: UserRole): NavigationDestination {
+        return when (role) {
+            UserRole.ADMIN -> NavigationDestination.AdminDashboard
+            UserRole.SUPERVISOR -> NavigationDestination.SupervisorDashboard
+            UserRole.DRIVER -> NavigationDestination.DriverDashboard
+            UserRole.ACCOUNTANT -> NavigationDestination.AccountantDashboard
+            UserRole.FLEET_MANAGER -> NavigationDestination.FleetManagerDashboard
+            UserRole.CUSTOMER -> NavigationDestination.CustomerDashboard
+            UserRole.WORKSHOP -> NavigationDestination.WorkshopDashboard
+        }
+    }
+    
+    /**
+     * Navigate to specific destination manually
+     */
+    fun navigateToDestination(destination: NavigationDestination) {
+        coroutineScope.launch {
+            navigateToDashboard(destination)
+        }
+    }
+    
+    /**
+     * Navigate back in history
+     */
+    fun navigateBack() {
+        coroutineScope.launch {
+            val history = _navigationHistory.value
+            if (history.isNotEmpty()) {
+                val previousDestination = history.last()
+                navigateToDestination(previousDestination)
+                Timber.d("Navigating back to ${previousDestination.role.displayName}")
+            } else {
+                navigateToLogin()
+                Timber.d("No navigation history, navigating to login")
+            }
+        }
+    }
+    
+    /**
+     * Clear navigation history
+     */
+    private fun clearNavigationHistory() {
+        _navigationHistory.value = emptyList()
+    }
+    
+    /**
+     * Reset navigation controller
+     */
+    fun reset() {
+        coroutineScope.launch {
+            _navigationState.value = NavControllerState.Idle
+            _currentDestination.value = null
+            clearNavigationHistory()
+            Timber.d("NavigationController reset")
+        }
+    }
+    
+    /**
+     * Get current navigation state
+     */
+    fun getCurrentNavigationState(): NavControllerState {
+        return _navigationState.value
+    }
+    
+    /**
+     * Get current destination
+     */
+    fun getCurrentDestination(): NavigationDestination? {
+        return _currentDestination.value
+    }
+    
+    /**
+     * Get navigation history
+     */
+    fun getNavigationHistory(): List<NavigationDestination> {
+        return _navigationHistory.value
+    }
+}
+
+/**
+ * Navigation Controller State
+ */
+sealed class NavControllerState {
+    object Idle : NavControllerState()
+    object Navigating : NavControllerState()
+    object NavigateToLogin : NavControllerState()
+    data class NavigateToFragment(val fragment: Fragment, val destination: NavigationDestination) : NavControllerState()
+    data class Protected(val reason: String) : NavControllerState()
+    data class Error(val message: String) : NavControllerState()
+}
+
+/**
+ * Navigation Destination enum
+ */
+enum class NavigationDestination(val fragmentId: Int) {
+    AdminDashboard(com.edham.logistics.R.id.adminDashboardFragment),
+    SupervisorDashboard(com.edham.logistics.R.id.supervisorDashboardFragment),
+    DriverDashboard(com.edham.logistics.R.id.driverDashboardFragment),
+    AccountantDashboard(com.edham.logistics.R.id.accountantDashboardFragment),
+    FleetManagerDashboard(com.edham.logistics.R.id.fleetManagerDashboardFragment),
+    CustomerDashboard(com.edham.logistics.R.id.customerDashboardFragment),
+    WorkshopDashboard(com.edham.logistics.R.id.workshopDashboardFragment)
+}
+
+/**
+ * ViewModel for UI components that need navigation control
+ */
+@HiltViewModel
+class NavigationViewModel @Inject constructor(
+    private val navigationController: NavigationController
+) : ViewModel() {
+    
+    val navigationState = navigationController.navigationState
+    val currentDestination = navigationController.currentDestination
+    val navigationHistory = navigationController.getNavigationHistory()
+    
+    fun navigateToDestination(destination: NavigationDestination) {
+        navigationController.navigateToDestination(destination)
+    }
+    
+    fun navigateBack() {
+        navigationController.navigateBack()
+    }
+    
+    fun reset() {
+        navigationController.reset()
+    }
+    
+    fun getCurrentNavigationState(): NavControllerState {
+        return navigationController.getCurrentNavigationState()
+    }
+    
+    fun getCurrentDestination(): NavigationDestination? {
+        return navigationController.getCurrentDestination()
+    }
+}

@@ -1,0 +1,471 @@
+package com.edham.logistics.feature.telematics
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import kotlin.math.abs
+
+/**
+ * Event Processing System - Advanced telematics event processing and analysis
+ * Processes raw telematics data to detect driving events and generate insights
+ */
+class EventProcessing {
+    
+    companion object {
+        private const val TAG = "EventProcessing"
+        
+        // Event detection thresholds
+        private const val HARSH_BRAKING_THRESHOLD = 3.5 // m/s²
+        private const val RAPID_ACCELERATION_THRESHOLD = 2.5 // m/s²
+        private const val SHARP_TURN_THRESHOLD = 2.0 // m/s²
+        private const val SPEED_LIMIT_BUFFER = 5.0 // km/h over limit
+        private const val IDLE_SPEED_THRESHOLD = 2.0 // km/h
+        private const val IDLE_TIME_THRESHOLD = 60 // seconds
+        
+        // Event validation parameters
+        private const val MIN_EVENT_DURATION = 1.0 // seconds
+        private const val MAX_EVENT_DURATION = 30.0 // seconds
+        private const val GPS_ACCURACY_THRESHOLD = 10.0 // meters
+        private const val SPEED_CHANGE_THRESHOLD = 5.0 // km/s
+    }
+    
+    /**
+     * Process telematics data stream and detect events
+     */
+    fun processTelematicsStream(dataFlow: Flow<TelematicsData>): Flow<TelematicsEvent> {
+        return flow {
+            var previousData: TelematicsData? = null
+            var currentSession: DrivingSession? = null
+            var idleStartTime: LocalDateTime? = null
+            var speedingStartTime: LocalDateTime? = null
+            
+            dataFlow.collect { currentData ->
+                try {
+                    // Validate data quality
+                    if (!isValidTelematicsData(currentData)) {
+                        Log.w(TAG, "Invalid telematics data detected, skipping")
+                        return@collect
+                    }
+                    
+                    // Initialize session if needed
+                    if (currentSession == null) {
+                        currentSession = createNewSession(currentData)
+                    }
+                    
+                    // Process events based on data changes
+                    val events = mutableListOf<TelematicsEvent>()
+                    
+                    // Detect harsh braking
+                    previousData?.let { prev ->
+                        detectHarshBraking(prev, currentData)?.let { event ->
+                            events.add(event)
+                        }
+                        
+                        // Detect rapid acceleration
+                        detectRapidAcceleration(prev, currentData)?.let { event ->
+                            events.add(event)
+                        }
+                        
+                        // Detect sharp turns
+                        detectSharpTurn(prev, currentData)?.let { event ->
+                            events.add(event)
+                        }
+                    }
+                    
+                    // Detect speeding
+                    detectSpeeding(currentData)?.let { speeding ->
+                        if (speeding.isSpeeding && speedingStartTime == null) {
+                            speedingStartTime = currentData.timestamp
+                        } else if (!speeding.isSpeeding && speedingStartTime != null) {
+                            val duration = java.time.Duration.between(
+                                speedingStartTime, 
+                                currentData.timestamp
+                            ).seconds
+                            
+                            if (duration >= MIN_EVENT_DURATION) {
+                                events.add(createSpeedingEvent(speedingStartTime!!, currentData.timestamp, currentData.speed))
+                            }
+                            speedingStartTime = null
+                        }
+                    }
+                    
+                    // Detect idle time
+                    detectIdleTime(currentData)?.let { isIdle ->
+                        if (isIdle && idleStartTime == null) {
+                            idleStartTime = currentData.timestamp
+                        } else if (!isIdle && idleStartTime != null) {
+                            val duration = java.time.Duration.between(
+                                idleStartTime, 
+                                currentData.timestamp
+                            ).seconds
+                            
+                            if (duration >= IDLE_TIME_THRESHOLD) {
+                                events.add(createIdleEvent(idleStartTime!!, currentData.timestamp, duration))
+                            }
+                            idleStartTime = null
+                        }
+                    }
+                    
+                    // Update session metrics
+                    currentSession?.let { session ->
+                        updateSessionMetrics(session, currentData)
+                    }
+                    
+                    // Emit detected events
+                    events.forEach { event ->
+                        emit(event)
+                        Log.d(TAG, "Event detected: ${event.type} at ${event.timestamp}")
+                    }
+                    
+                    previousData = currentData
+                    
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error processing telematics data", e)
+                }
+            }
+            
+            // End session and emit final events
+            currentSession?.let { session ->
+                finalizeSession(session)
+            }
+        }.flowOn(Dispatchers.IO)
+    }
+    
+    /**
+     * Process batch telematics data for historical analysis
+     */
+    suspend fun processBatchData(
+        dataPoints: List<TelematicsData>,
+        speedLimits: Map<String, Double> = emptyMap()
+    ): BatchProcessingResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Processing batch of ${dataPoints.size} data points")
+                
+                val events = mutableListOf<TelematicsEvent>()
+                val sessions = mutableListOf<DrivingSession>()
+                
+                var currentSession: DrivingSession? = null
+                var previousData: TelematicsData? = null
+                
+                for (i in dataPoints.indices) {
+                    val currentData = dataPoints[i]
+                    
+                    // Validate data
+                    if (!isValidTelematicsData(currentData)) {
+                        continue
+                    }
+                    
+                    // Create new session if needed
+                    if (currentSession == null || shouldStartNewSession(previousData, currentData)) {
+                        currentSession?.let { sessions.add(it) }
+                        currentSession = createNewSession(currentData)
+                    }
+                    
+                    // Process events
+                    previousData?.let { prev ->
+                        detectHarshBraking(prev, currentData)?.let { events.add(it) }
+                        detectRapidAcceleration(prev, currentData)?.let { events.add(it) }
+                        detectSharpTurn(prev, currentData)?.let { events.add(it) }
+                    }
+                    
+                    // Update session
+                    currentSession?.let { session ->
+                        updateSessionMetrics(session, currentData)
+                    }
+                    
+                    previousData = currentData
+                }
+                
+                // Add final session
+                currentSession?.let { 
+                    finalizeSession(it)
+                    sessions.add(it) 
+                }
+                
+                val result = BatchProcessingResult(
+                    totalDataPoints = dataPoints.size,
+                    validDataPoints = dataPoints.count { isValidTelematicsData(it) },
+                    eventsDetected = events,
+                    sessionsCreated = sessions,
+                    processingTime = LocalDateTime.now()
+                )
+                
+                Log.d(TAG, "Batch processing completed: ${events.size} events, ${sessions.size} sessions")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in batch processing", e)
+                BatchProcessingResult.createError(dataPoints.size)
+            }
+        }
+    }
+    
+    // Event detection methods
+    private fun detectHarshBraking(previous: TelematicsData, current: TelematicsData): TelematicsEvent? {
+        val acceleration = calculateAcceleration(previous, current)
+        
+        return if (acceleration < -HARSH_BRAKING_THRESHOLD) {
+            TelematicsEvent(
+                id = generateEventId(),
+                type = TelematicsEvent.Type.HARSH_BRAKING,
+                timestamp = current.timestamp,
+                severity = determineSeverity(abs(acceleration), HARSH_BRAKING_THRESHOLD),
+                location = current.location,
+                value = acceleration,
+                context = mapOf(
+                    "previousSpeed" to previous.speed,
+                    "currentSpeed" to current.speed,
+                    "deceleration" to acceleration
+                )
+            )
+        } else null
+    }
+    
+    private fun detectRapidAcceleration(previous: TelematicsData, current: TelematicsData): TelematicsEvent? {
+        val acceleration = calculateAcceleration(previous, current)
+        
+        return if (acceleration > RAPID_ACCELERATION_THRESHOLD) {
+            TelematicsEvent(
+                id = generateEventId(),
+                type = TelematicsEvent.Type.RAPID_ACCELERATION,
+                timestamp = current.timestamp,
+                severity = determineSeverity(acceleration, RAPID_ACCELERATION_THRESHOLD),
+                location = current.location,
+                value = acceleration,
+                context = mapOf(
+                    "previousSpeed" to previous.speed,
+                    "currentSpeed" to current.speed,
+                    "acceleration" to acceleration
+                )
+            )
+        } else null
+    }
+    
+    private fun detectSharpTurn(previous: TelematicsData, current: TelematicsData): TelematicsEvent? {
+        val lateralAcceleration = calculateLateralAcceleration(previous, current)
+        
+        return if (abs(lateralAcceleration) > SHARP_TURN_THRESHOLD) {
+            TelematicsEvent(
+                id = generateEventId(),
+                type = TelematicsEvent.Type.SHARP_TURN,
+                timestamp = current.timestamp,
+                severity = determineSeverity(abs(lateralAcceleration), SHARP_TURN_THRESHOLD),
+                location = current.location,
+                value = lateralAcceleration,
+                context = mapOf(
+                    "previousHeading" to previous.location.heading,
+                    "currentHeading" to current.location.heading,
+                    "lateralAcceleration" to lateralAcceleration
+                )
+            )
+        } else null
+    }
+    
+    private fun detectSpeeding(data: TelematicsData): SpeedingDetection? {
+        val speedLimit = getSpeedLimit(data.location, emptyMap()) // Default to empty map for now
+        val isSpeeding = data.speed > (speedLimit + SPEED_LIMIT_BUFFER)
+        
+        return SpeedingDetection(
+            isSpeeding = isSpeeding,
+            currentSpeed = data.speed,
+            speedLimit = speedLimit,
+            excessSpeed = if (isSpeeding) data.speed - speedLimit else 0.0
+        )
+    }
+    
+    private fun detectIdleTime(data: TelematicsData): Boolean? {
+        return if (data.speed < IDLE_SPEED_THRESHOLD && data.engineStatus) {
+            true
+        } else if (data.speed >= IDLE_SPEED_THRESHOLD) {
+            false
+        } else null
+    }
+    
+    // Helper methods
+    private fun isValidTelematicsData(data: TelematicsData): Boolean {
+        return data.location.accuracy <= GPS_ACCURACY_THRESHOLD &&
+               data.speed >= 0 &&
+               data.timestamp.isBefore(LocalDateTime.now().plusMinutes(5))
+    }
+    
+    private fun calculateAcceleration(previous: TelematicsData, current: TelematicsData): Double {
+        val timeDiff = java.time.Duration.between(previous.timestamp, current.timestamp).seconds
+        if (timeDiff <= 0) return 0.0
+        
+        val speedDiff = (current.speed - previous.speed) * 1000 / 3600 // Convert km/h to m/s
+        return speedDiff / timeDiff
+    }
+    
+    private fun calculateLateralAcceleration(previous: TelematicsData, current: TelematicsData): Double {
+        val timeDiff = java.time.Duration.between(previous.timestamp, current.timestamp).seconds
+        if (timeDiff <= 0) return 0.0
+        
+        val headingDiff = current.location.heading - previous.location.heading
+        val avgSpeed = (previous.speed + current.speed) / 2
+        
+        return (avgSpeed * 1000 / 3600) * kotlin.math.sin(Math.toRadians(headingDiff.toDouble())) / timeDiff
+    }
+    
+    private fun determineSeverity(value: Double, threshold: Double): TelematicsEvent.Severity {
+        return when {
+            value > threshold * 2.0 -> TelematicsEvent.Severity.HIGH
+            value > threshold * 1.5 -> TelematicsEvent.Severity.MEDIUM
+            else -> TelematicsEvent.Severity.LOW
+        }
+    }
+    
+    private fun getSpeedLimit(location: LocationData, speedLimits: Map<String, Double>): Double {
+        // Default speed limit - in real implementation, this would use road data
+        return 50.0 // km/h
+    }
+    
+    private fun shouldStartNewSession(previous: TelematicsData?, current: TelematicsData): Boolean {
+        if (previous == null) return false
+        
+        val timeGap = java.time.Duration.between(previous.timestamp, current.timestamp).toMinutes()
+        return timeGap > 30 // New session if gap > 30 minutes
+    }
+    
+    private fun createNewSession(data: TelematicsData): DrivingSession {
+        return DrivingSession(
+            id = generateSessionId(),
+            driverId = data.driverId,
+            vehicleId = data.vehicleId,
+            startTime = data.timestamp,
+            endTime = null,
+            distance = 0.0,
+            duration = 0,
+            fuelConsumed = 0.0,
+            idleTime = 0,
+            harshBrakingCount = 0,
+            rapidAccelerationCount = 0,
+            overSpeedingCount = 0,
+            sharpTurnCount = 0,
+            seatbeltViolations = 0,
+            overallScore = 0.0,
+            safetyScore = 0.0,
+            efficiencyScore = 0.0,
+            complianceScore = 0.0
+        )
+    }
+    
+    private fun updateSessionMetrics(session: DrivingSession, data: TelematicsData) {
+        // Update basic metrics
+        session.duration = java.time.Duration.between(session.startTime, data.timestamp).seconds.toInt()
+        
+        // Update distance (simplified - would use proper GPS distance calculation)
+        session.distance += data.speed / 3600.0 // km per second
+        
+        // Update fuel consumption (estimated)
+        session.fuelConsumed += calculateFuelConsumption(data)
+    }
+    
+    private fun calculateFuelConsumption(data: TelematicsData): Double {
+        // Simplified fuel consumption calculation
+        val baseConsumption = 0.1 // liters per hour at idle
+        val speedConsumption = data.speed * 0.05 // additional consumption based on speed
+        
+        return (baseConsumption + speedConsumption) / 3600.0 // convert to liters per second
+    }
+    
+    private fun finalizeSession(session: DrivingSession) {
+        session.endTime = LocalDateTime.now()
+        
+        // Calculate scores based on events
+        session.safetyScore = calculateSafetyScore(session)
+        session.efficiencyScore = calculateEfficiencyScore(session)
+        session.complianceScore = calculateComplianceScore(session)
+        session.overallScore = (session.safetyScore + session.efficiencyScore + session.complianceScore) / 3.0
+    }
+    
+    private fun calculateSafetyScore(session: DrivingSession): Double {
+        val eventPenalty = (session.harshBrakingCount * 5 + 
+                           session.rapidAccelerationCount * 3 + 
+                           session.sharpTurnCount * 2 + 
+                           session.seatbeltViolations * 10)
+        
+        return maxOf(0.0, 100.0 - eventPenalty)
+    }
+    
+    private fun calculateEfficiencyScore(session: DrivingSession): Double {
+        val idlePenalty = (session.idleTime / 60.0) * 2 // 2 points per minute of idle
+        val distanceEfficiency = if (session.distance > 0) {
+            minOf(100.0, (session.distance / session.fuelConsumed) * 10)
+        } else 100.0
+        
+        return maxOf(0.0, distanceEfficiency - idlePenalty)
+    }
+    
+    private fun calculateComplianceScore(session: DrivingSession): Double {
+        val speedingPenalty = session.overSpeedingCount * 4
+        return maxOf(0.0, 100.0 - speedingPenalty)
+    }
+    
+    private fun createSpeedingEvent(startTime: LocalDateTime, endTime: LocalDateTime, speed: Double): TelematicsEvent {
+        return TelematicsEvent(
+            id = generateEventId(),
+            type = TelematicsEvent.Type.OVER_SPEEDING,
+            timestamp = startTime,
+            severity = TelematicsEvent.Severity.MEDIUM,
+            location = LocationData(0.0, 0.0, 0.0, 0.0), // Would be actual location
+            value = speed,
+            context = mapOf(
+                "duration" to java.time.Duration.between(startTime, endTime).seconds,
+                "endTime" to endTime
+            )
+        )
+    }
+    
+    private fun createIdleEvent(startTime: LocalDateTime, endTime: LocalDateTime, duration: Long): TelematicsEvent {
+        return TelematicsEvent(
+            id = generateEventId(),
+            type = TelematicsEvent.Type.IDLE_TIME,
+            timestamp = startTime,
+            severity = TelematicsEvent.Severity.LOW,
+            location = LocationData(0.0, 0.0, 0.0, 0.0), // Would be actual location
+            value = duration.toDouble(),
+            context = mapOf(
+                "duration" to duration,
+                "endTime" to endTime
+            )
+        )
+    }
+    
+    private fun generateEventId(): String = "event_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    private fun generateSessionId(): String = "session_${System.currentTimeMillis()}_${(1000..9999).random()}"
+}
+
+// Data classes
+data class BatchProcessingResult(
+    val totalDataPoints: Int,
+    val validDataPoints: Int,
+    val eventsDetected: List<TelematicsEvent>,
+    val sessionsCreated: List<DrivingSession>,
+    val processingTime: LocalDateTime,
+    val errorMessage: String? = null
+) {
+    companion object {
+        fun createError(totalPoints: Int): BatchProcessingResult {
+            return BatchProcessingResult(
+                totalDataPoints = totalPoints,
+                validDataPoints = 0,
+                eventsDetected = emptyList(),
+                sessionsCreated = emptyList(),
+                processingTime = LocalDateTime.now(),
+                errorMessage = "Error processing batch data"
+            )
+        }
+    }
+}
+
+data class SpeedingDetection(
+    val isSpeeding: Boolean,
+    val currentSpeed: Double,
+    val speedLimit: Double,
+    val excessSpeed: Double
+)

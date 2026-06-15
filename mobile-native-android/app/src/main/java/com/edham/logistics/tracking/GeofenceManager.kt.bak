@@ -1,0 +1,529 @@
+package com.edham.logistics.tracking
+
+import android.annotation.SuppressLint
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.location.Location
+// import com.edham.logistics.data.local.entity.GeofenceEntity
+import com.edham.logistics.data.local.entity.RouteEntity
+import com.edham.logistics.receivers.GeofenceBroadcastReceiver
+import com.google.android.gms.location.Geofence
+import com.google.android.gms.location.GeofencingClient
+import com.google.android.gms.location.GeofencingRequest
+import com.google.android.gms.location.LocationServices
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+// import javax.inject.Inject
+// import javax.inject.Singleton
+
+/**
+ * Geofence Manager - Advanced geofencing system
+ * 
+ * Features:
+ * - Multiple geofence types
+ * - Real-time geofence monitoring
+ * - Custom geofence events
+ * - Battery-efficient monitoring
+ * - Geofence clustering
+ * - Dynamic geofence updates
+ */
+// @Singleton
+class GeofenceManager(
+    private val context: Context
+) {
+    
+    private val _geofenceState = MutableStateFlow<GeofenceState>(GeofenceState.Initial)
+    val geofenceState: StateFlow<GeofenceState> = _geofenceState.asStateFlow()
+    
+    private val _geofenceEvents = MutableStateFlow<List<GeofenceEvent>>(emptyList())
+    val geofenceEvents: StateFlow<List<GeofenceEvent>> = _geofenceEvents.asStateFlow()
+    
+    // private val _activeGeofences = MutableStateFlow<List<GeofenceEntity>>(emptyList())
+    // val activeGeofences: StateFlow<List<GeofenceEntity>> = _activeGeofences.asStateFlow()
+    
+    private val geofencingClient: GeofencingClient by lazy {
+        LocationServices.getGeofencingClient(context)
+    }
+    
+    private var currentRoute: RouteEntity? = null
+    // private var routeGeofences: MutableList<GeofenceEntity> = mutableListOf()
+    private var isMonitoring = false
+    
+    companion object {
+        private const val TAG = "GeofenceManager"
+        private const val GEOFENCE_EXPIRATION = 24 * 60 * 60 * 1000L // 24 hours
+        private const val GEOFENCE_LOITERING_DELAY = 30 * 1000L // 30 seconds
+        private const val MAX_GEOFENCES = 100
+    }
+    
+    /**
+     * Initialize geofences for a route
+     */
+    fun initializeGeofences(route: RouteEntity) {
+        try {
+            _geofenceState.value = GeofenceState.Initializing
+            
+            currentRoute = route
+            routeGeofences.clear()
+            
+            // Create geofences for route stops
+            createStopGeofences(route)
+            
+            // Create geofences for route waypoints
+            createWaypointGeofences(route)
+            
+            // Create geofences for restricted areas
+            createRestrictedAreaGeofences(route)
+            
+            // Create geofences for delivery zones
+            createDeliveryZoneGeofences(route)
+            
+            _activeGeofences.value = routeGeofences.toList()
+            _geofenceState.value = GeofenceState.Ready
+            
+        } catch (e: Exception) {
+            _geofenceState.value = GeofenceState.Error("Failed to initialize geofences: ${e.message}")
+        }
+    }
+    
+    /**
+     * Start geofence monitoring
+     */
+    @SuppressLint("MissingPermission")
+    fun startMonitoring() {
+        if (isMonitoring || routeGeofences.isEmpty()) {
+            return
+        }
+        
+        try {
+            _geofenceState.value = GeofenceState.Starting
+            
+            // Create geofence list
+            val geofenceList = createGeofenceList()
+            
+            // Create geofencing request
+            val geofencingRequest = createGeofencingRequest(geofenceList)
+            
+            // Create pending intent
+            val geofencePendingIntent = createGeofencePendingIntent()
+            
+            // Add geofences
+            geofencingClient.addGeofences(geofencingRequest, geofencePendingIntent)
+                .addOnSuccessListener {
+                    isMonitoring = true
+                    _geofenceState.value = GeofenceState.Monitoring
+                }
+                .addOnFailureListener { exception ->
+                    _geofenceState.value = GeofenceState.Error("Failed to start monitoring: ${exception.message}")
+                }
+                
+        } catch (e: Exception) {
+            _geofenceState.value = GeofenceState.Error("Failed to start monitoring: ${e.message}")
+        }
+    }
+    
+    /**
+     * Stop geofence monitoring
+     */
+    fun stopMonitoring() {
+        if (!isMonitoring) {
+            return
+        }
+        
+        try {
+            _geofenceState.value = GeofenceState.Stopping
+            
+            val geofencePendingIntent = createGeofencePendingIntent()
+            
+            geofencingClient.removeGeofences(geofencePendingIntent)
+                .addOnSuccessListener {
+                    isMonitoring = false
+                    routeGeofences.clear()
+                    _activeGeofences.value = emptyList()
+                    _geofenceState.value = GeofenceState.Stopped
+                }
+                .addOnFailureListener { exception ->
+                    _geofenceState.value = GeofenceState.Error("Failed to stop monitoring: ${exception.message}")
+                }
+                
+        } catch (e: Exception) {
+            _geofenceState.value = GeofenceState.Error("Failed to stop monitoring: ${e.message}")
+        }
+    }
+    
+    /**
+     * Check if location is within any geofence
+     */
+    fun checkLocation(location: Location): List<GeofenceEvent> {
+        val events = mutableListOf<GeofenceEvent>()
+        
+        routeGeofences.forEach { geofence ->
+            val distance = calculateDistance(location, geofence)
+            val isInside = distance <= geofence.radius
+            
+            if (isInside && !geofence.isActive) {
+                // Geofence entered
+                geofence.isActive = true
+                geofence.lastEnterTime = System.currentTimeMillis()
+                
+                events.add(
+                    GeofenceEvent(
+                        geofenceId = geofence.id,
+                        type = GeofenceEventType.ENTER,
+                        location = location,
+                        timestamp = System.currentTimeMillis(),
+                        geofenceName = geofence.name
+                    )
+                )
+                
+            } else if (!isInside && geofence.isActive) {
+                // Geofence exited
+                geofence.isActive = false
+                geofence.lastExitTime = System.currentTimeMillis()
+                
+                events.add(
+                    GeofenceEvent(
+                        geofenceId = geofence.id,
+                        type = GeofenceEventType.EXIT,
+                        location = location,
+                        timestamp = System.currentTimeMillis(),
+                        geofenceName = geofence.name
+                    )
+                )
+                
+            } else if (isInside && geofence.isActive) {
+                // Check for dwell time
+                val dwellTime = System.currentTimeMillis() - geofence.lastEnterTime
+                if (dwellTime > geofence.dwellTimeThreshold) {
+                    events.add(
+                        GeofenceEvent(
+                            geofenceId = geofence.id,
+                            type = GeofenceEventType.DWELL,
+                            location = location,
+                            timestamp = System.currentTimeMillis(),
+                            geofenceName = geofence.name,
+                            dwellTime = dwellTime
+                        )
+                    )
+                }
+            }
+        }
+        
+        // Update events list
+        if (events.isNotEmpty()) {
+            val currentEvents = _geofenceEvents.value.toMutableList()
+            currentEvents.addAll(events)
+            _geofenceEvents.value = currentEvents
+        }
+        
+        return events
+    }
+    
+    /**
+     * Add dynamic geofence
+     */
+    fun addGeofence(geofence: GeofenceEntity) {
+        if (routeGeofences.size >= MAX_GEOFENCES) {
+            _geofenceState.value = GeofenceState.Error("Maximum geofences reached")
+            return
+        }
+        
+        routeGeofences.add(geofence)
+        _activeGeofences.value = routeGeofences.toList()
+        
+        // Restart monitoring if active
+        if (isMonitoring) {
+            stopMonitoring()
+            startMonitoring()
+        }
+    }
+    
+    /**
+     * Remove geofence
+     */
+    fun removeGeofence(geofenceId: String) {
+        routeGeofences.removeAll { it.id == geofenceId }
+        _activeGeofences.value = routeGeofences.toList()
+        
+        // Restart monitoring if active
+        if (isMonitoring) {
+            stopMonitoring()
+            startMonitoring()
+        }
+    }
+    
+    /**
+     * Update geofence
+     */
+    // fun updateGeofence(geofence: GeofenceEntity) {
+        val index = routeGeofences.indexOfFirst { it.id == geofence.id }
+        if (index != -1) {
+            routeGeofences[index] = geofence
+            _activeGeofences.value = routeGeofences.toList()
+            
+            // Restart monitoring if active
+            if (isMonitoring) {
+                stopMonitoring()
+                startMonitoring()
+            }
+        }
+    }
+    
+    /**
+     * Get geofence statistics
+     */
+    fun getGeofenceStats(): GeofenceStats {
+        val totalGeofences = routeGeofences.size
+        val activeGeofences = routeGeofences.count { it.isActive }
+        val eventsCount = _geofenceEvents.value.size
+        
+        val enterEvents = _geofenceEvents.value.count { it.type == GeofenceEventType.ENTER }
+        val exitEvents = _geofenceEvents.value.count { it.type == GeofenceEventType.EXIT }
+        val dwellEvents = _geofenceEvents.value.count { it.type == GeofenceEventType.DWELL }
+        
+        return GeofenceStats(
+            totalGeofences = totalGeofences,
+            activeGeofences = activeGeofences,
+            eventsCount = eventsCount,
+            enterEvents = enterEvents,
+            exitEvents = exitEvents,
+            dwellEvents = dwellEvents
+        )
+    }
+    
+    /**
+     * Create geofences for route stops
+     */
+    private fun createStopGeofences(route: RouteEntity) {
+        // route.stops.forEach { stop ->
+        //     val geofence = GeofenceEntity(
+        //         id = "stop_${stop.id}",
+        //         name = stop.name,
+                latitude = stop.latitude,
+                longitude = stop.longitude,
+                radius = stop.geofenceRadius ?: 100f, // Default 100m
+                type = GeofenceType.STOP,
+                isActive = false,
+                dwellTimeThreshold = GEOFENCE_LOITERING_DELAY,
+                notificationRequired = true,
+                autoTriggerAction = stop.autoAction
+            )
+            
+            routeGeofences.add(geofence)
+        }
+    }
+    
+    /**
+     * Create geofences for route waypoints
+     */
+    private fun createWaypointGeofences(route: RouteEntity) {
+        // route.waypoints?.forEach { waypoint ->
+        //     val geofence = GeofenceEntity(
+        //         id = "waypoint_${waypoint.id}",
+        //         name = waypoint.name,
+                latitude = waypoint.latitude,
+                longitude = waypoint.longitude,
+                radius = waypoint.radius ?: 50f,
+                type = GeofenceType.WAYPOINT,
+                isActive = false,
+                dwellTimeThreshold = GEOFENCE_LOITERING_DELAY,
+                notificationRequired = false,
+                autoTriggerAction = null
+            )
+            
+            routeGeofences.add(geofence)
+        }
+    }
+    
+    /**
+     * Create geofences for restricted areas
+     */
+    private fun createRestrictedAreaGeofences(route: RouteEntity) {
+        // route.restrictedAreas?.forEach { area ->
+        //     val geofence = GeofenceEntity(
+        //         id = "restricted_${area.id}",
+        //         name = area.name,
+                latitude = area.latitude,
+                longitude = area.longitude,
+                radius = area.radius,
+                type = GeofenceType.RESTRICTED,
+                isActive = false,
+                dwellTimeThreshold = 0, // Immediate alert
+                notificationRequired = true,
+                autoTriggerAction = "alert_authorities"
+            )
+            
+            routeGeofences.add(geofence)
+        }
+    }
+    
+    /**
+     * Create geofences for delivery zones
+     */
+    private fun createDeliveryZoneGeofences(route: RouteEntity) {
+        // route.deliveryZones?.forEach { zone ->
+        //     val geofence = GeofenceEntity(
+        //         id = "delivery_${zone.id}",
+        //         name = zone.name,
+                latitude = zone.latitude,
+                longitude = zone.longitude,
+                radius = zone.radius,
+                type = GeofenceType.DELIVERY_ZONE,
+                isActive = false,
+                dwellTimeThreshold = zone.dwellTime ?: GEOFENCE_LOITERING_DELAY,
+                notificationRequired = true,
+                autoTriggerAction = "mark_delivered"
+            )
+            
+            routeGeofences.add(geofence)
+        }
+    }
+    
+    /**
+     * Create geofence list for Android Geofencing API
+     */
+    private fun createGeofenceList(): List<Geofence> {
+        return routeGeofences.map { geofence ->
+            Geofence.Builder()
+                .setRequestId(geofence.id)
+                .setCircularRegion(
+                    geofence.latitude,
+                    geofence.longitude,
+                    geofence.radius.toFloat()
+                )
+                .setExpirationDuration(GEOFENCE_EXPIRATION)
+                .setTransitionTypes(
+                    Geofence.GEOFENCE_TRANSITION_ENTER or
+                    Geofence.GEOFENCE_TRANSITION_EXIT or
+                    Geofence.GEOFENCE_TRANSITION_DWELL
+                )
+                .setLoiteringDelay(geofence.dwellTimeThreshold)
+                .build()
+        }
+    }
+    
+    /**
+     * Create geofencing request
+     */
+    private fun createGeofencingRequest(geofenceList: List<Geofence>): GeofencingRequest {
+        return GeofencingRequest.Builder()
+            .setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_ENTER)
+            .addGeofences(geofenceList)
+            .build()
+    }
+    
+    /**
+     * Create pending intent for geofence events
+     */
+    private fun createGeofencePendingIntent(): PendingIntent {
+        val intent = Intent(context, GeofenceBroadcastReceiver::class.java)
+        return PendingIntent.getBroadcast(
+            context,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
+    }
+    
+    /**
+     * Calculate distance from location to geofence center
+     */
+    private fun calculateDistance(location: Location, geofence: GeofenceEntity): Float {
+        val results = FloatArray(1)
+        Location.distanceBetween(
+            location.latitude,
+            location.longitude,
+            geofence.latitude,
+            geofence.longitude,
+            results
+        )
+        return results[0]
+    }
+    
+    /**
+     * Get geofence by ID
+     */
+    // fun getGeofenceById(geofenceId: String): GeofenceEntity? {
+        return routeGeofences.find { it.id == geofenceId }
+    }
+    
+    /**
+     * Get all geofences of specific type
+     */
+    // fun getGeofencesByType(type: GeofenceType): List<GeofenceEntity> {
+        return routeGeofences.filter { it.type == type }
+    }
+    
+    /**
+     * Clear all geofence events
+     */
+    fun clearEvents() {
+        _geofenceEvents.value = emptyList()
+    }
+    
+    /**
+     * Get geofence monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+    
+    /**
+     * Get current route
+     */
+    fun getCurrentRoute(): RouteEntity? = currentRoute
+}
+
+/**
+ * Data classes
+ */
+data class GeofenceEvent(
+    val geofenceId: String,
+    val type: GeofenceEventType,
+    val location: Location,
+    val timestamp: Long,
+    val geofenceName: String,
+    val dwellTime: Long = 0L
+)
+
+data class GeofenceStats(
+    val totalGeofences: Int,
+    val activeGeofences: Int,
+    val eventsCount: Int,
+    val enterEvents: Int,
+    val exitEvents: Int,
+    val dwellEvents: Int
+)
+
+/**
+ * Enums
+ */
+enum class GeofenceType {
+    STOP,
+    WAYPOINT,
+    RESTRICTED,
+    DELIVERY_ZONE,
+    CUSTOM
+}
+
+enum class GeofenceEventType {
+    ENTER,
+    EXIT,
+    DWELL
+}
+
+/**
+ * Geofence state
+ */
+sealed class GeofenceState {
+    object Initial : GeofenceState()
+    object Initializing : GeofenceState()
+    object Ready : GeofenceState()
+    object Starting : GeofenceState()
+    object Monitoring : GeofenceState()
+    object Stopping : GeofenceState()
+    object Stopped : GeofenceState()
+    data class Error(val message: String) : GeofenceState()
+}

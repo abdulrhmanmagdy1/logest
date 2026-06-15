@@ -1,0 +1,734 @@
+package com.edham.logistics.feature.dispatch
+
+import android.util.Log
+import com.edham.logistics.data.model.Driver
+import com.edham.logistics.data.model.Shipment
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.temporal.ChronoUnit
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Load Balancing Algorithm - Advanced driver workload distribution
+ * Ensures optimal resource utilization and prevents driver overload
+ */
+class LoadBalancingAlgorithm {
+    
+    companion object {
+        private const val TAG = "LoadBalancingAlgorithm"
+        
+        // Load balancing strategies
+        enum class Strategy {
+            ROUND_ROBIN,           // Distribute evenly across all drivers
+            LEAST_LOADED,          // Assign to driver with least current load
+            CAPACITY_BASED,        // Assign based on remaining capacity
+            PERFORMANCE_BASED,      // Prioritize high-performing drivers
+            LOCATION_BASED,         // Optimize for geographic proximity
+            HYBRID                 // Combine multiple strategies
+        }
+        
+        // Load balancing parameters
+        private const val MAX_WORKLOAD_RATIO = 0.85     // 85% maximum utilization
+        private const val MIN_WORKLOAD_RATIO = 0.30     // 30% minimum utilization
+        private const val BALANCE_THRESHOLD = 0.20        // 20% imbalance threshold
+        private const val PERFORMANCE_WEIGHT = 0.30         // Performance factor weight
+        private const val LOCATION_WEIGHT = 0.25             // Location factor weight
+        private const val CAPACITY_WEIGHT = 0.25              // Capacity factor weight
+        private const val WORKLOAD_WEIGHT = 0.20              // Current workload weight
+    }
+    
+    /**
+     * Calculate optimal load distribution for shipments
+     */
+    suspend fun calculateLoadDistribution(
+        shipments: List<Shipment>,
+        drivers: List<Driver>,
+        strategy: Strategy = Strategy.HYBRID,
+        currentWorkloads: Map<String, Int> = emptyMap()
+    ): LoadBalancingResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Calculating load distribution for ${shipments.size} shipments across ${drivers.size} drivers")
+                
+                // Calculate current driver states
+                val driverStates = drivers.map { driver ->
+                    DriverState(
+                        driver = driver,
+                        currentLoad = currentWorkloads[driver.id] ?: 0,
+                        maxCapacity = driver.maxConcurrentShipments,
+                        utilizationRate = calculateUtilizationRate(driver, currentWorkloads),
+                        performanceScore = calculatePerformanceScore(driver),
+                        availabilityScore = calculateAvailabilityScore(driver)
+                    )
+                }
+                
+                // Apply load balancing strategy
+                val assignments = when (strategy) {
+                    Strategy.ROUND_ROBIN -> applyRoundRobinStrategy(shipments, driverStates)
+                    Strategy.LEAST_LOADED -> applyLeastLoadedStrategy(shipments, driverStates)
+                    Strategy.CAPACITY_BASED -> applyCapacityBasedStrategy(shipments, driverStates)
+                    Strategy.PERFORMANCE_BASED -> applyPerformanceBasedStrategy(shipments, driverStates)
+                    Strategy.LOCATION_BASED -> applyLocationBasedStrategy(shipments, driverStates)
+                    Strategy.HYBRID -> applyHybridStrategy(shipments, driverStates)
+                }
+                
+                // Calculate load balancing metrics
+                val metrics = calculateLoadBalancingMetrics(assignments, driverStates)
+                
+                // Generate recommendations
+                val recommendations = generateLoadBalancingRecommendations(metrics, driverStates)
+                
+                val result = LoadBalancingResult(
+                    assignments = assignments,
+                    metrics = metrics,
+                    recommendations = recommendations,
+                    strategy = strategy,
+                    totalShipments = shipments.size,
+                    totalDrivers = drivers.size,
+                    calculatedAt = LocalDateTime.now()
+                )
+                
+                Log.d(TAG, "Load balancing completed: ${metrics.balanceScore} balance score")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error calculating load distribution", e)
+                LoadBalancingResult.createDefault(shipments.size, drivers.size)
+            }
+        }
+    }
+    
+    /**
+     * Apply round-robin load balancing strategy
+     */
+    private fun applyRoundRobinStrategy(
+        shipments: List<Shipment>,
+        driverStates: List<DriverState>
+    ): List<LoadAssignment> {
+        val assignments = mutableListOf<LoadAssignment>()
+        val availableDrivers = driverStates.filter { it.isAvailable() }
+        var driverIndex = 0
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                val selectedDriver = availableDrivers[driverIndex % availableDrivers.size]
+                
+                if (selectedDriver.canAcceptShipment()) {
+                    assignments.add(
+                        LoadAssignment(
+                            shipmentId = shipment.id,
+                            driverId = selectedDriver.driver.id,
+                            driverName = selectedDriver.driver.name,
+                            strategy = "ROUND_ROBIN",
+                            confidenceScore = 0.7,
+                            reasoning = "Round-robin distribution"
+                        )
+                    )
+                    selectedDriver.currentLoad++
+                }
+                
+                driverIndex++
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply least-loaded load balancing strategy
+     */
+    private fun applyLeastLoadedStrategy(
+        shipments: List<Shipment>,
+        driverStates: List<DriverState>
+    ): List<LoadAssignment> {
+        val assignments = mutableListOf<LoadAssignment>()
+        val availableDrivers = driverStates.filter { it.isAvailable() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort by current load (ascending)
+                availableDrivers.sortBy { it.currentLoad }
+                
+                val selectedDriver = availableDrivers.firstOrNull { it.canAcceptShipment() }
+                
+                if (selectedDriver != null) {
+                    assignments.add(
+                        LoadAssignment(
+                            shipmentId = shipment.id,
+                            driverId = selectedDriver.driver.id,
+                            driverName = selectedDriver.driver.name,
+                            strategy = "LEAST_LOADED",
+                            confidenceScore = 0.8,
+                            reasoning = "Driver with least current workload"
+                        )
+                    )
+                    selectedDriver.currentLoad++
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply capacity-based load balancing strategy
+     */
+    private fun applyCapacityBasedStrategy(
+        shipments: List<Shipment>,
+        driverStates: List<DriverState>
+    ): List<LoadAssignment> {
+        val assignments = mutableListOf<LoadAssignment>()
+        val availableDrivers = driverStates.filter { it.isAvailable() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort by remaining capacity (descending)
+                availableDrivers.sortByDescending { it.remainingCapacity }
+                
+                val selectedDriver = availableDrivers.firstOrNull { it.canAcceptShipment() }
+                
+                if (selectedDriver != null) {
+                    assignments.add(
+                        LoadAssignment(
+                            shipmentId = shipment.id,
+                            driverId = selectedDriver.driver.id,
+                            driverName = selectedDriver.driver.name,
+                            strategy = "CAPACITY_BASED",
+                            confidenceScore = 0.75,
+                            reasoning = "Driver with most remaining capacity"
+                        )
+                    )
+                    selectedDriver.currentLoad++
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply performance-based load balancing strategy
+     */
+    private fun applyPerformanceBasedStrategy(
+        shipments: List<Shipment>,
+        driverStates: List<DriverState>
+    ): List<LoadAssignment> {
+        val assignments = mutableListOf<LoadAssignment>()
+        val availableDrivers = driverStates.filter { it.isAvailable() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort by performance score (descending)
+                availableDrivers.sortByDescending { it.performanceScore }
+                
+                val selectedDriver = availableDrivers.firstOrNull { it.canAcceptShipment() }
+                
+                if (selectedDriver != null) {
+                    assignments.add(
+                        LoadAssignment(
+                            shipmentId = shipment.id,
+                            driverId = selectedDriver.driver.id,
+                            driverName = selectedDriver.driver.name,
+                            strategy = "PERFORMANCE_BASED",
+                            confidenceScore = 0.85,
+                            reasoning = "Highest performing driver available"
+                        )
+                    )
+                    selectedDriver.currentLoad++
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply location-based load balancing strategy
+     */
+    private fun applyLocationBasedStrategy(
+        shipments: List<Shipment>,
+        driverStates: List<DriverState>
+    ): List<LoadAssignment> {
+        val assignments = mutableListOf<LoadAssignment>()
+        val availableDrivers = driverStates.filter { it.isAvailable() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort by distance to shipment pickup (ascending)
+                availableDrivers.sortBy { state ->
+                    calculateDistanceToShipment(state.driver, shipment)
+                }
+                
+                val selectedDriver = availableDrivers.firstOrNull { it.canAcceptShipment() }
+                
+                if (selectedDriver != null) {
+                    val distance = calculateDistanceToShipment(selectedDriver.driver, shipment)
+                    
+                    assignments.add(
+                        LoadAssignment(
+                            shipmentId = shipment.id,
+                            driverId = selectedDriver.driver.id,
+                            driverName = selectedDriver.driver.name,
+                            strategy = "LOCATION_BASED",
+                            confidenceScore = calculateLocationConfidence(distance),
+                            reasoning = "Closest driver to pickup location (${distance.toInt()}km)"
+                        )
+                    )
+                    selectedDriver.currentLoad++
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Apply hybrid load balancing strategy (combines multiple factors)
+     */
+    private fun applyHybridStrategy(
+        shipments: List<Shipment>,
+        driverStates: List<DriverState>
+    ): List<LoadAssignment> {
+        val assignments = mutableListOf<LoadAssignment>()
+        val availableDrivers = driverStates.filter { it.isAvailable() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Calculate composite scores for all available drivers
+                val driverScores = availableDrivers.map { driverState ->
+                    val performanceScore = (driverState.performanceScore / 5.0) * PERFORMANCE_WEIGHT
+                    val locationScore = calculateLocationScore(driverState.driver, shipment) * LOCATION_WEIGHT
+                    val capacityScore = (driverState.remainingCapacity.toDouble() / driverState.maxCapacity) * CAPACITY_WEIGHT
+                    val workloadScore = ((driverState.maxCapacity - driverState.currentLoad).toDouble() / driverState.maxCapacity) * WORKLOAD_WEIGHT
+                    
+                    val totalScore = performanceScore + locationScore + capacityScore + workloadScore
+                    
+                    Pair(driverState, totalScore)
+                }
+                
+                // Select driver with highest composite score
+                val selectedDriver = driverScores.maxByOrNull { it.second }?.first
+                
+                if (selectedDriver != null && selectedDriver.canAcceptShipment()) {
+                    val confidenceScore = minOf(0.95, (driverScores.maxOfOrNull { it.second } ?: 0.0) / 1.0)
+                    
+                    assignments.add(
+                        LoadAssignment(
+                            shipmentId = shipment.id,
+                            driverId = selectedDriver.driver.id,
+                            driverName = selectedDriver.driver.name,
+                            strategy = "HYBRID",
+                            confidenceScore = confidenceScore,
+                            reasoning = "Optimal balance of performance, location, capacity, and workload"
+                        )
+                    )
+                    selectedDriver.currentLoad++
+                }
+            }
+        }
+        
+        return assignments
+    }
+    
+    /**
+     * Calculate driver utilization rate
+     */
+    private fun calculateUtilizationRate(
+        driver: Driver,
+        currentWorkloads: Map<String, Int>
+    ): Double {
+        val currentLoad = currentWorkloads[driver.id] ?: 0
+        return (currentLoad.toDouble() / driver.maxConcurrentShipments) * 100.0
+    }
+    
+    /**
+     * Calculate driver performance score
+     */
+    private fun calculatePerformanceScore(driver: Driver): Double {
+        var score = 50.0 // Base score
+        
+        // Rating contribution (0-50 points)
+        if (driver.rating != null) {
+            score += (driver.rating - 3.0) * 50.0 // Scale rating to 0-50
+        }
+        
+        // On-time delivery rate contribution (0-30 points)
+        if (driver.onTimeDeliveryRate != null) {
+            score += driver.onTimeDeliveryRate * 30.0
+        }
+        
+        // Average delivery time contribution (0-20 points)
+        if (driver.averageDeliveryTime != null) {
+            val targetTime = 120.0 // 2 hours target
+            val timeScore = maxOf(0.0, (targetTime - driver.averageDeliveryTime) / targetTime * 20.0)
+            score += timeScore
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate driver availability score
+     */
+    private fun calculateAvailabilityScore(driver: Driver): Double {
+        var score = 50.0 // Base score
+        
+        when (driver.status) {
+            Driver.Status.AVAILABLE -> score += 50.0
+            Driver.Status.BUSY -> score += 20.0
+            Driver.Status.BREAK -> score += 10.0
+            Driver.Status.OFF_DUTY -> score -= 30.0
+        }
+        
+        // Hours worked today
+        if (driver.hoursWorkedToday != null) {
+            when {
+                driver.hoursWorkedToday <= 4 -> score += 20.0
+                driver.hoursWorkedToday <= 8 -> score += 10.0
+                driver.hoursWorkedToday > 10 -> score -= 20.0
+            }
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate distance between driver and shipment
+     */
+    private fun calculateDistanceToShipment(driver: Driver, shipment: Shipment): Double {
+        val driverLocation = driver.currentLocation
+        val shipmentLocation = shipment.pickupLocation
+        
+        return if (driverLocation != null && shipmentLocation != null) {
+            // Simplified distance calculation (would use actual distance API in production)
+            val latDiff = abs(driverLocation.latitude - shipmentLocation.latitude)
+            val lonDiff = abs(driverLocation.longitude - shipmentLocation.longitude)
+            kotlin.math.sqrt((latDiff * latDiff + lonDiff * lonDiff)) * 111.0 // Approximate km
+        } else {
+            50.0 // Default distance
+        }
+    }
+    
+    /**
+     * Calculate location score for driver
+     */
+    private fun calculateLocationScore(driver: Driver, shipment: Shipment): Double {
+        val distance = calculateDistanceToShipment(driver, shipment)
+        
+        return when {
+            distance <= 5 -> 100.0
+            distance <= 10 -> 80.0
+            distance <= 20 -> 60.0
+            distance <= 50 -> 40.0
+            else -> 20.0
+        }
+    }
+    
+    /**
+     * Calculate confidence score based on distance
+     */
+    private fun calculateLocationConfidence(distance: Double): Double {
+        return when {
+            distance <= 5 -> 0.95
+            distance <= 10 -> 0.85
+            distance <= 20 -> 0.75
+            distance <= 50 -> 0.65
+            else -> 0.55
+        }
+    }
+    
+    /**
+     * Calculate load balancing metrics
+     */
+    private fun calculateLoadBalancingMetrics(
+        assignments: List<LoadAssignment>,
+        driverStates: List<DriverState>
+    ): LoadBalancingMetrics {
+        // Calculate driver utilization after assignments
+        val finalUtilizations = driverStates.map { driverState ->
+            val assignedCount = assignments.count { it.driverId == driverState.driver.id }
+            val finalLoad = driverState.currentLoad + assignedCount
+            val finalUtilization = (finalLoad.toDouble() / driverState.maxCapacity) * 100.0
+            
+            Pair(driverState.driver.id, finalUtilization)
+        }
+        
+        val utilizationRates = finalUtilizations.map { it.second }
+        
+        // Calculate balance metrics
+        val averageUtilization = utilizationRates.average()
+        val maxUtilization = utilizationRates.maxOrNull() ?: 0.0
+        val minUtilization = utilizationRates.minOrNull() ?: 0.0
+        val utilizationRange = maxUtilization - minUtilization
+        
+        // Calculate balance score (0-100, higher is better)
+        val balanceScore = maxOf(0.0, 100.0 - (utilizationRange * 2.0))
+        
+        // Calculate efficiency metrics
+        val underutilizedDrivers = utilizationRates.count { it < MIN_WORKLOAD_RATIO * 100 }
+        val overutilizedDrivers = utilizationRates.count { it > MAX_WORKLOAD_RATIO * 100 }
+        val optimallyUtilizedDrivers = utilizationRates.count { 
+            it >= MIN_WORKLOAD_RATIO * 100 && it <= MAX_WORKLOAD_RATIO * 100 
+        }
+        
+        return LoadBalancingMetrics(
+            averageUtilization = averageUtilization,
+            maxUtilization = maxUtilization,
+            minUtilization = minUtilization,
+            utilizationRange = utilizationRange,
+            balanceScore = balanceScore,
+            underutilizedDrivers = underutilizedDrivers,
+            overutilizedDrivers = overutilizedDrivers,
+            optimallyUtilizedDrivers = optimallyUtilizedDrivers,
+            totalAssignments = assignments.size,
+            calculatedAt = LocalDateTime.now()
+        )
+    }
+    
+    /**
+     * Generate load balancing recommendations
+     */
+    private fun generateLoadBalancingRecommendations(
+        metrics: LoadBalancingMetrics,
+        driverStates: List<DriverState>
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (metrics.balanceScore < 70.0) {
+            recommendations.add("Consider using hybrid strategy for better load distribution")
+        }
+        
+        if (metrics.overutilizedDrivers > 0) {
+            recommendations.add("Reduce workload for ${metrics.overutilizedDrivers} overutilized drivers")
+        }
+        
+        if (metrics.underutilizedDrivers > 2) {
+            recommendations.add("Consider reducing active driver pool or increasing shipment volume")
+        }
+        
+        if (metrics.averageUtilization < 40.0) {
+            recommendations.add("Low overall utilization - review driver availability and scheduling")
+        }
+        
+        if (metrics.averageUtilization > 85.0) {
+            recommendations.add("High utilization - consider adding more drivers to the pool")
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Rebalance loads for existing assignments
+     */
+    suspend fun rebalanceLoads(
+        currentAssignments: List<LoadAssignment>,
+        drivers: List<Driver>
+    ): RebalancingResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Rebalancing ${currentAssignments.size} assignments")
+                
+                // Analyze current distribution
+                val currentWorkloads = mutableMapOf<String, Int>()
+                currentAssignments.forEach { assignment ->
+                    currentWorkloads[assignment.driverId] = (currentWorkloads[assignment.driverId] ?: 0) + 1
+                }
+                
+                // Apply load balancing
+                val newDistribution = calculateLoadDistribution(
+                    shipments = emptyList(), // Will be derived from assignments
+                    drivers = drivers,
+                    strategy = Strategy.HYBRID,
+                    currentWorkloads = currentWorkloads
+                )
+                
+                // Generate rebalancing suggestions
+                val suggestions = generateRebalancingSuggestions(
+                    currentAssignments,
+                    newDistribution,
+                    currentWorkloads
+                )
+                
+                RebalancingResult(
+                    currentAssignments = currentAssignments,
+                    suggestedAssignments = newDistribution.assignments,
+                    suggestions = suggestions,
+                    improvementScore = calculateImprovementScore(
+                        currentWorkloads,
+                        newDistribution.metrics
+                    ),
+                    calculatedAt = LocalDateTime.now()
+                )
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error rebalancing loads", e)
+                RebalancingResult.createDefault(currentAssignments)
+            }
+        }
+    }
+    
+    /**
+     * Generate rebalancing suggestions
+     */
+    private fun generateRebalancingSuggestions(
+        currentAssignments: List<LoadAssignment>,
+        newDistribution: LoadBalancingResult,
+        currentWorkloads: Map<String, Int>
+    ): List<String> {
+        val suggestions = mutableListOf<String>()
+        
+        // Compare current vs suggested distribution
+        currentAssignments.forEach { assignment ->
+            val currentLoad = currentWorkloads[assignment.driverId] ?: 0
+            val suggestedLoad = newDistribution.assignments.count { it.driverId == assignment.driverId }
+            
+            if (suggestedLoad < currentLoad) {
+                suggestions.add("Reduce load for ${assignment.driverName} from $currentLoad to $suggestedLoad assignments")
+            } else if (suggestedLoad > currentLoad) {
+                suggestions.add("Increase load for ${assignment.driverName} from $currentLoad to $suggestedLoad assignments")
+            }
+        }
+        
+        return suggestions
+    }
+    
+    /**
+     * Calculate improvement score
+     */
+    private fun calculateImprovementScore(
+        currentWorkloads: Map<String, Int>,
+        newMetrics: LoadBalancingMetrics
+    ): Double {
+        // Calculate current balance score
+        val currentUtilizations = currentWorkloads.values.map { load ->
+            (load.toDouble() / 5) * 100.0 // Assuming 5 max capacity
+        }
+        
+        val currentRange = (currentUtilizations.maxOrNull() ?: 0.0) - (currentUtilizations.minOrNull() ?: 0.0)
+        val currentBalanceScore = maxOf(0.0, 100.0 - (currentRange * 2.0))
+        
+        // Calculate improvement
+        return maxOf(0.0, newMetrics.balanceScore - currentBalanceScore)
+    }
+}
+
+/**
+ * Driver state for load balancing
+ */
+data class DriverState(
+    val driver: Driver,
+    var currentLoad: Int,
+    val maxCapacity: Int,
+    val utilizationRate: Double,
+    val performanceScore: Double,
+    val availabilityScore: Double
+) {
+    val remainingCapacity: Int
+        get() = maxCapacity - currentLoad
+    
+    fun isAvailable(): Boolean {
+        return driver.status == Driver.Status.AVAILABLE && remainingCapacity > 0
+    }
+    
+    fun canAcceptShipment(): Boolean {
+        return isAvailable() && utilizationRate < 85.0 // Below 85% utilization
+    }
+}
+
+/**
+ * Load assignment result
+ */
+data class LoadAssignment(
+    val shipmentId: String,
+    val driverId: String,
+    val driverName: String,
+    val strategy: String,
+    val confidenceScore: Double,
+    val reasoning: String
+)
+
+/**
+ * Load balancing result
+ */
+data class LoadBalancingResult(
+    val assignments: List<LoadAssignment>,
+    val metrics: LoadBalancingMetrics,
+    val recommendations: List<String>,
+    val strategy: LoadBalancingAlgorithm.Strategy,
+    val totalShipments: Int,
+    val totalDrivers: Int,
+    val calculatedAt: LocalDateTime
+) {
+    companion object {
+        fun createDefault(totalShipments: Int, totalDrivers: Int): LoadBalancingResult {
+            return LoadBalancingResult(
+                assignments = emptyList(),
+                metrics = LoadBalancingMetrics.createDefault(),
+                recommendations = emptyList(),
+                strategy = LoadBalancingAlgorithm.Strategy.HYBRID,
+                totalShipments = totalShipments,
+                totalDrivers = totalDrivers,
+                calculatedAt = LocalDateTime.now()
+            )
+        }
+    }
+}
+
+/**
+ * Load balancing metrics
+ */
+data class LoadBalancingMetrics(
+    val averageUtilization: Double,
+    val maxUtilization: Double,
+    val minUtilization: Double,
+    val utilizationRange: Double,
+    val balanceScore: Double,
+    val underutilizedDrivers: Int,
+    val overutilizedDrivers: Int,
+    val optimallyUtilizedDrivers: Int,
+    val totalAssignments: Int,
+    val calculatedAt: LocalDateTime
+) {
+    companion object {
+        fun createDefault(): LoadBalancingMetrics {
+            return LoadBalancingMetrics(
+                averageUtilization = 0.0,
+                maxUtilization = 0.0,
+                minUtilization = 0.0,
+                utilizationRange = 0.0,
+                balanceScore = 0.0,
+                underutilizedDrivers = 0,
+                overutilizedDrivers = 0,
+                optimallyUtilizedDrivers = 0,
+                totalAssignments = 0,
+                calculatedAt = LocalDateTime.now()
+            )
+        }
+    }
+}
+
+/**
+ * Rebalancing result
+ */
+data class RebalancingResult(
+    val currentAssignments: List<LoadAssignment>,
+    val suggestedAssignments: List<LoadAssignment>,
+    val suggestions: List<String>,
+    val improvementScore: Double,
+    val calculatedAt: LocalDateTime
+) {
+    companion object {
+        fun createDefault(currentAssignments: List<LoadAssignment>): RebalancingResult {
+            return RebalancingResult(
+                currentAssignments = currentAssignments,
+                suggestedAssignments = currentAssignments,
+                suggestions = emptyList(),
+                improvementScore = 0.0,
+                calculatedAt = LocalDateTime.now()
+            )
+        }
+    }
+}

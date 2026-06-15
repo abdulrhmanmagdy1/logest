@@ -1,0 +1,593 @@
+package com.edham.logistics.tracking
+
+import android.location.Location
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.SpeedViolationEntity
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.remote.api.SpeedMonitoringApi
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.pow
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Speed Monitor - Advanced speed monitoring and violation tracking
+ * 
+ * Features:
+ * - Real-time speed monitoring
+ * - Speed limit detection
+ * - Violation tracking
+ * - Speed analytics
+ * - Driver behavior analysis
+ * - Alert system
+ */
+@Singleton
+class SpeedMonitor @Inject constructor(
+    private val database: EdhamDatabase,
+    private val speedMonitoringApi: SpeedMonitoringApi
+) {
+    
+    private val _monitoringState = MutableStateFlow<SpeedMonitoringState>(SpeedMonitoringState.Stopped)
+    val monitoringState: StateFlow<SpeedMonitoringState> = _monitoringState.asStateFlow()
+    
+    private val _currentSpeed = MutableStateFlow<SpeedInfo?>(null)
+    val currentSpeed: StateFlow<SpeedInfo?> = _currentSpeed.asStateFlow()
+    
+    private val _speedViolations = MutableStateFlow<List<SpeedViolationEntity>>(emptyList())
+    val speedViolations: StateFlow<List<SpeedViolationEntity>> = _speedViolations.asStateFlow()
+    
+    private val _speedAnalytics = MutableStateFlow<SpeedAnalytics?>(null)
+    val speedAnalytics: StateFlow<SpeedAnalytics?> = _speedAnalytics.asStateFlow()
+    
+    private val _speedAlerts = MutableStateFlow<List<SpeedAlert>>(emptyList())
+    val speedAlerts: StateFlow<List<SpeedAlert>> = _speedAlerts.asStateFlow()
+    
+    private var currentVehicleId: String? = null
+    private var isMonitoring = false
+    private var lastLocation: Location? = null
+    private var lastUpdateTime: Long = 0L
+    private var currentSpeedLimit: Float = 0f
+    private var speedReadings: MutableList<SpeedInfo> = mutableListOf()
+    private var violationCount = 0
+    private var totalDistance = 0.0
+    
+    private val monitoringScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    
+    companion object {
+        private const val TAG = "SpeedMonitor"
+        private const val SPEED_UPDATE_INTERVAL = 2000L // 2 seconds
+        private const val VIOLATION_THRESHOLD = 5f // 5 km/h over limit
+        private const val SEVERE_VIOLATION_THRESHOLD = 20f // 20 km/h over limit
+        private const val MAX_SPEED_READINGS = 1000
+        private const val SPEED_HISTORY_HOURS = 24
+    }
+    
+    /**
+     * Initialize speed monitoring for vehicle
+     */
+    fun initialize(vehicleId: String) {
+        try {
+            _monitoringState.value = SpeedMonitoringState.Initializing
+            
+            currentVehicleId = vehicleId
+            speedReadings.clear()
+            violationCount = 0
+            totalDistance = 0.0
+            
+            // Load vehicle information
+            monitoringScope.launch {
+                loadVehicleInfo(vehicleId)
+            }
+            
+            // Load speed limit data
+            monitoringScope.launch {
+                loadSpeedLimits()
+            }
+            
+            _monitoringState.value = SpeedMonitoringState.Ready
+            
+        } catch (e: Exception) {
+            _monitoringState.value = SpeedMonitoringState.Error("Failed to initialize: " + (e.message ?: "Unknown error"))
+        }
+    }
+    
+    /**
+     * Start speed monitoring
+     */
+    fun startMonitoring() {
+        if (isMonitoring) return
+        
+        try {
+            _monitoringState.value = SpeedMonitoringState.Starting
+            
+            isMonitoring = true
+            lastUpdateTime = System.currentTimeMillis()
+            
+            _monitoringState.value = SpeedMonitoringState.Monitoring
+            
+        } catch (e: Exception) {
+            _monitoringState.value = SpeedMonitoringState.Error("Failed to start monitoring: " + (e.message ?: "Unknown error"))
+        }
+    }
+    
+    /**
+     * Stop speed monitoring
+     */
+    fun stopMonitoring() {
+        if (!isMonitoring) return
+        
+        try {
+            _monitoringState.value = SpeedMonitoringState.Stopping
+            
+            isMonitoring = false
+            
+            // Save final data
+            monitoringScope.launch {
+                saveSpeedData()
+            }
+            
+            _monitoringState.value = SpeedMonitoringState.Stopped
+            
+        } catch (e: Exception) {
+            _monitoringState.value = SpeedMonitoringState.Error("Failed to stop monitoring: " + (e.message ?: "Unknown error"))
+        }
+    }
+    
+    /**
+     * Update speed with new location
+     */
+    fun updateSpeed(location: Location, distance: Double) {
+        if (!isMonitoring) return
+        
+        try {
+            val currentTime = System.currentTimeMillis()
+            val speedKmh = location.speed * 3.6f // Convert to km/h
+            
+            // Update current speed info
+            val speedInfo = SpeedInfo(
+                currentSpeed = speedKmh,
+                speedLimit = currentSpeedLimit,
+                speedDifference = speedKmh - currentSpeedLimit,
+                isOverLimit = speedKmh > currentSpeedLimit,
+                timestamp = currentTime,
+                location = location,
+                accuracy = location.accuracy
+            )
+            
+            _currentSpeed.value = speedInfo
+            
+            // Add to readings
+            addSpeedReading(speedInfo)
+            
+            // Check for violations
+            checkSpeedViolation(speedInfo)
+            
+            // Update analytics
+            updateSpeedAnalytics()
+            
+            // Update total distance
+            totalDistance += distance
+            
+            lastLocation = location
+            lastUpdateTime = currentTime
+            
+        } catch (e: Exception) {
+            _monitoringState.value = SpeedMonitoringState.Error("Failed to update speed: " + (e.message ?: "Unknown error"))
+        }
+    }
+    
+    /**
+     * Get maximum speed
+     */
+    fun getMaxSpeed(): Float {
+        return speedReadings.maxOfOrNull { it.currentSpeed } ?: 0f
+    }
+    
+    /**
+     * Get average speed
+     */
+    fun getAverageSpeed(): Float {
+        return if (speedReadings.isNotEmpty()) {
+            speedReadings.map { it.currentSpeed }.average().toFloat()
+        } else 0f
+    }
+    
+    /**
+     * Get violation count
+     */
+    fun getViolationCount(): Int = violationCount
+    
+    /**
+     * Get speed statistics
+     */
+    fun getSpeedStatistics(): SpeedStatistics {
+        val readings = speedReadings.toList()
+        
+        return SpeedStatistics(
+            averageSpeed = if (readings.isNotEmpty()) readings.map { it.currentSpeed }.average().toFloat() else 0f,
+            maxSpeed = readings.maxOfOrNull { it.currentSpeed } ?: 0f,
+            minSpeed = readings.minOfOrNull { it.currentSpeed } ?: 0f,
+            violationCount = violationCount,
+            totalDistance = totalDistance,
+            monitoringDuration = if (readings.isNotEmpty()) readings.last().timestamp - readings.first().timestamp else 0L,
+            speedLimitCompliance = calculateCompliance(readings)
+        )
+    }
+    
+    /**
+     * Load vehicle information
+     */
+    private suspend fun loadVehicleInfo(vehicleId: String) {
+        // Implementation would load vehicle info from database
+    }
+    
+    /**
+     * Load speed limits
+     */
+    private suspend fun loadSpeedLimits() {
+        // Implementation would load speed limits based on location
+        currentSpeedLimit = 60f // Default speed limit
+    }
+    
+    /**
+     * Add speed reading
+     */
+    private fun addSpeedReading(speedInfo: SpeedInfo) {
+        speedReadings.add(speedInfo)
+        
+        // Limit readings to prevent memory issues
+        if (speedReadings.size > MAX_SPEED_READINGS) {
+            speedReadings.removeAt(0)
+        }
+    }
+    
+    /**
+     * Check for speed violations
+     */
+    private fun checkSpeedViolation(speedInfo: SpeedInfo) {
+        if (speedInfo.isOverLimit && speedInfo.speedDifference > VIOLATION_THRESHOLD) {
+            val violation = SpeedViolationEntity(
+                id = 0,
+                vehicleId = currentVehicleId ?: "",
+                timestamp = Date(speedInfo.timestamp),
+                locationLat = speedInfo.location.latitude,
+                locationLng = speedInfo.location.longitude,
+                recordedSpeed = speedInfo.currentSpeed.toDouble(),
+                speedLimit = speedInfo.speedLimit.toDouble(),
+                severity = determineViolationSeverity(speedInfo.speedDifference).name
+            )
+            
+            // Save violation
+            monitoringScope.launch {
+                saveSpeedViolation(violation)
+            }
+            
+            // Update violation count
+            violationCount++
+            
+            // Add to violations list
+            val currentViolations = _speedViolations.value.toMutableList()
+            currentViolations.add(violation)
+            _speedViolations.value = currentViolations
+            
+            // Create alert
+            createSpeedAlert(violation)
+        }
+    }
+    
+    /**
+     * Determine violation type
+     */
+    private fun determineViolationType(speedDifference: Float): SpeedViolationType {
+        return when {
+            speedDifference > SEVERE_VIOLATION_THRESHOLD -> SpeedViolationType.SEVERE
+            speedDifference > VIOLATION_THRESHOLD * 2 -> SpeedViolationType.MODERATE
+            else -> SpeedViolationType.MINOR
+        }
+    }
+    
+    /**
+     * Determine violation severity
+     */
+    private fun determineViolationSeverity(speedDifference: Float): SpeedViolationSeverity {
+        return when {
+            speedDifference > SEVERE_VIOLATION_THRESHOLD -> SpeedViolationSeverity.HIGH
+            speedDifference > VIOLATION_THRESHOLD * 2 -> SpeedViolationSeverity.MEDIUM
+            else -> SpeedViolationSeverity.LOW
+        }
+    }
+    
+    /**
+     * Save speed violation
+     */
+    private suspend fun saveSpeedViolation(violation: SpeedViolationEntity) {
+        // Implementation would save to database
+    }
+    
+    /**
+     * Create speed alert
+     */
+    private fun createSpeedAlert(violation: SpeedViolationEntity) {
+        val alert = SpeedAlert(
+            type = SpeedAlertType.SPEED_VIOLATION,
+            severity = SpeedViolationSeverity.valueOf(violation.severity),
+            message = "Speed limit exceeded: ${violation.recordedSpeed.toInt()} km/h (limit: ${violation.speedLimit.toInt()} km/h)",
+            timestamp = violation.timestamp.time,
+            location = Location("").apply {
+                latitude = violation.locationLat
+                longitude = violation.locationLng
+            },
+            data = mapOf(
+                "violationId" to violation.id,
+                "actualSpeed" to violation.recordedSpeed,
+                "speedLimit" to violation.speedLimit
+            )
+        )
+        
+        val currentAlerts = _speedAlerts.value.toMutableList()
+        currentAlerts.add(alert)
+        _speedAlerts.value = currentAlerts
+    }
+    
+    /**
+     * Update speed analytics
+     */
+    private fun updateSpeedAnalytics() {
+        val readings = speedReadings.toList()
+        if (readings.isEmpty()) return
+        
+        val analytics = SpeedAnalytics(
+            averageSpeed = readings.map { it.currentSpeed }.average().toFloat(),
+            maxSpeed = readings.maxOfOrNull { it.currentSpeed } ?: 0f,
+            minSpeed = readings.minOfOrNull { it.currentSpeed } ?: 0f,
+            speedVariance = calculateSpeedVariance(readings),
+            speedDistribution = calculateSpeedDistribution(readings),
+            violationRate = if (readings.isNotEmpty()) violationCount.toFloat() / readings.size else 0f,
+            complianceRate = calculateCompliance(readings),
+            peakSpeedTimes = findPeakSpeedTimes(readings),
+            speedTrends = calculateSpeedTrends(readings)
+        )
+        
+        _speedAnalytics.value = analytics
+    }
+    
+    /**
+     * Calculate speed variance
+     */
+    private fun calculateSpeedVariance(readings: List<SpeedInfo>): Float {
+        if (readings.isEmpty()) return 0f
+        
+        val mean = readings.map { it.currentSpeed }.average()
+        val variance = readings.map { (it.currentSpeed - mean).pow(2).toDouble() }.average()
+        
+        return variance.toFloat()
+    }
+    
+    /**
+     * Calculate speed distribution
+     */
+    private fun calculateSpeedDistribution(readings: List<SpeedInfo>): SpeedDistribution {
+        val speedRanges = mutableMapOf<String, Int>()
+        
+        readings.forEach { reading ->
+            val range = when {
+                reading.currentSpeed < 30 -> "0-30"
+                reading.currentSpeed < 50 -> "30-50"
+                reading.currentSpeed < 70 -> "50-70"
+                reading.currentSpeed < 90 -> "70-90"
+                else -> "90+"
+            }
+            
+            speedRanges[range] = speedRanges.getOrDefault(range, 0) + 1
+        }
+        
+        return SpeedDistribution(speedRanges)
+    }
+    
+    /**
+     * Calculate compliance rate
+     */
+    private fun calculateCompliance(readings: List<SpeedInfo>): Float {
+        if (readings.isEmpty()) return 1f
+        
+        val compliantReadings = readings.count { it.currentSpeed <= currentSpeedLimit }
+        return compliantReadings.toFloat() / readings.size
+    }
+    
+    /**
+     * Find peak speed times
+     */
+    private fun findPeakSpeedTimes(readings: List<SpeedInfo>): List<PeakSpeedTime> {
+        val peakTimes = mutableListOf<PeakSpeedTime>()
+        
+        // Group readings by hour
+        val readingsByHour = readings.groupBy { 
+            Calendar.getInstance().apply { timeInMillis = it.timestamp }.get(Calendar.HOUR_OF_DAY)
+        }
+        
+        // Find peak speed for each hour
+        readingsByHour.forEach { (hour, hourReadings) ->
+            val maxSpeed = hourReadings.maxOfOrNull { it.currentSpeed } ?: 0f
+            val peakReading = hourReadings.find { it.currentSpeed == maxSpeed }
+            
+            peakReading?.let {
+                peakTimes.add(
+                    PeakSpeedTime(
+                        hour = hour,
+                        speed = maxSpeed,
+                        timestamp = it.timestamp,
+                        location = it.location
+                    )
+                )
+            }
+        }
+        
+        return peakTimes.sortedByDescending { it.speed }
+    }
+    
+    /**
+     * Calculate speed trends
+     */
+    private fun calculateSpeedTrends(readings: List<SpeedInfo>): SpeedTrends {
+        if (readings.size < 2) return SpeedTrends()
+        
+        val recentReadings = readings.takeLast(100) // Last 100 readings
+        val olderReadings = readings.dropLast(100).takeLast(100)
+        
+        if (olderReadings.isEmpty()) return SpeedTrends()
+        
+        val recentAverage = recentReadings.map { it.currentSpeed }.average()
+        val olderAverage = olderReadings.map { it.currentSpeed }.average()
+        
+        val trend = when {
+            recentAverage > olderAverage * 1.1 -> SpeedTrend.INCREASING
+            recentAverage < olderAverage * 0.9 -> SpeedTrend.DECREASING
+            else -> SpeedTrend.STABLE
+        }
+        
+        return SpeedTrends(
+            currentTrend = trend,
+            trendPercentage = ((recentAverage - olderAverage) / olderAverage * 100).toFloat(),
+            trendDuration = recentReadings.last().timestamp - olderReadings.first().timestamp
+        )
+    }
+    
+    /**
+     * Save speed data
+     */
+    private suspend fun saveSpeedData() {
+        // Implementation would save speed data to database
+    }
+    
+    /**
+     * Clear speed data
+     */
+    fun clearSpeedData() {
+        speedReadings.clear()
+        violationCount = 0
+        totalDistance = 0.0
+        _currentSpeed.value = null
+        _speedViolations.value = emptyList()
+        _speedAnalytics.value = null
+        _speedAlerts.value = emptyList()
+    }
+    
+    /**
+     * Get monitoring status
+     */
+    fun isMonitoring(): Boolean = isMonitoring
+}
+
+/**
+ * Data classes
+ */
+data class SpeedInfo(
+    val currentSpeed: Float,
+    val speedLimit: Float,
+    val speedDifference: Float,
+    val isOverLimit: Boolean,
+    val timestamp: Long,
+    val location: Location,
+    val accuracy: Float
+)
+
+data class SpeedReading(
+    val currentSpeed: Float,
+    val speedLimit: Float,
+    val timestamp: Long,
+    val location: Location
+)
+
+data class SpeedStatistics(
+    val averageSpeed: Float,
+    val maxSpeed: Float,
+    val minSpeed: Float,
+    val violationCount: Int,
+    val totalDistance: Double,
+    val monitoringDuration: Long,
+    val speedLimitCompliance: Float
+)
+
+data class SpeedAnalytics(
+    val averageSpeed: Float,
+    val maxSpeed: Float,
+    val minSpeed: Float,
+    val speedVariance: Float,
+    val speedDistribution: SpeedDistribution,
+    val violationRate: Float,
+    val complianceRate: Float,
+    val peakSpeedTimes: List<PeakSpeedTime>,
+    val speedTrends: SpeedTrends
+)
+
+data class SpeedDistribution(
+    val ranges: Map<String, Int>
+)
+
+data class PeakSpeedTime(
+    val hour: Int,
+    val speed: Float,
+    val timestamp: Long,
+    val location: Location
+)
+
+data class SpeedTrends(
+    val currentTrend: SpeedTrend = SpeedTrend.STABLE,
+    val trendPercentage: Float = 0f,
+    val trendDuration: Long = 0L
+)
+
+data class SpeedAlert(
+    val type: SpeedAlertType,
+    val severity: SpeedViolationSeverity,
+    val message: String,
+    val timestamp: Long,
+    val location: Location,
+    val data: Map<String, Any>
+)
+
+/**
+ * Enums
+ */
+sealed class SpeedMonitoringState {
+    object Stopped : SpeedMonitoringState()
+    object Initializing : SpeedMonitoringState()
+    object Ready : SpeedMonitoringState()
+    object Starting : SpeedMonitoringState()
+    object Monitoring : SpeedMonitoringState()
+    object Stopping : SpeedMonitoringState()
+    data class Error(val message: String = "") : SpeedMonitoringState()
+}
+
+enum class SpeedViolationType {
+    MINOR,
+    MODERATE,
+    SEVERE
+}
+
+enum class SpeedViolationSeverity {
+    LOW,
+    MEDIUM,
+    HIGH
+}
+
+enum class SpeedAlertType {
+    SPEED_VIOLATION,
+    EXCESSIVE_SPEED,
+    SPEED_LIMIT_CHANGED,
+    COMPLIANCE_WARNING
+}
+
+enum class SpeedTrend {
+    INCREASING,
+    DECREASING,
+    STABLE
+}

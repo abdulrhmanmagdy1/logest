@@ -1,0 +1,714 @@
+package com.edham.logistics.feature.activitylogs.domain.usecase
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.activitylogs.domain.model.*
+import com.edham.logistics.feature.activitylogs.domain.repository.ActivityLogRepository
+import kotlinx.coroutines.flow.Flow
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Activity logging use cases for comprehensive activity tracking
+ */
+@Singleton
+class LogActivityUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        action: ActivityAction,
+        entityType: EntityType,
+        entityId: String? = null,
+        entityName: String? = null,
+        description: String,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String? = null,
+        userAgent: String? = null,
+        deviceId: String? = null,
+        location: String? = null,
+        sessionId: String? = null,
+        success: Boolean = true,
+        errorMessage: String? = null,
+        severity: LogSeverity = LogSeverity.INFO,
+        source: LogSource = LogSource.MOBILE,
+        metadata: ActivityLogMetadata? = null
+    ): Result<ActivityLog> {
+        return try {
+            val activityLog = ActivityLog(
+                id = java.util.UUID.randomUUID().toString(),
+                userId = userId,
+                userRole = userRole,
+                userName = userName,
+                userEmail = userEmail,
+                action = action,
+                actionType = getActionType(action),
+                entityType = entityType,
+                entityId = entityId,
+                entityName = entityName,
+                description = description,
+                details = details,
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                deviceId = deviceId,
+                location = location,
+                sessionId = sessionId,
+                timestamp = System.currentTimeMillis(),
+                success = success,
+                errorMessage = errorMessage,
+                severity = if (!success) LogSeverity.ERROR else severity,
+                category = action.category,
+                source = source,
+                metadata = metadata ?: ActivityLogMetadata(
+                    requestId = null,
+                    correlationId = null,
+                    traceId = null,
+                    duration = null,
+                    memoryUsage = null,
+                    cpuUsage = null,
+                    networkLatency = null,
+                    databaseQueryTime = null,
+                    cacheHitRate = null,
+                    errorCode = null,
+                    errorStack = null,
+                    userAgentParsed = parseUserAgent(userAgent),
+                    geoLocation = parseLocation(location),
+                    deviceInfo = parseDeviceInfo(deviceId),
+                    sessionInfo = parseSessionInfo(sessionId),
+                    performanceMetrics = null
+                )
+            )
+            
+            activityLogRepository.logActivity(activityLog)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+    
+    private fun getActionType(action: ActivityAction): ActionType {
+        return when (action) {
+            ActivityAction.LOGIN, ActivityAction.LOGOUT, ActivityAction.FAILED_LOGIN,
+            ActivityAction.PASSWORD_CHANGE, ActivityAction.PASSWORD_RESET,
+            ActivityAction.TWO_FACTOR_ENABLE, ActivityAction.TWO_FACTOR_DISABLE -> {
+                ActionType.AUTHENTICATION
+            }
+            ActivityAction.USER_CREATE, ActivityAction.USER_UPDATE, ActivityAction.USER_DELETE,
+            ActivityAction.USER_ENABLE, ActivityAction.USER_DISABLE, ActivityAction.USER_SUSPEND,
+            ActivityAction.USER_UNSUSPEND, ActivityAction.USER_LOCK, ActivityAction.UNLOCK,
+            ActivityAction.ROLE_CHANGE -> {
+                ActionType.USER_MANAGEMENT
+            }
+            ActivityAction.SHIPMENT_CREATE, ActivityAction.SHIPMENT_UPDATE, ActivityAction.SHIPMENT_DELETE,
+            ActivityAction.SHIPMENT_CANCEL, ActivityAction.SHIPMENT_PICKUP, ActivityAction.SHIPMENT_DELIVER,
+            ActivityAction.SHIPMENT_RETURN, ActivityAction.SHIPMENT_STATUS_UPDATE,
+            ActivityAction.SHIPMENT_ROUTE_UPDATE, ActivityAction.SHIPMENT_LOCATION_UPDATE -> {
+                ActionType.CREATE
+            }
+            ActivityAction.INVOICE_CREATE, ActivityAction.INVOICE_UPDATE, ActivityAction.INVOICE_DELETE,
+            ActivityAction.INVOICE_SEND, ActivityAction.INVOICE_PAID, ActivityAction.INVOICE_CANCEL -> {
+                ActionType.CREATE
+            }
+            ActivityAction.PAYMENT_PROCESS, ActivityAction.PAYMENT_REFUND, ActivityAction.PAYMENT_FAILED -> {
+                ActionType.CREATE
+            }
+            ActivityAction.SYSTEM_CONFIG_UPDATE, ActivityAction.SYSTEM_BACKUP, ActivityAction.SYSTEM_RESTORE,
+            ActivityAction.SYSTEM_MAINTENANCE, ActivityAction.SYSTEM_UPGRADE -> {
+                ActionType.SYSTEM
+            }
+            ActivityAction.SECURITY_ALERT, ActivityAction.SECURITY_VIOLATION, ActivityAction.SUSPICIOUS_ACTIVITY,
+            ActivityAction.UNAUTHORIZED_ACCESS, ActivityAction.DATA_BREACH -> {
+                ActionType.SECURITY
+            }
+            ActivityAction.DATA_EXPORT, ActivityAction.DATA_IMPORT, ActivityAction.DATA_DELETE,
+            ActivityAction.DATA_BACKUP, ActivityAction.DATA_RESTORE -> {
+                ActionType.DATA
+            }
+            ActivityAction.NOTIFICATION_SEND, ActivityAction.NOTIFICATION_READ, ActivityAction.NOTIFICATION_DELETE -> {
+                ActionType.NOTIFICATION
+            }
+            ActivityAction.REPORT_GENERATE, ActivityAction.REPORT_VIEW, ActivityAction.REPORT_EXPORT,
+            ActivityAction.REPORT_DELETE -> {
+                ActionType.REPORT
+            }
+            ActivityAction.API_CALL, ActivityAction.API_ERROR, ActivityAction.API_RATE_LIMIT -> {
+                ActionType.API
+            }
+            ActivityAction.FILE_UPLOAD, ActivityAction.FILE_DOWNLOAD -> {
+                ActionType.CREATE
+            }
+            ActivityAction.SEARCH, ActivityAction.FILTER, ActivityAction.SORT -> {
+                ActionType.READ
+            }
+            ActivityAction.VIEW, ActivityAction.READ -> {
+                ActionType.READ
+            }
+            ActivityAction.EDIT, ActivityAction.UPDATE -> {
+                ActionType.UPDATE
+            }
+            ActivityAction.DELETE -> {
+                ActionType.DELETE
+            }
+            else -> ActionType.OTHER
+        }
+    }
+    
+    private fun parseUserAgent(userAgent: String?): UserAgentInfo? {
+        return try {
+            if (userAgent == null) return null
+            
+            // Simple user agent parsing - in production, use a proper library
+            val isMobile = userAgent.contains("Mobile", ignoreCase = true)
+            val isTablet = userAgent.contains("Tablet", ignoreCase = true)
+            val isDesktop = !isMobile && !isTablet
+            
+            UserAgentInfo(
+                browser = extractBrowser(userAgent),
+                browserVersion = extractBrowserVersion(userAgent),
+                os = extractOS(userAgent),
+                osVersion = extractOSVersion(userAgent),
+                device = extractDevice(userAgent),
+                isMobile = isMobile,
+                isTablet = isTablet,
+                isDesktop = isDesktop
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun extractBrowser(userAgent: String): String? {
+        return when {
+            userAgent.contains("Chrome", ignoreCase = true) -> "Chrome"
+            userAgent.contains("Firefox", ignoreCase = true) -> "Firefox"
+            userAgent.contains("Safari", ignoreCase = true) -> "Safari"
+            userAgent.contains("Edge", ignoreCase = true) -> "Edge"
+            userAgent.contains("Opera", ignoreCase = true) -> "Opera"
+            else -> null
+        }
+    }
+    
+    private fun extractBrowserVersion(userAgent: String): String? {
+        return try {
+            val browser = extractBrowser(userAgent)
+            if (browser != null) {
+                val pattern = "$browser[\\s/]([\\d.]+)".toRegex()
+                val match = pattern.find(userAgent)
+                match?.groupValues?.get(1)
+            } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun extractOS(userAgent: String): String? {
+        return when {
+            userAgent.contains("Windows", ignoreCase = true) -> "Windows"
+            userAgent.contains("Mac", ignoreCase = true) -> "macOS"
+            userAgent.contains("Linux", ignoreCase = true) -> "Linux"
+            userAgent.contains("Android", ignoreCase = true) -> "Android"
+            userAgent.contains("iOS", ignoreCase = true) -> "iOS"
+            else -> null
+        }
+    }
+    
+    private fun extractOSVersion(userAgent: String): String? {
+        return try {
+            val os = extractOS(userAgent)
+            if (os != null) {
+                val pattern = "$os[\\s/]([\\d._]+)".toRegex()
+                val match = pattern.find(userAgent)
+                match?.groupValues?.get(1)?.replace("_", ".")
+            } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun extractDevice(userAgent: String): String? {
+        return try {
+            // Simple device extraction
+            when {
+                userAgent.contains("iPhone", ignoreCase = true) -> "iPhone"
+                userAgent.contains("iPad", ignoreCase = true) -> "iPad"
+                userAgent.contains("Android", ignoreCase = true) -> "Android Device"
+                userAgent.contains("Windows", ignoreCase = true) -> "Windows PC"
+                userAgent.contains("Mac", ignoreCase = true) -> "Mac"
+                else -> null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun parseLocation(location: String?): GeoLocation? {
+        return try {
+            if (location == null) return null
+            
+            // Simple location parsing - in production, use a proper geocoding service
+            GeoLocation(
+                country = null,
+                region = null,
+                city = location,
+                latitude = null,
+                longitude = null,
+                accuracy = null,
+                timezone = null
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun parseDeviceInfo(deviceId: String?): DeviceInfo? {
+        return try {
+            if (deviceId == null) return null
+            
+            DeviceInfo(
+                deviceId = deviceId,
+                deviceType = null,
+                deviceModel = null,
+                deviceBrand = null,
+                osVersion = null,
+                appVersion = null,
+                screenSize = null,
+                isRooted = null,
+                isEmulator = null
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun parseSessionInfo(sessionId: String?): SessionInfo? {
+        return try {
+            if (sessionId == null) return null
+            
+            SessionInfo(
+                sessionId = sessionId,
+                sessionStartTime = null,
+                sessionDuration = null,
+                sessionActivityCount = null,
+                lastActivityTime = null,
+                isNewSession = null
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+}
+
+@Singleton
+class GetActivityLogsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        filters: ActivityLogFilters = ActivityLogFilters()
+    ): Result<List<ActivityLog>> {
+        return activityLogRepository.getActivityLogs(filters)
+    }
+}
+
+@Singleton
+class GetActivityLogStatisticsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        startTime: Long? = null,
+        endTime: Long? = null
+    ): Result<ActivityLogStatistics> {
+        return activityLogRepository.getActivityLogStatistics(startTime, endTime)
+    }
+}
+
+@Singleton
+class SearchActivityLogsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        query: String,
+        filters: ActivityLogFilters = ActivityLogFilters()
+    ): Result<List<ActivityLog>> {
+        val searchFilters = filters.copy(searchQuery = query)
+        return activityLogRepository.getActivityLogs(searchFilters)
+    }
+}
+
+@Singleton
+class ExportActivityLogsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        exportOptions: ActivityLogExportOptions
+    ): Result<ActivityLogExportResult> {
+        return activityLogRepository.exportActivityLogs(exportOptions)
+    }
+}
+
+@Singleton
+class DeleteActivityLogsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        filters: ActivityLogFilters
+    ): Result<Long> {
+        return activityLogRepository.deleteActivityLogs(filters)
+    }
+}
+
+@Singleton
+class ArchiveActivityLogsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        filters: ActivityLogFilters
+    ): Result<Long> {
+        return activityLogRepository.archiveActivityLogs(filters)
+    }
+}
+
+@Singleton
+class GetActivityLogDashboardUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(): Result<ActivityLogDashboardData> {
+        return activityLogRepository.getActivityLogDashboardData()
+    }
+}
+
+@Singleton
+class BatchActivityLogOperationUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        operation: ActivityLogBatchOperation
+    ): Result<ActivityLogBatchOperationResult> {
+        return activityLogRepository.performBatchOperation(operation)
+    }
+}
+
+@Singleton
+class CreateActivityLogAlertRuleUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        rule: ActivityLogAlertRule
+    ): Result<ActivityLogAlertRule> {
+        return activityLogRepository.createAlertRule(rule)
+    }
+}
+
+@Singleton
+class GetActivityLogAlertsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        limit: Int = 50
+    ): Result<List<ActivityLogAlert>> {
+        return activityLogRepository.getActivityLogAlerts(limit)
+    }
+}
+
+@Singleton
+class GetActivityLogTagsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(): Result<List<ActivityLogTag>> {
+        return activityLogRepository.getActivityLogTags()
+    }
+}
+
+@Singleton
+class TagActivityLogUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        logId: String,
+        tagIds: List<String>
+    ): Result<ActivityLog> {
+        return activityLogRepository.tagActivityLog(logId, tagIds)
+    }
+}
+
+@Singleton
+class ObserveActivityLogsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    operator fun invoke(
+        filters: ActivityLogFilters = ActivityLogFilters()
+    ): Flow<List<ActivityLog>> {
+        return activityLogRepository.observeActivityLogs(filters)
+    }
+}
+
+@Singleton
+class ObserveActivityLogStatisticsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    operator fun invoke(): Flow<ActivityLogStatistics> {
+        return activityLogRepository.observeActivityLogStatistics()
+    }
+}
+
+@Singleton
+class GetActivityLogRetentionPoliciesUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(): Result<List<ActivityLogRetentionPolicy>> {
+        return activityLogRepository.getActivityLogRetentionPolicies()
+    }
+}
+
+@Singleton
+class UpdateActivityLogRetentionPolicyUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(
+        policy: ActivityLogRetentionPolicy
+    ): Result<ActivityLogRetentionPolicy> {
+        return activityLogRepository.updateRetentionPolicy(policy)
+    }
+}
+
+@Singleton
+class CleanupExpiredActivityLogsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(): Result<Long> {
+        return activityLogRepository.cleanupExpiredLogs()
+    }
+}
+
+@Singleton
+class GetActivityLogHealthMetricsUseCase @Inject constructor(
+    private val activityLogRepository: ActivityLogRepository
+) {
+    suspend operator fun invoke(): Result<SystemHealthMetrics> {
+        return activityLogRepository.getSystemHealthMetrics()
+    }
+}
+
+// Convenience use cases for common logging scenarios
+
+@Singleton
+class LogLoginUseCase @Inject constructor(
+    private val logActivityUseCase: LogActivityUseCase
+) {
+    suspend operator fun invoke(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        success: Boolean,
+        ipAddress: String?,
+        userAgent: String?,
+        deviceId: String?,
+        location: String?,
+        sessionId: String?,
+        errorMessage: String? = null
+    ): Result<ActivityLog> {
+        return logActivityUseCase(
+            userId = userId,
+            userRole = userRole,
+            userName = userName,
+            userEmail = userEmail,
+            action = if (success) ActivityAction.LOGIN else ActivityAction.FAILED_LOGIN,
+            entityType = EntityType.USER,
+            entityId = userId,
+            entityName = userName,
+            description = if (success) "User logged in successfully" else "User login failed",
+            details = mapOf(
+                "success" to success,
+                "sessionId" to sessionId
+            ),
+            ipAddress = ipAddress,
+            userAgent = userAgent,
+            deviceId = deviceId,
+            location = location,
+            sessionId = sessionId,
+            success = success,
+            errorMessage = errorMessage,
+            severity = if (success) LogSeverity.INFO else LogSeverity.WARNING,
+            source = LogSource.MOBILE
+        )
+    }
+}
+
+@Singleton
+class LogLogoutUseCase @Inject constructor(
+    private val logActivityUseCase: LogActivityUseCase
+) {
+    suspend operator fun invoke(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        sessionId: String?,
+        ipAddress: String?,
+        userAgent: String?,
+        deviceId: String?,
+        location: String?
+    ): Result<ActivityLog> {
+        return logActivityUseCase(
+            userId = userId,
+            userRole = userRole,
+            userName = userName,
+            userEmail = userEmail,
+            action = ActivityAction.LOGOUT,
+            entityType = EntityType.USER,
+            entityId = userId,
+            entityName = userName,
+            description = "User logged out",
+            details = mapOf(
+                "sessionId" to sessionId
+            ),
+            ipAddress = ipAddress,
+            userAgent = userAgent,
+            deviceId = deviceId,
+            location = location,
+            sessionId = sessionId,
+            success = true,
+            severity = LogSeverity.INFO,
+            source = LogSource.MOBILE
+        )
+    }
+}
+
+@Singleton
+class LogShipmentCreationUseCase @Inject constructor(
+    private val logActivityUseCase: LogActivityUseCase
+) {
+    suspend operator fun invoke(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        shipmentId: String,
+        shipmentName: String,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String?,
+        userAgent: String?,
+        deviceId: String?,
+        location: String?,
+        sessionId: String?
+    ): Result<ActivityLog> {
+        return logActivityUseCase(
+            userId = userId,
+            userRole = userRole,
+            userName = userName,
+            userEmail = userEmail,
+            action = ActivityAction.SHIPMENT_CREATE,
+            entityType = EntityType.SHIPMENT,
+            entityId = shipmentId,
+            entityName = shipmentName,
+            description = "Shipment created",
+            details = details,
+            ipAddress = ipAddress,
+            userAgent = userAgent,
+            deviceId = deviceId,
+            location = location,
+            sessionId = sessionId,
+            success = true,
+            severity = LogSeverity.INFO,
+            source = LogSource.MOBILE
+        )
+    }
+}
+
+@Singleton
+class LogShipmentStatusUpdateUseCase @Inject constructor(
+    private val logActivityUseCase: LogActivityUseCase
+) {
+    suspend operator fun invoke(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        shipmentId: String,
+        shipmentName: String,
+        oldStatus: String,
+        newStatus: String,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String?,
+        userAgent: String?,
+        deviceId: String?,
+        location: String?,
+        sessionId: String?
+    ): Result<ActivityLog> {
+        return logActivityUseCase(
+            userId = userId,
+            userRole = userRole,
+            userName = userName,
+            userEmail = userEmail,
+            action = ActivityAction.SHIPMENT_STATUS_UPDATE,
+            entityType = EntityType.SHIPMENT,
+            entityId = shipmentId,
+            entityName = shipmentName,
+            description = "Shipment status updated",
+            details = details + mapOf(
+                "oldStatus" to oldStatus,
+                "newStatus" to newStatus
+            ),
+            ipAddress = ipAddress,
+            userAgent = userAgent,
+            deviceId = deviceId,
+            location = location,
+            sessionId = sessionId,
+            success = true,
+            severity = LogSeverity.INFO,
+            source = LogSource.MOBILE
+        )
+    }
+}
+
+@Singleton
+class LogPaymentUseCase @Inject constructor(
+    private val logActivityUseCase: LogActivityUseCase
+) {
+    suspend operator fun invoke(
+        userId: String,
+        userRole: UserRole,
+        userName: String,
+        userEmail: String,
+        paymentId: String,
+        paymentAmount: Double,
+        paymentMethod: String,
+        success: Boolean,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String?,
+        userAgent: String?,
+        deviceId: String?,
+        location: String?,
+        sessionId: String?,
+        errorMessage: String? = null
+    ): Result<ActivityLog> {
+        val action = if (success) ActivityAction.PAYMENT_PROCESS else ActivityAction.PAYMENT_FAILED
+        
+        return logActivityUseCase(
+            userId = userId,
+            userRole = userRole,
+            userName = userName,
+            userEmail = userEmail,
+            action = action,
+            entityType = EntityType.PAYMENT,
+            entityId = paymentId,
+            entityName = "Payment: $paymentAmount",
+            description = if (success) "Payment processed successfully" else "Payment failed",
+            details = details + mapOf(
+                "amount" to paymentAmount,
+                "method" to paymentMethod,
+                "success" to success
+            ),
+            ipAddress = ipAddress,
+            userAgent = userAgent,
+            deviceId = deviceId,
+            location = location,
+            sessionId = sessionId,
+            success = success,
+            errorMessage = errorMessage,
+            severity = if (success) LogSeverity.INFO else LogSeverity.ERROR,
+            source = LogSource.MOBILE
+        )
+    }
+}

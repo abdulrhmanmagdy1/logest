@@ -1,0 +1,624 @@
+package com.edham.logistics.sync
+
+import android.content.Context
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * Sync Status Indicator - Shows sync status in UI
+ */
+class SyncStatusIndicator private constructor(context: Context) {
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: SyncStatusIndicator? = null
+        
+        fun getInstance(context: Context): SyncStatusIndicator {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: SyncStatusIndicator(context).also { INSTANCE = it }
+            }
+        }
+    }
+    
+    private val syncEngine = SyncEngine.getInstance(context)
+    private val backgroundSyncService = BackgroundSyncService.getInstance(context)
+    private val batchProcessor = BatchProcessor.getInstance(context)
+    private val conflictResolver = ConflictResolver.getInstance(context)
+    
+    init {
+        // Initialize indicator
+    }
+    
+    /**
+     * Get current sync status
+     */
+    fun getCurrentSyncStatus(): SyncStatusInfo {
+        val syncState = syncEngine.syncState.value
+        val syncProgress = syncEngine.syncProgress.value
+        val conflictCount = syncEngine.conflictList.value.size
+        val lastSyncTime = backgroundSyncService.lastSyncTime.value
+        
+        return SyncStatusInfo(
+            syncState = syncState,
+            syncProgress = syncProgress,
+            conflictCount = conflictCount,
+            lastSyncTime = lastSyncTime,
+            isBackgroundSyncRunning = backgroundSyncService.isRunning.value,
+            batchQueueSize = batchProcessor.batchQueue.value.size
+        )
+    }
+}
+
+/**
+ * Sync Status Composable
+ */
+@Composable
+fun SyncStatusIndicator(
+    modifier: Modifier = Modifier,
+    showDetails: Boolean = false,
+    compact: Boolean = false
+) {
+    val context = LocalContext.current
+    val indicator = remember { SyncStatusIndicator.getInstance(context) }
+    
+    var syncStatusInfo by remember {
+        mutableStateOf(indicator.getCurrentSyncStatus())
+    }
+    
+    // Update status periodically
+    LaunchedEffect(Unit) {
+        while (true) {
+            syncStatusInfo = indicator.getCurrentSyncStatus()
+            delay(1000) // Update every second
+        }
+    }
+    
+    if (compact) {
+        CompactSyncIndicator(syncStatusInfo, modifier)
+    } else {
+        FullSyncIndicator(syncStatusInfo, modifier, showDetails)
+    }
+}
+
+/**
+ * Compact sync indicator
+ */
+@Composable
+private fun CompactSyncIndicator(
+    statusInfo: SyncStatusInfo,
+    modifier: Modifier = Modifier
+) {
+    val (icon, color, text) = getSyncStatusVisuals(statusInfo.syncState)
+    
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(color.copy(alpha = 0.8f))
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        if (statusInfo.syncState == com.edham.logistics.sync.SyncState.SYNCING) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+                color = Color.White
+            )
+        } else {
+            Icon(
+                imageVector = icon,
+                contentDescription = text,
+                tint = Color.White,
+                modifier = Modifier.size(16.dp)
+            )
+        }
+        
+        Text(
+            text = text,
+            color = Color.White,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+/**
+ * Full sync indicator
+ */
+@Composable
+private fun FullSyncIndicator(
+    statusInfo: SyncStatusInfo,
+    modifier: Modifier = Modifier,
+    showDetails: Boolean = false
+) {
+    val (icon, color, text) = getSyncStatusVisuals(statusInfo.syncState)
+    
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(
+            containerColor = color.copy(alpha = 0.1f)
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (statusInfo.syncState == com.edham.logistics.sync.SyncState.SYNCING) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        strokeWidth = 2.dp,
+                        color = color
+                    )
+                } else {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = text,
+                        tint = color,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+                
+                Column {
+                    Text(
+                        text = text,
+                        color = color,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    if (showDetails) {
+                        Text(
+                            text = getDetailedStatusText(statusInfo),
+                            color = Color.Gray,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+            
+            if (showDetails) {
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                // Progress bar
+                if (statusInfo.syncState == com.edham.logistics.sync.SyncState.SYNCING) {
+                    LinearProgressIndicator(
+                        progress = statusInfo.syncProgress.progressPercentage / 100f,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(2.dp)),
+                        color = color
+                    )
+                    
+                    Spacer(modifier = Modifier.height(4.dp))
+                    
+                    Text(
+                        text = "${statusInfo.syncProgress.currentStep} (${statusInfo.syncProgress.progressPercentage.toInt()}%)",
+                        color = Color.Gray,
+                        fontSize = 11.sp
+                    )
+                }
+                
+                // Status details
+                if (statusInfo.conflictCount > 0) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Conflicts",
+                            tint = Color.Red,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "${statusInfo.conflictCount} conflicts",
+                            color = Color.Red,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+                
+                if (statusInfo.batchQueueSize > 0) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        // Icon(
+                        //     imageVector = Icons.Default.Queue,
+                        //     contentDescription = "Batch Queue",
+                        //     tint = Color.Orange,
+                        //     modifier = Modifier.size(16.dp)
+                        // )
+                        Text(
+                            text = "${statusInfo.batchQueueSize} pending batches",
+                            color = Color(0xFFFFA500), // Orange
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+                
+                if (statusInfo.lastSyncTime > 0) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Last sync: ${formatTimestamp(statusInfo.lastSyncTime)}",
+                        color = Color.Gray,
+                        fontSize = 11.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Sync Status Banner
+ */
+@Composable
+fun SyncStatusBanner(
+    modifier: Modifier = Modifier,
+    onDismiss: (() -> Unit)? = null,
+    onForceSync: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val indicator = remember { SyncStatusIndicator.getInstance(context) }
+    
+    var syncStatusInfo by remember {
+        mutableStateOf(indicator.getCurrentSyncStatus())
+    }
+    
+    LaunchedEffect(Unit) {
+        while (true) {
+            syncStatusInfo = indicator.getCurrentSyncStatus()
+            delay(1000)
+        }
+    }
+    
+    val isVisible = syncStatusInfo.syncState != com.edham.logistics.sync.SyncState.IDLE ||
+                    syncStatusInfo.conflictCount > 0 ||
+                    syncStatusInfo.batchQueueSize > 0
+    
+    AnimatedVisibility(
+        visible = isVisible,
+        enter = slideInVertically() + fadeIn(),
+        exit = slideOutVertically() + fadeOut(),
+        modifier = modifier
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = when (syncStatusInfo.syncState) {
+                    com.edham.logistics.sync.SyncState.ERROR -> Color.Red.copy(alpha = 0.1f)
+                    com.edham.logistics.sync.SyncState.SUCCESS -> Color.Green.copy(alpha = 0.1f)
+                    else -> Color.Blue.copy(alpha = 0.1f)
+                }
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val (icon, color, _) = getSyncStatusVisuals(syncStatusInfo.syncState)
+                        
+                        if (syncStatusInfo.syncState == com.edham.logistics.sync.SyncState.SYNCING) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                strokeWidth = 2.dp,
+                                color = color
+                            )
+                        } else {
+                            Icon(
+                                imageVector = icon,
+                                contentDescription = null,
+                                tint = color,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        
+                        Column {
+                            Text(
+                                text = getSyncStatusTitle(syncStatusInfo),
+                                color = color,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            
+                            Text(
+                                text = getDetailedStatusText(syncStatusInfo),
+                                color = Color.Gray,
+                                fontSize = 14.sp
+                            )
+                        }
+                    }
+                    
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        onForceSync?.let { forceSync ->
+                            IconButton(onClick = forceSync) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Force Sync",
+                                    tint = color
+                                )
+                            }
+                        }
+                        
+                        onDismiss?.let { dismiss ->
+                            IconButton(onClick = dismiss) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Dismiss",
+                                    tint = Color.Gray
+                                )
+                            }
+                        }
+                    }
+                }
+                
+                // Progress bar
+                if (syncStatusInfo.syncState == com.edham.logistics.sync.SyncState.SYNCING) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    LinearProgressIndicator(
+                        progress = syncStatusInfo.syncProgress.progressPercentage / 100f,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(3.dp)),
+                        color = color
+                    )
+                    
+                    Spacer(modifier = Modifier.height(4.dp))
+                    
+                    Text(
+                        text = "${syncStatusInfo.syncProgress.currentStep} (${syncStatusInfo.syncProgress.progressPercentage.toInt()}%)",
+                        color = Color.Gray,
+                        fontSize = 12.sp
+                    )
+                }
+                
+                // Action buttons for conflicts and pending batches
+                if (syncStatusInfo.conflictCount > 0 || syncStatusInfo.batchQueueSize > 0) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (syncStatusInfo.conflictCount > 0) {
+                            OutlinedButton(
+                                onClick = { /* Navigate to conflict resolution */ }
+                            ) {
+                                Text(
+                                    text = "Resolve ${syncStatusInfo.conflictCount} Conflicts",
+                                    color = Color.Red
+                                )
+                            }
+                        }
+                        
+                        if (syncStatusInfo.batchQueueSize > 0) {
+                            OutlinedButton(
+                                onClick = { /* Navigate to batch queue */ }
+                            ) {
+                                Text(
+                                    text = "View ${syncStatusInfo.batchQueueSize} Pending"
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Floating Sync Status
+ */
+@Composable
+fun FloatingSyncStatus(
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val indicator = remember { SyncStatusIndicator.getInstance(context) }
+    
+    var syncStatusInfo by remember {
+        mutableStateOf(indicator.getCurrentSyncStatus())
+    }
+    
+    LaunchedEffect(Unit) {
+        while (true) {
+            syncStatusInfo = indicator.getCurrentSyncStatus()
+            delay(1000)
+        }
+    }
+    
+    val isVisible = syncStatusInfo.syncState != com.edham.logistics.sync.SyncState.IDLE ||
+                    syncStatusInfo.conflictCount > 0 ||
+                    syncStatusInfo.batchQueueSize > 0
+    
+    AnimatedVisibility(
+        visible = isVisible,
+        enter = scaleIn() + fadeIn(),
+        exit = scaleOut() + fadeOut(),
+        modifier = modifier
+    ) {
+        Box(
+            contentAlignment = Alignment.TopEnd
+        ) {
+            Card(
+                modifier = Modifier
+                    .padding(16.dp)
+                    .clip(RoundedCornerShape(50)),
+                colors = CardDefaults.cardColors(
+                    containerColor = when (syncStatusInfo.syncState) {
+                        com.edham.logistics.sync.SyncState.ERROR -> Color.Red
+                        com.edham.logistics.sync.SyncState.SUCCESS -> Color.Green
+                        com.edham.logistics.sync.SyncState.SYNCING -> Color.Blue
+                        else -> Color.Gray
+                    }
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (syncStatusInfo.syncState == com.edham.logistics.sync.SyncState.SYNCING) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = Color.White
+                        )
+                    } else {
+                        val (icon, _, _) = getSyncStatusVisuals(syncStatusInfo.syncState)
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    
+                    // Show badge count for conflicts or pending batches
+                    val badgeCount = syncStatusInfo.conflictCount + syncStatusInfo.batchQueueSize
+                    if (badgeCount > 0) {
+                        Badge {
+                            Text(
+                                text = badgeCount.toString(),
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Helper functions
+ */
+private fun getSyncStatusVisuals(syncState: com.edham.logistics.sync.SyncState): Triple<ImageVector, Color, String> {
+    return when (syncState) {
+        com.edham.logistics.sync.SyncState.IDLE -> Triple(
+            Icons.Default.CheckCircle, // CloudDone not available, use CheckCircle
+            Color.Gray,
+            "Synced"
+        )
+        com.edham.logistics.sync.SyncState.SYNCING -> Triple(
+            Icons.Default.Refresh, // Sync not available, use Refresh
+            Color.Blue,
+            "Syncing"
+        )
+        com.edham.logistics.sync.SyncState.SUCCESS -> Triple(
+            Icons.Default.CheckCircle,
+            Color.Green,
+            "Sync Complete"
+        )
+        com.edham.logistics.sync.SyncState.ERROR -> Triple(
+            Icons.Default.Warning, // ErrorOutline not available
+            Color.Red,
+            "Sync Failed"
+        )
+        com.edham.logistics.sync.SyncState.CANCELLED -> Triple(
+            Icons.Default.Close, // Cancel not available, use Close
+            Color(0xFFFFA500), // Orange
+            "Sync Cancelled"
+        )
+    }
+}
+
+private fun getSyncStatusTitle(statusInfo: SyncStatusInfo): String {
+    return when (statusInfo.syncState) {
+        com.edham.logistics.sync.SyncState.IDLE -> "Sync Complete"
+        com.edham.logistics.sync.SyncState.SYNCING -> "Syncing Data"
+        com.edham.logistics.sync.SyncState.SUCCESS -> "Sync Successful"
+        com.edham.logistics.sync.SyncState.ERROR -> "Sync Failed"
+        com.edham.logistics.sync.SyncState.CANCELLED -> "Sync Cancelled"
+    }
+}
+
+private fun getDetailedStatusText(statusInfo: SyncStatusInfo): String {
+    return when (statusInfo.syncState) {
+        com.edham.logistics.sync.SyncState.IDLE -> {
+            if (statusInfo.lastSyncTime > 0) {
+                "Last sync: ${formatTimestamp(statusInfo.lastSyncTime)}"
+            } else {
+                "Ready to sync"
+            }
+        }
+        com.edham.logistics.sync.SyncState.SYNCING -> {
+            "${statusInfo.syncProgress.currentStep} (${statusInfo.syncProgress.progressPercentage.toInt()}%)"
+        }
+        com.edham.logistics.sync.SyncState.SUCCESS -> {
+            "All data synchronized successfully"
+        }
+        com.edham.logistics.sync.SyncState.ERROR -> {
+            "Sync encountered an error"
+        }
+        com.edham.logistics.sync.SyncState.CANCELLED -> {
+            "Sync was cancelled"
+        }
+    }
+}
+
+private fun formatTimestamp(timestamp: Long): String {
+    val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
+    return sdf.format(Date(timestamp))
+}
+
+/**
+ * Data classes
+ */
+data class SyncStatusInfo(
+    val syncState: com.edham.logistics.sync.SyncState,
+    val syncProgress: com.edham.logistics.sync.SyncProgress,
+    val conflictCount: Int,
+    val lastSyncTime: Long,
+    val isBackgroundSyncRunning: Boolean,
+    val batchQueueSize: Int
+)

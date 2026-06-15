@@ -1,0 +1,841 @@
+package com.edham.logistics.feature.coldchain.data.repository
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.core.utils.TokenManager
+import com.edham.logistics.feature.coldchain.data.api.ColdChainApiService
+import com.edham.logistics.feature.coldchain.data.database.ColdChainDatabase
+import com.edham.logistics.feature.coldchain.data.service.ColdChainWebSocketService
+import com.edham.logistics.feature.coldchain.domain.model.*
+import com.edham.logistics.feature.coldchain.domain.repository.ColdChainRepository
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class ColdChainRepositoryImpl @Inject constructor(
+    private val coldChainApiService: ColdChainApiService,
+    private val coldChainDatabase: ColdChainDatabase,
+    private val coldChainWebSocketService: ColdChainWebSocketService,
+    private val tokenManager: TokenManager
+) : ColdChainRepository {
+
+    override suspend fun startColdChainMonitoring(request: StartColdChainMonitoringRequest): Result<ColdChainShipment> {
+        return try {
+            val response = coldChainApiService.startColdChainMonitoring(request)
+            if (response.isSuccessful) {
+                response.body()?.let { coldChainShipment ->
+                    // Save to local database
+                    coldChainDatabase.coldChainDao().insertColdChainShipment(coldChainShipment.toEntity())
+                    Result.Success(coldChainShipment)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to start cold chain monitoring: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun stopColdChainMonitoring(shipmentId: String): Result<Unit> {
+        return try {
+            val response = coldChainApiService.stopColdChainMonitoring(shipmentId)
+            if (response.isSuccessful) {
+                // Update local database
+                coldChainDatabase.coldChainDao().updateShipmentStatus(
+                    shipmentId,
+                    ColdChainStatus.OFFLINE.name
+                )
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to stop cold chain monitoring: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun pauseColdChainMonitoring(shipmentId: String): Result<Unit> {
+        return try {
+            val response = coldChainApiService.pauseColdChainMonitoring(shipmentId)
+            if (response.isSuccessful) {
+                coldChainDatabase.coldChainDao().updateShipmentStatus(
+                    shipmentId,
+                    ColdChainStatus.MAINTENANCE.name
+                )
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to pause cold chain monitoring: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun resumeColdChainMonitoring(shipmentId: String): Result<Unit> {
+        return try {
+            val response = coldChainApiService.resumeColdChainMonitoring(shipmentId)
+            if (response.isSuccessful) {
+                coldChainDatabase.coldChainDao().updateShipmentStatus(
+                    shipmentId,
+                    ColdChainStatus.NORMAL.name
+                )
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to resume cold chain monitoring: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateTemperature(request: UpdateTemperatureRequest): Result<TemperatureReading> {
+        return try {
+            val response = coldChainApiService.updateTemperature(request)
+            if (response.isSuccessful) {
+                response.body()?.let { temperatureReading ->
+                    // Save to local database
+                    coldChainDatabase.coldChainDao().insertTemperatureReading(temperatureReading.toEntity())
+                    Result.Success(temperatureReading)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update temperature: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun batchUpdateTemperatures(requests: List<UpdateTemperatureRequest>): Result<List<TemperatureReading>> {
+        return try {
+            val response = coldChainApiService.batchUpdateTemperatures(requests)
+            if (response.isSuccessful) {
+                response.body()?.let { temperatureReadings ->
+                    // Save to local database
+                    temperatureReadings.forEach { reading ->
+                        coldChainDatabase.coldChainDao().insertTemperatureReading(reading.toEntity())
+                    }
+                    Result.Success(temperatureReadings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to batch update temperatures: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getColdChainStatus(request: GetColdChainStatusRequest): Result<List<ColdChainShipment>> {
+        return try {
+            val response = coldChainApiService.getColdChainStatus(request)
+            if (response.isSuccessful) {
+                response.body()?.let { coldChainShipments ->
+                    Result.Success(coldChainShipments)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get cold chain status: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getShipmentColdChainStatus(shipmentId: String): Result<ColdChainShipment> {
+        return try {
+            // Try local database first
+            val localShipment = coldChainDatabase.coldChainDao().getColdChainShipment(shipmentId)
+            if (localShipment != null) {
+                return Result.Success(localShipment.toDomainModel())
+            }
+
+            // Fetch from API if not in local database
+            val response = coldChainApiService.getShipmentColdChainStatus(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { coldChainShipment ->
+                    // Save to local database
+                    coldChainDatabase.coldChainDao().insertColdChainShipment(coldChainShipment.toEntity())
+                    Result.Success(coldChainShipment)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get shipment cold chain status: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeShipmentColdChainStatus(shipmentId: String): Flow<Result<ColdChainShipment>> {
+        return flow {
+            try {
+                // Emit local data first
+                val localShipment = coldChainDatabase.coldChainDao().getColdChainShipment(shipmentId)
+                if (localShipment != null) {
+                    emit(Result.Success(localShipment.toDomainModel()))
+                }
+
+                // Listen for WebSocket updates
+                coldChainWebSocketService.messageFlow.collect { message ->
+                    if (message.shipmentId == shipmentId) {
+                        when (message.type) {
+                            ColdChainMessageType.TEMPERATURE_UPDATE,
+                            ColdChainMessageType.ALERT_TRIGGERED,
+                            ColdChainMessageType.ALERT_RESOLVED -> {
+                                // Refresh local data
+                                val updatedShipment = coldChainDatabase.coldChainDao().getColdChainShipment(shipmentId)
+                                updatedShipment?.let {
+                                    emit(Result.Success(it.toDomainModel()))
+                                }
+                            }
+                            else -> {}
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getCustomerColdChainStatus(customerId: String): Result<List<ColdChainShipment>> {
+        return try {
+            val response = coldChainApiService.getCustomerColdChainStatus(customerId)
+            if (response.isSuccessful) {
+                response.body()?.let { coldChainShipments ->
+                    Result.Success(coldChainShipments)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get customer cold chain status: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getDriverColdChainStatus(driverId: String): Result<List<ColdChainShipment>> {
+        return try {
+            val response = coldChainApiService.getDriverColdChainStatus(driverId)
+            if (response.isSuccessful) {
+                response.body()?.let { coldChainShipments ->
+                    Result.Success(coldChainShipments)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get driver cold chain status: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getTemperatureHistory(request: GetTemperatureHistoryRequest): Result<TemperatureHistory> {
+        return try {
+            val response = coldChainApiService.getTemperatureHistory(request)
+            if (response.isSuccessful) {
+                response.body()?.let { temperatureHistory ->
+                    Result.Success(temperatureHistory)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get temperature history: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeTemperatureHistory(shipmentId: String): Flow<Result<TemperatureHistory>> {
+        return flow {
+            try {
+                coldChainWebSocketService.messageFlow.collect { message ->
+                    if (message.shipmentId == shipmentId) {
+                        when (message.type) {
+                            ColdChainMessageType.TEMPERATURE_UPDATE -> {
+                                // Refresh temperature history
+                                val response = coldChainApiService.getTemperatureHistory(
+                                    GetTemperatureHistoryRequest(
+                                        shipmentId = shipmentId,
+                                        startTime = null,
+                                        endTime = null,
+                                        includeAlerts = true
+                                    )
+                                )
+                                if (response.isSuccessful) {
+                                    response.body()?.let { history ->
+                                        emit(Result.Success(history))
+                                    }
+                                }
+                            }
+                            else -> {}
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getCustomerTemperatureHistory(customerId: String, limit: Int): Result<List<TemperatureHistory>> {
+        return try {
+            val response = coldChainApiService.getCustomerTemperatureHistory(customerId, limit)
+            if (response.isSuccessful) {
+                response.body()?.let { temperatureHistories ->
+                    Result.Success(temperatureHistories)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get customer temperature history: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getShipmentTemperatureSummary(shipmentId: String): Result<TemperatureSummary> {
+        return try {
+            val response = coldChainApiService.getShipmentTemperatureSummary(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { summary ->
+                    Result.Success(summary)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get shipment temperature summary: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun createTemperatureAlert(request: CreateAlertRequest): Result<TemperatureAlert> {
+        return try {
+            val response = coldChainApiService.createTemperatureAlert(request)
+            if (response.isSuccessful) {
+                response.body()?.let { alert ->
+                    // Save to local database
+                    coldChainDatabase.coldChainDao().insertTemperatureAlert(alert.toEntity())
+                    Result.Success(alert)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to create temperature alert: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun resolveTemperatureAlert(request: ResolveAlertRequest): Result<TemperatureAlert> {
+        return try {
+            val response = coldChainApiService.resolveTemperatureAlert(request)
+            if (response.isSuccessful) {
+                response.body()?.let { alert ->
+                    // Update local database
+                    coldChainDatabase.coldChainDao().updateAlertResolved(
+                        request.alertId,
+                        true,
+                        System.currentTimeMillis(),
+                        request.resolvedBy
+                    )
+                    Result.Success(alert)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to resolve temperature alert: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getActiveAlerts(shipmentId: String?): Result<List<TemperatureAlert>> {
+        return try {
+            val response = coldChainApiService.getActiveAlerts(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { alerts ->
+                    Result.Success(alerts)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get active alerts: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getAlertHistory(shipmentId: String, limit: Int): Result<List<TemperatureAlert>> {
+        return try {
+            val response = coldChainApiService.getAlertHistory(shipmentId, limit)
+            if (response.isSuccessful) {
+                response.body()?.let { alerts ->
+                    Result.Success(alerts)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get alert history: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeAlerts(shipmentId: String): Flow<Result<List<TemperatureAlert>>> {
+        return flow {
+            try {
+                coldChainWebSocketService.messageFlow.collect { message ->
+                    if (message.shipmentId == shipmentId) {
+                        when (message.type) {
+                            ColdChainMessageType.ALERT_TRIGGERED,
+                            ColdChainMessageType.ALERT_RESOLVED -> {
+                                // Refresh alerts
+                                val response = coldChainApiService.getActiveAlerts(shipmentId)
+                                if (response.isSuccessful) {
+                                    response.body()?.let { alerts ->
+                                        emit(Result.Success(alerts))
+                                    }
+                                }
+                            }
+                            else -> {}
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getComplianceReport(shipmentId: String): Result<ComplianceReport> {
+        return try {
+            val response = coldChainApiService.getComplianceReport(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { report ->
+                    Result.Success(report)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get compliance report: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getCustomerComplianceReports(customerId: String, period: String): Result<List<ComplianceReport>> {
+        return try {
+            val response = coldChainApiService.getCustomerComplianceReports(customerId, period)
+            if (response.isSuccessful) {
+                response.body()?.let { reports ->
+                    Result.Success(reports)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get customer compliance reports: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getFleetComplianceReports(period: String): Result<List<ComplianceReport>> {
+        return try {
+            val response = coldChainApiService.getFleetComplianceReports(period)
+            if (response.isSuccessful) {
+                response.body()?.let { reports ->
+                    Result.Success(reports)
+                } ?: Result.Success(emptyList())
+            } else {
+                Result.Error(Exception("Failed to get fleet compliance reports: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun generateColdChainReport(shipmentId: String, format: ReportFormat): Result<String> {
+        return try {
+            val response = coldChainApiService.generateColdChainReport(shipmentId, format)
+            if (response.isSuccessful) {
+                response.body()?.let { reportUrl ->
+                    Result.Success(reportUrl)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to generate cold chain report: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getPredictiveAnalysis(shipmentId: String): Result<PredictiveAnalysis> {
+        return try {
+            val response = coldChainApiService.getPredictiveAnalysis(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { analysis ->
+                    Result.Success(analysis)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get predictive analysis: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observePredictiveAlerts(): Flow<Result<PredictiveAnalysis>> {
+        return flow {
+            try {
+                coldChainWebSocketService.messageFlow.collect { message ->
+                    when (message.type) {
+                        ColdChainMessageType.PREDICTIVE_ALERT -> {
+                            // Handle predictive alerts
+                            val analysis = message.data as PredictiveAnalysis
+                            emit(Result.Success(analysis))
+                        }
+                        else -> {}
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getSensorInfo(sensorId: String): Result<SensorInfo> {
+        return try {
+            val response = coldChainApiService.getSensorInfo(sensorId)
+            if (response.isSuccessful) {
+                response.body()?.let { sensorInfo ->
+                    Result.Success(sensorInfo)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get sensor info: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateSensorCalibration(sensorId: String, calibrationData: Map<String, Any>): Result<SensorInfo> {
+        return try {
+            val response = coldChainApiService.updateSensorCalibration(sensorId, calibrationData)
+            if (response.isSuccessful) {
+                response.body()?.let { sensorInfo ->
+                    Result.Success(sensorInfo)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update sensor calibration: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getSensorStatus(sensorId: String): Result<SensorStatus> {
+        return try {
+            val response = coldChainApiService.getSensorStatus(sensorId)
+            if (response.isSuccessful) {
+                response.body()?.let { status ->
+                    Result.Success(status)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get sensor status: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeSensorStatus(sensorId: String): Flow<Result<SensorStatus>> {
+        return flow {
+            try {
+                coldChainWebSocketService.messageFlow.collect { message ->
+                    if (message.sensorId == sensorId) {
+                        when (message.type) {
+                            ColdChainMessageType.SENSOR_OFFLINE,
+                            ColdChainMessageType.BATTERY_LOW,
+                            ColdChainMessageType.CALIBRATION_REQUIRED -> {
+                                // Refresh sensor status
+                                val response = coldChainApiService.getSensorStatus(sensorId)
+                                if (response.isSuccessful) {
+                                    response.body()?.let { status ->
+                                        emit(Result.Success(status))
+                                    }
+                                }
+                            }
+                            else -> {}
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                emit(Result.Error(e))
+            }
+        }
+    }
+
+    override suspend fun getColdChainSettings(shipmentId: String): Result<ColdChainSettings> {
+        return try {
+            val response = coldChainApiService.getColdChainSettings(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { settings ->
+                    Result.Success(settings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get cold chain settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateColdChainSettings(request: UpdateColdChainSettingsRequest): Result<ColdChainSettings> {
+        return try {
+            val response = coldChainApiService.updateColdChainSettings(request)
+            if (response.isSuccessful) {
+                response.body()?.let { settings ->
+                    Result.Success(settings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update cold chain settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getDefaultColdChainSettings(): Result<ColdChainSettings> {
+        return try {
+            val response = coldChainApiService.getDefaultColdChainSettings()
+            if (response.isSuccessful) {
+                response.body()?.let { settings ->
+                    Result.Success(settings)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get default cold chain settings: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun connectToColdChainWebSocket(): Result<Unit> {
+        return try {
+            val token = tokenManager.getAccessToken()
+            if (token != null) {
+                coldChainWebSocketService.connect(token)
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("No access token available"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun disconnectFromColdChainWebSocket(): Result<Unit> {
+        return try {
+            coldChainWebSocketService.disconnect()
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun observeColdChainMessages(): Flow<Result<ColdChainWebSocketMessage>> {
+        return coldChainWebSocketService.messageFlow.map { message ->
+            Result.Success(message)
+        }
+    }
+
+    override suspend fun sendColdChainMessage(message: ColdChainWebSocketMessage): Result<Unit> {
+        return try {
+            coldChainWebSocketService.sendMessage(message)
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getColdChainStatistics(shipmentId: String): Result<Map<String, Any>> {
+        return try {
+            val response = coldChainApiService.getColdChainStatistics(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { statistics ->
+                    Result.Success(statistics)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get cold chain statistics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getFleetColdChainStatistics(period: String): Result<Map<String, Any>> {
+        return try {
+            val response = coldChainApiService.getFleetColdChainStatistics(period)
+            if (response.isSuccessful) {
+                response.body()?.let { statistics ->
+                    Result.Success(statistics)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get fleet cold chain statistics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getCustomerColdChainStatistics(customerId: String, period: String): Result<Map<String, Any>> {
+        return try {
+            val response = coldChainApiService.getCustomerColdChainStatistics(customerId, period)
+            if (response.isSuccessful) {
+                response.body()?.let { statistics ->
+                    Result.Success(statistics)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get customer cold chain statistics: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getTemperatureThreshold(cargoType: CargoType): Result<TemperatureThreshold> {
+        return try {
+            val response = coldChainApiService.getTemperatureThreshold(cargoType)
+            if (response.isSuccessful) {
+                response.body()?.let { threshold ->
+                    Result.Success(threshold)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get temperature threshold: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun updateTemperatureThreshold(cargoType: CargoType, threshold: TemperatureThreshold): Result<TemperatureThreshold> {
+        return try {
+            val response = coldChainApiService.updateTemperatureThreshold(cargoType, threshold)
+            if (response.isSuccessful) {
+                response.body()?.let { updatedThreshold ->
+                    Result.Success(updatedThreshold)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to update temperature threshold: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getCustomThreshold(shipmentId: String): Result<TemperatureThreshold> {
+        return try {
+            val response = coldChainApiService.getCustomThreshold(shipmentId)
+            if (response.isSuccessful) {
+                response.body()?.let { threshold ->
+                    Result.Success(threshold)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get custom threshold: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun setCustomThreshold(shipmentId: String, threshold: TemperatureThreshold): Result<TemperatureThreshold> {
+        return try {
+            val response = coldChainApiService.setCustomThreshold(shipmentId, threshold)
+            if (response.isSuccessful) {
+                response.body()?.let { updatedThreshold ->
+                    Result.Success(updatedThreshold)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to set custom threshold: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun acknowledgeAlert(alertId: String, userId: String): Result<Unit> {
+        return try {
+            val response = coldChainApiService.acknowledgeAlert(alertId, userId)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to acknowledge alert: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun escalateAlert(alertId: String, reason: String): Result<Unit> {
+        return try {
+            val response = coldChainApiService.escalateAlert(alertId, reason)
+            if (response.isSuccessful) {
+                Result.Success(Unit)
+            } else {
+                Result.Error(Exception("Failed to escalate alert: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun getAlertTrends(period: String): Result<Map<String, Any>> {
+        return try {
+            val response = coldChainApiService.getAlertTrends(period)
+            if (response.isSuccessful) {
+                response.body()?.let { trends ->
+                    Result.Success(trends)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to get alert trends: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun exportTemperatureData(shipmentId: String, format: ExportFormat, dateRange: DateRange): Result<String> {
+        return try {
+            val response = coldChainApiService.exportTemperatureData(shipmentId, format, dateRange)
+            if (response.isSuccessful) {
+                response.body()?.let { exportUrl ->
+                    Result.Success(exportUrl)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to export temperature data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun exportComplianceData(customerId: String, format: ExportFormat, dateRange: DateRange): Result<String> {
+        return try {
+            val response = coldChainApiService.exportComplianceData(customerId, format, dateRange)
+            if (response.isSuccessful) {
+                response.body()?.let { exportUrl ->
+                    Result.Success(exportUrl)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to export compliance data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+
+    override suspend fun exportAlertData(format: ExportFormat, dateRange: DateRange): Result<String> {
+        return try {
+            val response = coldChainApiService.exportAlertData(format, dateRange)
+            if (response.isSuccessful) {
+                response.body()?.let { exportUrl ->
+                    Result.Success(exportUrl)
+                } ?: Result.Error(Exception("Empty response"))
+            } else {
+                Result.Error(Exception("Failed to export alert data: ${response.code()}"))
+            }
+        } catch (e: Exception) {
+            Result.Error(e)
+        }
+    }
+}

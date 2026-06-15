@@ -1,0 +1,349 @@
+package com.edham.logistics.core.auth
+
+import android.content.Context
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import com.edham.logistics.auth.AuthenticationManager
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlin.coroutines.CoroutineScope
+import kotlin.coroutines.Dispatchers
+import kotlin.coroutines.launch
+
+/**
+ * Centralized Token Refresh Manager
+ * Handles automatic token refresh without affecting UI state
+ * Provides retry logic and error handling
+ */
+@Singleton
+class TokenRefreshManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val authenticationManager: AuthenticationManager
+) {
+    
+    private val coroutineScope = CoroutineScope(Dispatchers.IO)
+    
+    private val _refreshState = MutableStateFlow<TokenRefreshState>(TokenRefreshState.Idle)
+    val refreshState: StateFlow<TokenRefreshState> = _refreshState.asStateFlow()
+    
+    private val _refreshMetrics = MutableStateFlow<TokenRefreshMetrics>(TokenRefreshMetrics())
+    val refreshMetrics: StateFlow<TokenRefreshMetrics> = _refreshMetrics.asStateFlow()
+    
+    private val isRefreshing = AtomicBoolean(false)
+    private val lastRefreshTime = AtomicLong(0)
+    private val refreshSuccessCount = AtomicLong(0)
+    private val refreshFailureCount = AtomicLong(0)
+    
+    private val encryptedPrefs by lazy {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .setBlockModes(arrayOf(MasterKey.BlockMode.GCM))
+            .setEncryptionPaddings(arrayOf(MasterKey.EncryptionPadding.PKCS7_PADDING))
+            .setUserAuthenticationRequired(false)
+            .build()
+        
+        EncryptedSharedPreferences.create(
+            context,
+            "token_refresh_prefs",
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+    
+    init {
+        Timber.d("TokenRefreshManager initialized")
+        loadRefreshMetrics()
+        startAutomaticRefreshMonitoring()
+    }
+    
+    /**
+     * Start automatic refresh monitoring
+     */
+    private fun startAutomaticRefreshMonitoring() {
+        coroutineScope.launch {
+            while (true) {
+                try {
+                    checkAndRefreshIfNeeded()
+                    kotlinx.coroutines.delay(60000) // Check every minute
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in automatic refresh monitoring")
+                    kotlinx.coroutines.delay(300000) // Wait 5 minutes on error
+                }
+            }
+        }
+    }
+    
+    /**
+     * Check if token refresh is needed and perform it
+     */
+    private fun checkAndRefreshIfNeeded() {
+        if (!authenticationManager.hasValidToken()) {
+            Timber.d("No valid token, initiating refresh")
+            performTokenRefresh()
+        } else {
+            val tokenExpiryTime = getTokenExpiryTime()
+            val currentTime = System.currentTimeMillis()
+            val timeUntilExpiry = tokenExpiryTime - currentTime
+            
+            // Refresh 5 minutes before expiry
+            if (timeUntilExpiry <= 5 * 60 * 1000) {
+                Timber.d("Token expires soon, initiating refresh")
+                performTokenRefresh()
+            }
+        }
+    }
+    
+    /**
+     * Perform token refresh with retry logic
+     */
+    fun performTokenRefresh() {
+        if (isRefreshing.compareAndSet(false, true)) {
+            coroutineScope.launch {
+                try {
+                    _refreshState.value = TokenRefreshState.Refreshing
+                    lastRefreshTime.set(System.currentTimeMillis())
+                    
+                    Timber.d("Starting token refresh")
+                    
+                    val refreshResult = authenticationManager.refreshToken()
+                    
+                    refreshResult.onSuccess { success ->
+                        if (success) {
+                            _refreshState.value = TokenRefreshState.Success
+                            refreshSuccessCount.incrementAndGet()
+                            updateRefreshMetrics()
+                            Timber.d("Token refresh successful")
+                        } else {
+                            _refreshState.value = TokenRefreshState.Failed("Refresh returned false")
+                            refreshFailureCount.incrementAndGet()
+                            updateRefreshMetrics()
+                            scheduleRetry()
+                            Timber.w("Token refresh failed - refresh returned false")
+                        }
+                    }
+                    
+                    refreshResult.onFailure { error ->
+                        _refreshState.value = TokenRefreshState.Failed(error.message ?: "Unknown error")
+                        refreshFailureCount.incrementAndGet()
+                        updateRefreshMetrics()
+                        scheduleRetry()
+                        Timber.e(error, "Token refresh failed")
+                    }
+                    
+                } catch (e: Exception) {
+                    _refreshState.value = TokenRefreshState.Failed(e.message ?: "Exception occurred")
+                    refreshFailureCount.incrementAndGet()
+                    updateRefreshMetrics()
+                    scheduleRetry()
+                    Timber.e(e, "Exception during token refresh")
+                } finally {
+                    isRefreshing.set(false)
+                    kotlinx.coroutines.delay(2000)
+                    _refreshState.value = TokenRefreshState.Idle
+                }
+            }
+        } else {
+            Timber.d("Token refresh already in progress")
+        }
+    }
+    
+    /**
+     * Schedule retry with exponential backoff
+     */
+    private fun scheduleRetry() {
+        val failureCount = refreshFailureCount.get()
+        val delayMs = calculateRetryDelay(failureCount)
+        
+        Timber.d("Scheduling retry in ${delayMs}ms (failure count: $failureCount)")
+        
+        coroutineScope.launch {
+            kotlinx.coroutines.delay(delayMs)
+            if (failureCount < 5) {
+                performTokenRefresh()
+            } else {
+                _refreshState.value = TokenRefreshState.Failed("Too many retry attempts")
+                Timber.e("Too many retry attempts, stopping automatic refresh")
+            }
+        }
+    }
+    
+    /**
+     * Calculate retry delay with exponential backoff
+     */
+    private fun calculateRetryDelay(failureCount: Long): Long {
+        return when (failureCount) {
+            1L -> 5000L      // 5 seconds
+            2L -> 15000L     // 15 seconds
+            3L -> 45000L     // 45 seconds
+            4L -> 120000L    // 2 minutes
+            else -> 300000L   // 5 minutes
+        }
+    }
+    
+    /**
+     * Get token expiry time
+     */
+    private fun getTokenExpiryTime(): Long {
+        return encryptedPrefs.getLong("token_expiry", 0)
+    }
+    
+    /**
+     * Update refresh metrics
+     */
+    private fun updateRefreshMetrics() {
+        val metrics = TokenRefreshMetrics(
+            lastRefreshTime = lastRefreshTime.get(),
+            successCount = refreshSuccessCount.get(),
+            failureCount = refreshFailureCount.get(),
+            successRate = calculateSuccessRate(),
+            averageRetryDelay = calculateAverageRetryDelay()
+        )
+        
+        _refreshMetrics.value = metrics
+        
+        // Persist metrics
+        encryptedPrefs.edit()
+            .putLong("last_refresh_time", metrics.lastRefreshTime)
+            .putLong("refresh_success_count", metrics.successCount)
+            .putLong("refresh_failure_count", metrics.failureCount)
+            .apply()
+    }
+    
+    /**
+     * Load refresh metrics from storage
+     */
+    private fun loadRefreshMetrics() {
+        val lastRefreshTime = encryptedPrefs.getLong("last_refresh_time", 0)
+        val successCount = encryptedPrefs.getLong("refresh_success_count", 0)
+        val failureCount = encryptedPrefs.getLong("refresh_failure_count", 0)
+        
+        this.lastRefreshTime.set(lastRefreshTime)
+        this.refreshSuccessCount.set(successCount)
+        this.refreshFailureCount.set(failureCount)
+        
+        val metrics = TokenRefreshMetrics(
+            lastRefreshTime = lastRefreshTime,
+            successCount = successCount,
+            failureCount = failureCount,
+            successRate = calculateSuccessRate(),
+            averageRetryDelay = calculateAverageRetryDelay()
+        )
+        
+        _refreshMetrics.value = metrics
+        Timber.d("Refresh metrics loaded: $metrics")
+    }
+    
+    /**
+     * Calculate success rate
+     */
+    private fun calculateSuccessRate(): Double {
+        val total = refreshSuccessCount.get() + refreshFailureCount.get()
+        return if (total > 0) {
+            (refreshSuccessCount.get().toDouble() / total) * 100
+        } else {
+            0.0
+        }
+    }
+    
+    /**
+     * Calculate average retry delay
+     */
+    private fun calculateAverageRetryDelay(): Long {
+        val failureCount = refreshFailureCount.get()
+        return if (failureCount > 0) {
+            // Simplified calculation based on failure patterns
+            when (failureCount) {
+                1L -> 5000L
+                2L -> 10000L
+                3L -> 21667L
+                4L -> 46250L
+                else -> 75000L
+            }
+        } else {
+            0L
+        }
+    }
+    
+    /**
+     * Force manual token refresh
+     */
+    fun forceRefresh() {
+        Timber.d("Manual token refresh requested")
+        performTokenRefresh()
+    }
+    
+    /**
+     * Check if refresh is in progress
+     */
+    fun isRefreshing(): Boolean {
+        return isRefreshing.get()
+    }
+    
+    /**
+     * Get current refresh state
+     */
+    fun getCurrentRefreshState(): TokenRefreshState {
+        return _refreshState.value
+    }
+    
+    /**
+     * Get current refresh metrics
+     */
+    fun getCurrentRefreshMetrics(): TokenRefreshMetrics {
+        return _refreshMetrics.value
+    }
+    
+    /**
+     * Reset refresh manager
+     */
+    fun reset() {
+        coroutineScope.launch {
+            isRefreshing.set(false)
+            lastRefreshTime.set(0)
+            refreshSuccessCount.set(0)
+            refreshFailureCount.set(0)
+            _refreshState.value = TokenRefreshState.Idle
+            updateRefreshMetrics()
+            
+            // Clear persisted metrics
+            encryptedPrefs.edit()
+                .remove("last_refresh_time")
+                .remove("refresh_success_count")
+                .remove("refresh_failure_count")
+                .apply()
+            
+            Timber.d("TokenRefreshManager reset")
+        }
+    }
+}
+
+/**
+ * Token Refresh State
+ */
+sealed class TokenRefreshState {
+    object Idle : TokenRefreshState()
+    object Refreshing : TokenRefreshState()
+    object Success : TokenRefreshState()
+    data class Failed(val error: String) : TokenRefreshState()
+}
+
+/**
+ * Token Refresh Metrics
+ */
+data class TokenRefreshMetrics(
+    val lastRefreshTime: Long = 0,
+    val successCount: Long = 0,
+    val failureCount: Long = 0,
+    val successRate: Double = 0.0,
+    val averageRetryDelay: Long = 0
+) {
+    val totalAttempts: Long get() = successCount + failureCount
+    val isHealthy: Boolean get() = successRate >= 80.0 && totalAttempts > 0
+}

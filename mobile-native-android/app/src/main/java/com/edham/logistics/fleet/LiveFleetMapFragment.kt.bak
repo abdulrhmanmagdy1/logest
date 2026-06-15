@@ -1,0 +1,539 @@
+package com.edham.logistics.fleet
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentLiveFleetMapBinding
+import com.edham.logistics.fleet.adapters.LiveVehicleAdapter
+import com.edham.logistics.fleet.models.LiveVehicle
+import com.edham.logistics.fleet.viewmodels.LiveFleetMapViewModel
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.OnMapReadyCallback
+import com.google.android.gms.maps.SupportMapFragment
+import com.google.android.gms.maps.model.BitmapDescriptorFactory
+import com.google.android.gms.maps.model.LatLng
+import com.google.android.gms.maps.model.LatLngBounds
+import com.google.android.gms.maps.model.Marker
+import com.google.android.gms.maps.model.MarkerOptions
+import com.google.android.material.bottomsheet.BottomSheetBehavior
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * Live Fleet Map Fragment - Real-time fleet tracking map
+ * 
+ * Features:
+ * - Real-time vehicle positions
+ * - Interactive map controls
+ * - Vehicle filtering
+ * - Live status updates
+ * - Route visualization
+ * - Geofence boundaries
+ * - Traffic layer
+ */
+class LiveFleetMapFragment @Inject constructor(
+    private val liveVehicleAdapter: LiveVehicleAdapter
+) : Fragment(), OnMapReadyCallback {
+
+    private var _binding: FragmentLiveFleetMapBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: LiveFleetMapViewModel
+    private lateinit var googleMap: GoogleMap
+    private var vehicleMarkers = mutableMapOf<String, Marker>()
+    private var isMapReady = false
+    
+    private lateinit var filterBottomSheetBehavior: BottomSheetBehavior<View>
+    
+    companion object {
+        private const val LOCATION_PERMISSION_REQUEST_CODE = 1001
+        private const val DEFAULT_ZOOM = 12f
+        private const val ANIMATION_DURATION = 500L
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentLiveFleetMapBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupMap()
+        setupRecyclerView()
+        setupFilterBottomSheet()
+        setupClickListeners()
+        observeViewModel()
+        
+        // Check permissions and initialize
+        checkLocationPermission()
+    }
+
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[LiveFleetMapViewModel::class.java]
+    }
+
+    private fun setupMap() {
+        val mapFragment = childFragmentManager
+            .findFragmentById(R.id.map) as SupportMapFragment
+        mapFragment.getMapAsync(this)
+    }
+
+    private fun setupRecyclerView() {
+        binding.rvVehicleList.apply {
+            layoutManager = androidx.recyclerview.widget.LinearLayoutManager(context)
+            adapter = liveVehicleAdapter
+            isNestedScrollingEnabled = false
+        }
+    }
+
+    private fun setupFilterBottomSheet() {
+        filterBottomSheetBehavior = BottomSheetBehavior.from(binding.bottomSheetFilter)
+        filterBottomSheetBehavior.state = BottomSheetBehavior.STATE_HIDDEN
+        
+        // Set peek height for collapsed state
+        filterBottomSheetBehavior.peekHeight = 0
+        filterBottomSheetBehavior.isHideable = true
+    }
+
+    private fun setupClickListeners() {
+        // Search functionality
+        binding.etSearch.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH) {
+                performSearch(binding.etSearch.text.toString())
+                true
+            }
+            false
+        }
+
+        // Filter button
+        binding.btnFilter.setOnClickListener {
+            showFilterBottomSheet()
+        }
+
+        // Map controls
+        binding.fabCurrentLocation.setOnClickListener {
+            centerMapOnCurrentLocation()
+        }
+
+        binding.fabMapType.setOnClickListener {
+            toggleMapType()
+        }
+
+        binding.fabTraffic.setOnClickListener {
+            toggleTrafficLayer()
+        }
+
+        binding.fabHeatmap.setOnClickListener {
+            toggleHeatmap()
+        }
+
+        // Fleet status panel
+        binding.btnExpandCollapse.setOnClickListener {
+            toggleFleetStatusPanel()
+        }
+
+        // Filter controls
+        binding.btnCloseFilter.setOnClickListener {
+            hideFilterBottomSheet()
+        }
+
+        binding.btnApplyFilter.setOnClickListener {
+            applyFilters()
+        }
+
+        // Chip groups
+        setupChipListeners()
+    }
+
+    private fun setupChipListeners() {
+        // Status chips
+        binding.chipGroupStatus.setOnCheckedStateChangeListener { group, checkedId ->
+            val selectedStatuses = mutableListOf<String>()
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as com.google.android.material.chip.Chip
+                if (chip.isChecked) {
+                    selectedStatuses.add(chip.text.toString())
+                }
+            }
+            viewModel.updateStatusFilter(selectedStatuses)
+        }
+
+        // Type chips
+        binding.chipGroupType.setOnCheckedStateChangeListener { group, checkedId ->
+            val selectedTypes = mutableListOf<String>()
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as com.google.android.material.chip.Chip
+                if (chip.isChecked) {
+                    selectedTypes.add(chip.text.toString())
+                }
+            }
+            viewModel.updateTypeFilter(selectedTypes)
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.mapState.collect { state ->
+                when (state) {
+                    is LiveFleetMapState.Loading -> {
+                        showLoadingState()
+                    }
+                    is LiveFleetMapState.Success -> {
+                        hideLoadingState()
+                        updateMapWithVehicles(state.vehicles)
+                    }
+                    is LiveFleetMapState.Error -> {
+                        hideLoadingState()
+                        showError(state.message)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.fleetStats.collect { stats ->
+                updateFleetStats(stats)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.liveVehicles.collect { vehicles ->
+                liveVehicleAdapter.submitList(vehicles)
+                if (isMapReady) {
+                    updateVehicleMarkers(vehicles)
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.currentTime.collect { time ->
+                binding.tvLiveTime.text = "تحديث: $time"
+            }
+        }
+    }
+
+    override fun onMapReady(map: GoogleMap) {
+        googleMap = map
+        isMapReady = true
+        
+        setupMapSettings(map)
+        centerMapOnDefaultLocation()
+        
+        // Load initial data
+        viewModel.loadFleetData()
+    }
+
+    private fun setupMapSettings(map: GoogleMap) {
+        map.uiSettings.isZoomControlsEnabled = false
+        map.uiSettings.isCompassEnabled = true
+        map.uiSettings.isMyLocationButtonEnabled = false
+        map.uiSettings.isMapToolbarEnabled = false
+        
+        // Set map style
+        map.setMapStyle(com.google.android.gms.maps.model.MapStyleOptions(
+            resources.getString(R.string.map_style_dark)
+        ))
+        
+        // Enable location layer if permissions granted
+        if (hasLocationPermission()) {
+            try {
+                map.isMyLocationEnabled = true
+            } catch (e: SecurityException) {
+                // Handle case where permission is granted but still throws exception
+            }
+        }
+    }
+
+    private fun centerMapOnDefaultLocation() {
+        // Center on Riyadh, Saudi Arabia
+        val defaultLocation = LatLng(24.7136, 46.6753)
+        googleMap.moveCamera(CameraUpdateFactory.newLatLngZoom(defaultLocation, DEFAULT_ZOOM))
+    }
+
+    private fun centerMapOnCurrentLocation() {
+        if (hasLocationPermission()) {
+            googleMap.isMyLocationEnabled = true
+            googleMap.setOnMyLocationButtonClickListener {
+                // Custom location button handling
+                true
+            }
+        } else {
+            requestLocationPermission()
+        }
+    }
+
+    private fun toggleMapType() {
+        val currentType = googleMap.mapType
+        googleMap.mapType = when (currentType) {
+            GoogleMap.MAP_TYPE_NORMAL -> GoogleMap.MAP_TYPE_SATELLITE
+            GoogleMap.MAP_TYPE_SATELLITE -> GoogleMap.MAP_TYPE_HYBRID
+            GoogleMap.MAP_TYPE_HYBRID -> GoogleMap.MAP_TYPE_TERRAIN
+            GoogleMap.MAP_TYPE_TERRAIN -> GoogleMap.MAP_TYPE_NORMAL
+            else -> GoogleMap.MAP_TYPE_NORMAL
+        }
+        
+        // Update button icon
+        updateMapTypeIcon()
+    }
+
+    private fun toggleTrafficLayer() {
+        val isTrafficEnabled = googleMap.isTrafficEnabled
+        googleMap.isTrafficEnabled = !isTrafficEnabled
+        
+        // Update button tint
+        binding.fabTraffic.setColorFilter(
+            ContextCompat.getColor(
+                requireContext(),
+                if (isTrafficEnabled) R.color.white_60 else R.color.primary_blue
+            )
+        )
+    }
+
+    private fun toggleHeatmap() {
+        viewModel.toggleHeatmap()
+        
+        // Update button tint
+        binding.fabHeatmap.setColorFilter(
+            ContextCompat.getColor(
+                requireContext(),
+                if (viewModel.isHeatmapEnabled()) R.color.primary_blue else R.color.white_60
+            )
+        )
+    }
+
+    private fun updateMapWithVehicles(vehicles: List<LiveVehicle>) {
+        if (!isMapReady) return
+        
+        updateVehicleMarkers(vehicles)
+        adjustMapBounds(vehicles)
+    }
+
+    private fun updateVehicleMarkers(vehicles: List<LiveVehicle>) {
+        // Clear existing markers
+        vehicleMarkers.values.forEach { it.remove() }
+        vehicleMarkers.clear()
+        
+        // Add new markers
+        vehicles.forEach { vehicle ->
+            if (vehicle.latitude != 0.0 && vehicle.longitude != 0.0) {
+                val position = LatLng(vehicle.latitude, vehicle.longitude)
+                val marker = googleMap.addMarker(
+                    MarkerOptions()
+                        .position(position)
+                        .title(vehicle.vehicleIdString)
+                        .snippet(getVehicleSnippet(vehicle))
+                        .icon(getVehicleIcon(vehicle))
+                        .anchor(0.5f, 0.5f)
+                )
+                
+                vehicleMarkers[vehicle.vehicleIdString] = marker
+            }
+        }
+    }
+
+    private fun getVehicleSnippet(vehicle: LiveVehicle): String {
+        return """
+            الحالة: ${vehicle.status}
+            السرعة: ${vehicle.speed} كم/س
+            الوقود: ${vehicle.fuelLevel}%
+            """.trimIndent()
+    }
+
+    private fun getVehicleIcon(vehicle: LiveVehicle): BitmapDescriptor? {
+        val iconRes = when (vehicle.status.lowercase()) {
+            "active", "نشط" -> R.drawable.ic_truck_active
+            "idle", "متوقف" -> R.drawable.ic_truck_idle
+            "maintenance", "صيانة" -> R.drawable.ic_truck_maintenance
+            "offline", "غير متصل" -> R.drawable.ic_truck_offline
+            else -> R.drawable.ic_truck
+        }
+        
+        return BitmapDescriptorFactory.fromResource(requireContext(), iconRes)
+    }
+
+    private fun adjustMapBounds(vehicles: List<LiveVehicle>) {
+        if (vehicles.isEmpty()) return
+        
+        val builder = LatLngBounds.Builder()
+        vehicles.forEach { vehicle ->
+            if (vehicle.latitude != 0.0 && vehicle.longitude != 0.0) {
+                builder.include(LatLng(vehicle.latitude, vehicle.longitude))
+            }
+        }
+        
+        try {
+            val bounds = builder.build()
+            val padding = resources.getDimensionPixelSize(R.dimen.map_padding)
+            googleMap.animateCamera(CameraUpdateFactory.newLatLngBounds(bounds, padding))
+        } catch (e: Exception) {
+            // Handle case where bounds are invalid
+        }
+    }
+
+    private fun updateFleetStats(stats: FleetStats) {
+        binding.tvOnlineCount.text = stats.onlineCount.toString()
+        binding.tvTransitCount.text = stats.transitCount.toString()
+        binding.tvIdleCount.text = stats.idleCount.toString()
+        
+        // Animate number changes
+        animateNumberChange(binding.tvOnlineCount, stats.onlineCount.toString())
+        animateNumberChange(binding.tvTransitCount, stats.transitCount.toString())
+        animateNumberChange(binding.tvIdleCount, stats.idleCount.toString())
+    }
+
+    private fun animateNumberChange(textView: android.widget.TextView, newValue: String) {
+        // Simple animation for number changes
+        textView.animate()
+            .scaleX(1.2f)
+            .scaleY(1.2f)
+            .setDuration(100)
+            .withEndAction {
+                textView.text = newValue
+                textView.animate()
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(100)
+                    .start()
+            }
+            .start()
+    }
+
+    private fun toggleFleetStatusPanel() {
+        val isExpanded = binding.cardFleetStatus.layoutParams.height > ViewGroup.LayoutParams.WRAP_CONTENT
+        
+        if (isExpanded) {
+            // Collapse
+            binding.rvVehicleList.visibility = View.GONE
+            binding.tvExpandText.text = "عرض الكل"
+            binding.ivExpandIcon.setImageResource(R.drawable.ic_expand_more)
+        } else {
+            // Expand
+            binding.rvVehicleList.visibility = View.VISIBLE
+            binding.tvExpandText.text = "طي"
+            binding.ivExpandIcon.setImageResource(R.drawable.ic_expand_less)
+        }
+    }
+
+    private fun showFilterBottomSheet() {
+        filterBottomSheetBehavior.state = BottomSheetBehavior.STATE_EXPANDED
+    }
+
+    private fun hideFilterBottomSheet() {
+        filterBottomSheetBehavior.state = BottomSheetBehavior.STATE_HIDDEN
+    }
+
+    private fun applyFilters() {
+        hideFilterBottomSheet()
+        viewModel.applyFilters()
+    }
+
+    private fun performSearch(query: String) {
+        viewModel.searchVehicles(query)
+    }
+
+    private fun updateMapTypeIcon() {
+        val iconRes = when (googleMap.mapType) {
+            GoogleMap.MAP_TYPE_NORMAL -> R.drawable.ic_map
+            GoogleMap.MAP_TYPE_SATELLITE -> R.drawable.ic_satellite
+            GoogleMap.MAP_TYPE_HYBRID -> R.drawable.ic_layers
+            GoogleMap.MAP_TYPE_TERRAIN -> R.drawable.ic_terrain
+            else -> R.drawable.ic_map
+        }
+        binding.fabMapType.setImageResource(iconRes)
+    }
+
+    private fun showLoadingState() {
+        binding.layoutLoading.visibility = View.VISIBLE
+    }
+
+    private fun hideLoadingState() {
+        binding.layoutLoading.visibility = View.GONE
+    }
+
+    private fun showError(message: String) {
+        Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
+    }
+
+    private fun checkLocationPermission() {
+        if (hasLocationPermission()) {
+            enableLocationFeatures()
+        } else {
+            requestLocationPermission()
+        }
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            requireContext(),
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestLocationPermission() {
+        ActivityCompat.requestPermissions(
+            requireActivity(),
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+            LOCATION_PERMISSION_REQUEST_CODE
+        )
+    }
+
+    private fun enableLocationFeatures() {
+        if (isMapReady) {
+            try {
+                googleMap.isMyLocationEnabled = true
+            } catch (e: SecurityException) {
+                // Handle permission exception
+            }
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        
+        when (requestCode) {
+            LOCATION_PERMISSION_REQUEST_CODE -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    enableLocationFeatures()
+                } else {
+                    Toast.makeText(
+                        requireContext(),
+                        "Location permission required for this feature",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh data when fragment becomes visible
+        viewModel.refreshFleetData()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

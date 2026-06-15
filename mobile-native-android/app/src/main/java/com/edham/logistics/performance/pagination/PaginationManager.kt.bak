@@ -1,0 +1,504 @@
+package com.edham.logistics.performance.pagination
+
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Pagination Manager - Efficient data pagination with intelligent caching
+ * Implements preloading, infinite scrolling, and performance optimization
+ */
+
+@Singleton
+class PaginationManager @Inject constructor() {
+
+    private val paginationScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val paginationCache = ConcurrentHashMap<String, PaginationCache<*>>()
+    private val preloadingJobs = ConcurrentHashMap<String, Job>()
+    
+    // Performance metrics
+    private val totalPageRequests = AtomicLong(0)
+    private val cacheHits = AtomicLong(0)
+    private val preloadHits = AtomicLong(0)
+    private val averageLoadTime = AtomicLong(0)
+    
+    // Configuration
+    private val defaultPageSize = 20
+    private val maxCacheSize = 50 // pages
+    private val preloadDistance = 2 // preload 2 pages ahead
+    private val cacheExpiryTime = 15 * 60 * 1000L // 15 minutes
+    
+    /**
+     * Load a page of data with pagination
+     */
+    suspend fun <T> loadPage(
+        paginationKey: String,
+        page: Int,
+        pageSize: Int = defaultPageSize,
+        loader: suspend (Int, Int) -> Result<List<T>>
+    ): Result<PagedResult<T>> {
+        totalPageRequests.incrementAndGet()
+        val startTime = System.currentTimeMillis()
+        
+        return try {
+            // Check cache first
+            val cacheKey = "${paginationKey}_page_$page"
+            val cached = paginationCache[cacheKey] as? PaginationCache<T>
+            
+            if (cached != null && !cached.isExpired()) {
+                cacheHits.incrementAndGet()
+                cached.lastAccessed = System.currentTimeMillis()
+                return Result.success(cached.data)
+            }
+            
+            // Load data from source
+            val result = loader(page, pageSize)
+            if (result.isSuccess) {
+                val data = result.getOrThrow()
+                val pagedResult = PagedResult(
+                    data = data,
+                    currentPage = page,
+                    pageSize = pageSize,
+                    totalCount = data.size, // This would be updated with actual total count
+                    hasNext = data.size == pageSize,
+                    hasPrevious = page > 0
+                )
+                
+                // Cache the result
+                val cacheEntry = PaginationCache(
+                    data = pagedResult,
+                    loadedAt = startTime,
+                    lastAccessed = startTime,
+                    loadTime = System.currentTimeMillis() - startTime
+                )
+                
+                paginationCache[cacheKey] = cacheEntry
+                manageCacheSize(paginationKey)
+                
+                // Trigger preloading
+                triggerPreloading(paginationKey, page, pageSize, loader)
+                
+                // Update metrics
+                val loadTime = System.currentTimeMillis() - startTime
+                updateAverageLoadTime(loadTime)
+                
+                Result.success(pagedResult)
+            } else {
+                Result.failure(result.exceptionOrNull() ?: Exception("Unknown error"))
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error loading page $page for $paginationKey")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Load pages with infinite scrolling
+     */
+    suspend fun <T> loadInfinitePages(
+        paginationKey: String,
+        startPage: Int = 0,
+        pageSize: Int = defaultPageSize,
+        loader: suspend (Int, Int) -> Result<List<T>>
+    ): Flow<PagedResult<T>> = flow {
+        var currentPage = startPage
+        
+        while (true) {
+            val result = loadPage(paginationKey, currentPage, pageSize, loader)
+            if (result.isSuccess) {
+                emit(result.getOrThrow())
+                
+                if (!result.getOrThrow().hasNext) {
+                    break
+                }
+                
+                currentPage++
+            } else {
+                break
+            }
+        }
+    }.flowOn(Dispatchers.IO)
+    
+    /**
+     * Preload next pages
+     */
+    suspend fun <T> preloadNextPage(
+        paginationKey: String,
+        currentPage: Int,
+        pageSize: Int = defaultPageSize,
+        loader: suspend (Int, Int) -> Result<List<T>>
+    ) {
+        val nextPage = currentPage + 1
+        val cacheKey = "${paginationKey}_page_$nextPage"
+        
+        if (!paginationCache.containsKey(cacheKey)) {
+            preloadingJobs[paginationKey]?.cancel()
+            
+            val job = paginationScope.async {
+                delay(100) // Small delay to not interfere with current loading
+                loadPage(paginationKey, nextPage, pageSize, loader)
+            }
+            
+            preloadingJobs[paginationKey] = job
+        }
+    }
+    
+    /**
+     * Preload multiple pages ahead
+     */
+    suspend fun <T> preloadPagesAhead(
+        paginationKey: String,
+        currentPage: Int,
+        pagesAhead: Int = preloadDistance,
+        pageSize: Int = defaultPageSize,
+        loader: suspend (Int, Int) -> Result<List<T>>
+    ) {
+        for (i in 1..pagesAhead) {
+            preloadNextPage(paginationKey, currentPage + i, pageSize, loader)
+        }
+    }
+    
+    /**
+     * Clear pagination cache for specific key
+     */
+    fun <T> clearCache(paginationKey: String) {
+        val keysToRemove = paginationCache.keys.filter { it.startsWith("${paginationKey}_") }
+        keysToRemove.forEach { key ->
+            paginationCache.remove(key)
+        }
+        
+        preloadingJobs[paginationKey]?.cancel()
+        preloadingJobs.remove(paginationKey)
+    }
+    
+    /**
+     * Clear all pagination cache
+     */
+    fun clearAllCache() {
+        paginationCache.clear()
+        preloadingJobs.values.forEach { it.cancel() }
+        preloadingJobs.clear()
+    }
+    
+    /**
+     * Get pagination statistics
+     */
+    fun getPaginationStats(): PaginationStats {
+        val totalCachedPages = paginationCache.size
+        val expiredPages = paginationCache.values.count { it.isExpired() }
+        val memoryUsage = paginationCache.values.sumOf { it.estimateSize() }
+        val preloadingJobsCount = preloadingJobs.size
+        
+        return PaginationStats(
+            totalPageRequests = totalPageRequests.get(),
+            cacheHits = cacheHits.get(),
+            preloadHits = preloadHits.get(),
+            averageLoadTime = averageLoadTime.get(),
+            totalCachedPages = totalCachedPages,
+            expiredPages = expiredPages,
+            memoryUsage = memoryUsage,
+            preloadingJobsCount = preloadingJobsCount,
+            hitRate = if (totalPageRequests.get() > 0) {
+                cacheHits.get().toDouble() / totalPageRequests.get()
+            } else 0.0
+        )
+    }
+    
+    /**
+     * Check if page is cached
+     */
+    fun <T> isPageCached(paginationKey: String, page: Int): Boolean {
+        val cacheKey = "${paginationKey}_page_$page"
+        val cached = paginationCache[cacheKey] as? PaginationCache<T>
+        return cached != null && !cached.isExpired()
+    }
+    
+    /**
+     * Get cached page without loading
+     */
+    fun <T> getCachedPage(paginationKey: String, page: Int): PagedResult<T>? {
+        val cacheKey = "${paginationKey}_page_$page"
+        val cached = paginationCache[cacheKey] as? PaginationCache<T>
+        
+        return if (cached != null && !cached.isExpired()) {
+            cached.lastAccessed = System.currentTimeMillis()
+            cached.data
+        } else {
+            null
+        }
+    }
+    
+    /**
+     * Set up intelligent preloading strategy
+     */
+    fun setupIntelligentPreloading(strategy: PreloadStrategy) {
+        when (strategy) {
+            PreloadStrategy.AGGRESSIVE -> {
+                // Preload more pages ahead
+                // This would be implemented based on the strategy
+            }
+            PreloadStrategy.CONSERVATIVE -> {
+                // Preload fewer pages to save memory
+                // This would be implemented based on the strategy
+            }
+            PreloadStrategy.ADAPTIVE -> {
+                // Adjust preloading based on user behavior
+                // This would be implemented based on the strategy
+            }
+        }
+    }
+    
+    /**
+     * Optimize pagination for performance
+     */
+    suspend fun <T> optimizePagination(
+        paginationKey: String,
+        optimization: PaginationOptimization
+    ): Result<PaginationOptimizationResult> {
+        return try {
+            when (optimization) {
+                PaginationOptimization.CACHE_CLEANUP -> {
+                    cleanupExpiredCache()
+                    Result.success(PaginationOptimizationResult(true, "Cache cleaned up"))
+                }
+                PaginationOptimization.PRELOAD_ADJUSTMENT -> {
+                    adjustPreloadingStrategy(paginationKey)
+                    Result.success(PaginationOptimizationResult(true, "Preloading adjusted"))
+                }
+                PaginationOptimization.MEMORY_OPTIMIZATION -> {
+                    optimizeMemoryUsage()
+                    Result.success(PaginationOptimizationResult(true, "Memory optimized"))
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error optimizing pagination for $paginationKey")
+            Result.failure(e)
+        }
+    }
+    
+    // Private methods
+    
+    private fun <T> manageCacheSize(paginationKey: String) {
+        val keyPrefix = "${paginationKey}_"
+        val cachedPages = paginationCache.filter { it.key.startsWith(keyPrefix) }
+        
+        if (cachedPages.size > maxCacheSize) {
+            // Remove least recently used pages
+            val sortedPages = cachedPages.entries.sortedBy { it.value.lastAccessed }
+            val pagesToRemove = sortedPages.take(cachedPages.size - maxCacheSize)
+            
+            pagesToRemove.forEach { (key, _) ->
+                paginationCache.remove(key)
+            }
+        }
+    }
+    
+    private suspend fun <T> triggerPreloading(
+        paginationKey: String,
+        currentPage: Int,
+        pageSize: Int,
+        loader: suspend (Int, Int) -> Result<List<T>>
+    ) {
+        // Preload next pages if cache hit rate is high
+        val stats = getPaginationStats()
+        if (stats.hitRate > 0.7) { // 70% cache hit rate
+            preloadPagesAhead(paginationKey, currentPage, preloadDistance, pageSize, loader)
+        }
+    }
+    
+    private fun updateAverageLoadTime(loadTime: Long) {
+        val current = averageLoadTime.get()
+        val newAverage = (current + loadTime) / 2
+        averageLoadTime.set(newAverage)
+    }
+    
+    private suspend fun cleanupExpiredCache() {
+        val currentTime = System.currentTimeMillis()
+        val expiredKeys = paginationCache.filter { 
+            currentTime - it.value.loadedAt > cacheExpiryTime 
+        }.keys
+        
+        expiredKeys.forEach { key ->
+            paginationCache.remove(key)
+        }
+    }
+    
+    private suspend fun adjustPreloadingStrategy(paginationKey: String) {
+        val stats = getPaginationStats()
+        
+        // Adjust preloading based on performance
+        if (stats.memoryUsage > 50 * 1024 * 1024L) { // 50MB
+            // Reduce preloading to save memory
+            preloadingJobs[paginationKey]?.cancel()
+        } else if (stats.hitRate < 0.5) { // 50% hit rate
+            // Increase preloading to improve hit rate
+            // This would trigger more aggressive preloading
+        }
+    }
+    
+    private suspend fun optimizeMemoryUsage() {
+        // Remove least recently used pages
+        val sortedPages = paginationCache.entries.sortedBy { it.value.lastAccessed }
+        val pagesToRemove = sortedPages.take(paginationCache.size / 4) // Remove 25%
+        
+        pagesToRemove.forEach { (key, _) ->
+            paginationCache.remove(key)
+        }
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): PaginationPerformanceMetrics {
+        val stats = getPaginationStats()
+        
+        return PaginationPerformanceMetrics(
+            totalRequests = stats.totalPageRequests,
+            cacheHits = stats.cacheHits,
+            cacheMisses = stats.totalPageRequests - stats.cacheHits,
+            preloadHits = stats.preloadHits,
+            averageLoadTime = stats.averageLoadTime,
+            memoryUsage = stats.memoryUsage,
+            cachedPages = stats.totalCachedPages,
+            preloadingJobs = stats.preloadingJobsCount,
+            hitRate = stats.hitRate
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalPageRequests.set(0)
+        cacheHits.set(0)
+        preloadHits.set(0)
+        averageLoadTime.set(0)
+    }
+    
+    /**
+     * Stop pagination manager
+     */
+    fun stop() {
+        paginationScope.cancel()
+        clearAllCache()
+    }
+}
+
+/**
+ * Pagination Cache Entry
+ */
+data class PaginationCache<T>(
+    val data: PagedResult<T>,
+    val loadedAt: Long,
+    var lastAccessed: Long,
+    val loadTime: Long
+) {
+    fun isExpired(): Boolean {
+        return System.currentTimeMillis() - loadedAt > 15 * 60 * 1000L // 15 minutes
+    }
+    
+    fun estimateSize(): Long {
+        return data.data.size * 1024L // Estimate 1KB per item
+    }
+}
+
+/**
+ * Paged Result
+ */
+data class PagedResult<T>(
+    val data: List<T>,
+    val currentPage: Int,
+    val pageSize: Int,
+    val totalCount: Int,
+    val hasNext: Boolean,
+    val hasPrevious: Boolean = currentPage > 0
+)
+
+/**
+ * Preload Strategy
+ */
+enum class PreloadStrategy {
+    AGGRESSIVE,     // Preload many pages ahead
+    CONSERVATIVE,   // Preload fewer pages
+    ADAPTIVE        // Adjust based on performance
+}
+
+/**
+ * Pagination Optimization
+ */
+enum class PaginationOptimization {
+    CACHE_CLEANUP,       // Clean expired cache entries
+    PRELOAD_ADJUSTMENT,  // Adjust preloading strategy
+    MEMORY_OPTIMIZATION  // Optimize memory usage
+}
+
+/**
+ * Pagination Optimization Result
+ */
+data class PaginationOptimizationResult(
+    val success: Boolean,
+    val message: String
+)
+
+/**
+ * Pagination Statistics
+ */
+data class PaginationStats(
+    val totalPageRequests: Long,
+    val cacheHits: Long,
+    val preloadHits: Long,
+    val averageLoadTime: Long,
+    val totalCachedPages: Int,
+    val expiredPages: Int,
+    val memoryUsage: Long,
+    val preloadingJobsCount: Int,
+    val hitRate: Double
+)
+
+/**
+ * Pagination Performance Metrics
+ */
+data class PaginationPerformanceMetrics(
+    val totalRequests: Long,
+    val cacheHits: Long,
+    val cacheMisses: Long,
+    val preloadHits: Long,
+    val averageLoadTime: Long,
+    val memoryUsage: Long,
+    val cachedPages: Int,
+    val preloadingJobs: Int,
+    val hitRate: Double
+) {
+    val missRate: Double get() = if (totalRequests > 0) cacheMisses.toDouble() / totalRequests else 0.0
+    val preloadHitRate: Double get() = if (totalRequests > 0) preloadHits.toDouble() / totalRequests else 0.0
+    val cacheEfficiency: Double get() = hitRate * 100 // Percentage
+}
+
+/**
+ * Pagination State for UI
+ */
+data class PaginationState(
+    val isLoading: Boolean = false,
+    val currentPage: Int = 0,
+    val hasNext: Boolean = false,
+    val hasPrevious: Boolean = false,
+    val totalCount: Int = 0,
+    val error: String? = null
+)
+
+/**
+ * Pagination Configuration
+ */
+data class PaginationConfig(
+    val pageSize: Int = 20,
+    val preloadDistance: Int = 2,
+    val maxCacheSize: Int = 50,
+    val cacheExpiryTime: Long = 15 * 60 * 1000L, // 15 minutes
+    val enablePreloading: Boolean = true,
+    val preloadStrategy: PreloadStrategy = PreloadStrategy.ADAPTIVE
+)

@@ -1,0 +1,633 @@
+package com.edham.logistics.fleet
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import com.edham.logistics.R
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.VehicleEntity
+import com.edham.logistics.data.remote.api.FleetApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.*
+import timber.log.Timber
+import javax.inject.Inject
+
+/**
+ * Vehicle Monitoring Service - Background service for continuous vehicle monitoring
+ * 
+ * Features:
+ * - Real-time vehicle status monitoring
+ * - Location tracking and updates
+ * - Health monitoring and alerts
+ * - Fuel level monitoring
+ * - Maintenance scheduling
+ * - Performance tracking
+ * - Emergency alerts
+ * - Background data synchronization
+ */
+@AndroidEntryPoint
+class VehicleMonitoringService : Service() {
+
+    @Inject
+    lateinit var database: EdhamDatabase
+
+    @Inject
+    lateinit var fleetApi: FleetApi
+
+    @Inject
+    lateinit var liveTrackingManager: LiveTrackingManager
+
+    @Inject
+    lateinit var networkUtils: NetworkUtils
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var monitoringJob: Job? = null
+    private var isMonitoring = false
+
+    companion object {
+        private const val TAG = "VehicleMonitoringService"
+        private const val NOTIFICATION_CHANNEL_ID = "vehicle_monitoring_channel"
+        private const val NOTIFICATION_ID = 1001
+        private const val MONITORING_INTERVAL = 30000L // 30 seconds
+        private const val LOCATION_UPDATE_INTERVAL = 60000L // 1 minute
+        private const val HEALTH_CHECK_INTERVAL = 300000L // 5 minutes
+        private const val FUEL_CHECK_INTERVAL = 600000L // 10 minutes
+
+        fun startService(context: Context) {
+            val intent = Intent(context, VehicleMonitoringService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun stopService(context: Context) {
+            val intent = Intent(context, VehicleMonitoringService::class.java)
+            context.stopService(intent)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        Timber.d("VehicleMonitoringService created")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            "START_MONITORING" -> startMonitoring()
+            "STOP_MONITORING" -> stopMonitoring()
+            "UPDATE_VEHICLE_STATUS" -> {
+                val vehicleId = intent.getLongExtra("vehicle_id", -1)
+                val status = intent.getStringExtra("status")
+                if (vehicleId != -1L && status != null) {
+                    updateVehicleStatus(vehicleId, status)
+                }
+            }
+            "EMERGENCY_ALERT" -> {
+                val vehicleId = intent.getLongExtra("vehicle_id", -1)
+                val alertType = intent.getStringExtra("alert_type")
+                val message = intent.getStringExtra("message")
+                if (vehicleId != -1L && alertType != null && message != null) {
+                    handleEmergencyAlert(vehicleId, alertType, message)
+                }
+            }
+        }
+
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startMonitoring() {
+        if (isMonitoring) {
+            Timber.d("Monitoring already started")
+            return
+        }
+
+        isMonitoring = true
+        startForeground(NOTIFICATION_ID, createNotification())
+
+        monitoringJob = serviceScope.launch {
+            Timber.d("Starting vehicle monitoring")
+
+            // Initialize monitoring components
+            initializeMonitoring()
+
+            // Start continuous monitoring loops
+            launch { monitorVehicleStatus() }
+            launch { monitorVehicleLocations() }
+            launch { monitorVehicleHealth() }
+            launch { monitorFuelLevels() }
+            launch { syncWithServer() }
+            launch { checkMaintenanceSchedule() }
+        }
+    }
+
+    private fun stopMonitoring() {
+        if (!isMonitoring) {
+            Timber.d("Monitoring not started")
+            return
+        }
+
+        isMonitoring = false
+        monitoringJob?.cancel()
+        stopForeground(true)
+        stopSelf()
+
+        Timber.d("Vehicle monitoring stopped")
+    }
+
+    private suspend fun initializeMonitoring() {
+        try {
+            // Load all vehicles
+            val vehicles = database.vehicleDao().getAllVehicles()
+            Timber.d("Loaded ${vehicles.size} vehicles for monitoring")
+
+            // Initialize tracking for active vehicles
+            vehicles.filter { it.status == com.edham.logistics.fleet.VehicleStatus.IN_USE }
+                .forEach { vehicle ->
+                    liveTrackingManager.startTracking(vehicle.id)
+                }
+
+            // Initialize monitoring data
+            initializeMonitoringData(vehicles)
+
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to initialize monitoring")
+        }
+    }
+
+    private suspend fun monitorVehicleStatus() {
+        while (isMonitoring) {
+            try {
+                val vehicles = database.vehicleDao().getAllVehicles()
+                
+                vehicles.forEach { vehicle ->
+                    // Check for status changes
+                    val currentStatus = vehicle.status
+                    val monitoredStatus = getMonitoredStatus(vehicle.id)
+                    
+                    if (currentStatus != monitoredStatus) {
+                        handleStatusChange(vehicle.id, currentStatus, monitoredStatus)
+                    }
+
+                    // Check for anomalies
+                    checkForAnomalies(vehicle)
+                }
+
+                delay(MONITORING_INTERVAL)
+
+            } catch (e: Exception) {
+                Timber.e(e, "Error in vehicle status monitoring")
+                delay(MONITORING_INTERVAL)
+            }
+        }
+    }
+
+    private suspend fun monitorVehicleLocations() {
+        while (isMonitoring) {
+            try {
+                val activeVehicles = database.vehicleDao()
+                    .getVehiclesByStatus(com.edham.logistics.fleet.VehicleStatus.IN_USE)
+
+                activeVehicles.forEach { vehicle ->
+                    // Get latest location from tracking manager
+                    val location = liveTrackingManager.getLatestLocation(vehicle.id)
+                    
+                    if (location != null) {
+                        // Update vehicle location in database
+                        updateVehicleLocation(vehicle.id, location)
+                        
+                        // Check for geofence violations
+                        checkGeofenceViolations(vehicle, location)
+                        
+                        // Check for unusual locations
+                        checkUnusualLocations(vehicle, location)
+                    }
+                }
+
+                delay(LOCATION_UPDATE_INTERVAL)
+
+            } catch (e: Exception) {
+                Timber.e(e, "Error in location monitoring")
+                delay(LOCATION_UPDATE_INTERVAL)
+            }
+        }
+    }
+
+    private suspend fun monitorVehicleHealth() {
+        while (isMonitoring) {
+            try {
+                val vehicles = database.vehicleDao().getAllVehicles()
+                
+                vehicles.forEach { vehicle ->
+                    // Check engine health
+                    val engineHealth = checkEngineHealth(vehicle)
+                    
+                    // Check tire health
+                    val tireHealth = checkTireHealth(vehicle)
+                    
+                    // Check battery health
+                    val batteryHealth = checkBatteryHealth(vehicle)
+                    
+                    // Calculate overall health score
+                    val healthScore = calculateHealthScore(engineHealth, tireHealth, batteryHealth)
+                    
+                    // Update health monitoring data
+                    updateHealthMonitoring(vehicle.id, healthScore, engineHealth, tireHealth, batteryHealth)
+                    
+                    // Generate health alerts if needed
+                    generateHealthAlerts(vehicle, healthScore)
+                }
+
+                delay(HEALTH_CHECK_INTERVAL)
+
+            } catch (e: Exception) {
+                Timber.e(e, "Error in health monitoring")
+                delay(HEALTH_CHECK_INTERVAL)
+            }
+        }
+    }
+
+    private suspend fun monitorFuelLevels() {
+        while (isMonitoring) {
+            try {
+                val vehicles = database.vehicleDao().getAllVehicles()
+                
+                vehicles.forEach { vehicle ->
+                    // Get current fuel level
+                    val fuelLevel = getCurrentFuelLevel(vehicle.id)
+                    
+                    // Check for low fuel
+                    if (fuelLevel < 20f) {
+                        generateLowFuelAlert(vehicle, fuelLevel)
+                    }
+                    
+                    // Check for unusual fuel consumption
+                    checkUnusualFuelConsumption(vehicle, fuelLevel)
+                    
+                    // Update fuel monitoring data
+                    updateFuelMonitoring(vehicle.id, fuelLevel)
+                }
+
+                delay(FUEL_CHECK_INTERVAL)
+
+            } catch (e: Exception) {
+                Timber.e(e, "Error in fuel monitoring")
+                delay(FUEL_CHECK_INTERVAL)
+            }
+        }
+    }
+
+    private suspend fun syncWithServer() {
+        while (isMonitoring) {
+            try {
+                if (networkUtils.isNetworkAvailable()) {
+                    // Sync monitoring data with server
+                    syncMonitoringData()
+                    
+                    // Pull latest updates from server
+                    pullServerUpdates()
+                }
+
+                delay(300000L) // 5 minutes
+
+            } catch (e: Exception) {
+                Timber.e(e, "Error in server sync")
+                delay(300000L)
+            }
+        }
+    }
+
+    private suspend fun checkMaintenanceSchedule() {
+        while (isMonitoring) {
+            try {
+                val vehicles = database.vehicleDao().getAllVehicles()
+                
+                vehicles.forEach { vehicle ->
+                    // Check for upcoming maintenance
+                    val maintenanceDue = checkMaintenanceDue(vehicle)
+                    
+                    if (maintenanceDue.isDue) {
+                        generateMaintenanceAlert(vehicle, maintenanceDue)
+                    }
+                }
+
+                delay(3600000L) // 1 hour
+
+            } catch (e: Exception) {
+                Timber.e(e, "Error in maintenance schedule check")
+                delay(3600000L)
+            }
+        }
+    }
+
+    private fun handleStatusChange(vehicleId: Long, newStatus: com.edham.logistics.fleet.VehicleStatus, oldStatus: com.edham.logistics.fleet.VehicleStatus?) {
+        Timber.d("Vehicle $vehicleId status changed from $oldStatus to $newStatus")
+        
+        // Update monitoring data
+        updateMonitoredStatus(vehicleId, newStatus)
+        
+        // Notify listeners
+        notifyStatusChange(vehicleId, newStatus, oldStatus)
+        
+        // Generate appropriate alerts
+        generateStatusAlerts(vehicleId, newStatus, oldStatus)
+    }
+
+    private fun checkForAnomalies(vehicle: VehicleEntity) {
+        // Check for unusual behavior patterns
+        val anomalies = detectAnomalies(vehicle)
+        
+        anomalies.forEach { anomaly ->
+            generateAnomalyAlert(vehicle, anomaly)
+        }
+    }
+
+    private fun checkGeofenceViolations(vehicle: VehicleEntity, location: LocationData) {
+        // Check if vehicle is outside authorized areas
+        val violations = detectGeofenceViolations(vehicle, location)
+        
+        violations.forEach { violation ->
+            generateGeofenceAlert(vehicle, violation)
+        }
+    }
+
+    private fun checkUnusualLocations(vehicle: VehicleEntity, location: LocationData) {
+        // Check for unusual or unauthorized locations
+        val unusualLocations = detectUnusualLocations(vehicle, location)
+        
+        unusualLocations.forEach { unusualLocation ->
+            generateUnusualLocationAlert(vehicle, unusualLocation)
+        }
+    }
+
+    private fun generateLowFuelAlert(vehicle: VehicleEntity, fuelLevel: Float) {
+        val alert = MonitoringAlert(
+            id = generateAlertId(),
+            vehicleId = vehicle.id,
+            type = AlertType.LOW_FUEL,
+            severity = if (fuelLevel < 10f) AlertSeverity.CRITICAL else AlertSeverity.HIGH,
+            message = "مستوى الوقود منخفض: ${fuelLevel.toInt()}%",
+            timestamp = System.currentTimeMillis(),
+            data = mapOf("fuel_level" to fuelLevel)
+        )
+        
+        processAlert(alert)
+    }
+
+    private fun generateHealthAlerts(vehicle: VehicleEntity, healthScore: Float) {
+        if (healthScore < 50f) {
+            val alert = MonitoringAlert(
+                id = generateAlertId(),
+                vehicleId = vehicle.id,
+                type = AlertType.HEALTH_ISSUE,
+                severity = if (healthScore < 30f) AlertSeverity.CRITICAL else AlertSeverity.HIGH,
+                message = "مشكلة في صحة المركبة: ${healthScore.toInt()}%",
+                timestamp = System.currentTimeMillis(),
+                data = mapOf("health_score" to healthScore)
+            )
+            
+            processAlert(alert)
+        }
+    }
+
+    private fun generateMaintenanceAlert(vehicle: VehicleEntity, maintenanceDue: MaintenanceDue) {
+        val alert = MonitoringAlert(
+            id = generateAlertId(),
+            vehicleId = vehicle.id,
+            type = AlertType.MAINTENANCE_DUE,
+            severity = when {
+                maintenanceDue.daysUntil <= 1 -> AlertSeverity.CRITICAL
+                maintenanceDue.daysUntil <= 7 -> AlertSeverity.HIGH
+                else -> AlertSeverity.MEDIUM
+            },
+            message = "صيانة مجدولة خلال ${maintenanceDue.daysUntil} أيام",
+            timestamp = System.currentTimeMillis(),
+            data = mapOf(
+                "maintenance_type" to maintenanceDue.type,
+                "days_until" to maintenanceDue.daysUntil
+            )
+        )
+        
+        processAlert(alert)
+    }
+
+    private fun processAlert(alert: MonitoringAlert) {
+        // Save alert to database
+        serviceScope.launch {
+            try {
+                database.monitoringAlertDao().insertAlert(alert.toEntity())
+                
+                // Send notification
+                sendAlertNotification(alert)
+                
+                // Notify monitoring listeners
+                notifyAlertGenerated(alert)
+                
+                // Sync with server
+                if (networkUtils.isNetworkAvailable()) {
+                    syncAlertWithServer(alert)
+                }
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to process alert: ${alert.id}")
+            }
+        }
+    }
+
+    private fun sendAlertNotification(alert: MonitoringAlert) {
+        val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("تنبيه أسطول")
+            .setContentText(alert.message)
+            .setPriority(getNotificationPriority(alert.severity))
+            .setAutoCancel(true)
+            .setContentIntent(createNotificationIntent(alert))
+            .build()
+
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(alert.id.hashCode(), notification)
+    }
+
+    private fun createNotificationIntent(alert: MonitoringAlert): PendingIntent {
+        val intent = Intent(this, FleetDashboardActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            putExtra("alert_id", alert.id)
+            putExtra("vehicle_id", alert.vehicleId)
+        }
+        
+        return PendingIntent.getActivity(
+            this,
+            alert.id.hashCode(),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun createNotification(): Notification {
+        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_fleet)
+            .setContentTitle("مراقبة الأسطول")
+            .setContentText("جاري مراقبة أسطول المركبات")
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "Vehicle Monitoring",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Notifications for vehicle monitoring alerts"
+                enableLights(true)
+                enableVibration(true)
+            }
+
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun getNotificationPriority(severity: AlertSeverity): Int {
+        return when (severity) {
+            AlertSeverity.CRITICAL -> NotificationCompat.PRIORITY_MAX
+            AlertSeverity.HIGH -> NotificationCompat.PRIORITY_HIGH
+            AlertSeverity.MEDIUM -> NotificationCompat.PRIORITY_DEFAULT
+            AlertSeverity.LOW -> NotificationCompat.PRIORITY_LOW
+        }
+    }
+
+    // Placeholder implementations for helper functions
+    private suspend fun initializeMonitoringData(vehicles: List<VehicleEntity>) {
+        // Initialize monitoring data structures
+    }
+
+    private fun getMonitoredStatus(vehicleId: Long): com.edham.logistics.fleet.VehicleStatus {
+        // Get last monitored status
+        return com.edham.logistics.fleet.VehicleStatus.AVAILABLE
+    }
+
+    private fun updateMonitoredStatus(vehicleId: Long, status: com.edham.logistics.fleet.VehicleStatus) {
+        // Update monitored status
+    }
+
+    private fun updateVehicleLocation(vehicleId: Long, location: LocationData) {
+        // Update vehicle location in database
+    }
+
+    private fun checkEngineHealth(vehicle: VehicleEntity): HealthStatus = HealthStatus.GOOD
+    private fun checkTireHealth(vehicle: VehicleEntity): HealthStatus = HealthStatus.GOOD
+    private fun checkBatteryHealth(vehicle: VehicleEntity): HealthStatus = HealthStatus.GOOD
+    private fun calculateHealthScore(engine: HealthStatus, tire: HealthStatus, battery: HealthStatus): Float = 85f
+    private fun updateHealthMonitoring(vehicleId: Long, score: Float, engine: HealthStatus, tire: HealthStatus, battery: HealthStatus) {}
+    private fun getCurrentFuelLevel(vehicleId: Long): Float = 75f
+    private fun checkUnusualFuelConsumption(vehicle: VehicleEntity, fuelLevel: Float) {}
+    private fun updateFuelMonitoring(vehicleId: Long, fuelLevel: Float) {}
+    private fun detectAnomalies(vehicle: VehicleEntity): List<Anomaly> = emptyList()
+    private fun detectGeofenceViolations(vehicle: VehicleEntity, location: LocationData): List<GeofenceViolation> = emptyList()
+    private fun detectUnusualLocations(vehicle: VehicleEntity, location: LocationData): List<UnusualLocation> = emptyList()
+    private fun checkMaintenanceDue(vehicle: VehicleEntity): MaintenanceDue = MaintenanceDue(false, 30, "routine")
+    private fun generateStatusAlerts(vehicleId: Long, newStatus: com.edham.logistics.fleet.VehicleStatus, oldStatus: com.edham.logistics.fleet.VehicleStatus?) {}
+    private fun generateAnomalyAlert(vehicle: VehicleEntity, anomaly: Anomaly) {}
+    private fun generateGeofenceAlert(vehicle: VehicleEntity, violation: GeofenceViolation) {}
+    private fun generateUnusualLocationAlert(vehicle: VehicleEntity, unusualLocation: UnusualLocation) {}
+    private fun notifyStatusChange(vehicleId: Long, newStatus: com.edham.logistics.fleet.VehicleStatus, oldStatus: com.edham.logistics.fleet.VehicleStatus?) {}
+    private fun notifyAlertGenerated(alert: MonitoringAlert) {}
+    private suspend fun syncMonitoringData() {}
+    private suspend fun pullServerUpdates() {}
+    private suspend fun syncAlertWithServer(alert: MonitoringAlert) {}
+    private fun generateAlertId(): String = "alert_${System.currentTimeMillis()}"
+    private fun updateVehicleStatus(vehicleId: Long, status: String) {}
+    private fun handleEmergencyAlert(vehicleId: Long, alertType: String, message: String) {}
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceScope.cancel()
+        Timber.d("VehicleMonitoringService destroyed")
+    }
+}
+
+/**
+ * Data classes
+ */
+data class MonitoringAlert(
+    val id: String,
+    val vehicleId: Long,
+    val type: AlertType,
+    val severity: AlertSeverity,
+    val message: String,
+    val timestamp: Long,
+    val data: Map<String, Any>
+) {
+    fun toEntity() = com.edham.logistics.data.local.entity.MonitoringAlertEntity(
+        id = 0,
+        alertId = id,
+        vehicleId = vehicleId,
+        type = type.name,
+        severity = severity.name,
+        message = message,
+        timestamp = timestamp,
+        data = data.toString(),
+        resolved = false,
+        createdAt = System.currentTimeMillis()
+    )
+}
+
+data class LocationData(
+    val latitude: Double,
+    val longitude: Double,
+    val accuracy: Float,
+    val speed: Float,
+    val heading: Float,
+    val timestamp: Long
+)
+
+data class HealthStatus(val score: Float, val status: String) {
+    companion object {
+        val GOOD = HealthStatus(90f, "good")
+        val FAIR = HealthStatus(70f, "fair")
+        val POOR = HealthStatus(50f, "poor")
+        val CRITICAL = HealthStatus(30f, "critical")
+    }
+}
+
+data class Anomaly(val type: String, val description: String, val confidence: Float)
+data class GeofenceViolation(val area: String, val violationType: String, val timestamp: Long)
+data class UnusualLocation(val location: String, val reason: String, val confidence: Float)
+data class MaintenanceDue(val isDue: Boolean, val daysUntil: Int, val type: String)
+
+/**
+ * Enums
+ */
+enum class AlertType {
+    STATUS_CHANGE,
+    LOCATION_ANOMALY,
+    HEALTH_ISSUE,
+    LOW_FUEL,
+    MAINTENANCE_DUE,
+    GEOFENCE_VIOLATION,
+    UNUSUAL_LOCATION,
+    EMERGENCY
+}
+
+enum class AlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}

@@ -1,0 +1,360 @@
+package com.edham.logistics.core.navigation
+
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.FragmentManager
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import androidx.navigation.NavController
+import androidx.navigation.NavOptions
+import androidx.navigation.fragment.NavHostFragment
+import com.edham.logistics.R
+import com.edham.logistics.auth.AuthenticationManager
+import com.edham.logistics.auth.UserRole
+import com.edham.logistics.core.auth.AuthStateManager
+import dagger.hilt.android.scopes.ActivityScoped
+import kotlinx.coroutines.flow.StateFlow
+import timber.log.Timber
+import javax.inject.Inject
+
+/**
+ * Centralized Navigation Controller
+ * Manages all navigation operations, animations, and state tracking
+ * Prevents direct navigation from fragments
+ */
+@ActivityScoped
+class AppNavigationController @Inject constructor(
+    private val authStateManager: AuthStateManager,
+    private val authenticationManager: AuthenticationManager
+) {
+    
+    private var navController: NavController? = null
+    private var fragmentManager: FragmentManager? = null
+    
+    // Navigation state tracking
+    private val _navigationState = MutableLiveData<NavigationState>()
+    val navigationState: LiveData<NavigationState> get() = _navigationState
+    
+    // Navigation history for back stack management
+    private val navigationHistory = mutableListOf<NavigationDestination>()
+    
+    // Current navigation destination
+    private val _currentDestination = MutableLiveData<NavigationDestination>()
+    val currentDestination: LiveData<NavigationDestination> get() = _currentDestination
+    
+    // Navigation animations configuration
+    private val defaultNavOptions = NavOptions.Builder()
+        .setEnterAnim(R.anim.slide_in_right)
+        .setExitAnim(R.anim.slide_out_left)
+        .setPopEnterAnim(R.anim.slide_in_left)
+        .setPopExitAnim(R.anim.slide_out_right)
+        .build()
+    
+    private val modalNavOptions = NavOptions.Builder()
+        .setEnterAnim(R.anim.fade_in)
+        .setExitAnim(R.anim.fade_out)
+        .setPopEnterAnim(R.anim.fade_in)
+        .setPopExitAnim(R.anim.fade_out)
+        .build()
+    
+    /**
+     * Initialize navigation controller with activity's nav controller
+     */
+    fun initialize(navController: NavController, fragmentManager: FragmentManager) {
+        this.navController = navController
+        this.fragmentManager = fragmentManager
+        
+        // Setup navigation listener for state tracking
+        navController.addOnDestinationChangedListener { controller, destination, arguments ->
+            handleDestinationChanged(destination.id, arguments)
+        }
+        
+        Timber.d("AppNavigationController initialized")
+    }
+    
+    /**
+     * Navigate to a specific destination with validation
+     */
+    fun navigateToDestination(
+        destination: NavigationDestination,
+        arguments: android.os.Bundle? = null,
+        isModal: Boolean = false
+    ) {
+        if (!isNavigationAllowed(destination)) {
+            Timber.w("Navigation to ${destination.destinationName} not allowed: insufficient permissions")
+            _navigationState.value = NavigationState.Error("Access denied: ${destination.destinationName}")
+            return
+        }
+        
+        try {
+            val navOptions = if (isModal) modalNavOptions else defaultNavOptions
+            val bundle = arguments ?: android.os.Bundle()
+            
+            // Add role information to arguments
+            bundle.putString("user_role", getCurrentUserRole()?.name)
+            
+            navController?.navigate(destination.fragmentId, bundle, navOptions)
+            
+            // Update navigation history
+            addToHistory(destination)
+            
+            // Update current destination
+            _currentDestination.value = destination
+            
+            // Update navigation state
+            _navigationState.value = NavigationState.Success(destination)
+            
+            Timber.d("Navigated to ${destination.destinationName}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Navigation error for destination: ${destination.destinationName}")
+            _navigationState.value = NavigationState.Error("Navigation failed: ${e.message}")
+        }
+    }
+    
+    /**
+     * Navigate to login screen
+     */
+    fun navigateToLogin() {
+        val destination = NavigationDestination.LOGIN
+        navigateToDestination(destination, isModal = true)
+    }
+    
+    /**
+     * Navigate to user's role-based dashboard
+     */
+    fun navigateToDashboard() {
+        val userRole = getCurrentUserRole()
+        if (userRole == null) {
+            navigateToLogin()
+            return
+        }
+        
+        val destination = when (userRole) {
+            UserRole.CUSTOMER -> NavigationDestination.CUSTOMER_DASHBOARD
+            UserRole.DRIVER -> NavigationDestination.DRIVER_DASHBOARD
+            UserRole.SUPERVISOR -> NavigationDestination.SUPERVISOR_DASHBOARD
+            UserRole.ACCOUNTANT -> NavigationDestination.ACCOUNTANT_DASHBOARD
+            UserRole.WORKSHOP -> NavigationDestination.WORKSHOP_DASHBOARD
+            UserRole.ADMIN -> NavigationDestination.ADMIN_DASHBOARD
+        }
+        
+        navigateToDestination(destination)
+    }
+    
+    /**
+     * Navigate back with proper state management
+     */
+    fun navigateBack(): Boolean {
+        if (canGoBack()) {
+            navController?.navigateUp()
+            
+            // Update history
+            if (navigationHistory.isNotEmpty()) {
+                navigationHistory.removeLastOrNull()
+                _currentDestination.value = navigationHistory.lastOrNull()
+            }
+            
+            return true
+        }
+        return false
+    }
+    
+    /**
+     * Check if back navigation is possible
+     */
+    fun canGoBack(): Boolean {
+        return navController?.previousBackStackEntry != null && navigationHistory.size > 1
+    }
+    
+    /**
+     * Navigate to a specific fragment by ID with validation
+     * This is the only way fragments should navigate
+     */
+    fun navigateToFragment(
+        fragmentId: Int,
+        arguments: android.os.Bundle? = null,
+        isModal: Boolean = false
+    ) {
+        val destination = NavigationDestination.fromFragmentId(fragmentId)
+        navigateToDestination(destination, arguments, isModal)
+    }
+    
+    /**
+     * Check if navigation is allowed based on user role and permissions
+     */
+    private fun isNavigationAllowed(destination: NavigationDestination): Boolean {
+        val userRole = getCurrentUserRole() ?: return false
+        
+        // Check role-based access
+        return when (destination) {
+            NavigationDestination.CUSTOMER_DASHBOARD -> userRole == UserRole.CUSTOMER
+            NavigationDestination.DRIVER_DASHBOARD -> userRole == UserRole.DRIVER
+            NavigationDestination.SUPERVISOR_DASHBOARD -> userRole == UserRole.SUPERVISOR
+            NavigationDestination.ACCOUNTANT_DASHBOARD -> userRole == UserRole.ACCOUNTANT
+            NavigationDestination.WORKSHOP_DASHBOARD -> userRole == UserRole.WORKSHOP
+            NavigationDestination.ADMIN_DASHBOARD -> userRole == UserRole.ADMIN
+            NavigationDestination.LOGIN -> true // Login is always accessible
+            else -> false
+        }
+    }
+    
+    /**
+     * Get current user role
+     */
+    private fun getCurrentUserRole(): UserRole? {
+        return authenticationManager.currentUser.value?.role
+    }
+    
+    /**
+     * Handle destination change for state tracking (reduced logging)
+     */
+    private fun handleDestinationChanged(destinationId: Int, arguments: android.os.Bundle?) {
+        val destination = NavigationDestination.fromFragmentId(destinationId)
+        _currentDestination.value = destination
+        
+        // Update navigation history if not already present
+        if (navigationHistory.isEmpty() || navigationHistory.last().fragmentId != destinationId) {
+            addToHistory(destination)
+        }
+        
+        // Reduced logging - only log sensitive destinations
+        if (isSensitiveDestination(destination)) {
+            Timber.d("Sensitive navigation to: ${destination.destinationName}")
+        }
+    }
+    
+    /**
+     * Check if destination is sensitive (requires logging)
+     */
+    private fun isSensitiveDestination(destination: NavigationDestination): Boolean {
+        return when (destination) {
+            NavigationDestination.ADMIN_DASHBOARD,
+            NavigationDestination.ACCOUNTANT_DASHBOARD,
+            NavigationDestination.INVOICES,
+            NavigationDestination.PAYMENTS,
+            NavigationDestination.FINANCIAL_REPORTS,
+            NavigationDestination.MANAGE_USERS,
+            NavigationDestination.MANAGE_SYSTEM -> true
+            else -> false
+        }
+    }
+    
+    /**
+     * Add destination to navigation history
+     */
+    private fun addToHistory(destination: NavigationDestination) {
+        navigationHistory.add(destination)
+        
+        // Limit history size to prevent memory issues
+        if (navigationHistory.size > 50) {
+            navigationHistory.removeFirst()
+        }
+    }
+    
+    /**
+     * Get navigation history
+     */
+    fun getNavigationHistory(): List<NavigationDestination> {
+        return navigationHistory.toList()
+    }
+    
+    /**
+     * Clear navigation history (useful for logout)
+     */
+    fun clearNavigationHistory() {
+        navigationHistory.clear()
+        _currentDestination.value = null
+        _navigationState.value = NavigationState.Idle
+        
+        Timber.d("Navigation history cleared")
+    }
+    
+    /**
+     * Get current navigation state
+     */
+    fun getCurrentNavigationState(): NavigationState {
+        return _navigationState.value ?: NavigationState.Idle
+    }
+    
+    /**
+     * Check if user can access specific destination
+     */
+    fun canAccessDestination(destination: NavigationDestination): Boolean {
+        return isNavigationAllowed(destination)
+    }
+    
+    /**
+     * Get navigation statistics
+     */
+    fun getNavigationStatistics(): NavigationStatistics {
+        return NavigationStatistics(
+            currentDestination = _currentDestination.value,
+            historySize = navigationHistory.size,
+            canGoBack = canGoBack(),
+            lastNavigationTime = System.currentTimeMillis()
+        )
+    }
+}
+
+/**
+ * Navigation destination definitions
+ */
+enum class NavigationDestination(
+    val fragmentId: Int,
+    val destinationName: String,
+    val requiresAuth: Boolean = true
+) {
+    LOGIN(R.id.loginFragment, "Login", false),
+    CUSTOMER_DASHBOARD(R.id.customerDashboardFragment, "Customer Dashboard"),
+    DRIVER_DASHBOARD(R.id.driverDashboardFragment, "Driver Dashboard"),
+    SUPERVISOR_DASHBOARD(R.id.supervisorDashboardFragment, "Supervisor Dashboard"),
+    ACCOUNTANT_DASHBOARD(R.id.accountantDashboardFragment, "Accountant Dashboard"),
+    WORKSHOP_DASHBOARD(R.id.workshopDashboardFragment, "Workshop Dashboard"),
+    ADMIN_DASHBOARD(R.id.adminDashboardFragment, "Admin Dashboard"),
+    
+    // Order related
+    CREATE_SHIPMENT(R.id.createShipmentFragment, "Create Shipment"),
+    SHIPMENT_DETAILS(R.id.shipmentDetailsFragment, "Shipment Details"),
+    SHIPMENT_TRACKING(R.id.shipmentTrackingFragment, "Shipment Tracking"),
+    
+    // Driver related
+    DRIVER_TASKS(R.id.driverTasksFragment, "Driver Tasks"),
+    DRIVER_EARNINGS(R.id.driverEarningsFragment, "Driver Earnings"),
+    DRIVER_SCHEDULE(R.id.driverScheduleFragment, "Driver Schedule"),
+    
+    // Financial related
+    INVOICES(R.id.invoicesFragment, "Invoices"),
+    PAYMENTS(R.id.paymentsFragment, "Payments"),
+    FINANCIAL_REPORTS(R.id.financialReportsFragment, "Financial Reports"),
+    
+    // Settings
+    PROFILE(R.id.profileFragment, "Profile"),
+    SETTINGS(R.id.settingsFragment, "Settings");
+    
+    companion object {
+        fun fromFragmentId(fragmentId: Int): NavigationDestination {
+            return values().find { it.fragmentId == fragmentId }
+                ?: throw IllegalArgumentException("Unknown fragment ID: $fragmentId")
+        }
+    }
+}
+
+/**
+ * Navigation state sealed class
+ */
+sealed class NavigationState {
+    object Idle : NavigationState()
+    data class Success(val destination: NavigationDestination) : NavigationState()
+    data class Error(val message: String) : NavigationState()
+    data class Loading(val destination: NavigationDestination) : NavigationState()
+}
+
+/**
+ * Navigation statistics data class
+ */
+data class NavigationStatistics(
+    val currentDestination: NavigationDestination?,
+    val historySize: Int,
+    val canGoBack: Boolean,
+    val lastNavigationTime: Long
+)

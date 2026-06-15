@@ -1,0 +1,889 @@
+package com.edham.logistics.notification
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.DelayApi
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Delay Alert Service - Specialized service for delay-related alerts
+ * 
+ * Features:
+ * - Delay detection and prediction
+ * - Delay severity assessment
+ * - ETA recalculation
+ * - Delay notification management
+ * - Customer delay notifications
+ * - Driver delay notifications
+ * - Delay impact analysis
+ * - Delay resolution tracking
+ * - Delay analytics and reporting
+ */
+@Singleton
+class DelayAlertService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val delayApi: DelayApi,
+    private val networkUtils: NetworkUtils,
+    private val smartNotificationManager: SmartNotificationManager
+) {
+    
+    private val _delayAlertState = MutableStateFlow<DelayAlertState>(DelayAlertState.Idle)
+    val delayAlertState: StateFlow<DelayAlertState> = _delayAlertState.asStateFlow()
+    
+    private val _activeDelayAlerts = MutableStateFlow<List<DelayAlert>>(emptyList())
+    val activeDelayAlerts: StateFlow<List<DelayAlert>> = _activeDelayAlerts.asStateFlow()
+    
+    private val _delayAnalytics = MutableStateFlow<DelayAnalytics>(DelayAnalytics())
+    val delayAnalytics: StateFlow<DelayAnalytics> = _delayAnalytics.asStateFlow()
+    
+    private var isInitialized = false
+    private val delayAlertListeners = mutableListOf<DelayAlertListener>()
+    
+    companion object {
+        private const val TAG = "DelayAlertService"
+        private const val MINOR_DELAY_THRESHOLD_MINUTES = 15
+        private const val MODERATE_DELAY_THRESHOLD_MINUTES = 30
+        private const val SEVERE_DELAY_THRESHOLD_MINUTES = 60
+        private const val CRITICAL_DELAY_THRESHOLD_MINUTES = 120
+        private const val DELAY_PREDICTION_WINDOW_MINUTES = 60
+        private const val ETA_UPDATE_THRESHOLD_MINUTES = 10
+        private const val MAX_ACTIVE_DELAY_ALERTS = 50
+    }
+    
+    /**
+     * Initialize delay alert service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _delayAlertState.value = DelayAlertState.Initializing
+                
+                // Load delay alert configuration
+                loadDelayAlertConfiguration()
+                
+                // Initialize delay prediction models
+                initializeDelayPredictionModels()
+                
+                // Load active delay alerts
+                loadActiveDelayAlerts()
+                
+                // Start delay monitoring
+                startDelayMonitoring()
+                
+                isInitialized = true
+                _delayAlertState.value = DelayAlertState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _delayAlertState.value = DelayAlertState.Error("Failed to initialize delay alert service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create delay alert
+     */
+    suspend fun createDelayAlert(
+        shipmentId: String,
+        delayData: DelayAlertData
+    ): Result<DelayAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Delay alert service not initialized")
+                }
+                
+                // Validate delay data
+                validateDelayAlertData(shipmentId, delayData)
+                
+                // Determine delay severity
+                val severity = determineDelaySeverity(delayData.delayMinutes)
+                
+                // Check for duplicate alerts
+                if (isDuplicateDelayAlert(shipmentId, severity)) {
+                    throw Exception("Duplicate delay alert detected")
+                }
+                
+                // Create alert
+                val alert = DelayAlert(
+                    id = UUID.randomUUID().toString(),
+                    shipmentId = shipmentId,
+                    severity = severity,
+                    originalETA = delayData.originalETA,
+                    currentETA = delayData.currentETA,
+                    delayMinutes = delayData.delayMinutes,
+                    delayReason = delayData.reason,
+                    delayCategory = determineDelayCategory(delayData),
+                    impact = assessDelayImpact(shipmentId, delayData),
+                    recipients = determineDelayRecipients(shipmentId, severity, delayData),
+                    metadata = delayData.toMetadata(),
+                    status = DelayAlertStatus.ACTIVE,
+                    createdAt = Date(),
+                    updatedAt = Date(),
+                    acknowledgedAt = null,
+                    acknowledgedBy = null,
+                    resolvedAt = null,
+                    resolvedBy = null,
+                    resolution = null
+                )
+                
+                // Save alert to database
+                database.delayAlertDao().insertAlert(alert.toEntity())
+                
+                // Add to active alerts
+                addToActiveDelayAlerts(alert)
+                
+                // Process alert
+                processDelayAlert(alert)
+                
+                // Update analytics
+                updateDelayAnalytics()
+                
+                // Notify listeners
+                notifyDelayAlertCreated(alert)
+                
+                Result.success(alert)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Predict delay
+     */
+    suspend fun predictDelay(
+        shipmentId: String,
+        currentLocation: String,
+        trafficConditions: TrafficConditions,
+        weatherConditions: WeatherConditions
+    ): Result<DelayPrediction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get shipment details
+                val shipment = database.shipmentDao().getShipmentById(shipmentId)
+                    ?: throw Exception("Shipment not found")
+                
+                // Calculate predicted delay
+                val predictedDelay = calculatePredictedDelay(
+                    shipment,
+                    currentLocation,
+                    trafficConditions,
+                    weatherConditions
+                )
+                
+                // Determine confidence level
+                val confidence = calculatePredictionConfidence(
+                    shipment,
+                    trafficConditions,
+                    weatherConditions
+                )
+                
+                // Create prediction
+                val prediction = DelayPrediction(
+                    shipmentId = shipmentId,
+                    predictedDelayMinutes = predictedDelay,
+                    confidence = confidence,
+                    factors = listOf(
+                        DelayFactor.TRAFFIC,
+                        DelayFactor.WEATHER,
+                        DelayFactor.ROUTE_CONDITIONS
+                    ),
+                    predictedNewETA = Date(shipment.estimatedDelivery.time + predictedDelay * 60 * 1000L),
+                    predictionTime = Date(),
+                    currentLocation = currentLocation,
+                    trafficConditions = trafficConditions,
+                    weatherConditions = weatherConditions
+                )
+                
+                // Save prediction to database
+                database.delayPredictionDao().insertPrediction(prediction.toEntity())
+                
+                // Create alert if significant delay predicted
+                if (predictedDelay >= MINOR_DELAY_THRESHOLD_MINUTES && confidence >= 0.7f) {
+                    val delayData = DelayAlertData(
+                        shipmentId = shipmentId,
+                        originalETA = shipment.estimatedDelivery,
+                        currentETA = prediction.predictedNewETA,
+                        delayMinutes = predictedDelay,
+                        reason = "Predicted delay based on current conditions",
+                        delayCategory = DelayCategory.PREDICTED,
+                        impact = DelayImpact.MODERATE,
+                        isPredicted = true,
+                        predictionId = prediction.id,
+                        metadata = mapOf(
+                            "confidence" to confidence.toString(),
+                            "factors" to prediction.factors.joinToString(",")
+                        )
+                    )
+                    
+                    createDelayAlert(shipmentId, delayData)
+                }
+                
+                Result.success(prediction)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update delay alert
+     */
+    suspend fun updateDelayAlert(
+        alertId: String,
+        newDelayMinutes: Int,
+        newETA: Date,
+        reason: String
+    ): Result<DelayAlert> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get existing alert
+                val existingAlert = _activeDelayAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Delay alert not found")
+                
+                // Determine new severity
+                val newSeverity = determineDelaySeverity(newDelayMinutes)
+                
+                // Update alert
+                val updatedAlert = existingAlert.copy(
+                    severity = newSeverity,
+                    currentETA = newETA,
+                    delayMinutes = newDelayMinutes,
+                    delayReason = reason,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.delayAlertDao().updateAlert(updatedAlert.toEntity())
+                
+                // Update active alerts
+                updateActiveDelayAlert(updatedAlert)
+                
+                // Process updated alert
+                processDelayAlert(updatedAlert)
+                
+                // Notify listeners
+                notifyDelayAlertUpdated(updatedAlert)
+                
+                Result.success(updatedAlert)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Resolve delay alert
+     */
+    suspend fun resolveDelayAlert(
+        alertId: String,
+        resolvedBy: String,
+        resolution: String,
+        actualDelayMinutes: Int
+    ): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Get alert
+                val alert = _activeDelayAlerts.value.find { it.id == alertId }
+                    ?: throw Exception("Delay alert not found")
+                
+                // Update alert status
+                val resolvedAlert = alert.copy(
+                    status = DelayAlertStatus.RESOLVED,
+                    resolvedAt = Date(),
+                    resolvedBy = resolvedBy,
+                    resolution = resolution,
+                    actualDelayMinutes = actualDelayMinutes,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.delayAlertDao().updateAlert(resolvedAlert.toEntity())
+                
+                // Remove from active alerts
+                removeFromActiveDelayAlerts(alertId)
+                
+                // Update analytics
+                updateDelayAnalytics()
+                
+                // Notify listeners
+                notifyDelayAlertResolved(resolvedAlert)
+                
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get delay alerts by severity
+     */
+    suspend fun getDelayAlertsBySeverity(severity: DelaySeverity): List<DelayAlert> {
+        return _activeDelayAlerts.value.filter { it.severity == severity }
+    }
+    
+    /**
+     * Get delay alerts by shipment
+     */
+    suspend fun getDelayAlertsByShipment(shipmentId: String): List<DelayAlert> {
+        return _activeDelayAlerts.value.filter { it.shipmentId == shipmentId }
+    }
+    
+    /**
+     * Get active delay alerts
+     */
+    suspend fun getActiveDelayAlerts(): List<DelayAlert> {
+        return _activeDelayAlerts.value.filter { it.status == DelayAlertStatus.ACTIVE }
+    }
+    
+    /**
+     * Get delay analytics
+     */
+    suspend fun getDelayAnalytics(dateRange: DateRange = DateRange.last30Days()): Result<DelayAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val analytics = database.delayAlertDao().getDelayAnalytics(dateRange.startDate, dateRange.endDate)
+                Result.success(analytics)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Add delay alert listener
+     */
+    fun addDelayAlertListener(listener: DelayAlertListener) {
+        delayAlertListeners.add(listener)
+    }
+    
+    /**
+     * Remove delay alert listener
+     */
+    fun removeDelayAlertListener(listener: DelayAlertListener) {
+        delayAlertListeners.remove(listener)
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadDelayAlertConfiguration() {
+        // Load delay alert configuration
+    }
+    
+    private suspend fun initializeDelayPredictionModels() {
+        // Initialize delay prediction models
+    }
+    
+    private suspend fun loadActiveDelayAlerts() {
+        try {
+            val alerts = database.delayAlertDao().getActiveAlerts()
+                .map { it.toDomainModel() }
+                .sortedByDescending { it.createdAt }
+                .take(MAX_ACTIVE_DELAY_ALERTS)
+            
+            _activeDelayAlerts.value = alerts
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun startDelayMonitoring() {
+        // Start delay monitoring
+    }
+    
+    private fun validateDelayAlertData(shipmentId: String, delayData: DelayAlertData) {
+        if (shipmentId.isBlank()) throw Exception("Shipment ID cannot be empty")
+        if (delayData.delayMinutes < 0) throw Exception("Delay minutes cannot be negative")
+        if (delayData.originalETA == null) throw Exception("Original ETA cannot be null")
+        if (delayData.currentETA == null) throw Exception("Current ETA cannot be null")
+    }
+    
+    private fun determineDelaySeverity(delayMinutes: Int): DelaySeverity {
+        return when {
+            delayMinutes >= CRITICAL_DELAY_THRESHOLD_MINUTES -> DelaySeverity.CRITICAL
+            delayMinutes >= SEVERE_DELAY_THRESHOLD_MINUTES -> DelaySeverity.SEVERE
+            delayMinutes >= MODERATE_DELAY_THRESHOLD_MINUTES -> DelaySeverity.MODERATE
+            delayMinutes >= MINOR_DELAY_THRESHOLD_MINUTES -> DelaySeverity.MINOR
+            else -> DelaySeverity.MINOR
+        }
+    }
+    
+    private fun isDuplicateDelayAlert(shipmentId: String, severity: DelaySeverity): Boolean {
+        val cutoffTime = Date(System.currentTimeMillis() - 10 * 60 * 1000L) // 10 minutes
+        return _activeDelayAlerts.value.any { alert ->
+            alert.shipmentId == shipmentId &&
+            alert.severity == severity &&
+            alert.createdAt.after(cutoffTime)
+        }
+    }
+    
+    private fun determineDelayCategory(delayData: DelayAlertData): DelayCategory {
+        return when {
+            delayData.isPredicted -> DelayCategory.PREDICTED
+            delayData.reason.contains("traffic", ignoreCase = true) -> DelayCategory.TRAFFIC
+            delayData.reason.contains("weather", ignoreCase = true) -> DelayCategory.WEATHER
+            delayData.reason.contains("vehicle", ignoreCase = true) -> DelayCategory.VEHICLE_ISSUE
+            delayData.reason.contains("route", ignoreCase = true) -> DelayCategory.ROUTE_ISSUE
+            delayData.reason.contains("customer", ignoreCase = true) -> DelayCategory.CUSTOMER_ISSUE
+            else -> DelayCategory.OTHER
+        }
+    }
+    
+    private fun assessDelayImpact(shipmentId: String, delayData: DelayAlertData): DelayImpact {
+        // Get shipment details for impact assessment
+        val shipment = database.shipmentDao().getShipmentById(shipmentId)
+        
+        return when {
+            delayData.delayMinutes >= SEVERE_DELAY_THRESHOLD_MINUTES -> DelayImpact.SEVERE
+            delayData.delayMinutes >= MODERATE_DELAY_THRESHOLD_MINUTES -> DelayImpact.MODERATE
+            shipment?.priority == "HIGH" && delayData.delayMinutes >= MINOR_DELAY_THRESHOLD_MINUTES -> DelayImpact.HIGH
+            else -> DelayImpact.LOW
+        }
+    }
+    
+    private fun determineDelayRecipients(
+        shipmentId: String,
+        severity: DelaySeverity,
+        delayData: DelayAlertData
+    ): List<NotificationRecipient> {
+        val recipients = mutableListOf<NotificationRecipient>()
+        
+        // Get shipment details
+        val shipment = database.shipmentDao().getShipmentById(shipmentId)
+        
+        // Always notify admin for significant delays
+        if (severity == DelaySeverity.SEVERE || severity == DelaySeverity.CRITICAL) {
+            recipients.add(
+                NotificationRecipient(
+                    id = "delay_admin",
+                    type = RecipientType.ADMIN,
+                    address = "admin@edham.com",
+                    name = "Delay Admin"
+                )
+            )
+        }
+        
+        // Notify driver
+        shipment?.driverId?.let { driverId ->
+            recipients.add(
+                NotificationRecipient(
+                    id = driverId,
+                    type = RecipientType.DRIVER,
+                    address = shipment.driverPhone ?: "",
+                    name = shipment.driverName
+                )
+            )
+        }
+        
+        // Notify customer for moderate+ delays
+        if (severity != DelaySeverity.MINOR) {
+            shipment?.customerEmail?.let { email ->
+                recipients.add(
+                    NotificationRecipient(
+                        id = shipment.customerId ?: "customer",
+                        type = RecipientType.CUSTOMER,
+                        address = email,
+                        name = shipment.customerName
+                    )
+                )
+            }
+        }
+        
+        return recipients
+    }
+    
+    private suspend fun calculatePredictedDelay(
+        shipment: com.edham.logistics.data.local.entity.ShipmentEntity,
+        currentLocation: String,
+        trafficConditions: TrafficConditions,
+        weatherConditions: WeatherConditions
+    ): Int {
+        var baseDelay = 0
+        
+        // Traffic delay
+        baseDelay += when (trafficConditions.level) {
+            TrafficLevel.LIGHT -> 0
+            TrafficLevel.MODERATE -> 15
+            TrafficLevel.HEAVY -> 30
+            TrafficLevel.SEVERE -> 60
+        }
+        
+        // Weather delay
+        baseDelay += when (weatherConditions.condition) {
+            WeatherCondition.CLEAR -> 0
+            WeatherCondition.CLOUDY -> 5
+            WeatherCondition.RAIN -> 15
+            WeatherCondition.SNOW -> 30
+            WeatherCondition.STORM -> 60
+        }
+        
+        // Route conditions delay
+        baseDelay += when (weatherConditions.visibility) {
+            Visibility.EXCELLENT -> 0
+            Visibility.GOOD -> 5
+            Visibility.MODERATE -> 10
+            Visibility.POOR -> 20
+        }
+        
+        return baseDelay
+    }
+    
+    private fun calculatePredictionConfidence(
+        shipment: com.edham.logistics.data.local.entity.ShipmentEntity,
+        trafficConditions: TrafficConditions,
+        weatherConditions: WeatherConditions
+    ): Float {
+        var confidence = 0.8f // Base confidence
+        
+        // Adjust confidence based on data quality
+        if (trafficConditions.level == TrafficLevel.UNKNOWN) confidence -= 0.2f
+        if (weatherConditions.condition == WeatherCondition.UNKNOWN) confidence -= 0.1f
+        
+        return confidence.coerceIn(0f, 1f)
+    }
+    
+    private suspend fun processDelayAlert(alert: DelayAlert) {
+        try {
+            // Create notification request
+            val notificationRequest = NotificationRequest(
+                title = generateAlertTitle(alert),
+                message = generateAlertMessage(alert),
+                category = NotificationCategory.DELAY,
+                priority = mapSeverityToPriority(alert.severity),
+                recipients = alert.recipients,
+                data = alert.metadata + mapOf(
+                    "alertId" to alert.id,
+                    "shipmentId" to alert.shipmentId,
+                    "delayMinutes" to alert.delayMinutes.toString(),
+                    "originalETA" to alert.originalETA.toString(),
+                    "currentETA" to alert.currentETA.toString()
+                ),
+                channels = determineNotificationChannels(alert)
+            )
+            
+            // Send notification
+            smartNotificationManager.sendNotification(notificationRequest)
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun generateAlertTitle(alert: DelayAlert): String {
+        return when (alert.severity) {
+            DelaySeverity.MINOR -> "تأخير طفيف في الشحنة"
+            DelaySeverity.MODERATE -> "تأخير متوسط في الشحنة"
+            DelaySeverity.SEVERE -> "تأخير شديد في الشحنة"
+            DelaySeverity.CRITICAL -> "تأخير حرج في الشحنة"
+        }
+    }
+    
+    private fun generateAlertMessage(alert: DelayAlert): String {
+        val shipment = database.shipmentDao().getShipmentById(alert.shipmentId)
+        return """
+            الشحنة ${alert.shipmentId} متأخرة بمقدار ${alert.delayMinutes} دقيقة.
+            السبب: ${alert.delayReason}
+            التوصيل الأصلي: ${alert.originalETA}
+            التوصيل الجديد: ${alert.currentETA}
+            ${shipment?.customerName?.let { "العميل: $it" } ?: ""}
+        """.trimIndent()
+    }
+    
+    private fun mapSeverityToPriority(severity: DelaySeverity): NotificationPriority {
+        return when (severity) {
+            DelaySeverity.MINOR -> NotificationPriority.NORMAL
+            DelaySeverity.MODERATE -> NotificationPriority.HIGH
+            DelaySeverity.SEVERE -> NotificationPriority.HIGH
+            DelaySeverity.CRITICAL -> NotificationPriority.EMERGENCY
+        }
+    }
+    
+    private fun determineNotificationChannels(alert: DelayAlert): List<NotificationChannel> {
+        return when (alert.severity) {
+            DelaySeverity.CRITICAL -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL,
+                NotificationChannel.IN_APP
+            )
+            DelaySeverity.SEVERE -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.SMS,
+                NotificationChannel.EMAIL
+            )
+            DelaySeverity.MODERATE -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.EMAIL
+            )
+            DelaySeverity.MINOR -> listOf(
+                NotificationChannel.PUSH,
+                NotificationChannel.IN_APP
+            )
+        }
+    }
+    
+    private fun addToActiveDelayAlerts(alert: DelayAlert) {
+        val currentAlerts = _activeDelayAlerts.value.toMutableList()
+        currentAlerts.add(0, alert)
+        
+        // Keep only max alerts
+        if (currentAlerts.size > MAX_ACTIVE_DELAY_ALERTS) {
+            currentAlerts.removeAt(currentAlerts.size - 1)
+        }
+        
+        _activeDelayAlerts.value = currentAlerts
+    }
+    
+    private fun updateActiveDelayAlert(alert: DelayAlert) {
+        val currentAlerts = _activeDelayAlerts.value.toMutableList()
+        val index = currentAlerts.indexOfFirst { it.id == alert.id }
+        
+        if (index != -1) {
+            currentAlerts[index] = alert
+            _activeDelayAlerts.value = currentAlerts
+        }
+    }
+    
+    private fun removeFromActiveDelayAlerts(alertId: String) {
+        val currentAlerts = _activeDelayAlerts.value.toMutableList()
+        currentAlerts.removeAll { it.id == alertId }
+        _activeDelayAlerts.value = currentAlerts
+    }
+    
+    private suspend fun updateDelayAnalytics() {
+        try {
+            val alerts = _activeDelayAlerts.value
+            val analytics = DelayAnalytics(
+                totalActive = alerts.size,
+                minorAlerts = alerts.count { it.severity == DelaySeverity.MINOR },
+                moderateAlerts = alerts.count { it.severity == DelaySeverity.MODERATE },
+                severeAlerts = alerts.count { it.severity == DelaySeverity.SEVERE },
+                criticalAlerts = alerts.count { it.severity == DelaySeverity.CRITICAL },
+                averageDelayMinutes = if (alerts.isNotEmpty()) alerts.map { it.delayMinutes }.average().toFloat() else 0f,
+                categoryStats = alerts.groupBy { it.delayCategory }
+                    .mapValues { it.value.size },
+                impactStats = alerts.groupBy { it.impact }
+                    .mapValues { it.value.size }
+            )
+            
+            _delayAnalytics.value = analytics
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun notifyDelayAlertCreated(alert: DelayAlert) {
+        delayAlertListeners.forEach { listener ->
+            listener.onDelayAlertCreated(alert)
+        }
+    }
+    
+    private fun notifyDelayAlertUpdated(alert: DelayAlert) {
+        delayAlertListeners.forEach { listener ->
+            listener.onDelayAlertUpdated(alert)
+        }
+    }
+    
+    private fun notifyDelayAlertResolved(alert: DelayAlert) {
+        delayAlertListeners.forEach { listener ->
+            listener.onDelayAlertResolved(alert)
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class DelayAlertData(
+    val shipmentId: String,
+    val originalETA: Date,
+    val currentETA: Date,
+    val delayMinutes: Int,
+    val reason: String,
+    val delayCategory: DelayCategory = DelayCategory.OTHER,
+    val impact: DelayImpact = DelayImpact.LOW,
+    val isPredicted: Boolean = false,
+    val predictionId: Long? = null,
+    val metadata: Map<String, String> = emptyMap()
+) {
+    fun toMetadata(): Map<String, String> {
+        return metadata + mapOf(
+            "shipmentId" to shipmentId,
+            "originalETA" to originalETA.toString(),
+            "currentETA" to currentETA.toString(),
+            "delayMinutes" to delayMinutes.toString(),
+            "reason" to reason,
+            "delayCategory" to delayCategory.name,
+            "impact" to impact.name,
+            "isPredicted" to isPredicted.toString(),
+            "predictionId" to (predictionId?.toString() ?: "")
+        )
+    }
+}
+
+data class DelayAlert(
+    val id: String,
+    val shipmentId: String,
+    val severity: DelaySeverity,
+    val originalETA: Date,
+    val currentETA: Date,
+    val delayMinutes: Int,
+    val delayReason: String,
+    val delayCategory: DelayCategory,
+    val impact: DelayImpact,
+    val recipients: List<NotificationRecipient>,
+    val metadata: Map<String, String>,
+    val status: DelayAlertStatus,
+    val createdAt: Date,
+    val updatedAt: Date,
+    val acknowledgedAt: Date?,
+    val acknowledgedBy: String?,
+    val resolvedAt: Date?,
+    val resolvedBy: String?,
+    val resolution: String?,
+    val actualDelayMinutes: Int? = null
+)
+
+data class DelayPrediction(
+    val id: Long = 0,
+    val shipmentId: String,
+    val predictedDelayMinutes: Int,
+    val confidence: Float,
+    val factors: List<DelayFactor>,
+    val predictedNewETA: Date,
+    val predictionTime: Date,
+    val currentLocation: String,
+    val trafficConditions: TrafficConditions,
+    val weatherConditions: WeatherConditions
+)
+
+data class DelayAnalytics(
+    val totalActive: Int = 0,
+    val minorAlerts: Int = 0,
+    val moderateAlerts: Int = 0,
+    val severeAlerts: Int = 0,
+    val criticalAlerts: Int = 0,
+    val averageDelayMinutes: Float = 0f,
+    val categoryStats: Map<DelayCategory, Int> = emptyMap(),
+    val impactStats: Map<DelayImpact, Int> = emptyMap()
+)
+
+data class TrafficConditions(
+    val level: TrafficLevel,
+    val averageSpeed: Float,
+    val congestionFactor: Float
+)
+
+data class WeatherConditions(
+    val condition: WeatherCondition,
+    val temperature: Float,
+    val humidity: Float,
+    val windSpeed: Float,
+    val visibility: Visibility
+)
+
+/**
+ * Interfaces
+ */
+interface DelayAlertListener {
+    fun onDelayAlertCreated(alert: DelayAlert)
+    fun onDelayAlertUpdated(alert: DelayAlert)
+    fun onDelayAlertResolved(alert: DelayAlert)
+}
+
+/**
+ * Enums
+ */
+enum class DelayAlertState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class DelaySeverity {
+    MINOR,
+    MODERATE,
+    SEVERE,
+    CRITICAL
+}
+
+enum class DelayCategory {
+    TRAFFIC,
+    WEATHER,
+    VEHICLE_ISSUE,
+    ROUTE_ISSUE,
+    CUSTOMER_ISSUE,
+    PREDICTED,
+    OTHER
+}
+
+enum class DelayImpact {
+    LOW,
+    MODERATE,
+    HIGH,
+    SEVERE
+}
+
+enum class DelayAlertStatus {
+    ACTIVE,
+    ACKNOWLEDGED,
+    RESOLVED
+}
+
+enum class DelayFactor {
+    TRAFFIC,
+    WEATHER,
+    ROUTE_CONDITIONS,
+    VEHICLE_PERFORMANCE,
+    DRIVER_BEHAVIOR,
+    CUSTOMER_REQUESTS
+}
+
+enum class TrafficLevel {
+    LIGHT,
+    MODERATE,
+    HEAVY,
+    SEVERE,
+    UNKNOWN
+}
+
+enum class WeatherCondition {
+    CLEAR,
+    CLOUDY,
+    RAIN,
+    SNOW,
+    STORM,
+    UNKNOWN
+}
+
+enum class Visibility {
+    EXCELLENT,
+    GOOD,
+    MODERATE,
+    POOR
+}

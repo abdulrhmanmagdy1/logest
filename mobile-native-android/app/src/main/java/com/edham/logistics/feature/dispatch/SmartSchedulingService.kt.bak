@@ -1,0 +1,823 @@
+package com.edham.logistics.feature.dispatch
+
+import android.util.Log
+import com.edham.logistics.data.model.Driver
+import com.edham.logistics.data.model.Shipment
+import com.edham.logistics.feature.dispatch.LoadBalancingAlgorithm
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
+import java.time.temporal.ChronoUnit
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Smart Scheduling Service - Advanced scheduling algorithm
+ * Optimizes driver schedules with time windows, breaks, and constraints
+ */
+class SmartSchedulingService {
+    
+    companion object {
+        private const val TAG = "SmartSchedulingService"
+        
+        // Scheduling constraints
+        private const val MAX_WORKING_HOURS = 12.0 // Maximum working hours per day
+        private const val MIN_BREAK_TIME = 30 // Minimum break time in minutes
+        private const val MAX_CONSECUTIVE_HOURS = 8.0 // Maximum consecutive working hours
+        private const val REST_REQUIRED_HOURS = 11.0 // Rest required after this many hours
+        
+        // Scheduling strategies
+        enum class Strategy {
+            EARLIEST_DEADLINE,    // Prioritize earliest delivery deadlines
+            LEAST_LOADED,         // Balance driver workloads
+            OPTIMAL_ROUTE,          // Minimize total travel distance
+            DRIVER_PREFERENCE,      // Respect driver preferences
+            HYBRID                 // Combine multiple strategies
+        }
+        
+        // Priority weights
+        private const val DEADLINE_WEIGHT = 0.40
+        private const val WORKLOAD_WEIGHT = 0.25
+        private const val ROUTE_WEIGHT = 0.20
+        private const val PREFERENCE_WEIGHT = 0.15
+    }
+    
+    /**
+     * Generate optimal schedule for shipments
+     */
+    suspend fun generateOptimalSchedule(
+        shipments: List<Shipment>,
+        drivers: List<Driver>,
+        strategy: Strategy = Strategy.HYBRID,
+        timeWindow: LocalDateTime = LocalDateTime.now()
+    ): SchedulingResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "Generating optimal schedule for ${shipments.size} shipments")
+                
+                // Initialize driver schedules
+                val driverSchedules = drivers.map { driver ->
+                    DriverSchedule(
+                        driver = driver,
+                        currentWorkload = driver.activeShipments ?: 0,
+                        availableHours = calculateAvailableHours(driver, timeWindow),
+                        preferredRoutes = driver.preferredRoutes ?: emptyList(),
+                        maxCapacity = driver.maxConcurrentShipments,
+                        constraints = getDriverConstraints(driver)
+                    )
+                }
+                
+                // Apply scheduling strategy
+                val schedule = when (strategy) {
+                    Strategy.EARLIEST_DEADLINE -> applyEarliestDeadlineStrategy(shipments, driverSchedules)
+                    Strategy.LEAST_LOADED -> applyLeastLoadedStrategy(shipments, driverSchedules)
+                    Strategy.OPTIMAL_ROUTE -> applyOptimalRouteStrategy(shipments, driverSchedules)
+                    Strategy.DRIVER_PREFERENCE -> applyDriverPreferenceStrategy(shipments, driverSchedules)
+                    Strategy.HYBRID -> applyHybridStrategy(shipments, driverSchedules)
+                }
+                
+                // Validate schedule constraints
+                val validatedSchedule = validateScheduleConstraints(schedule, driverSchedules)
+                
+                // Calculate scheduling metrics
+                val metrics = calculateSchedulingMetrics(validatedSchedule, driverSchedules)
+                
+                // Generate recommendations
+                val recommendations = generateSchedulingRecommendations(metrics, driverSchedules)
+                
+                val result = SchedulingResult(
+                    schedule = validatedSchedule,
+                    metrics = metrics,
+                    recommendations = recommendations,
+                    strategy = strategy,
+                    totalShipments = shipments.size,
+                    totalDrivers = drivers.size,
+                    timeWindow = timeWindow,
+                    calculatedAt = LocalDateTime.now()
+                )
+                
+                Log.d(TAG, "Schedule generated with ${metrics.efficiencyScore} efficiency score")
+                result
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error generating optimal schedule", e)
+                SchedulingResult.createDefault(shipments.size, drivers.size)
+            }
+        }
+    }
+    
+    /**
+     * Apply earliest deadline scheduling strategy
+     */
+    private fun applyEarliestDeadlineStrategy(
+        shipments: List<Shipment>,
+        driverSchedules: List<DriverSchedule>
+    ): Schedule {
+        val assignments = mutableListOf<ScheduleAssignment>()
+        val availableDrivers = driverSchedules.filter { it.hasAvailableCapacity() }.toMutableList()
+        
+        // Sort shipments by deadline (earliest first)
+        val sortedShipments = shipments.sortedBy { it.deliveryTimeWindow }
+        
+        sortedShipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Find best driver for this shipment
+                val bestDriver = findBestDriverForShipment(shipment, availableDrivers, Strategy.EARLIEST_DEADLINE)
+                
+                if (bestDriver != null) {
+                    val assignment = ScheduleAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        scheduledTime = calculateOptimalTime(shipment, bestDriver),
+                        estimatedDuration = calculateEstimatedDuration(shipment),
+                        strategy = "EARLIEST_DEADLINE",
+                        confidenceScore = calculateConfidenceScore(shipment, bestDriver),
+                        priority = shipment.priority
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addAssignment(assignment)
+                    
+                    // Update driver availability
+                    if (!bestDriver.hasAvailableCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return Schedule(assignments = assignments)
+    }
+    
+    /**
+     * Apply least loaded scheduling strategy
+     */
+    private fun applyLeastLoadedStrategy(
+        shipments: List<Shipment>,
+        driverSchedules: List<DriverSchedule>
+    ): Schedule {
+        val assignments = mutableListOf<ScheduleAssignment>()
+        val availableDrivers = driverSchedules.filter { it.hasAvailableCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort drivers by current workload (least loaded first)
+                availableDrivers.sortBy { it.currentWorkload }
+                
+                val bestDriver = availableDrivers.firstOrNull { it.canAcceptShipment(shipment) }
+                
+                if (bestDriver != null) {
+                    val assignment = ScheduleAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        scheduledTime = calculateOptimalTime(shipment, bestDriver),
+                        estimatedDuration = calculateEstimatedDuration(shipment),
+                        strategy = "LEAST_LOADED",
+                        confidenceScore = calculateConfidenceScore(shipment, bestDriver),
+                        priority = shipment.priority
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addAssignment(assignment)
+                    
+                    // Update driver availability
+                    if (!bestDriver.hasAvailableCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return Schedule(assignments = assignments)
+    }
+    
+    /**
+     * Apply optimal route scheduling strategy
+     */
+    private fun applyOptimalRouteStrategy(
+        shipments: List<Shipment>,
+        driverSchedules: List<DriverSchedule>
+    ): Schedule {
+        val assignments = mutableListOf<ScheduleAssignment>()
+        val availableDrivers = driverSchedules.filter { it.hasAvailableCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort drivers by proximity to shipment pickup
+                availableDrivers.sortBy { driver ->
+                    calculateDistanceToShipment(driver.driver, shipment)
+                }
+                
+                val bestDriver = availableDrivers.firstOrNull { it.canAcceptShipment(shipment) }
+                
+                if (bestDriver != null) {
+                    val assignment = ScheduleAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        scheduledTime = calculateOptimalTime(shipment, bestDriver),
+                        estimatedDuration = calculateEstimatedDuration(shipment),
+                        strategy = "OPTIMAL_ROUTE",
+                        confidenceScore = calculateConfidenceScore(shipment, bestDriver),
+                        priority = shipment.priority
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addAssignment(assignment)
+                    
+                    // Update driver availability
+                    if (!bestDriver.hasAvailableCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return Schedule(assignments = assignments)
+    }
+    
+    /**
+     * Apply driver preference scheduling strategy
+     */
+    private fun applyDriverPreferenceStrategy(
+        shipments: List<Shipment>,
+        driverSchedules: List<DriverSchedule>
+    ): Schedule {
+        val assignments = mutableListOf<ScheduleAssignment>()
+        val availableDrivers = driverSchedules.filter { it.hasAvailableCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Sort drivers by preference score
+                availableDrivers.sortByDescending { driver ->
+                    calculatePreferenceScore(driver, shipment)
+                }
+                
+                val bestDriver = availableDrivers.firstOrNull { it.canAcceptShipment(shipment) }
+                
+                if (bestDriver != null) {
+                    val assignment = ScheduleAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        scheduledTime = calculateOptimalTime(shipment, bestDriver),
+                        estimatedDuration = calculateEstimatedDuration(shipment),
+                        strategy = "DRIVER_PREFERENCE",
+                        confidenceScore = calculateConfidenceScore(shipment, bestDriver),
+                        priority = shipment.priority
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addAssignment(assignment)
+                    
+                    // Update driver availability
+                    if (!bestDriver.hasAvailableCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return Schedule(assignments = assignments)
+    }
+    
+    /**
+     * Apply hybrid scheduling strategy (combines multiple factors)
+     */
+    private fun applyHybridStrategy(
+        shipments: List<Shipment>,
+        driverSchedules: List<DriverSchedule>
+    ): Schedule {
+        val assignments = mutableListOf<ScheduleAssignment>()
+        val availableDrivers = driverSchedules.filter { it.hasAvailableCapacity() }.toMutableList()
+        
+        shipments.forEach { shipment ->
+            if (availableDrivers.isNotEmpty()) {
+                // Calculate composite scores for all available drivers
+                val driverScores = availableDrivers.map { driverSchedule ->
+                    val deadlineScore = calculateDeadlineScore(shipment, driverSchedule) * DEADLINE_WEIGHT
+                    val workloadScore = calculateWorkloadScore(driverSchedule) * WORKLOAD_WEIGHT
+                    val routeScore = calculateRouteScore(shipment, driverSchedule) * ROUTE_WEIGHT
+                    val preferenceScore = calculatePreferenceScore(driverSchedule, shipment) * PREFERENCE_WEIGHT
+                    
+                    val totalScore = deadlineScore + workloadScore + routeScore + preferenceScore
+                    
+                    Pair(driverSchedule, totalScore)
+                }
+                
+                // Select driver with highest composite score
+                val bestDriver = driverScores.maxByOrNull { it.second }?.first
+                
+                if (bestDriver != null && bestDriver.canAcceptShipment(shipment)) {
+                    val assignment = ScheduleAssignment(
+                        shipmentId = shipment.id,
+                        driverId = bestDriver.driver.id,
+                        driverName = bestDriver.driver.name,
+                        scheduledTime = calculateOptimalTime(shipment, bestDriver),
+                        estimatedDuration = calculateEstimatedDuration(shipment),
+                        strategy = "HYBRID",
+                        confidenceScore = calculateConfidenceScore(shipment, bestDriver),
+                        priority = shipment.priority
+                    )
+                    
+                    assignments.add(assignment)
+                    bestDriver.addAssignment(assignment)
+                    
+                    // Update driver availability
+                    if (!bestDriver.hasAvailableCapacity()) {
+                        availableDrivers.remove(bestDriver)
+                    }
+                }
+            }
+        }
+        
+        return Schedule(assignments = assignments)
+    }
+    
+    /**
+     * Calculate available hours for driver
+     */
+    private fun calculateAvailableHours(driver: Driver, timeWindow: LocalDateTime): Double {
+        val hoursWorkedToday = driver.hoursWorkedToday ?: 0.0
+        val remainingHours = maxOf(0.0, MAX_WORKING_HOURS - hoursWorkedToday)
+        
+        // Consider driver status
+        return when (driver.status) {
+            Driver.Status.AVAILABLE -> remainingHours
+            Driver.Status.BUSY -> remainingHours * 0.5
+            Driver.Status.BREAK -> remainingHours * 0.8
+            Driver.Status.OFF_DUTY -> 0.0
+            else -> remainingHours * 0.3
+        }
+    }
+    
+    /**
+     * Get driver constraints
+     */
+    private fun getDriverConstraints(driver: Driver): DriverConstraints {
+        return DriverConstraints(
+            maxWorkingHours = MAX_WORKING_HOURS,
+            minBreakTime = MIN_BREAK_TIME,
+            maxConsecutiveHours = MAX_CONSECUTIVE_HOURS,
+            restRequiredHours = REST_REQUIRED_HOURS,
+            preferredStartTime = driver.preferredStartTime,
+            preferredEndTime = driver.preferredEndTime,
+            preferredBreakTimes = driver.preferredBreakTimes ?: emptyList()
+        )
+    }
+    
+    /**
+     * Find best driver for shipment
+     */
+    private fun findBestDriverForShipment(
+        shipment: Shipment,
+        drivers: List<DriverSchedule>,
+        strategy: Strategy
+    ): DriverSchedule? {
+        return when (strategy) {
+            Strategy.EARLIEST_DEADLINE -> drivers.minByOrNull { calculateDeadlineScore(shipment, it) }
+            Strategy.LEAST_LOADED -> drivers.minByOrNull { it.currentWorkload }
+            Strategy.OPTIMAL_ROUTE -> drivers.minByOrNull { calculateRouteScore(shipment, it) }
+            Strategy.DRIVER_PREFERENCE -> drivers.maxByOrNull { calculatePreferenceScore(it, shipment) }
+            else -> drivers.maxByOrNull { calculateCompositeScore(shipment, it) }
+        }
+    }
+    
+    /**
+     * Calculate deadline score
+     */
+    private fun calculateDeadlineScore(shipment: Shipment, driverSchedule: DriverSchedule): Double {
+        val hoursUntilDeadline = ChronoUnit.HOURS.between(
+            LocalDateTime.now(),
+            shipment.deliveryTimeWindow
+        )
+        
+        val travelTime = calculateTravelTime(driverSchedule.driver, shipment)
+        val processingTime = 1.0 // Time for pickup processing
+        
+        val availableTime = driverSchedule.availableHours - travelTime - processingTime
+        
+        return when {
+            availableTime >= hoursUntilDeadline -> 100.0
+            availableTime >= hoursUntilDeadline * 0.8 -> 80.0
+            availableTime >= hoursUntilDeadline * 0.6 -> 60.0
+            availableTime >= hoursUntilDeadline * 0.4 -> 40.0
+            else -> 20.0
+        }
+    }
+    
+    /**
+     * Calculate workload score
+     */
+    private fun calculateWorkloadScore(driverSchedule: DriverSchedule): Double {
+        val utilizationRate = (driverSchedule.currentWorkload.toDouble() / driverSchedule.maxCapacity) * 100.0
+        
+        return when {
+            utilizationRate <= 30.0 -> 100.0
+            utilizationRate <= 50.0 -> 80.0
+            utilizationRate <= 70.0 -> 60.0
+            utilizationRate <= 85.0 -> 40.0
+            else -> 20.0
+        }
+    }
+    
+    /**
+     * Calculate route score
+     */
+    private fun calculateRouteScore(shipment: Shipment, driverSchedule: DriverSchedule): Double {
+        val distance = calculateDistanceToShipment(driverSchedule.driver, shipment)
+        val isInPreferredRoute = driverSchedule.preferredRoutes.any { route ->
+            shipment.pickupAddress.contains(route) || shipment.deliveryAddress.contains(route)
+        }
+        
+        var score = when {
+            distance <= 5 -> 100.0
+            distance <= 10 -> 80.0
+            distance <= 20 -> 60.0
+            distance <= 50 -> 40.0
+            else -> 20.0
+        }
+        
+        if (isInPreferredRoute) {
+            score += 20.0
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate preference score
+     */
+    private fun calculatePreferenceScore(driverSchedule: DriverSchedule, shipment: Shipment): Double {
+        var score = 50.0 // Base score
+        
+        // Time preference
+        val now = LocalDateTime.now()
+        val currentTime = now.hour + now.minute / 60.0
+        
+        if (driverSchedule.constraints.preferredStartTime != null) {
+            val preferredStart = driverSchedule.constraints.preferredStartTime!!.hour + 
+                              driverSchedule.constraints.preferredStartTime!!.minute / 60.0
+            
+            if (currentTime >= preferredStart && currentTime <= preferredStart + 2.0) {
+                score += 20.0
+            }
+        }
+        
+        // Route preference
+        val isInPreferredRoute = driverSchedule.preferredRoutes.any { route ->
+            shipment.pickupAddress.contains(route) || shipment.deliveryAddress.contains(route)
+        }
+        
+        if (isInPreferredRoute) {
+            score += 15.0
+        }
+        
+        // Shipment type preference
+        val preferredShipmentTypes = driverSchedule.driver.preferredShipmentTypes ?: emptyList()
+        if (preferredShipmentTypes.contains(shipment.type)) {
+            score += 10.0
+        }
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Calculate composite score
+     */
+    private fun calculateCompositeScore(shipment: Shipment, driverSchedule: DriverSchedule): Double {
+        val deadlineScore = calculateDeadlineScore(shipment, driverSchedule)
+        val workloadScore = calculateWorkloadScore(driverSchedule)
+        val routeScore = calculateRouteScore(shipment, driverSchedule)
+        val preferenceScore = calculatePreferenceScore(driverSchedule, shipment)
+        
+        return (deadlineScore + workloadScore + routeScore + preferenceScore) / 4.0
+    }
+    
+    /**
+     * Calculate optimal time for assignment
+     */
+    private fun calculateOptimalTime(shipment: Shipment, driverSchedule: DriverSchedule): LocalDateTime {
+        val now = LocalDateTime.now()
+        val travelTime = calculateTravelTime(driverSchedule.driver, shipment)
+        val processingTime = 30 // 30 minutes for pickup processing
+        
+        return now.plusMinutes((travelTime * 60).toInt() + processingTime)
+    }
+    
+    /**
+     * Calculate estimated duration
+     */
+    private fun calculateEstimatedDuration(shipment: Shipment): Double {
+        return when (shipment.priority.uppercase()) {
+            "URGENT" -> 2.0
+            "HIGH" -> 4.0
+            "NORMAL" -> 6.0
+            "LOW" -> 8.0
+            else -> 6.0
+        }
+    }
+    
+    /**
+     * Calculate travel time
+     */
+    private fun calculateTravelTime(driver: Driver, shipment: Shipment): Double {
+        val driverLocation = driver.currentLocation
+        val shipmentLocation = shipment.pickupLocation
+        
+        return if (driverLocation != null && shipmentLocation != null) {
+            // Simplified distance calculation (would use actual routing API)
+            val latDiff = driverLocation.latitude - shipmentLocation.latitude
+            val lonDiff = driverLocation.longitude - shipmentLocation.longitude
+            val distance = kotlin.math.sqrt(latDiff * latDiff + lonDiff * lonDiff) * 111.0 // Approximate km
+            
+            distance / 50.0 // Assuming 50 km/h average speed
+        } else {
+            1.0 // Default 1 hour
+        }
+    }
+    
+    /**
+     * Calculate distance to shipment
+     */
+    private fun calculateDistanceToShipment(driver: Driver, shipment: Shipment): Double {
+        val driverLocation = driver.currentLocation
+        val shipmentLocation = shipment.pickupLocation
+        
+        return if (driverLocation != null && shipmentLocation != null) {
+            val latDiff = driverLocation.latitude - shipmentLocation.latitude
+            val lonDiff = driverLocation.longitude - shipmentLocation.longitude
+            kotlin.math.sqrt(latDiff * latDiff + lonDiff * lonDiff) * 111.0
+        } else {
+            50.0 // Default distance
+        }
+    }
+    
+    /**
+     * Calculate confidence score
+     */
+    private fun calculateConfidenceScore(shipment: Shipment, driverSchedule: DriverSchedule): Double {
+        var confidence = 80.0 // Base confidence
+        
+        // Data completeness
+        if (shipment.deliveryTimeWindow != null) confidence += 10.0
+        if (driverSchedule.driver.currentLocation != null) confidence += 5.0
+        if (shipment.pickupAddress.isNotBlank()) confidence += 5.0
+        
+        return confidence.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Validate schedule constraints
+     */
+    private fun validateScheduleConstraints(
+        schedule: Schedule,
+        driverSchedules: List<DriverSchedule>
+    ): Schedule {
+        val validAssignments = schedule.assignments.filter { assignment ->
+            val driver = driverSchedules.find { it.driver.id == assignment.driverId }
+            driver != null && validateAssignmentConstraints(assignment, driver)
+        }
+        
+        return Schedule(assignments = validAssignments)
+    }
+    
+    /**
+     * Validate assignment constraints
+     */
+    private fun validateAssignmentConstraints(assignment: ScheduleAssignment, driver: DriverSchedule): Boolean {
+        val totalWorkload = driver.currentWorkload + 1
+        val hoursWorkedToday = driver.driver.hoursWorkedToday ?: 0.0
+        
+        // Check capacity constraint
+        if (totalWorkload > driver.maxCapacity) return false
+        
+        // Check working hours constraint
+        if (hoursWorkedToday >= MAX_WORKING_HOURS) return false
+        
+        // Check consecutive hours constraint
+        if (hoursWorkedToday >= MAX_CONSECUTIVE_HOURS) return false
+        
+        return true
+    }
+    
+    /**
+     * Calculate scheduling metrics
+     */
+    private fun calculateSchedulingMetrics(
+        schedule: Schedule,
+        driverSchedules: List<DriverSchedule>
+    ): SchedulingMetrics {
+        val totalAssignments = schedule.assignments.size
+        val assignedDrivers = schedule.assignments.map { it.driverId }.distinct().size
+        
+        // Calculate driver utilization
+        val driverUtilizations = driverSchedules.map { driverSchedule ->
+            val assignedCount = schedule.assignments.count { it.driverId == driverSchedule.driver.id }
+            val utilizationRate = (driverSchedule.currentWorkload + assignedCount).toDouble() / driverSchedule.maxCapacity * 100.0
+            Pair(driverSchedule.driver.id, utilizationRate)
+        }
+        
+        val averageUtilization = driverUtilizations.map { it.second }.average()
+        val maxUtilization = driverUtilizations.maxByOrNull { it.second }?.second ?: 0.0
+        val minUtilization = driverUtilizations.minByOrNull { it.second }?.second ?: 0.0
+        
+        // Calculate deadline compliance
+        val onTimeAssignments = schedule.assignments.count { assignment ->
+            val shipment = getShipmentById(assignment.shipmentId)
+            shipment != null && assignment.scheduledTime.isBefore(shipment.deliveryTimeWindow)
+        }
+        
+        val deadlineComplianceRate = if (totalAssignments > 0) {
+            (onTimeAssignments.toDouble() / totalAssignments) * 100.0
+        } else {
+            0.0
+        }
+        
+        // Calculate efficiency score
+        val efficiencyScore = calculateEfficiencyScore(schedule, driverSchedules)
+        
+        return SchedulingMetrics(
+            totalAssignments = totalAssignments,
+            assignedDrivers = assignedDrivers,
+            averageUtilization = averageUtilization,
+            maxUtilization = maxUtilization,
+            minUtilization = minUtilization,
+            deadlineComplianceRate = deadlineComplianceRate,
+            efficiencyScore = efficiencyScore,
+            calculatedAt = LocalDateTime.now()
+        )
+    }
+    
+    /**
+     * Calculate efficiency score
+     */
+    private fun calculateEfficiencyScore(
+        schedule: Schedule,
+        driverSchedules: List<DriverSchedule>
+    ): Double {
+        var score = 50.0 // Base score
+        
+        // Driver utilization balance
+        val utilizations = driverSchedules.map { driverSchedule ->
+            val assignedCount = schedule.assignments.count { it.driverId == driverSchedule.driver.id }
+            (driverSchedule.currentWorkload + assignedCount).toDouble() / driverSchedule.maxCapacity * 100.0
+        }
+        
+        val utilizationRange = (utilizations.maxOrNull() ?: 0.0) - (utilizations.minOrNull() ?: 0.0)
+        if (utilizationRange <= 20.0) score += 20.0
+        else if (utilizationRange <= 40.0) score += 10.0
+        
+        // Deadline compliance
+        val onTimeRate = schedule.assignments.count { assignment ->
+            val shipment = getShipmentById(assignment.shipmentId)
+            shipment != null && assignment.scheduledTime.isBefore(shipment.deliveryTimeWindow)
+        }.toDouble() / schedule.assignments.size * 100.0
+        
+        if (onTimeRate >= 95.0) score += 20.0
+        else if (onTimeRate >= 85.0) score += 10.0
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    /**
+     * Generate scheduling recommendations
+     */
+    private fun generateSchedulingRecommendations(
+        metrics: SchedulingMetrics,
+        driverSchedules: List<DriverSchedule>
+    ): List<String> {
+        val recommendations = mutableListOf<String>()
+        
+        if (metrics.efficiencyScore < 70.0) {
+            recommendations.add("Consider using hybrid strategy for better efficiency")
+        }
+        
+        if (metrics.averageUtilization < 40.0) {
+            recommendations.add("Low driver utilization - consider reducing driver pool or increasing shipments")
+        }
+        
+        if (metrics.maxUtilization > 90.0) {
+            recommendations.add("High driver utilization - consider adding more drivers to the pool")
+        }
+        
+        if (metrics.deadlineComplianceRate < 85.0) {
+            recommendations.add("Poor deadline compliance - review scheduling constraints and time estimates")
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Get shipment by ID (placeholder)
+     */
+    private fun getShipmentById(shipmentId: String): Shipment? {
+        // This would fetch from repository
+        return null
+    }
+}
+
+/**
+ * Driver schedule data class
+ */
+data class DriverSchedule(
+    val driver: Driver,
+    val currentWorkload: Int,
+    val availableHours: Double,
+    val preferredRoutes: List<String>,
+    val maxCapacity: Int,
+    val constraints: DriverConstraints
+) {
+    val assignments = mutableListOf<ScheduleAssignment>()
+    
+    fun hasAvailableCapacity(): Boolean {
+        return currentWorkload + assignments.size < maxCapacity
+    }
+    
+    fun canAcceptShipment(shipment: Shipment): Boolean {
+        return hasAvailableCapacity() && availableHours > 2.0 // Minimum 2 hours available
+    }
+    
+    fun addAssignment(assignment: ScheduleAssignment) {
+        assignments.add(assignment)
+    }
+}
+
+/**
+ * Driver constraints data class
+ */
+data class DriverConstraints(
+    val maxWorkingHours: Double,
+    val minBreakTime: Int,
+    val maxConsecutiveHours: Double,
+    val restRequiredHours: Double,
+    val preferredStartTime: LocalDateTime?,
+    val preferredEndTime: LocalDateTime?,
+    val preferredBreakTimes: List<LocalDateTime>
+)
+
+/**
+ * Schedule assignment data class
+ */
+data class ScheduleAssignment(
+    val shipmentId: String,
+    val driverId: String,
+    val driverName: String,
+    val scheduledTime: LocalDateTime,
+    val estimatedDuration: Double,
+    val strategy: String,
+    val confidenceScore: Double,
+    val priority: String
+)
+
+/**
+ * Schedule data class
+ */
+data class Schedule(
+    val assignments: List<ScheduleAssignment>
+)
+
+/**
+ * Scheduling metrics data class
+ */
+data class SchedulingMetrics(
+    val totalAssignments: Int,
+    val assignedDrivers: Int,
+    val averageUtilization: Double,
+    val maxUtilization: Double,
+    val minUtilization: Double,
+    val deadlineComplianceRate: Double,
+    val efficiencyScore: Double,
+    val calculatedAt: LocalDateTime
+)
+
+/**
+ * Scheduling result data class
+ */
+data class SchedulingResult(
+    val schedule: Schedule,
+    val metrics: SchedulingMetrics,
+    val recommendations: List<String>,
+    val strategy: SmartSchedulingService.Strategy,
+    val totalShipments: Int,
+    val totalDrivers: Int,
+    val timeWindow: LocalDateTime,
+    val calculatedAt: LocalDateTime
+) {
+    companion object {
+        fun createDefault(totalShipments: Int, totalDrivers: Int): SchedulingResult {
+            return SchedulingResult(
+                schedule = Schedule(assignments = emptyList()),
+                metrics = SchedulingMetrics.createDefault(),
+                recommendations = emptyList(),
+                strategy = SmartSchedulingService.Strategy.HYBRID,
+                totalShipments = totalShipments,
+                totalDrivers = totalDrivers,
+                timeWindow = LocalDateTime.now(),
+                calculatedAt = LocalDateTime.now()
+            )
+        }
+    }
+}

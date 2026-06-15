@@ -1,0 +1,703 @@
+package com.edham.logistics.finance.wallet
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.WalletApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Wallet Service - Manages digital wallet functionality
+ * 
+ * Features:
+ * - Wallet balance management
+ * - Wallet transactions
+ * - Top-up functionality
+ * - Withdrawal processing
+ * - Transaction history
+ * - Wallet security
+ * - Multi-currency support
+ * - Wallet analytics
+ */
+@Singleton
+class WalletService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val walletApi: WalletApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _walletState = MutableStateFlow<WalletState>(WalletState.Idle)
+    val walletState: StateFlow<WalletState> = _walletState.asStateFlow()
+    
+    private val _walletBalances = MutableStateFlow<Map<String, WalletBalance>>(emptyMap())
+    val walletBalances: StateFlow<Map<String, WalletBalance>> = _walletBalances.asStateFlow()
+    
+    private val _walletTransactions = MutableStateFlow<List<WalletTransaction>>(emptyList())
+    val walletTransactions: StateFlow<List<WalletTransaction>> = _walletTransactions.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "WalletService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val MIN_TOPUP_AMOUNT = 10f
+        private const val MAX_TOPUP_AMOUNT = 10000f
+        private const val MIN_WITHDRAWAL_AMOUNT = 10f
+        private const val MAX_WITHDRAWAL_AMOUNT = 5000f
+        private const val TRANSACTION_FEE_RATE = 0.01f // 1%
+    }
+    
+    /**
+     * Initialize wallet service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _walletState.value = WalletState.Initializing
+                
+                // Load wallet configuration
+                loadWalletConfiguration()
+                
+                // Load wallet balances
+                loadWalletBalances()
+                
+                // Load recent transactions
+                loadRecentTransactions()
+                
+                isInitialized = true
+                _walletState.value = WalletState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _walletState.value = WalletState.Error("Failed to initialize wallet service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get wallet balance
+     */
+    suspend fun getWalletBalance(userId: String): Result<WalletBalance> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Wallet service not initialized")
+                }
+                
+                // Get from cache first
+                val cachedBalance = _walletBalances.value[userId]
+                if (cachedBalance != null) {
+                    return@withContext Result.success(cachedBalance)
+                }
+                
+                // Fetch from API
+                val balance = walletApi.getWalletBalance(userId)
+                if (balance.success) {
+                    val walletBalance = balance.data!!
+                    
+                    // Update cache
+                    updateWalletBalanceInCache(userId, walletBalance)
+                    
+                    Result.success(walletBalance)
+                } else {
+                    throw Exception(balance.message ?: "Failed to fetch wallet balance")
+                }
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Top-up wallet
+     */
+    suspend fun topUpWallet(
+        userId: String,
+        amount: Float,
+        paymentMethod: WalletTopUpMethod,
+        reference: String? = null
+    ): Result<WalletTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Wallet service not initialized")
+                }
+                
+                _walletState.value = WalletState.Processing
+                
+                // Validate amount
+                validateTopUpAmount(amount)
+                
+                // Create top-up request
+                val topUpRequest = WalletTopUpRequest(
+                    userId = userId,
+                    amount = amount,
+                    currency = DEFAULT_CURRENCY,
+                    paymentMethod = paymentMethod,
+                    reference = reference
+                )
+                
+                // Process top-up
+                val result = walletApi.topUpWallet(topUpRequest)
+                if (result.success) {
+                    val transaction = result.data!!
+                    
+                    // Update wallet balance
+                    updateWalletBalanceAfterTransaction(userId, amount, WalletTransactionType.TOP_UP)
+                    
+                    // Add to transactions
+                    addTransactionToCache(transaction)
+                    
+                    _walletState.value = WalletState.Ready
+                    Result.success(transaction)
+                } else {
+                    throw Exception(result.message ?: "Top-up failed")
+                }
+                
+            } catch (e: Exception) {
+                _walletState.value = WalletState.Error("Top-up failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Withdraw from wallet
+     */
+    suspend fun withdrawFromWallet(
+        userId: String,
+        amount: Float,
+        withdrawalMethod: WalletWithdrawalMethod,
+        destination: String,
+        reference: String? = null
+    ): Result<WalletTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Wallet service not initialized")
+                }
+                
+                _walletState.value = WalletState.Processing
+                
+                // Get current balance
+                val currentBalance = getWalletBalance(userId).getOrThrow()
+                
+                // Validate withdrawal
+                validateWithdrawal(amount, currentBalance.balance)
+                
+                // Calculate fee
+                val fee = calculateTransactionFee(amount)
+                val totalAmount = amount + fee
+                
+                // Create withdrawal request
+                val withdrawalRequest = WalletWithdrawalRequest(
+                    userId = userId,
+                    amount = amount,
+                    fee = fee,
+                    totalAmount = totalAmount,
+                    currency = DEFAULT_CURRENCY,
+                    withdrawalMethod = withdrawalMethod,
+                    destination = destination,
+                    reference = reference
+                )
+                
+                // Process withdrawal
+                val result = walletApi.withdrawFromWallet(withdrawalRequest)
+                if (result.success) {
+                    val transaction = result.data!!
+                    
+                    // Update wallet balance
+                    updateWalletBalanceAfterTransaction(userId, totalAmount, WalletTransactionType.WITHDRAWAL)
+                    
+                    // Add to transactions
+                    addTransactionToCache(transaction)
+                    
+                    _walletState.value = WalletState.Ready
+                    Result.success(transaction)
+                } else {
+                    throw Exception(result.message ?: "Withdrawal failed")
+                }
+                
+            } catch (e: Exception) {
+                _walletState.value = WalletState.Error("Withdrawal failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process wallet transaction
+     */
+    suspend fun processWalletTransaction(
+        userId: String,
+        amount: Float,
+        transactionType: WalletTransactionType,
+        referenceId: String? = null,
+        description: String? = null
+    ): Result<WalletTransaction> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Wallet service not initialized")
+                }
+                
+                // Create transaction
+                val transaction = WalletTransaction(
+                    id = UUID.randomUUID().toString(),
+                    userId = userId,
+                    amount = amount,
+                    currency = DEFAULT_CURRENCY,
+                    type = transactionType,
+                    status = WalletTransactionStatus.COMPLETED,
+                    referenceId = referenceId,
+                    description = description,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Update wallet balance
+                updateWalletBalanceAfterTransaction(userId, amount, transactionType)
+                
+                // Save transaction
+                saveTransaction(transaction)
+                
+                // Add to cache
+                addTransactionToCache(transaction)
+                
+                Result.success(transaction)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Transfer between wallets
+     */
+    suspend fun transferBetweenWallets(
+        fromUserId: String,
+        toUserId: String,
+        amount: Float,
+        description: String? = null
+    ): Result<WalletTransfer> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Wallet service not initialized")
+                }
+                
+                _walletState.value = WalletState.Processing
+                
+                // Get sender balance
+                val senderBalance = getWalletBalance(fromUserId).getOrThrow()
+                
+                // Validate transfer
+                validateTransfer(amount, senderBalance.balance)
+                
+                // Calculate fee
+                val fee = calculateTransactionFee(amount)
+                val totalAmount = amount + fee
+                
+                // Create transfer request
+                val transferRequest = WalletTransferRequest(
+                    fromUserId = fromUserId,
+                    toUserId = toUserId,
+                    amount = amount,
+                    fee = fee,
+                    totalAmount = totalAmount,
+                    currency = DEFAULT_CURRENCY,
+                    description = description
+                )
+                
+                // Process transfer
+                val result = walletApi.transferBetweenWallets(transferRequest)
+                if (result.success) {
+                    val transfer = result.data!!
+                    
+                    // Update sender balance
+                    updateWalletBalanceAfterTransaction(fromUserId, totalAmount, WalletTransactionType.TRANSFER_OUT)
+                    
+                    // Update receiver balance
+                    updateWalletBalanceAfterTransaction(toUserId, amount, WalletTransactionType.TRANSFER_IN)
+                    
+                    // Add transactions to cache
+                    addTransactionToCache(transfer.fromTransaction)
+                    addTransactionToCache(transfer.toTransaction)
+                    
+                    _walletState.value = WalletState.Ready
+                    Result.success(transfer)
+                } else {
+                    throw Exception(result.message ?: "Transfer failed")
+                }
+                
+            } catch (e: Exception) {
+                _walletState.value = WalletState.Error("Transfer failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get transaction history
+     */
+    suspend fun getTransactionHistory(
+        userId: String,
+        dateRange: DateRange = DateRange.last30Days(),
+        transactionType: WalletTransactionType? = null,
+        status: WalletTransactionStatus? = null
+    ): Result<List<WalletTransaction>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = database.walletTransactionDao().getTransactionHistory(
+                    userId = userId,
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    transactionType = transactionType,
+                    status = status
+                ).map { it.toDomainModel() }
+                
+                Result.success(transactions)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get wallet analytics
+     */
+    suspend fun getWalletAnalytics(
+        userId: String,
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<WalletAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val transactions = getTransactionHistory(userId, dateRange).getOrThrow()
+                
+                val analytics = WalletAnalytics(
+                    totalTransactions = transactions.size,
+                    totalCredits = transactions.filter { it.type in listOf(WalletTransactionType.TOP_UP, WalletTransactionType.TRANSFER_IN) }.sumOf { it.amount.toDouble() }.toFloat(),
+                    totalDebits = transactions.filter { it.type in listOf(WalletTransactionType.WITHDRAWAL, WalletTransactionType.TRANSFER_OUT, WalletTransactionType.PAYMENT, WalletTransactionType.EXPENSE) }.sumOf { it.amount.toDouble() }.toFloat(),
+                    totalFees = transactions.sumOf { (it.fee ?: 0f).toDouble() }.toFloat(),
+                    averageTransactionAmount = if (transactions.isNotEmpty()) transactions.map { it.amount }.average().toFloat() else 0f,
+                    transactionTypeStats = transactions.groupBy { it.type }.mapValues { it.value.size },
+                    monthlyStats = calculateMonthlyStats(transactions),
+                    currency = DEFAULT_CURRENCY
+                )
+                
+                Result.success(analytics)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get total wallet balance
+     */
+    suspend fun getTotalWalletBalance(): Float {
+        return _walletBalances.value.values.sumOf { it.balance.toDouble() }.toFloat()
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadWalletConfiguration() {
+        // Load wallet configuration from API or local storage
+    }
+    
+    private suspend fun loadWalletBalances() {
+        try {
+            // For demo purposes, load all active user wallets
+            val balances = database.walletBalanceDao().getAllBalances()
+                .map { it.toDomainModel() }
+                .associateBy { it.userId }
+            
+            _walletBalances.value = balances
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun loadRecentTransactions() {
+        try {
+            val transactions = database.walletTransactionDao().getRecentTransactions(50)
+                .map { it.toDomainModel() }
+            
+            _walletTransactions.value = transactions
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun validateTopUpAmount(amount: Float) {
+        if (amount < MIN_TOPUP_AMOUNT) {
+            throw Exception("Minimum top-up amount is $MIN_TOPUP_AMOUNT")
+        }
+        if (amount > MAX_TOPUP_AMOUNT) {
+            throw Exception("Maximum top-up amount is $MAX_TOPUP_AMOUNT")
+        }
+    }
+    
+    private fun validateWithdrawal(amount: Float, currentBalance: Float) {
+        if (amount < MIN_WITHDRAWAL_AMOUNT) {
+            throw Exception("Minimum withdrawal amount is $MIN_WITHDRAWAL_AMOUNT")
+        }
+        if (amount > MAX_WITHDRAWAL_AMOUNT) {
+            throw Exception("Maximum withdrawal amount is $MAX_WITHDRAWAL_AMOUNT")
+        }
+        if (amount > currentBalance) {
+            throw Exception("Insufficient balance")
+        }
+    }
+    
+    private fun validateTransfer(amount: Float, currentBalance: Float) {
+        if (amount <= 0) {
+            throw Exception("Transfer amount must be positive")
+        }
+        if (amount > currentBalance) {
+            throw Exception("Insufficient balance")
+        }
+    }
+    
+    private fun calculateTransactionFee(amount: Float): Float {
+        return amount * TRANSACTION_FEE_RATE
+    }
+    
+    private suspend fun updateWalletBalanceAfterTransaction(
+        userId: String,
+        amount: Float,
+        transactionType: WalletTransactionType
+    ) {
+        try {
+            val currentBalance = _walletBalances.value[userId]
+            currentBalance?.let { balance ->
+                val newBalance = when (transactionType) {
+                    WalletTransactionType.TOP_UP,
+                    WalletTransactionType.TRANSFER_IN -> balance.balance + amount
+                    
+                    WalletTransactionType.WITHDRAWAL,
+                    WalletTransactionType.TRANSFER_OUT,
+                    WalletTransactionType.PAYMENT,
+                    WalletTransactionType.EXPENSE -> balance.balance - amount
+                    
+                    else -> balance.balance
+                }
+                
+                val updatedBalance = balance.copy(
+                    balance = newBalance,
+                    updatedAt = Date()
+                )
+                
+                updateWalletBalanceInCache(userId, updatedBalance)
+                
+                // Save to database
+                database.walletBalanceDao().updateBalance(updatedBalance.toEntity())
+            }
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun updateWalletBalanceInCache(userId: String, balance: WalletBalance) {
+        val currentBalances = _walletBalances.value.toMutableMap()
+        currentBalances[userId] = balance
+        _walletBalances.value = currentBalances
+    }
+    
+    private suspend fun saveTransaction(transaction: WalletTransaction) {
+        try {
+            database.walletTransactionDao().insertTransaction(transaction.toEntity())
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun addTransactionToCache(transaction: WalletTransaction) {
+        val currentTransactions = _walletTransactions.value.toMutableList()
+        currentTransactions.add(0, transaction) // Add to beginning
+        
+        // Keep only last 100 transactions in cache
+        if (currentTransactions.size > 100) {
+            currentTransactions.removeAt(currentTransactions.size - 1)
+        }
+        
+        _walletTransactions.value = currentTransactions
+    }
+    
+    private fun calculateMonthlyStats(transactions: List<WalletTransaction>): Map<String, MonthlyWalletStats> {
+        return transactions.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.createdAt
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { (_, monthTransactions) ->
+            MonthlyWalletStats(
+                transactionCount = monthTransactions.size,
+                totalAmount = monthTransactions.sumOf { it.amount.toDouble() }.toFloat(),
+                averageAmount = if (monthTransactions.isNotEmpty()) monthTransactions.map { it.amount }.average().toFloat() else 0f
+            )
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class WalletBalance(
+    val userId: String,
+    val balance: Float,
+    val currency: String,
+    val availableBalance: Float,
+    val frozenBalance: Float,
+    val lastUpdated: Date,
+    val createdAt: Date
+)
+
+data class WalletTransaction(
+    val id: String,
+    val userId: String,
+    val amount: Float,
+    val currency: String,
+    val type: WalletTransactionType,
+    val status: WalletTransactionStatus,
+    val fee: Float? = null,
+    val referenceId: String? = null,
+    val description: String? = null,
+    val metadata: Map<String, String> = emptyMap(),
+    val createdAt: Date,
+    val updatedAt: Date
+)
+
+data class WalletTransfer(
+    val id: String,
+    val fromUserId: String,
+    val toUserId: String,
+    val amount: Float,
+    val fee: Float,
+    val totalAmount: Float,
+    val currency: String,
+    val fromTransaction: WalletTransaction,
+    val toTransaction: WalletTransaction,
+    val status: WalletTransferStatus,
+    val createdAt: Date
+)
+
+data class WalletAnalytics(
+    val totalTransactions: Int,
+    val totalCredits: Float,
+    val totalDebits: Float,
+    val totalFees: Float,
+    val averageTransactionAmount: Float,
+    val transactionTypeStats: Map<WalletTransactionType, Int>,
+    val monthlyStats: Map<String, MonthlyWalletStats>,
+    val currency: String
+)
+
+data class MonthlyWalletStats(
+    val transactionCount: Int,
+    val totalAmount: Float,
+    val averageAmount: Float
+)
+
+data class WalletTopUpRequest(
+    val userId: String,
+    val amount: Float,
+    val currency: String,
+    val paymentMethod: WalletTopUpMethod,
+    val reference: String? = null
+)
+
+data class WalletWithdrawalRequest(
+    val userId: String,
+    val amount: Float,
+    val fee: Float,
+    val totalAmount: Float,
+    val currency: String,
+    val withdrawalMethod: WalletWithdrawalMethod,
+    val destination: String,
+    val reference: String? = null
+)
+
+data class WalletTransferRequest(
+    val fromUserId: String,
+    val toUserId: String,
+    val amount: Float,
+    val fee: Float,
+    val totalAmount: Float,
+    val currency: String,
+    val description: String? = null
+)
+
+/**
+ * Enums
+ */
+enum class WalletState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class WalletTransactionType {
+    TOP_UP,
+    WITHDRAWAL,
+    TRANSFER_IN,
+    TRANSFER_OUT,
+    PAYMENT,
+    REFUND,
+    EXPENSE,
+    REWARD
+}
+
+enum class WalletTransactionStatus {
+    PENDING,
+    PROCESSING,
+    COMPLETED,
+    FAILED,
+    CANCELLED
+}
+
+enum class WalletTopUpMethod {
+    CREDIT_CARD,
+    BANK_TRANSFER,
+    CASH,
+    MOBILE_MONEY
+}
+
+enum class WalletWithdrawalMethod {
+    BANK_TRANSFER,
+    MOBILE_MONEY,
+    CASH
+}
+
+enum class WalletTransferStatus {
+    PENDING,
+    PROCESSING,
+    COMPLETED,
+    FAILED,
+    CANCELLED
+}

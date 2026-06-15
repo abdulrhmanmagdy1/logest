@@ -1,0 +1,413 @@
+package com.edham.logistics.feature.tracking.presentation.ui
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.edham.logistics.R
+import com.edham.logistics.core.extensions.gone
+import com.edham.logistics.core.extensions.showSnackbar
+import com.edham.logistics.core.extensions.visible
+import com.edham.logistics.databinding.FragmentFleetTrackingBinding
+import com.edham.logistics.feature.tracking.presentation.ui.FleetTrackingViewModel
+import com.edham.logistics.feature.tracking.presentation.adapter.VehiclesAdapter
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.OnMapReadyCallback
+import com.google.android.gms.maps.SupportMapFragment
+import com.google.android.gms.maps.model.*
+import com.google.android.gms.maps.model.BitmapDescriptorFactory
+import com.google.maps.android.clustering.ClusterManager
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class FleetTrackingFragment : Fragment(), OnMapReadyCallback {
+
+    private var _binding: FragmentFleetTrackingBinding? = null
+    private val binding get() = _binding!!
+    
+    private val viewModel: FleetTrackingViewModel by viewModels()
+    
+    @Inject
+    lateinit var vehiclesAdapter: VehiclesAdapter
+    
+    private var googleMap: GoogleMap? = null
+    private var clusterManager: ClusterManager<com.edham.logistics.feature.tracking.presentation.map.VehicleClusterItem>? = null
+    
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        when {
+            permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true -> {
+                enableLocation()
+            }
+            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true -> {
+                enableLocation()
+            }
+            else -> {
+                showSnackbar("GPS permission denied")
+            }
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentFleetTrackingBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupMap()
+        setupAdapters()
+        observeViewModel()
+        setupClickListeners()
+        
+        // Initialize tracking
+        viewModel.initialize()
+    }
+
+    private fun setupMap() {
+        val mapFragment = childFragmentManager.findFragmentById(R.id.map) as SupportMapFragment
+        mapFragment.getMapAsync(this)
+    }
+
+    private fun setupAdapters() {
+        vehiclesAdapter = VehiclesAdapter { vehicle, action ->
+            when (action) {
+                "select" -> viewModel.selectVehicle(vehicle.id)
+                "center" -> viewModel.centerMapOnVehicle(vehicle.id)
+                "details" -> navigateToVehicleDetails(vehicle.id)
+                "track" -> navigateToShipmentTracking(vehicle.currentShipmentId ?: "")
+            }
+        }
+        
+        binding.recyclerViewVehicles.adapter = vehiclesAdapter
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.uiState.collect { uiState ->
+                updateUI(uiState)
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.buttonRefresh.setOnClickListener {
+            viewModel.refresh()
+        }
+        
+        binding.buttonToggleMapStyle.setOnClickListener {
+            viewModel.toggleMapStyle()
+        }
+        
+        binding.buttonToggleTraffic.setOnClickListener {
+            viewModel.toggleTrafficLayer()
+        }
+        
+        binding.buttonCenterOnFleet.setOnClickListener {
+            centerMapOnFleet()
+        }
+        
+        binding.spinnerVehicleType.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val vehicleType = parent?.getItemAtPosition(position).toString()
+                viewModel.filterByVehicleType(vehicleType)
+            }
+            
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        
+        binding.spinnerStatus.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val status = when (parent?.getItemAtPosition(position).toString()) {
+                    "Moving" -> com.edham.logistics.feature.tracking.domain.model.VehicleStatus.MOVING
+                    "Stopped" -> com.edham.logistics.feature.tracking.domain.model.VehicleStatus.STOPPED
+                    "Idle" -> com.edham.logistics.feature.tracking.domain.model.VehicleStatus.IDLE
+                    "Offline" -> com.edham.logistics.feature.tracking.domain.model.VehicleStatus.OFFLINE
+                    else -> null
+                }
+                status?.let { viewModel.filterByStatus(it) }
+            }
+            
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        
+        binding.editTextSearch.setOnEditorActionListener { _, _, _ ->
+            val query = binding.editTextSearch.text.toString()
+            viewModel.searchVehicles(query)
+            true
+        }
+        
+        binding.buttonClearSearch.setOnClickListener {
+            binding.editTextSearch.text.clear()
+            viewModel.searchVehicles("")
+        }
+    }
+
+    private fun updateUI(uiState: FleetTrackingViewModel.FleetTrackingUiState) {
+        when {
+            uiState.isLoading -> {
+                showLoading()
+            }
+            uiState.error != null -> {
+                showError(uiState.error)
+            }
+            else -> {
+                showContent(uiState)
+            }
+        }
+    }
+
+    private fun showLoading() {
+        binding.progressBar.visible()
+        binding.contentLayout.alpha = 0.5f
+        binding.layoutError.gone()
+    }
+
+    private fun showError(error: String?) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.layoutError.visible()
+        binding.textError.text = error ?: "حدث خطأ غير متوقع"
+        binding.contentLayout.gone()
+        
+        binding.buttonRetry.setOnClickListener {
+            viewModel.refresh()
+        }
+    }
+
+    private fun showContent(uiState: FleetTrackingViewModel.FleetTrackingUiState) {
+        binding.progressBar.gone()
+        binding.contentLayout.alpha = 1.0f
+        binding.contentLayout.visible()
+        binding.layoutError.gone()
+        
+        // Update vehicles list
+        val vehiclesToShow = if (uiState.filteredVehicles.isNotEmpty()) {
+            uiState.filteredVehicles
+        } else {
+            uiState.fleetTracking?.vehicles ?: emptyList()
+        }
+        vehiclesAdapter.submitList(vehiclesToShow)
+        
+        // Update map
+        updateMapWithVehicles(uiState.fleetTracking?.vehicles ?: emptyList())
+        
+        // Update selected vehicle/shipment info
+        updateSelectedInfo(uiState)
+        
+        // Update map style
+        updateMapStyle(uiState.isDarkMap)
+        
+        // Update traffic layer
+        updateTrafficLayer(uiState.showTrafficLayer)
+        
+        // Center map if needed
+        uiState.mapCenter?.let { center ->
+            uiState.mapZoom.let { zoom ->
+                googleMap?.moveCamera(CameraUpdateFactory.newLatLngZoom(center, zoom))
+            }
+        }
+    }
+
+    private fun updateMapWithVehicles(vehicles: List<com.edham.logistics.feature.tracking.domain.model.VehicleTracking>) {
+        googleMap?.let { map ->
+            map.clear()
+            
+            // Add vehicle markers
+            vehicles.forEach { vehicle ->
+                val markerOptions = MarkerOptions()
+                    .position(vehicle.currentLocation)
+                    .title(vehicle.driverName)
+                    .snippet("${vehicle.vehicleLicensePlate} - ${vehicle.status.name}")
+                    .icon(getVehicleIcon(vehicle))
+                
+                val marker = map.addMarker(markerOptions)
+                marker?.tag = vehicle
+            }
+            
+            // Add route lines for active shipments
+            vehicles.filter { it.currentShipmentId != null }.forEach { vehicle ->
+                // This would need route data from the shipment
+                // For now, just show vehicle position
+            }
+            
+            // Adjust camera to show all vehicles
+            if (vehicles.isNotEmpty()) {
+                val boundsBuilder = LatLngBounds.Builder()
+                vehicles.forEach { vehicle ->
+                    boundsBuilder.include(vehicle.currentLocation)
+                }
+                val bounds = boundsBuilder.build()
+                val padding = 100
+                map.moveCamera(CameraUpdateFactory.newLatLngBounds(bounds, padding))
+            }
+        }
+    }
+
+    private fun getVehicleIcon(vehicle: com.edham.logistics.feature.tracking.domain.model.VehicleTracking): BitmapDescriptor {
+        val color = when (vehicle.status) {
+            com.edham.logistics.feature.tracking.domain.model.VehicleStatus.MOVING -> android.graphics.Color.GREEN
+            com.edham.logistics.feature.tracking.domain.model.VehicleStatus.STOPPED -> android.graphics.Color.RED
+            com.edham.logistics.feature.tracking.domain.model.VehicleStatus.IDLE -> android.graphics.Color.YELLOW
+            com.edham.logistics.feature.tracking.domain.model.VehicleStatus.OFFLINE -> android.graphics.Color.GRAY
+            else -> android.graphics.Color.BLUE
+        }
+        
+        return BitmapDescriptorFactory.defaultMarker(color)
+    }
+
+    private fun updateSelectedInfo(uiState: FleetTrackingViewModel.FleetTrackingUiState) {
+        uiState.selectedVehicle?.let { vehicle ->
+            binding.layoutSelectedInfo.visible()
+            binding.textSelectedTitle.text = "مركبة: ${vehicle.vehicleLicensePlate}"
+            binding.textSelectedDriver.text = "السائق: ${vehicle.driverName}"
+            binding.textSelectedStatus.text = "الحالة: ${vehicle.status.name}"
+            binding.textSelectedSpeed.text = "السرعة: ${vehicle.speed} كم/س"
+            
+            if (vehicle.currentShipmentNumber != null) {
+                binding.textSelectedShipment.visible()
+                binding.textSelectedShipment.text = "الشحنة: ${vehicle.currentShipmentNumber}"
+            } else {
+                binding.textSelectedShipment.gone()
+            }
+        } ?: run {
+            binding.layoutSelectedInfo.gone()
+        }
+        
+        uiState.selectedShipment?.let { shipment ->
+            binding.layoutSelectedInfo.visible()
+            binding.textSelectedTitle.text = "شحنة: ${shipment.trackingNumber}"
+            binding.textSelectedDriver.text = "السائق: ${shipment.driverName}"
+            binding.textSelectedStatus.text = "الحالة: ${shipment.status.name}"
+            binding.textSelectedSpeed.text = "السرعة: ${shipment.speed} كم/س"
+            
+            shipment.estimatedArrivalTime?.let { eta ->
+                binding.textSelectedETA.visible()
+                binding.textSelectedETA.text = "وقت الوصول: ${formatTimestamp(eta)}"
+            } ?: run {
+                binding.textSelectedETA.gone()
+            }
+        }
+    }
+
+    private fun updateMapStyle(isDark: Boolean) {
+        googleMap?.let { map ->
+            val style = if (isDark) {
+                com.edham.logistics.R.raw.map_style_dark
+            } else {
+                com.edham.logistics.R.raw.map_style_light
+            }
+            map.setMapStyle(com.google.android.gms.maps.model.MapStyleOptions.loadRawResourceStyle(requireContext(), style))
+        }
+    }
+
+    private fun updateTrafficLayer(showTraffic: Boolean) {
+        googleMap?.let { map ->
+            map.isTrafficEnabled = showTraffic
+        }
+    }
+
+    private fun centerMapOnFleet() {
+        val vehicles = viewModel.uiState.value.fleetTracking?.vehicles ?: return
+        
+        if (vehicles.isNotEmpty()) {
+            val boundsBuilder = LatLngBounds.Builder()
+            vehicles.forEach { vehicle ->
+                boundsBuilder.include(vehicle.currentLocation)
+            }
+            val bounds = boundsBuilder.build()
+            val padding = 100
+            googleMap?.moveCamera(CameraUpdateFactory.newLatLngBounds(bounds, padding))
+        }
+    }
+
+    private fun formatTimestamp(timestamp: Long): String {
+        return java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date(timestamp))
+    }
+
+    private fun enableLocation() {
+        if (ContextCompat.checkSelfPermission(
+                requireContext(),
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            googleMap?.isMyLocationEnabled = true
+        }
+    }
+
+    private fun checkLocationPermission() {
+        when {
+            ContextCompat.checkSelfPermission(
+                requireContext(),
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED -> {
+                enableLocation()
+            }
+            else -> {
+                locationPermissionLauncher.launch(
+                    arrayOf(
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
+                )
+            }
+        }
+    }
+
+    // Navigation methods
+    private fun navigateToVehicleDetails(vehicleId: String) {
+        val action = FleetTrackingFragmentDirections
+            .actionFleetTrackingFragmentToVehicleDetailsFragment(vehicleId)
+        findNavController().navigate(action)
+    }
+
+    private fun navigateToShipmentTracking(shipmentId: String) {
+        val action = FleetTrackingFragmentDirections
+            .actionFleetTrackingFragmentToShipmentTrackingFragment(shipmentId)
+        findNavController().navigate(action)
+    }
+
+    override fun onMapReady(map: GoogleMap) {
+        googleMap = map
+        
+        // Setup map settings
+        map.uiSettings.apply {
+            isZoomControlsEnabled = true
+            isCompassEnabled = true
+            isMyLocationButtonEnabled = true
+            isMapToolbarEnabled = false
+        }
+        
+        // Check location permission
+        checkLocationPermission()
+        
+        // Setup cluster manager for better performance with many vehicles
+        clusterManager = ClusterManager(requireContext(), map)
+        map.setOnCameraIdleListener(clusterManager)
+        map.setOnMarkerClickListener(clusterManager)
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+        googleMap = null
+        clusterManager = null
+    }
+}

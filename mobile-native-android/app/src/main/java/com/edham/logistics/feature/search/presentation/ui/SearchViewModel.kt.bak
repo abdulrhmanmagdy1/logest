@@ -1,0 +1,643 @@
+package com.edham.logistics.feature.search.presentation.ui
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.feature.search.domain.model.*
+import com.edham.logistics.feature.search.domain.usecase.*
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * ViewModel for global search operations
+ */
+@HiltViewModel
+class SearchViewModel @Inject constructor(
+    private val globalSearchUseCase: GlobalSearchUseCase,
+    private val searchSuggestionsUseCase: SearchSuggestionsUseCase,
+    private val searchHistoryUseCase: SearchHistoryUseCase,
+    private val searchAnalyticsUseCase: SearchAnalyticsUseCase,
+    private val shipmentSearchUseCase: ShipmentSearchUseCase,
+    private val userSearchUseCase: UserSearchUseCase,
+    private val vehicleSearchUseCase: VehicleSearchUseCase,
+    private val invoiceSearchUseCase: InvoiceSearchUseCase,
+    private val advancedSearchUseCase: AdvancedSearchUseCase,
+    private val realTimeSearchUseCase: RealTimeSearchUseCase,
+    private val searchTemplateManagementUseCase: SearchTemplateManagementUseCase,
+    private val searchAlertManagementUseCase: SearchAlertManagementUseCase,
+    private val searchExportUseCase: SearchExportUseCase
+) : ViewModel() {
+
+    // UI State
+    private val _uiState = MutableStateFlow<SearchUiState>(SearchUiState.Idle)
+    val uiState: StateFlow<SearchUiState> = _uiState.asStateFlow()
+
+    // Search Results
+    private val _searchResults = MutableStateFlow<List<SearchResult>>(emptyList())
+    val searchResults: StateFlow<List<SearchResult>> = _searchResults.asStateState()
+
+    // Search Response
+    private val _searchResponse = MutableStateFlow<SearchResponse?>(null)
+    val searchResponse: StateFlow<SearchResponse?> = _searchResponse.asStateFlow()
+
+    // Search Query
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
+
+    // Search Filters
+    private val _searchFilters = MutableStateFlow(SearchFilters())
+    val searchFilters: StateFlow<SearchFilters> = _searchFilters.asStateState()
+
+    // Search Options
+    private val _searchOptions = MutableStateFlow(SearchOptions())
+    val searchOptions: StateFlow<SearchOptions> = _searchOptions.asStateState()
+
+    // Pagination
+    private val _pagination = MutableStateFlow(PaginationOptions())
+    val pagination: StateFlow<PaginationOptions> = _pagination.asStateState()
+
+    // Sorting
+    private val _sorting = MutableStateFlow(SortingOptions())
+    val sorting: StateFlow<SortingOptions> = _sorting.asStateState()
+
+    // Suggestions
+    private val _suggestions = MutableStateFlow<List<SearchSuggestion>>(emptyList())
+    val suggestions: StateFlow<List<SearchSuggestion>> = _suggestions.asStateState()
+
+    // Search History
+    private val _searchHistory = MutableStateFlow<List<SearchHistory>>(emptyList())
+    val searchHistory: StateFlow<List<SearchHistory>> = _searchHistory.asStateState()
+
+    // Search Analytics
+    private val _searchAnalytics = MutableStateFlow<SearchAnalytics?>(null)
+    val searchAnalytics: StateFlow<SearchAnalytics?> = _searchAnalytics.asStateState()
+
+    // Search Templates
+    private val _searchTemplates = MutableStateFlow<List<SearchTemplate>>(emptyList())
+    val searchTemplates: StateFlow<List<SearchTemplate>> = _searchTemplates.asStateState()
+
+    // Search Alerts
+    private val _searchAlerts = MutableStateFlow<List<SearchAlertConfig>>(emptyList())
+    val searchAlerts: StateFlow<List<SearchAlertConfig>> = _searchAlerts.asStateState()
+
+    // Export Result
+    private val _exportResult = MutableStateFlow<SearchExportResult?>(null)
+    val exportResult: StateFlow<SearchExportResult?> = _exportResult.asStateState()
+
+    // Selected Result
+    private val _selectedResult = MutableStateFlow<SearchResult?>(null)
+    val selectedResult: StateFlow<SearchResult?> = _selectedResult.asStateState()
+
+    // Search Mode
+    private val _searchMode = MutableStateFlow(SearchMode.GLOBAL)
+    val searchMode: StateFlow<SearchMode> = _searchMode.asStateState()
+
+    // Advanced Search
+    private val _advancedSearchMode = MutableStateFlow(false)
+    val advancedSearchMode: StateFlow<Boolean> = _advancedSearchMode.asStateState()
+
+    init {
+        loadSearchHistory()
+        loadSearchTemplates()
+        loadSearchAlerts()
+        observeSearchQuery()
+    }
+
+    // Global Search
+    fun performGlobalSearch(
+        query: String,
+        filters: SearchFilters = _searchFilters.value,
+        options: SearchOptions = _searchOptions.value,
+        pagination: PaginationOptions = _pagination.value,
+        sorting: SortingOptions = _sorting.value
+    ) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+            _searchQuery.value = query
+
+            when (val result = globalSearchUseCase(query, filters, options, pagination, sorting)) {
+                is Result.Success -> {
+                    _searchResponse.value = result.data
+                    _searchResults.value = result.data.results
+                    _pagination.value = pagination.copy(
+                        page = result.data.pagination.currentPage,
+                        pageSize = result.data.pagination.pageSize
+                    )
+                    _uiState.value = SearchUiState.Success
+
+                    // Add to search history
+                    searchHistoryUseCase.addToHistory(
+                        userId = "current_user", // Would get from context
+                        query = query,
+                        filters = filters,
+                        resultCount = result.data.results.size,
+                        duration = result.data.took
+                    )
+                }
+                is Result.Error -> {
+                    _uiState.value = SearchUiState.Error(result.exception.message ?: "Search failed")
+                }
+            }
+        }
+    }
+
+    // Entity-specific Searches
+    fun searchShipments(
+        query: String,
+        filters: ShipmentSearchFilters = ShipmentSearchFilters(),
+        pagination: PaginationOptions = _pagination.value
+    ) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+            _searchQuery.value = query
+            _searchMode.value = SearchMode.SHIPMENTS
+
+            when (val result = shipmentSearchUseCase(query, filters, pagination)) {
+                is Result.Success -> {
+                    _searchResults.value = result.data
+                    _uiState.value = SearchUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = SearchUiState.Error(result.exception.message ?: "Shipment search failed")
+                }
+            }
+        }
+    }
+
+    fun searchUsers(
+        query: String,
+        filters: UserSearchFilters = UserSearchFilters(),
+        pagination: PaginationOptions = _pagination.value
+    ) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+            _searchQuery.value = query
+            _searchMode.value = SearchMode.USERS
+
+            when (val result = userSearchUseCase(query, filters, pagination)) {
+                is Result.Success -> {
+                    _searchResults.value = result.data
+                    _uiState.value = SearchUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = SearchUiState.Error(result.exception.message ?: "User search failed")
+                }
+            }
+        }
+    }
+
+    fun searchVehicles(
+        query: String,
+        filters: VehicleSearchFilters = VehicleSearchFilters(),
+        pagination: PaginationOptions = _pagination.value
+    ) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+            _searchQuery.value = query
+            _searchMode.value = SearchMode.VEHICLES
+
+            when (val result = vehicleSearchUseCase(query, filters, pagination)) {
+                is Result.Success -> {
+                    _searchResults.value = result.data
+                    _uiState.value = SearchUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = SearchUiState.Error(result.exception.message ?: "Vehicle search failed")
+                }
+            }
+        }
+    }
+
+    fun searchInvoices(
+        query: String,
+        filters: InvoiceSearchFilters = InvoiceSearchFilters(),
+        pagination: PaginationOptions = _pagination.value
+    ) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+            _searchQuery.value = query
+            _searchMode.value = SearchMode.INVOICES
+
+            when (val result = invoiceSearchUseCase(query, filters, pagination)) {
+                is Result.Success -> {
+                    _searchResults.value = result.data
+                    _uiState.value = SearchUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = SearchUiState.Error(result.exception.message ?: "Invoice search failed")
+                }
+            }
+        }
+    }
+
+    // Advanced Search
+    fun performAdvancedSearch(request: AdvancedSearchRequest) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+            _advancedSearchMode.value = true
+
+            when (val result = advancedSearchUseCase(request)) {
+                is Result.Success -> {
+                    _searchResults.value = result.data.results
+                    _uiState.value = SearchUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = SearchUiState.Error(result.exception.message ?: "Advanced search failed")
+                }
+            }
+        }
+    }
+
+    // Real-time Search
+    fun startRealTimeSearch(query: String, filters: SearchFilters = _searchFilters.value) {
+        viewModelScope.launch {
+            realTimeSearchUseCase(query, filters).collect { results ->
+                _searchResults.value = results
+            }
+        }
+    }
+
+    // Suggestions
+    fun loadSuggestions(query: String, limit: Int = 10) {
+        viewModelScope.launch {
+            when (val result = searchSuggestionsUseCase(query, limit)) {
+                is Result.Success -> {
+                    _suggestions.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for suggestions
+                }
+            }
+        }
+    }
+
+    // Search History
+    private fun loadSearchHistory() {
+        viewModelScope.launch {
+            when (val result = searchHistoryUseCase("current_user")) {
+                is Result.Success -> {
+                    _searchHistory.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for history
+                }
+            }
+        }
+    }
+
+    fun clearSearchHistory() {
+        viewModelScope.launch {
+            searchHistoryUseCase.clearHistory("current_user")
+            _searchHistory.value = emptyList()
+        }
+    }
+
+    // Search Analytics
+    fun loadSearchAnalytics() {
+        viewModelScope.launch {
+            when (val result = searchAnalyticsUseCase()) {
+                is Result.Success -> {
+                    _searchAnalytics.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for analytics
+                }
+            }
+        }
+    }
+
+    // Search Templates
+    private fun loadSearchTemplates() {
+        viewModelScope.launch {
+            when (val result = searchTemplateManagementUseCase.getTemplates("current_user")) {
+                is Result.Success -> {
+                    _searchTemplates.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for templates
+                }
+            }
+        }
+    }
+
+    fun executeTemplate(templateId: String, parameters: Map<String, Any>) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+
+            when (val result = searchTemplateManagementUseCase.executeTemplate(templateId, parameters)) {
+                is Result.Success -> {
+                    _searchResponse.value = result.data
+                    _searchResults.value = result.data.results
+                    _uiState.value = SearchUiState.Success
+                }
+                is Result.Error -> {
+                    _uiState.value = SearchUiState.Error(result.exception.message ?: "Template execution failed")
+                }
+            }
+        }
+    }
+
+    // Search Alerts
+    private fun loadSearchAlerts() {
+        viewModelScope.launch {
+            when (val result = searchAlertManagementUseCase.getAlerts("current_user")) {
+                is Result.Success -> {
+                    _searchAlerts.value = result.data
+                }
+                is Result.Error -> {
+                    // Handle error silently for alerts
+                }
+            }
+        }
+    }
+
+    fun createAlert(config: SearchAlertConfig) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+
+            when (val result = searchAlertManagementUseCase.createAlert(config)) {
+                is Result.Success -> {
+                    _uiState.value = SearchUiState.AlertCreated(result.data)
+                    loadSearchAlerts()
+                }
+                is Result.Error -> {
+                    _uiState.value = SearchUiState.Error(result.exception.message ?: "Alert creation failed")
+                }
+            }
+        }
+    }
+
+    // Export
+    fun exportSearchResults(format: ExportFormat) {
+        viewModelScope.launch {
+            _uiState.value = SearchUiState.Loading
+
+            val currentResponse = _searchResponse.value
+            if (currentResponse != null) {
+                val exportConfig = SearchExportConfig(
+                    format = format,
+                    fields = listOf("title", "description", "type", "status", "timestamp"),
+                    maxRecords = 10000,
+                    includeMetadata = true
+                )
+
+                when (val result = searchExportUseCase(currentResponse.query, exportConfig)) {
+                    is Result.Success -> {
+                        _exportResult.value = result.data
+                        _uiState.value = SearchUiState.ExportCompleted(result.data)
+                    }
+                    is Result.Error -> {
+                        _uiState.value = SearchUiState.Error(result.exception.message ?: "Export failed")
+                    }
+                }
+            } else {
+                _uiState.value = SearchUiState.Error("No search results to export")
+            }
+        }
+    }
+
+    // Filter Management
+    fun updateSearchFilters(filters: SearchFilters) {
+        _searchFilters.value = filters
+    }
+
+    fun updateDateRangeFilter(startDate: Long?, endDate: Long?) {
+        val currentFilters = _searchFilters.value
+        _searchFilters.value = currentFilters.copy(
+            dateRange = if (startDate != null || endDate != null) {
+                DateRangeFilter("timestamp", startDate, endDate)
+            } else null
+        )
+    }
+
+    fun updateStatusFilter(statuses: List<String>) {
+        val currentFilters = _searchFilters.value
+        _searchFilters.value = currentFilters.copy(
+            statusFilter = if (statuses.isNotEmpty()) {
+                StatusFilter("status", statuses)
+            } else null
+        )
+    }
+
+    fun updateRoleFilter(roles: List<String>) {
+        val currentFilters = _searchFilters.value
+        _searchFilters.value = currentFilters.copy(
+            roleFilter = if (roles.isNotEmpty()) {
+                RoleFilter(roles)
+            } else null
+        )
+    }
+
+    fun updateLocationFilter(latitude: Double?, longitude: Double?, radius: Double?) {
+        val currentFilters = _searchFilters.value
+        _searchFilters.value = currentFilters.copy(
+            locationFilter = if (latitude != null && longitude != null) {
+                LocationFilter(latitude, longitude, radius, null, null, null)
+            } else null
+        )
+    }
+
+    fun clearFilters() {
+        _searchFilters.value = SearchFilters()
+    }
+
+    // Search Options
+    fun updateSearchOptions(options: SearchOptions) {
+        _searchOptions.value = options
+    }
+
+    fun toggleFuzzySearch(enabled: Boolean) {
+        val currentOptions = _searchOptions.value
+        _searchOptions.value = currentOptions.copy(fuzzySearch = enabled)
+    }
+
+    fun toggleCaseSensitive(enabled: Boolean) {
+        val currentOptions = _searchOptions.value
+        _searchOptions.value = currentOptions.copy(caseSensitive = enabled)
+    }
+
+    // Sorting
+    fun updateSorting(sorting: SortingOptions) {
+        _sorting.value = sorting
+    }
+
+    fun updateSortField(field: String) {
+        val currentSorting = _sorting.value
+        _sorting.value = currentSorting.copy(field = field)
+    }
+
+    fun toggleSortOrder() {
+        val currentSorting = _sorting.value
+        _sorting.value = currentSorting.copy(
+            order = if (currentSorting.order == SortOrder.ASC) SortOrder.DESC else SortOrder.ASC
+        )
+    }
+
+    // Pagination
+    fun loadNextPage() {
+        val currentPagination = _pagination.value
+        val nextPage = currentPagination.page + 1
+        _pagination.value = currentPagination.copy(page = nextPage)
+        
+        // Re-run search with new pagination
+        when (_searchMode.value) {
+            SearchMode.GLOBAL -> performGlobalSearch(
+                _searchQuery.value,
+                _searchFilters.value,
+                _searchOptions.value,
+                _pagination.value,
+                _sorting.value
+            )
+            SearchMode.SHIPMENTS -> searchShipments(
+                _searchQuery.value,
+                ShipmentSearchFilters(),
+                _pagination.value
+            )
+            SearchMode.USERS -> searchUsers(
+                _searchQuery.value,
+                UserSearchFilters(),
+                _pagination.value
+            )
+            SearchMode.VEHICLES -> searchVehicles(
+                _searchQuery.value,
+                VehicleSearchFilters(),
+                _pagination.value
+            )
+            SearchMode.INVOICES -> searchInvoices(
+                _searchQuery.value,
+                InvoiceSearchFilters(),
+                _pagination.value
+            )
+        }
+    }
+
+    fun loadPreviousPage() {
+        val currentPagination = _pagination.value
+        if (currentPagination.page > 1) {
+            val previousPage = currentPagination.page - 1
+            _pagination.value = currentPagination.copy(page = previousPage)
+            
+            // Re-run search with new pagination
+            when (_searchMode.value) {
+                SearchMode.GLOBAL -> performGlobalSearch(
+                    _searchQuery.value,
+                    _searchFilters.value,
+                    _searchOptions.value,
+                    _pagination.value,
+                    _sorting.value
+                )
+                SearchMode.SHIPMENTS -> searchShipments(
+                    _searchQuery.value,
+                    ShipmentSearchFilters(),
+                    _pagination.value
+                )
+                SearchMode.USERS -> searchUsers(
+                    _searchQuery.value,
+                    UserSearchFilters(),
+                    _pagination.value
+                )
+                SearchMode.VEHICLES -> searchVehicles(
+                    _searchQuery.value,
+                    VehicleSearchFilters(),
+                    _pagination.value
+                )
+                SearchMode.INVOICES -> searchInvoices(
+                    _searchQuery.value,
+                    InvoiceSearchFilters(),
+                    _pagination.value
+                )
+            }
+        }
+    }
+
+    // Selection
+    fun selectResult(result: SearchResult) {
+        _selectedResult.value = result
+    }
+
+    fun clearSelection() {
+        _selectedResult.value = null
+    }
+
+    // Search Mode
+    fun setSearchMode(mode: SearchMode) {
+        _searchMode.value = mode
+        _searchResults.value = emptyList()
+        _searchResponse.value = null
+    }
+
+    // Advanced Search Mode
+    fun toggleAdvancedSearchMode() {
+        _advancedSearchMode.value = !_advancedSearchMode.value
+    }
+
+    // Real-time Search Toggle
+    fun toggleRealTimeSearch(enabled: Boolean) {
+        if (enabled && _searchQuery.value.isNotEmpty()) {
+            startRealTimeSearch(_searchQuery.value, _searchFilters.value)
+        }
+    }
+
+    // Clear Search
+    fun clearSearch() {
+        _searchQuery.value = ""
+        _searchResults.value = emptyList()
+        _searchResponse.value = null
+        _suggestions.value = emptyList()
+        _selectedResult.value = null
+        _uiState.value = SearchUiState.Idle
+    }
+
+    // Reset UI State
+    fun resetUiState() {
+        _uiState.value = SearchUiState.Idle
+    }
+
+    // Clear Export Result
+    fun clearExportResult() {
+        _exportResult.value = null
+    }
+
+    // Observe Search Query for Real-time Updates
+    private fun observeSearchQuery() {
+        viewModelScope.launch {
+            _searchQuery
+                .debounce(300) // Debounce to avoid too many searches
+                .collect { query ->
+                    if (query.isNotEmpty()) {
+                        loadSuggestions(query)
+                    } else {
+                        _suggestions.value = emptyList()
+                    }
+                }
+        }
+    }
+}
+
+/**
+ * UI State for Search
+ */
+sealed class SearchUiState {
+    object Idle : SearchUiState()
+    object Loading : SearchUiState()
+    object Success : SearchUiState()
+    data class Error(val message: String) : SearchUiState()
+    data class AlertCreated(val alert: SearchAlertConfig) : SearchUiState()
+    data class ExportCompleted(val result: SearchExportResult) : SearchUiState()
+}
+
+/**
+ * Search modes
+ */
+enum class SearchMode {
+    GLOBAL,
+    SHIPMENTS,
+    USERS,
+    VEHICLES,
+    INVOICES
+}

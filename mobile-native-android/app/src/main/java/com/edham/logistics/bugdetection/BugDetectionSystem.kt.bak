@@ -1,0 +1,811 @@
+package com.edham.logistics.bugdetection
+
+import android.content.Context
+import android.os.Build
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Comprehensive Bug Detection System
+ * Automatically detects, analyzes, and reports bugs and anomalies
+ */
+
+@Singleton
+class BugDetectionSystem @Inject constructor(
+    private val context: Context,
+    private val crashReporter: CrashReporter,
+    private val performanceMonitor: PerformanceMonitor,
+    private val networkMonitor: NetworkMonitor,
+    private val memoryMonitor: MemoryMonitor,
+    private val anomalyDetector: AnomalyDetector
+) {
+    
+    private val detectionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val bugReports = ConcurrentHashMap<String, BugReport>()
+    private val detectionRules = mutableListOf<DetectionRule>()
+    private val bugDetectionFlow = MutableSharedFlow<BugDetectionEvent>()
+    
+    // Detection statistics
+    private val totalDetections = AtomicLong(0)
+    private val criticalBugs = AtomicLong(0)
+    private val performanceIssues = AtomicLong(0)
+    private val networkIssues = AtomicLong(0)
+    private val memoryIssues = AtomicLong(0)
+    
+    init {
+        initializeDetectionSystem()
+    }
+    
+    private fun initializeDetectionSystem() {
+        Timber.d("Initializing Bug Detection System")
+        
+        // Initialize detection rules
+        setupDetectionRules()
+        
+        // Start monitoring
+        startContinuousMonitoring()
+        
+        // Register system callbacks
+        registerSystemCallbacks()
+        
+        Timber.d("Bug Detection System initialized successfully")
+    }
+    
+    private fun setupDetectionRules() {
+        // Performance detection rules
+        detectionRules.add(PerformanceDetectionRule(
+            name = "High CPU Usage",
+            threshold = 80.0, // 80% CPU usage
+            duration = 5000L, // 5 seconds
+            severity = BugSeverity.HIGH
+        ))
+        
+        detectionRules.add(PerformanceDetectionRule(
+            name = "High Memory Usage",
+            threshold = 85.0, // 85% memory usage
+            duration = 3000L, // 3 seconds
+            severity = BugSeverity.CRITICAL
+        ))
+        
+        detectionRules.add(PerformanceDetectionRule(
+            name = "Slow UI Rendering",
+            threshold = 16.67, // 60 FPS threshold (16.67ms per frame)
+            duration = 1000L, // 1 second
+            severity = BugSeverity.MEDIUM
+        ))
+        
+        // Network detection rules
+        detectionRules.add(NetworkDetectionRule(
+            name = "High API Latency",
+            threshold = 5000L, // 5 seconds
+            severity = BugSeverity.MEDIUM
+        ))
+        
+        detectionRules.add(NetworkDetectionRule(
+            name = "Frequent Network Errors",
+            threshold = 5, // 5 errors in 1 minute
+            window = 60000L, // 1 minute
+            severity = BugSeverity.HIGH
+        ))
+        
+        // Memory detection rules
+        detectionRules.add(MemoryDetectionRule(
+            name = "Memory Leak Detected",
+            threshold = 50 * 1024 * 1024L, // 50MB increase
+            window = 300000L, // 5 minutes
+            severity = BugSeverity.CRITICAL
+        ))
+        
+        detectionRules.add(MemoryDetectionRule(
+            name = "Frequent GC Activity",
+            threshold = 10, // 10 GC cycles in 1 minute
+            window = 60000L, // 1 minute
+            severity = BugSeverity.MEDIUM
+        ))
+        
+        // ANR detection rules
+        detectionRules.add(ANRDetectionRule(
+            name = "Application Not Responding",
+            threshold = 5000L, // 5 seconds
+            severity = BugSeverity.CRITICAL
+        ))
+        
+        // Crash detection rules
+        detectionRules.add(CrashDetectionRule(
+            name = "Frequent Crashes",
+            threshold = 3, // 3 crashes in 10 minutes
+            window = 600000L, // 10 minutes
+            severity = BugSeverity.CRITICAL
+        ))
+        
+        // Battery detection rules
+        detectionRules.add(BatteryDetectionRule(
+            name = "Excessive Battery Drain",
+            threshold = 20.0, // 20% battery drain in 1 hour
+            window = 3600000L, // 1 hour
+            severity = BugSeverity.HIGH
+        ))
+    }
+    
+    private fun startContinuousMonitoring() {
+        // Performance monitoring
+        detectionScope.launch {
+            performanceMonitor.performanceFlow.collect { metrics ->
+                detectPerformanceIssues(metrics)
+            }
+        }
+        
+        // Network monitoring
+        detectionScope.launch {
+            networkMonitor.networkFlow.collect { metrics ->
+                detectNetworkIssues(metrics)
+            }
+        }
+        
+        // Memory monitoring
+        detectionScope.launch {
+            memoryMonitor.memoryFlow.collect { metrics ->
+                detectMemoryIssues(metrics)
+            }
+        }
+        
+        // Anomaly detection
+        detectionScope.launch {
+            anomalyDetector.anomalyFlow.collect { anomaly ->
+                detectAnomalies(anomaly)
+            }
+        }
+    }
+    
+    private fun registerSystemCallbacks() {
+        // Register crash callback
+        crashReporter.setCrashCallback { crashInfo ->
+            handleCrash(crashInfo)
+        }
+        
+        // Register ANR callback
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            registerANRCallback()
+        }
+    }
+    
+    private fun detectPerformanceIssues(metrics: PerformanceMetrics) {
+        detectionRules.filterIsInstance<PerformanceDetectionRule>().forEach { rule ->
+            when (rule.name) {
+                "High CPU Usage" -> {
+                    if (metrics.cpuUsage > rule.threshold) {
+                        reportBug(
+                            type = BugType.PERFORMANCE,
+                            severity = rule.severity,
+                            title = rule.name,
+                            description = "CPU usage detected at ${metrics.cpuUsage}%",
+                            data = mapOf(
+                                "cpuUsage" to metrics.cpuUsage,
+                                "threshold" to rule.threshold,
+                                "timestamp" to System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+                
+                "High Memory Usage" -> {
+                    if (metrics.memoryUsage > rule.threshold) {
+                        reportBug(
+                            type = BugType.PERFORMANCE,
+                            severity = rule.severity,
+                            title = rule.name,
+                            description = "Memory usage detected at ${metrics.memoryUsage}%",
+                            data = mapOf(
+                                "memoryUsage" to metrics.memoryUsage,
+                                "threshold" to rule.threshold,
+                                "timestamp" to System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+                
+                "Slow UI Rendering" -> {
+                    if (metrics.frameRenderTime > rule.threshold) {
+                        reportBug(
+                            type = BugType.PERFORMANCE,
+                            severity = rule.severity,
+                            title = rule.name,
+                            description = "UI frame render time: ${metrics.frameRenderTime}ms",
+                            data = mapOf(
+                                "frameRenderTime" to metrics.frameRenderTime,
+                                "threshold" to rule.threshold,
+                                "fps" to (1000.0 / metrics.frameRenderTime),
+                                "timestamp" to System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+    
+    private fun detectNetworkIssues(metrics: NetworkMetrics) {
+        detectionRules.filterIsInstance<NetworkDetectionRule>().forEach { rule ->
+            when (rule.name) {
+                "High API Latency" -> {
+                    if (metrics.averageLatency > rule.threshold) {
+                        reportBug(
+                            type = BugType.NETWORK,
+                            severity = rule.severity,
+                            title = rule.name,
+                            description = "API latency: ${metrics.averageLatency}ms",
+                            data = mapOf(
+                                "latency" to metrics.averageLatency,
+                                "threshold" to rule.threshold,
+                                "endpoint" to metrics.endpoint,
+                                "timestamp" to System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+                
+                "Frequent Network Errors" -> {
+                    if (metrics.errorCount >= rule.threshold) {
+                        reportBug(
+                            type = BugType.NETWORK,
+                            severity = rule.severity,
+                            title = rule.name,
+                            description = "${metrics.errorCount} network errors detected",
+                            data = mapOf(
+                                "errorCount" to metrics.errorCount,
+                                "threshold" to rule.threshold,
+                                "window" to rule.window,
+                                "errors" to metrics.errors,
+                                "timestamp" to System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+    
+    private fun detectMemoryIssues(metrics: MemoryMetrics) {
+        detectionRules.filterIsInstance<MemoryDetectionRule>().forEach { rule ->
+            when (rule.name) {
+                "Memory Leak Detected" -> {
+                    if (metrics.memoryIncrease > rule.threshold) {
+                        reportBug(
+                            type = BugType.MEMORY,
+                            severity = rule.severity,
+                            title = rule.name,
+                            description = "Memory increase: ${metrics.memoryIncrease / 1024 / 1024}MB",
+                            data = mapOf(
+                                "memoryIncrease" to metrics.memoryIncrease,
+                                "threshold" to rule.threshold,
+                                "window" to rule.window,
+                                "timestamp" to System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+                
+                "Frequent GC Activity" -> {
+                    if (metrics.gcCount >= rule.threshold) {
+                        reportBug(
+                            type = BugType.MEMORY,
+                            severity = rule.severity,
+                            title = rule.name,
+                            description = "${metrics.gcCount} GC cycles detected",
+                            data = mapOf(
+                                "gcCount" to metrics.gcCount,
+                                "threshold" to rule.threshold,
+                                "window" to rule.window,
+                                "timestamp" to System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+    
+    private fun detectAnomalies(anomaly: AnomalyEvent) {
+        reportBug(
+            type = BugType.ANOMALY,
+            severity = when (anomaly.severity) {
+                AnomalySeverity.LOW -> BugSeverity.LOW
+                AnomalySeverity.MEDIUM -> BugSeverity.MEDIUM
+                AnomalySeverity.HIGH -> BugSeverity.HIGH
+                AnomalySeverity.CRITICAL -> BugSeverity.CRITICAL
+            },
+            title = "Anomaly Detected: ${anomaly.type}",
+            description = anomaly.description,
+            data = mapOf(
+                "anomalyType" to anomaly.type,
+                "anomalySeverity" to anomaly.severity,
+                "confidence" to anomaly.confidence,
+                "features" to anomaly.features,
+                "timestamp" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    private fun handleCrash(crashInfo: CrashInfo) {
+        // Check crash frequency rule
+        val crashRule = detectionRules.filterIsInstance<CrashDetectionRule>().firstOrNull()
+        if (crashRule != null) {
+            val recentCrashes = bugReports.values.filter { 
+                it.type == BugType.CRASH && 
+                (System.currentTimeMillis() - it.timestamp) < crashRule.window
+            }
+            
+            if (recentCrashes.size >= crashRule.threshold) {
+                reportBug(
+                    type = BugType.CRASH,
+                    severity = crashRule.severity,
+                    title = crashRule.name,
+                    description = "${recentCrashes.size + 1} crashes detected in ${crashRule.window / 60000} minutes",
+                    data = mapOf(
+                        "crashCount" to recentCrashes.size + 1,
+                        "threshold" to crashRule.threshold,
+                        "window" to crashRule.window,
+                        "crashes" to recentCrashes.map { it.id },
+                        "timestamp" to System.currentTimeMillis()
+                    )
+                )
+            }
+        }
+        
+        // Report individual crash
+        reportBug(
+            type = BugType.CRASH,
+            severity = BugSeverity.CRITICAL,
+            title = "Application Crash",
+            description = crashInfo.stackTrace,
+            data = mapOf(
+                "exceptionType" to crashInfo.exceptionType,
+                "exceptionMessage" to crashInfo.exceptionMessage,
+                "stackTrace" to crashInfo.stackTrace,
+                "deviceInfo" to crashInfo.deviceInfo,
+                "appVersion" to crashInfo.appVersion,
+                "timestamp" to System.currentTimeMillis()
+            )
+        )
+    }
+    
+    private fun reportBug(
+        type: BugType,
+        severity: BugSeverity,
+        title: String,
+        description: String,
+        data: Map<String, Any>
+    ) {
+        val bugId = generateBugId()
+        val bugReport = BugReport(
+            id = bugId,
+            type = type,
+            severity = severity,
+            title = title,
+            description = description,
+            data = data,
+            timestamp = System.currentTimeMillis(),
+            status = BugStatus.OPEN,
+            deviceInfo = getDeviceInfo(),
+            appInfo = getAppInfo()
+        )
+        
+        // Store bug report
+        bugReports[bugId] = bugReport
+        
+        // Update statistics
+        totalDetections.incrementAndGet()
+        when (type) {
+            BugType.PERFORMANCE -> performanceIssues.incrementAndGet()
+            BugType.NETWORK -> networkIssues.incrementAndGet()
+            BugType.MEMORY -> memoryIssues.incrementAndGet()
+            BugType.CRASH -> criticalBugs.incrementAndGet()
+            else -> { /* Other types */ }
+        }
+        
+        // Emit detection event
+        detectionScope.launch {
+            bugDetectionFlow.emit(
+                BugDetectionEvent(
+                    bugId = bugId,
+                    type = type,
+                    severity = severity,
+                    title = title,
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+        
+        // Log detection
+        Timber.w("Bug detected: $title [$severity] - $description")
+        
+        // Auto-report critical bugs
+        if (severity == BugSeverity.CRITICAL) {
+            autoReportBug(bugReport)
+        }
+    }
+    
+    private fun generateBugId(): String {
+        return "BUG_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    }
+    
+    private fun getDeviceInfo(): DeviceInfo {
+        return DeviceInfo(
+            manufacturer = Build.MANUFACTURER,
+            model = Build.MODEL,
+            androidVersion = Build.VERSION.RELEASE,
+            sdkVersion = Build.VERSION.SDK_INT,
+            totalMemory = getTotalMemory(),
+            availableMemory = getAvailableMemory(),
+            batteryLevel = getBatteryLevel(),
+            networkType = getNetworkType()
+        )
+    }
+    
+    private fun getAppInfo(): AppInfo {
+        return AppInfo(
+            versionName = getAppVersionName(),
+            versionCode = getAppVersionCode(),
+            buildType = getBuildType(),
+            installTime = getInstallTime(),
+            updateTime = getUpdateTime()
+        )
+    }
+    
+    private fun autoReportBug(bugReport: BugReport) {
+        detectionScope.launch {
+            try {
+                crashReporter.reportBug(bugReport)
+                Timber.i("Auto-reported critical bug: ${bugReport.id}")
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to auto-report bug: ${bugReport.id}")
+            }
+        }
+    }
+    
+    // Public API methods
+    
+    fun getBugDetectionFlow(): Flow<BugDetectionEvent> = bugDetectionFlow.asSharedFlow()
+    
+    fun getBugReports(): List<BugReport> = bugReports.values.toList()
+    
+    fun getBugReport(bugId: String): BugReport? = bugReports[bugId]
+    
+    fun getBugStatistics(): BugStatistics {
+        return BugStatistics(
+            totalDetections = totalDetections.get(),
+            criticalBugs = criticalBugs.get(),
+            performanceIssues = performanceIssues.get(),
+            networkIssues = networkIssues.get(),
+            memoryIssues = memoryIssues.get(),
+            openBugs = bugReports.values.count { it.status == BugStatus.OPEN },
+            resolvedBugs = bugReports.values.count { it.status == BugStatus.RESOLVED }
+        )
+    }
+    
+    fun updateBugStatus(bugId: String, status: BugStatus): Boolean {
+        val bugReport = bugReports[bugId] ?: return false
+        bugReport.status = status
+        return true
+    }
+    
+    fun addDetectionRule(rule: DetectionRule) {
+        detectionRules.add(rule)
+        Timber.d("Added detection rule: ${rule.name}")
+    }
+    
+    fun removeDetectionRule(ruleName: String): Boolean {
+        return detectionRules.removeAll { it.name == ruleName }
+    }
+    
+    fun getDetectionRules(): List<DetectionRule> = detectionRules.toList()
+    
+    fun runManualDetection() {
+        detectionScope.launch {
+            Timber.d("Running manual bug detection")
+            
+            // Trigger performance check
+            val performanceMetrics = performanceMonitor.getCurrentMetrics()
+            detectPerformanceIssues(performanceMetrics)
+            
+            // Trigger network check
+            val networkMetrics = networkMonitor.getCurrentMetrics()
+            detectNetworkIssues(networkMetrics)
+            
+            // Trigger memory check
+            val memoryMetrics = memoryMonitor.getCurrentMetrics()
+            detectMemoryIssues(memoryMetrics)
+            
+            Timber.d("Manual bug detection completed")
+        }
+    }
+    
+    fun clearBugReports() {
+        bugReports.clear()
+        totalDetections.set(0)
+        criticalBugs.set(0)
+        performanceIssues.set(0)
+        networkIssues.set(0)
+        memoryIssues.set(0)
+        
+        Timber.d("Bug reports cleared")
+    }
+    
+    fun exportBugReports(): String {
+        val reports = bugReports.values.sortedByDescending { it.timestamp }
+        return buildString {
+            appendLine("=== Bug Detection Report ===")
+            appendLine("Generated: ${java.util.Date()}")
+            appendLine("Total Bugs: ${reports.size}")
+            appendLine()
+            
+            reports.forEach { report ->
+                appendLine("Bug ID: ${report.id}")
+                appendLine("Type: ${report.type}")
+                appendLine("Severity: ${report.severity}")
+                appendLine("Title: ${report.title}")
+                appendLine("Description: ${report.description}")
+                appendLine("Status: ${report.status}")
+                appendLine("Timestamp: ${java.util.Date(report.timestamp)}")
+                appendLine("Device: ${report.deviceInfo.manufacturer} ${report.deviceInfo.model}")
+                appendLine("App Version: ${report.appInfo.versionName}")
+                appendLine("Data: ${report.data}")
+                appendLine("---")
+            }
+        }
+    }
+    
+    private fun registerANRCallback() {
+        // Register ANR detection callback for Android Q+
+        // Implementation depends on specific ANR detection library
+    }
+    
+    private fun getTotalMemory(): Long {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val memInfo = android.app.ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memInfo)
+        return memInfo.totalMem
+    }
+    
+    private fun getAvailableMemory(): Long {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val memInfo = android.app.ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memInfo)
+        return memInfo.availMem
+    }
+    
+    private fun getBatteryLevel(): Float {
+        // Implementation depends on battery monitoring
+        return 0.0f
+    }
+    
+    private fun getNetworkType(): String {
+        // Implementation depends on network monitoring
+        return "Unknown"
+    }
+    
+    private fun getAppVersionName(): String {
+        return try {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "Unknown"
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+    
+    private fun getAppVersionCode(): Int {
+        return try {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionCode
+        } catch (e: Exception) {
+            0
+        }
+    }
+    
+    private fun getBuildType(): String {
+        return BuildConfig.BUILD_TYPE
+    }
+    
+    private fun getInstallTime(): Long {
+        return try {
+            context.packageManager.getPackageInfo(context.packageName, 0).firstInstallTime
+        } catch (e: Exception) {
+            0L
+        }
+    }
+    
+    private fun getUpdateTime(): Long {
+        return try {
+            context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
+        } catch (e: Exception) {
+            0L
+        }
+    }
+    
+    fun cleanup() {
+        detectionScope.cancel()
+        bugReports.clear()
+        Timber.d("Bug Detection System cleaned up")
+    }
+}
+
+// Data classes for bug detection
+data class BugReport(
+    val id: String,
+    val type: BugType,
+    val severity: BugSeverity,
+    val title: String,
+    val description: String,
+    val data: Map<String, Any>,
+    val timestamp: Long,
+    var status: BugStatus,
+    val deviceInfo: DeviceInfo,
+    val appInfo: AppInfo
+)
+
+data class BugDetectionEvent(
+    val bugId: String,
+    val type: BugType,
+    val severity: BugSeverity,
+    val title: String,
+    val timestamp: Long
+)
+
+data class BugStatistics(
+    val totalDetections: Long,
+    val criticalBugs: Long,
+    val performanceIssues: Long,
+    val networkIssues: Long,
+    val memoryIssues: Long,
+    val openBugs: Int,
+    val resolvedBugs: Int
+)
+
+data class DeviceInfo(
+    val manufacturer: String,
+    val model: String,
+    val androidVersion: String,
+    val sdkVersion: Int,
+    val totalMemory: Long,
+    val availableMemory: Long,
+    val batteryLevel: Float,
+    val networkType: String
+)
+
+data class AppInfo(
+    val versionName: String,
+    val versionCode: Int,
+    val buildType: String,
+    val installTime: Long,
+    val updateTime: Long
+)
+
+data class PerformanceMetrics(
+    val cpuUsage: Double,
+    val memoryUsage: Double,
+    val frameRenderTime: Double,
+    val timestamp: Long
+)
+
+data class NetworkMetrics(
+    val averageLatency: Long,
+    val errorCount: Int,
+    val endpoint: String,
+    val errors: List<String>,
+    val timestamp: Long
+)
+
+data class MemoryMetrics(
+    val memoryIncrease: Long,
+    val gcCount: Int,
+    val timestamp: Long
+)
+
+data class AnomalyEvent(
+    val type: String,
+    val severity: AnomalySeverity,
+    val description: String,
+    val confidence: Double,
+    val features: Map<String, Any>,
+    val timestamp: Long
+)
+
+data class CrashInfo(
+    val exceptionType: String,
+    val exceptionMessage: String,
+    val stackTrace: String,
+    val deviceInfo: DeviceInfo,
+    val appVersion: String
+)
+
+// Detection rule interfaces
+interface DetectionRule {
+    val name: String
+    val severity: BugSeverity
+}
+
+data class PerformanceDetectionRule(
+    override val name: String,
+    val threshold: Double,
+    val duration: Long,
+    override val severity: BugSeverity
+) : DetectionRule
+
+data class NetworkDetectionRule(
+    override val name: String,
+    val threshold: Long,
+    val window: Long = 0L,
+    override val severity: BugSeverity
+) : DetectionRule
+
+data class MemoryDetectionRule(
+    override val name: String,
+    val threshold: Long,
+    val window: Long,
+    override val severity: BugSeverity
+) : DetectionRule
+
+data class ANRDetectionRule(
+    override val name: String,
+    val threshold: Long,
+    override val severity: BugSeverity
+) : DetectionRule
+
+data class CrashDetectionRule(
+    override val name: String,
+    val threshold: Int,
+    val window: Long,
+    override val severity: BugSeverity
+) : DetectionRule
+
+data class BatteryDetectionRule(
+    override val name: String,
+    val threshold: Double,
+    val window: Long,
+    override val severity: BugSeverity
+) : DetectionRule
+
+// Enums
+enum class BugType {
+    PERFORMANCE, NETWORK, MEMORY, CRASH, ANOMALY, UI, BATTERY, SECURITY
+}
+
+enum class BugSeverity {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+enum class BugStatus {
+    OPEN, IN_PROGRESS, RESOLVED, CLOSED
+}
+
+enum class AnomalySeverity {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+// Mock service interfaces
+interface CrashReporter {
+    fun setCrashCallback(callback: (CrashInfo) -> Unit)
+    suspend fun reportBug(bugReport: BugReport)
+}
+
+interface PerformanceMonitor {
+    val performanceFlow: Flow<PerformanceMetrics>
+    fun getCurrentMetrics(): PerformanceMetrics
+}
+
+interface NetworkMonitor {
+    val networkFlow: Flow<NetworkMetrics>
+    fun getCurrentMetrics(): NetworkMetrics
+}
+
+interface MemoryMonitor {
+    val memoryFlow: Flow<MemoryMetrics>
+    fun getCurrentMetrics(): MemoryMetrics
+}
+
+interface AnomalyDetector {
+    val anomalyFlow: Flow<AnomalyEvent>
+}

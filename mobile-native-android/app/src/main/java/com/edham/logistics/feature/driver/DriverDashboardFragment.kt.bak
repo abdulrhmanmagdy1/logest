@@ -1,0 +1,580 @@
+package com.edham.logistics.feature.driver
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentDriverDashboardBinding
+import com.edham.logistics.feature.driver.adapters.TodayTripsAdapter
+import com.edham.logistics.feature.driver.viewmodels.DriverDashboardViewModel
+import com.edham.logistics.utils.DriverPreferences
+import com.edham.logistics.utils.GPSOptimizer
+import com.edham.logistics.utils.VoiceAlertManager
+import com.edham.logistics.utils.BatteryOptimizer
+import timber.log.Timber
+import java.util.*
+
+/**
+ * Professional Driver Dashboard
+ * Large touch targets, one-hand usage, dark mode optimized
+ */
+class DriverDashboardFragment : Fragment(), TextToSpeech.OnInitListener {
+    
+    private var _binding: FragmentDriverDashboardBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: DriverDashboardViewModel
+    private lateinit var tripsAdapter: TodayTripsAdapter
+    private lateinit var voiceAlertManager: VoiceAlertManager
+    private lateinit var gpsOptimizer: GPSOptimizer
+    private lateinit var batteryOptimizer: BatteryOptimizer
+    
+    private var textToSpeech: TextToSpeech? = null
+    private var currentTripId: String? = null
+    
+    companion object {
+        private const val LOCATION_PERMISSION_REQUEST_CODE = 1001
+        private const val CAMERA_PERMISSION_REQUEST_CODE = 1002
+    }
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentDriverDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupUI()
+        setupPermissions()
+        initializeServices()
+        setupObservers()
+        setupClickListeners()
+    }
+    
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[DriverDashboardViewModel::class.java]
+    }
+    
+    private fun setupUI() {
+        // Large touch targets for one-hand usage
+        setupLargeTouchTargets()
+        
+        // Dark mode optimized colors
+        setupDarkModeColors()
+        
+        // High visibility status colors
+        setupStatusColors()
+        
+        // Today's trips adapter
+        tripsAdapter = TodayTripsAdapter { trip ->
+            onTripClicked(trip)
+        }
+        
+        binding.recyclerViewTodayTrips.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = tripsAdapter
+            itemAnimator = null // Better performance
+        }
+        
+        // Initialize Text-to-Speech
+        textToSpeech = TextToSpeech(requireContext(), this)
+    }
+    
+    private fun setupLargeTouchTargets() {
+        // Minimum 48dp touch targets for accessibility
+        binding.btnStartTrip.minimumHeight = 72.dp
+        binding.btnStartTrip.minimumWidth = 120.dp
+        
+        binding.btnEmergencySOS.minimumHeight = 80.dp
+        binding.btnEmergencySOS.minimumWidth = 80.dp
+        
+        binding.btnNavigation.minimumHeight = 64.dp
+        binding.btnNavigation.minimumWidth = 64.dp
+        
+        binding.btnBreak.minimumHeight = 64.dp
+        binding.btnBreak.minimumWidth = 64.dp
+        
+        binding.btnFuel.minimumHeight = 64.dp
+        binding.btnFuel.minimumWidth = 64.dp
+        
+        binding.btnChat.minimumHeight = 64.dp
+        binding.btnChat.minimumWidth = 64.dp
+        
+        binding.btnEarnings.minimumHeight = 64.dp
+        binding.btnEarnings.minimumWidth = 64.dp
+        
+        binding.btnHistory.minimumHeight = 64.dp
+        binding.btnHistory.minimumWidth = 64.dp
+    }
+    
+    private fun setupDarkModeColors() {
+        // Dark mode optimized colors with high contrast
+        binding.cardStatus.setCardBackgroundColor(ContextCompat.getColor(requireContext(), R.color.dark_surface))
+        binding.cardCurrentTrip.setCardBackgroundColor(ContextCompat.getColor(requireContext(), R.color.dark_surface))
+        binding.cardTodayStats.setCardBackgroundColor(ContextCompat.getColor(requireContext(), R.color.dark_surface))
+        
+        // High contrast text
+        binding.tvStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.text_primary_dark))
+        binding.tvCurrentTripTitle.setTextColor(ContextCompat.getColor(requireContext(), R.color.text_primary_dark))
+        binding.tvTodayStatsTitle.setTextColor(ContextCompat.getColor(requireContext(), R.color.text_primary_dark))
+    }
+    
+    private fun setupStatusColors() {
+        // High visibility status colors
+        binding.viewStatusIndicator.setBackgroundColor(
+            when (viewModel.getCurrentStatus()) {
+                "ACTIVE" -> ContextCompat.getColor(requireContext(), R.color.status_active)
+                "BREAK" -> ContextCompat.getColor(requireContext(), R.color.status_break)
+                "OFFLINE" -> ContextCompat.getColor(requireContext(), R.color.status_offline)
+                else -> ContextCompat.getColor(requireContext(), R.color.status_idle)
+            }
+        )
+    }
+    
+    private fun setupPermissions() {
+        val permissionsToRequest = mutableListOf<String>()
+        
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.ACCESS_FINE_LOCATION) 
+            != PackageManager.PERMISSION_GRANTED) {
+            permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.CAMERA) 
+            != PackageManager.PERMISSION_GRANTED) {
+            permissionsToRequest.add(Manifest.permission.CAMERA)
+        }
+        
+        if (permissionsToRequest.isNotEmpty()) {
+            ActivityCompat.requestPermissions(
+                requireActivity(),
+                permissionsToRequest.toTypedArray(),
+                LOCATION_PERMISSION_REQUEST_CODE
+            )
+        }
+    }
+    
+    private fun initializeServices() {
+        // Voice Alert Manager
+        voiceAlertManager = VoiceAlertManager(requireContext())
+        
+        // GPS Optimizer for battery efficiency
+        gpsOptimizer = GPSOptimizer(requireContext())
+        
+        // Battery Optimizer
+        batteryOptimizer = BatteryOptimizer(requireContext())
+        
+        // Apply optimizations
+        gpsOptimizer.optimizeForDriver()
+        batteryOptimizer.enableDriverMode()
+    }
+    
+    private fun setupObservers() {
+        // Today's trips observer
+        viewModel.todayTrips.observe(viewLifecycleOwner) { trips ->
+            tripsAdapter.submitList(trips)
+            binding.tvTodayTripsCount.text = "${trips.size} trips today"
+            
+            // Voice alert for new trips
+            if (trips.isNotEmpty() && DriverPreferences.isVoiceAlertsEnabled()) {
+                voiceAlertManager.speak("You have ${trips.size} trips scheduled for today")
+            }
+        }
+        
+        // Current trip observer
+        viewModel.currentTrip.observe(viewLifecycleOwner) { trip ->
+            currentTripId = trip?.id
+            updateCurrentTripUI(trip)
+        }
+        
+        // Driver status observer
+        viewModel.driverStatus.observe(viewLifecycleOwner) { status ->
+            updateStatusUI(status)
+        }
+        
+        // Earnings observer
+        viewModel.todayEarnings.observe(viewLifecycleOwner) { earnings ->
+            binding.tvTodayEarnings.text = "Today: $${String.format("%.2f", earnings)}"
+        }
+        
+        // Battery level observer
+        batteryOptimizer.batteryLevel.observe(viewLifecycleOwner) { level ->
+            binding.tvBatteryLevel.text = "Battery: $level%"
+            
+            // Change color based on battery level
+            binding.tvBatteryLevel.setTextColor(
+                when {
+                    level > 50 -> ContextCompat.getColor(requireContext(), R.color.battery_good)
+                    level > 20 -> ContextCompat.getColor(requireContext(), R.color.battery_medium)
+                    else -> ContextCompat.getColor(requireContext(), R.color.battery_low)
+                }
+            )
+        }
+        
+        // GPS status observer
+        gpsOptimizer.gpsStatus.observe(viewLifecycleOwner) { status ->
+            binding.tvGpsStatus.text = "GPS: $status"
+            
+            binding.tvGpsStatus.setTextColor(
+                when (status) {
+                    "EXCELLENT" -> ContextCompat.getColor(requireContext(), R.color.gps_excellent)
+                    "GOOD" -> ContextCompat.getColor(requireContext(), R.color.gps_good)
+                    "POOR" -> ContextCompat.getColor(requireContext(), R.color.gps_poor)
+                    else -> ContextCompat.getColor(requireContext(), R.color.gps_offline)
+                }
+            )
+        }
+    }
+    
+    private fun setupClickListeners() {
+        // Start/End Trip
+        binding.btnStartTrip.setOnClickListener {
+            if (currentTripId == null) {
+                startNewTrip()
+            } else {
+                endCurrentTrip()
+            }
+        }
+        
+        // Navigation
+        binding.btnNavigation.setOnClickListener {
+            openNavigation()
+        }
+        
+        // Emergency SOS
+        binding.btnEmergencySOS.setOnClickListener {
+            triggerEmergencySOS()
+        }
+        
+        // Break/Rest
+        binding.btnBreak.setOnClickListener {
+            toggleBreakMode()
+        }
+        
+        // Fuel Logging
+        binding.btnFuel.setOnClickListener {
+            openFuelLogging()
+        }
+        
+        // Chat with Dispatcher
+        binding.btnChat.setOnClickListener {
+            openDispatcherChat()
+        }
+        
+        // Earnings
+        binding.btnEarnings.setOnClickListener {
+            openEarningsDashboard()
+        }
+        
+        // Trip History
+        binding.btnHistory.setOnClickListener {
+            openTripHistory()
+        }
+        
+        // QR Scanner
+        binding.btnScanQr.setOnClickListener {
+            openQRScanner()
+        }
+        
+        // Incident Reporting
+        binding.btnIncident.setOnClickListener {
+            openIncidentReporting()
+        }
+    }
+    
+    private fun onTripClicked(trip: DriverTrip) {
+        // Navigate to trip details
+        // Implementation depends on navigation system
+        Toast.makeText(requireContext(), "Trip: ${trip.id}", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun startNewTrip() {
+        if (!hasLocationPermission()) {
+            requestLocationPermission()
+            return
+        }
+        
+        viewModel.startNewTrip(
+            onSuccess = { tripId ->
+                currentTripId = tripId
+                voiceAlertManager.speak("Trip started successfully")
+                updateUIForActiveTrip()
+            },
+            onError = { error ->
+                Toast.makeText(requireContext(), "Failed to start trip: $error", Toast.LENGTH_LONG).show()
+            }
+        )
+    }
+    
+    private fun endCurrentTrip() {
+        currentTripId?.let { tripId ->
+            viewModel.endTrip(
+                tripId = tripId,
+                onSuccess = {
+                    currentTripId = null
+                    voiceAlertManager.speak("Trip completed successfully")
+                    updateUIForNoActiveTrip()
+                },
+                onError = { error ->
+                    Toast.makeText(requireContext(), "Failed to end trip: $error", Toast.LENGTH_LONG).show()
+                }
+            )
+        }
+    }
+    
+    private fun openNavigation() {
+        currentTripId?.let { tripId ->
+            viewModel.getCurrentTripDetails(tripId)?.let { trip ->
+                // Open navigation with route guidance
+                voiceAlertManager.speak("Starting navigation to ${trip.destinationAddress}")
+                // Implementation for navigation integration
+            }
+        }
+    }
+    
+    private fun triggerEmergencySOS() {
+        // Emergency SOS with location sharing
+        viewModel.triggerEmergencySOS(
+            currentLocation = gpsOptimizer.getCurrentLocation(),
+            onSuccess = {
+                voiceAlertManager.speak("Emergency alert sent. Help is on the way.")
+                // Show emergency UI
+                showEmergencyUI()
+            },
+            onError = { error ->
+                Toast.makeText(requireContext(), "Failed to send SOS: $error", Toast.LENGTH_LONG).show()
+            }
+        )
+    }
+    
+    private fun toggleBreakMode() {
+        val isOnBreak = viewModel.toggleBreakMode()
+        
+        if (isOnBreak) {
+            voiceAlertManager.speak("Break mode started")
+            binding.btnBreak.text = "End Break"
+            binding.btnBreak.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.break_active))
+        } else {
+            voiceAlertManager.speak("Break mode ended")
+            binding.btnBreak.text = "Take Break"
+            binding.btnBreak.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.break_inactive))
+        }
+    }
+    
+    private fun openFuelLogging() {
+        // Open fuel logging dialog/activity
+        Toast.makeText(requireContext(), "Fuel Logging", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun openDispatcherChat() {
+        // Open chat with dispatcher
+        Toast.makeText(requireContext(), "Chat with Dispatcher", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun openEarningsDashboard() {
+        // Open earnings dashboard
+        Toast.makeText(requireContext(), "Earnings Dashboard", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun openTripHistory() {
+        // Open trip history
+        Toast.makeText(requireContext(), "Trip History", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun openQRScanner() {
+        if (!hasCameraPermission()) {
+            requestCameraPermission()
+            return
+        }
+        
+        // Open QR/Barcode scanner
+        Toast.makeText(requireContext(), "QR Scanner", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun openIncidentReporting() {
+        // Open incident reporting
+        Toast.makeText(requireContext(), "Incident Reporting", Toast.LENGTH_SHORT).show()
+    }
+    
+    private fun updateCurrentTripUI(trip: DriverTrip?) {
+        if (trip != null) {
+            binding.layoutCurrentTrip.visibility = View.VISIBLE
+            binding.tvCurrentTripTitle.text = trip.destinationAddress
+            binding.tvCurrentTripStatus.text = trip.status
+            binding.tvCurrentTripTime.text = "Started: ${trip.startTime}"
+            binding.btnStartTrip.text = "End Trip"
+            binding.btnStartTrip.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.trip_active))
+        } else {
+            binding.layoutCurrentTrip.visibility = View.GONE
+            binding.btnStartTrip.text = "Start Trip"
+            binding.btnStartTrip.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.trip_inactive))
+        }
+    }
+    
+    private fun updateStatusUI(status: String) {
+        binding.tvStatus.text = status
+        
+        binding.viewStatusIndicator.setBackgroundColor(
+            when (status) {
+                "ACTIVE" -> ContextCompat.getColor(requireContext(), R.color.status_active)
+                "BREAK" -> ContextCompat.getColor(requireContext(), R.color.status_break)
+                "OFFLINE" -> ContextCompat.getColor(requireContext(), R.color.status_offline)
+                else -> ContextCompat.getColor(requireContext(), R.color.status_idle)
+            }
+        )
+    }
+    
+    private fun updateUIForActiveTrip() {
+        binding.btnStartTrip.text = "End Trip"
+        binding.btnStartTrip.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.trip_active))
+    }
+    
+    private fun updateUIForNoActiveTrip() {
+        binding.btnStartTrip.text = "Start Trip"
+        binding.btnStartTrip.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.trip_inactive))
+    }
+    
+    private fun showEmergencyUI() {
+        // Show emergency UI with countdown and location sharing
+        binding.layoutEmergency.visibility = View.VISIBLE
+        binding.tvEmergencyStatus.text = "Emergency alert sent. Location sharing active."
+    }
+    
+    private fun hasLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            requireContext(),
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+    
+    private fun hasCameraPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            requireContext(),
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+    
+    private fun requestLocationPermission() {
+        ActivityCompat.requestPermissions(
+            requireActivity(),
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+            LOCATION_PERMISSION_REQUEST_CODE
+        )
+    }
+    
+    private fun requestCameraPermission() {
+        ActivityCompat.requestPermissions(
+            requireActivity(),
+            arrayOf(Manifest.permission.CAMERA),
+            CAMERA_PERMISSION_REQUEST_CODE
+        )
+    }
+    
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        
+        when (requestCode) {
+            LOCATION_PERMISSION_REQUEST_CODE -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    // Permission granted
+                    gpsOptimizer.startLocationUpdates()
+                } else {
+                    Toast.makeText(requireContext(), "Location permission required for driver features", Toast.LENGTH_LONG).show()
+                }
+            }
+            CAMERA_PERMISSION_REQUEST_CODE -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    // Permission granted
+                    openQRScanner()
+                } else {
+                    Toast.makeText(requireContext(), "Camera permission required for QR scanning", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+    
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            val result = textToSpeech?.setLanguage(Locale.US)
+            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                Timber.e("Language not supported for TTS")
+            }
+        } else {
+            Timber.e("TTS Initialization failed")
+        }
+    }
+    
+    override fun onResume() {
+        super.onResume()
+        
+        // Refresh data
+        viewModel.refreshTodayTrips()
+        
+        // Start GPS updates
+        if (hasLocationPermission()) {
+            gpsOptimizer.startLocationUpdates()
+        }
+        
+        // Start battery monitoring
+        batteryOptimizer.startMonitoring()
+    }
+    
+    override fun onPause() {
+        super.onPause()
+        
+        // Stop GPS updates to save battery
+        gpsOptimizer.stopLocationUpdates()
+        
+        // Stop battery monitoring
+        batteryOptimizer.stopMonitoring()
+    }
+    
+    override fun onDestroyView() {
+        super.onDestroyView()
+        
+        // Clean up resources
+        textToSpeech?.shutdown()
+        voiceAlertManager.cleanup()
+        gpsOptimizer.cleanup()
+        batteryOptimizer.cleanup()
+        
+        _binding = null
+    }
+    
+    // Extension for dp to pixels
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+}
+
+/**
+ * Driver trip data class
+ */
+data class DriverTrip(
+    val id: String,
+    val destinationAddress: String,
+    val status: String,
+    val startTime: String,
+    val estimatedDuration: String,
+    val priority: String,
+    val customerName: String,
+    val phoneNumber: String
+)

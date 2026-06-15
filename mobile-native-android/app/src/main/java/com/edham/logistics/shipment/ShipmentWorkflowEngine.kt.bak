@@ -1,0 +1,886 @@
+package com.edham.logistics.shipment
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.ShipmentEntity
+// import com.edham.logistics.data.local.entity.WorkflowStepEntity
+// import com.edham.logistics.data.local.entity.WorkflowTransitionEntity
+import com.edham.logistics.data.remote.api.ShipmentApi
+import com.edham.logistics.domain.model.ShipmentStatus
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+// import javax.inject.Inject
+// import javax.inject.Singleton
+
+/**
+ * Shipment Workflow Engine - Advanced workflow management for shipments
+ * 
+ * Features:
+ * - Workflow definition and execution
+ * - State transitions
+ * - Conditional logic
+ * - Automated actions
+ * - Workflow monitoring
+ * - Exception handling
+ */
+// @Singleton
+class ShipmentWorkflowEngine(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val shipmentApi: ShipmentApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _workflowState = MutableStateFlow<WorkflowState>(WorkflowState.Idle)
+    val workflowState: StateFlow<WorkflowState> = _workflowState.asStateFlow()
+    
+    private val _activeWorkflows = MutableStateFlow<List<ActiveWorkflow>>(emptyList())
+    val activeWorkflows: StateFlow<List<ActiveWorkflow>> = _activeWorkflows.asStateFlow()
+    
+    private val _workflowAnalytics = MutableStateFlow<WorkflowAnalytics?>(null)
+    val workflowAnalytics: StateFlow<WorkflowAnalytics?> = _workflowAnalytics.asStateFlow()
+    
+    private var activeWorkflowInstances: MutableMap<Long, WorkflowInstance> = mutableMapOf()
+    private var workflowDefinitions: MutableMap<String, WorkflowDefinition> = mutableMapOf()
+    
+    companion object {
+        private const val TAG = "ShipmentWorkflowEngine"
+        private const val STANDARD_WORKFLOW = "STANDARD_SHIPMENT"
+        private const val EXPRESS_WORKFLOW = "EXPRESS_SHIPMENT"
+        private const val COLD_CHAIN_WORKFLOW = "COLD_CHAIN_SHIPMENT"
+        private const val MULTI_STOP_WORKFLOW = "MULTI_STOP_SHIPMENT"
+        private const val INTERNATIONAL_WORKFLOW = "INTERNATIONAL_SHIPMENT"
+    }
+    
+    init {
+        initializeWorkflowDefinitions()
+    }
+    
+    /**
+     * Initialize workflow definitions
+     */
+    private fun initializeWorkflowDefinitions() {
+        // Standard shipment workflow
+        workflowDefinitions[STANDARD_WORKFLOW] = WorkflowDefinition(
+            name = STANDARD_WORKFLOW,
+            description = "Standard shipment workflow",
+            steps = listOf(
+                WorkflowStep(
+                    id = "created",
+                    name = "Created",
+                    status = ShipmentStatus.PENDING, // CREATED not available, use PENDING
+                    actions = listOf("validate_shipment", "generate_barcode", "notify_customer"),
+                    conditions = emptyList(),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("assigned", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "assigned",
+                    name = "Assigned",
+                    status = ShipmentStatus.ASSIGNED,
+                    actions = listOf("assign_driver", "assign_vehicle", "schedule_pickup"),
+                    conditions = listOf("driver_available", "vehicle_available"),
+                    timeout = 7200000L, // 2 hours
+                    nextSteps = listOf("scheduled", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "scheduled",
+                    name = "Scheduled",
+                    status = ShipmentStatus.ASSIGNED, // SCHEDULED not available, use ASSIGNED
+                    actions = listOf("optimize_route", "send_notifications", "prepare_documents"),
+                    conditions = listOf("route_optimized"),
+                    timeout = 1800000L, // 30 minutes
+                    nextSteps = listOf("pickup_confirmed", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "pickup_confirmed",
+                    name = "Pickup Confirmed",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("start_tracking", "update_status", "notify_customer"),
+                    conditions = emptyList(),
+                    timeout = 86400000L, // 24 hours
+                    nextSteps = listOf("in_transit", "delayed")
+                ),
+                WorkflowStep(
+                    id = "in_transit",
+                    name = "In Transit",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("monitor_progress", "update_eta", "handle_exceptions"),
+                    conditions = emptyList(),
+                    timeout = 172800000L, // 48 hours
+                    nextSteps = listOf("out_for_delivery", "delayed", "returned")
+                ),
+                WorkflowStep(
+                    id = "out_for_delivery",
+                    name = "Out for Delivery",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("notify_customer", "prepare_delivery", "update_eta"),
+                    conditions = emptyList(),
+                    timeout = 14400000L, // 4 hours
+                    nextSteps = listOf("delivered", "failed_delivery")
+                ),
+                WorkflowStep(
+                    id = "delivered",
+                    name = "Delivered",
+                    status = ShipmentStatus.DELIVERED,
+                    actions = listOf("stop_tracking", "generate_report", "process_payment"),
+                    conditions = emptyList(),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("completed")
+                ),
+                WorkflowStep(
+                    id = "completed",
+                    name = "Completed",
+                    status = ShipmentStatus.DELIVERED,
+                    actions = listOf("archive_shipment", "send_feedback", "cleanup_data"),
+                    conditions = emptyList(),
+                    timeout = 0L,
+                    nextSteps = emptyList()
+                ),
+                WorkflowStep(
+                    id = "cancelled",
+                    name = "Cancelled",
+                    status = ShipmentStatus.CANCELLED,
+                    actions = listOf("stop_tracking", "process_refund", "notify_customer"),
+                    conditions = emptyList(),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("completed")
+                ),
+                WorkflowStep(
+                    id = "delayed",
+                    name = "Delayed",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("notify_customer", "update_eta", "analyze_delay"),
+                    conditions = emptyList(),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("in_transit", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "returned",
+                    name = "Returned",
+                    status = ShipmentStatus.CANCELLED, // RETURNED not available, use CANCELLED
+                    actions = listOf("process_return", "notify_customer", "update_inventory"),
+                    conditions = emptyList(),
+                    timeout = 7200000L, // 2 hours
+                    nextSteps = listOf("completed")
+                ),
+                WorkflowStep(
+                    id = "failed_delivery",
+                    name = "Failed Delivery",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("reschedule_delivery", "notify_customer", "update_status"),
+                    conditions = emptyList(),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("out_for_delivery", "cancelled")
+                )
+            )
+        )
+        
+        // Express shipment workflow
+        workflowDefinitions[EXPRESS_WORKFLOW] = WorkflowDefinition(
+            name = EXPRESS_WORKFLOW,
+            description = "Express shipment workflow with expedited steps",
+            steps = listOf(
+                WorkflowStep(
+                    id = "created",
+                    name = "Created",
+                    status = ShipmentStatus.PENDING, // CREATED not available, use PENDING
+                    actions = listOf("validate_shipment", "generate_barcode", "priority_assignment"),
+                    conditions = emptyList(),
+                    timeout = 1800000L, // 30 minutes
+                    nextSteps = listOf("assigned", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "assigned",
+                    name = "Assigned",
+                    status = ShipmentStatus.ASSIGNED,
+                    actions = listOf("assign_express_driver", "assign_priority_vehicle", "immediate_pickup"),
+                    conditions = listOf("express_driver_available", "priority_vehicle_available"),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("pickup_confirmed", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "pickup_confirmed",
+                    name = "Express Pickup",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("start_express_tracking", "expedited_route", "priority_notifications"),
+                    conditions = emptyList(),
+                    timeout = 43200000L, // 12 hours
+                    nextSteps = listOf("express_delivery", "delayed")
+                ),
+                WorkflowStep(
+                    id = "express_delivery",
+                    name = "Express Delivery",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("priority_delivery", "real_time_updates", "delivery_confirmation"),
+                    conditions = emptyList(),
+                    timeout = 7200000L, // 2 hours
+                    nextSteps = listOf("delivered", "failed_delivery")
+                ),
+                WorkflowStep(
+                    id = "delivered",
+                    name = "Express Delivered",
+                    status = ShipmentStatus.DELIVERED,
+                    actions = listOf("express_completion", "priority_report", "immediate_feedback"),
+                    conditions = emptyList(),
+                    timeout = 1800000L, // 30 minutes
+                    nextSteps = listOf("completed")
+                ),
+                WorkflowStep(
+                    id = "completed",
+                    name = "Express Completed",
+                    status = ShipmentStatus.DELIVERED,
+                    actions = listOf("express_archive", "priority_feedback", "quality_review"),
+                    conditions = emptyList(),
+                    timeout = 0L,
+                    nextSteps = emptyList()
+                ),
+                WorkflowStep(
+                    id = "cancelled",
+                    name = "Cancelled",
+                    status = ShipmentStatus.CANCELLED,
+                    actions = listOf("express_cancellation", "priority_refund", "immediate_notification"),
+                    conditions = emptyList(),
+                    timeout = 1800000L, // 30 minutes
+                    nextSteps = listOf("completed")
+                ),
+                WorkflowStep(
+                    id = "delayed",
+                    name = "Express Delay",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("priority_alert", "escalation", "alternative_routing"),
+                    conditions = emptyList(),
+                    timeout = 1800000L, // 30 minutes
+                    nextSteps = listOf("express_delivery", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "failed_delivery",
+                    name = "Express Failed",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("immediate_reschedule", "priority_notification", "escalation"),
+                    conditions = emptyList(),
+                    timeout = 1800000L, // 30 minutes
+                    nextSteps = listOf("express_delivery", "cancelled")
+                )
+            )
+        )
+        
+        // Cold chain workflow
+        workflowDefinitions[COLD_CHAIN_WORKFLOW] = WorkflowDefinition(
+            name = COLD_CHAIN_WORKFLOW,
+            description = "Cold chain shipment workflow with temperature monitoring",
+            steps = listOf(
+                WorkflowStep(
+                    id = "created",
+                    name = "Created",
+                    status = ShipmentStatus.PENDING, // CREATED not available, use PENDING
+                    actions = listOf("validate_cold_chain", "setup_temperature_monitoring", "prepare_cold_chain_docs"),
+                    conditions = listOf("temperature_sensors_ready", "cold_chain_compliant"),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("assigned", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "assigned",
+                    name = "Assigned",
+                    status = ShipmentStatus.ASSIGNED,
+                    actions = listOf("assign_cold_chain_driver", "assign_refrigerated_vehicle", "setup_monitoring"),
+                    conditions = listOf("cold_chain_driver_available", "refrigerated_vehicle_available"),
+                    timeout = 7200000L, // 2 hours
+                    nextSteps = listOf("scheduled", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "scheduled",
+                    name = "Scheduled",
+                    status = ShipmentStatus.ASSIGNED, // SCHEDULED not available, use ASSIGNED
+                    actions = listOf("optimize_cold_chain_route", "pre_cool_vehicle", "validate_temperature"),
+                    conditions = listOf("vehicle_pre_cooled", "temperature_stable"),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("pickup_confirmed", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "pickup_confirmed",
+                    name = "Cold Chain Pickup",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("start_temperature_monitoring", "validate_pickup_temp", "start_tracking"),
+                    conditions = listOf("temperature_in_range"),
+                    timeout = 86400000L, // 24 hours
+                    nextSteps = listOf("cold_chain_transit", "temperature_violation")
+                ),
+                WorkflowStep(
+                    id = "cold_chain_transit",
+                    name = "Cold Chain Transit",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("continuous_monitoring", "temperature_alerts", "compliance_tracking"),
+                    conditions = listOf("temperature_compliant"),
+                    timeout = 172800000L, // 48 hours
+                    nextSteps = listOf("out_for_delivery", "temperature_violation")
+                ),
+                WorkflowStep(
+                    id = "out_for_delivery",
+                    name = "Cold Chain Delivery",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("final_temperature_check", "delivery_preparation", "customer_notification"),
+                    conditions = listOf("final_temp_ok"),
+                    timeout = 14400000L, // 4 hours
+                    nextSteps = listOf("delivered", "temperature_violation")
+                ),
+                WorkflowStep(
+                    id = "delivered",
+                    name = "Cold Chain Delivered",
+                    status = ShipmentStatus.DELIVERED,
+                    actions = listOf("generate_temp_report", "compliance_certificate", "archive_data"),
+                    conditions = emptyList(),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("completed")
+                ),
+                WorkflowStep(
+                    id = "completed",
+                    name = "Cold Chain Completed",
+                    status = ShipmentStatus.DELIVERED,
+                    actions = listOf("compliance_audit", "quality_report", "data_retention"),
+                    conditions = emptyList(),
+                    timeout = 0L,
+                    nextSteps = emptyList()
+                ),
+                WorkflowStep(
+                    id = "temperature_violation",
+                    name = "Temperature Violation",
+                    status = ShipmentStatus.IN_TRANSIT,
+                    actions = listOf("violation_alert", "corrective_action", "compliance_review"),
+                    conditions = emptyList(),
+                    timeout = 1800000L, // 30 minutes
+                    nextSteps = listOf("cold_chain_transit", "cancelled")
+                ),
+                WorkflowStep(
+                    id = "cancelled",
+                    name = "Cold Chain Cancelled",
+                    status = ShipmentStatus.CANCELLED,
+                    actions = listOf("stop_monitoring", "violation_report", "quarantine_procedure"),
+                    conditions = emptyList(),
+                    timeout = 3600000L, // 1 hour
+                    nextSteps = listOf("completed")
+                )
+            )
+        )
+    }
+    
+    /**
+     * Initialize workflow for shipment
+     */
+    fun initializeWorkflow(shipment: ShipmentEntity) {
+        try {
+            _workflowState.value = WorkflowState.Initializing
+            
+            val workflowType = determineWorkflowType(shipment)
+            val workflowDefinition = workflowDefinitions[workflowType]
+                ?: workflowDefinitions[STANDARD_WORKFLOW]!!
+            
+            val workflowInstance = WorkflowInstance(
+                shipmentId = shipment.id,
+                workflowType = workflowType,
+                currentStep = workflowDefinition.steps.first(),
+                startTime = Date(),
+                lastUpdateTime = Date(),
+                completedSteps = mutableListOf(),
+                failedConditions = mutableListOf(),
+                metadata = mutableMapOf()
+            )
+            
+            activeWorkflowInstances[shipment.id] = workflowInstance
+            
+            // Execute initial step
+            executeWorkflowStep(workflowInstance)
+            
+            // Update active workflows
+            updateActiveWorkflows()
+            
+            _workflowState.value = WorkflowState.Initialized
+            
+        } catch (e: Exception) {
+            _workflowState.value = WorkflowState.Error("Failed to initialize workflow: ${e.message}")
+        }
+    }
+    
+    /**
+     * Process state change
+     */
+    fun processStateChange(shipmentId: Long, newStatus: ShipmentStatus, changedBy: String) {
+        try {
+            val workflowInstance = activeWorkflowInstances[shipmentId]
+                ?: return
+            
+            val currentStep = workflowInstance.currentStep
+            
+            // Find next step for new status
+            val nextStep = findNextStep(workflowInstance, newStatus)
+            
+            if (nextStep != null) {
+                // Transition to next step
+                transitionToStep(workflowInstance, nextStep, changedBy)
+            } else {
+                // Handle invalid transition
+                handleInvalidTransition(workflowInstance, newStatus, changedBy)
+            }
+            
+        } catch (e: Exception) {
+            _workflowState.value = WorkflowState.Error("Failed to process state change: ${e.message}")
+        }
+    }
+    
+    /**
+     * Execute workflow step
+     */
+    private fun executeWorkflowStep(workflowInstance: WorkflowInstance) {
+        try {
+            val step = workflowInstance.currentStep
+            
+            // Execute step actions
+            step.actions.forEach { action ->
+                executeAction(workflowInstance, action)
+            }
+            
+            // Check conditions
+            val conditionsMet = checkConditions(workflowInstance, step.conditions)
+            
+            if (conditionsMet) {
+                // Step completed successfully
+                workflowInstance.completedSteps.add(step)
+                
+                // Check for automatic transition
+                if (step.nextSteps.size == 1) {
+                    val nextStepId = step.nextSteps.first()
+                    val workflowDefinition = workflowDefinitions[workflowInstance.workflowType]!!
+                    val nextStep = workflowDefinition.steps.find { it.id == nextStepId }
+                    
+                    if (nextStep != null) {
+                        transitionToStep(workflowInstance, nextStep, "system")
+                    }
+                }
+            } else {
+                // Handle failed conditions
+                handleFailedConditions(workflowInstance, step)
+            }
+            
+            // Update workflow instance
+            workflowInstance.lastUpdateTime = Date()
+            updateActiveWorkflows()
+            
+        } catch (e: Exception) {
+            _workflowState.value = WorkflowState.Error("Failed to execute step: ${e.message}")
+        }
+    }
+    
+    /**
+     * Transition to next step
+     */
+    private fun transitionToStep(workflowInstance: WorkflowInstance, nextStep: WorkflowStep, triggeredBy: String) {
+        try {
+            // Create transition record
+            // val transition = WorkflowTransitionEntity(
+            //     id = 0,
+            //     shipmentId = workflowInstance.shipmentId,
+                fromStep = workflowInstance.currentStep.id,
+                toStep = nextStep.id,
+                transitionTime = Date(),
+                triggeredBy = triggeredBy,
+                metadata = mapOf(
+                    "workflow_type" to workflowInstance.workflowType,
+                    "previous_step_duration" to (Date().time - workflowInstance.startTime.time)
+                ).toString(),
+                createdAt = Date()
+            )
+            
+            // Save transition
+            // Implementation would save to database
+            
+            // Update current step
+            workflowInstance.currentStep = nextStep
+            workflowInstance.lastUpdateTime = Date()
+            
+            // Execute new step
+            executeWorkflowStep(workflowInstance)
+            
+        } catch (e: Exception) {
+            _workflowState.value = WorkflowState.Error("Failed to transition step: ${e.message}")
+        }
+    }
+    
+    /**
+     * Execute action
+     */
+    private fun executeAction(workflowInstance: WorkflowInstance, action: String) {
+        when (action) {
+            "validate_shipment" -> validateShipment(workflowInstance)
+            "generate_barcode" -> generateBarcode(workflowInstance)
+            "notify_customer" -> notifyCustomer(workflowInstance)
+            "assign_driver" -> assignDriver(workflowInstance)
+            "assign_vehicle" -> assignVehicle(workflowInstance)
+            "schedule_pickup" -> schedulePickup(workflowInstance)
+            "optimize_route" -> optimizeRoute(workflowInstance)
+            "send_notifications" -> sendNotifications(workflowInstance)
+            "prepare_documents" -> prepareDocuments(workflowInstance)
+            "start_tracking" -> startTracking(workflowInstance)
+            "update_status" -> updateStatus(workflowInstance)
+            "monitor_progress" -> monitorProgress(workflowInstance)
+            "update_eta" -> updateETA(workflowInstance)
+            "handle_exceptions" -> handleExceptions(workflowInstance)
+            "stop_tracking" -> stopTracking(workflowInstance)
+            "generate_report" -> generateReport(workflowInstance)
+            "process_payment" -> processPayment(workflowInstance)
+            "archive_shipment" -> archiveShipment(workflowInstance)
+            "send_feedback" -> sendFeedback(workflowInstance)
+            "cleanup_data" -> cleanupData(workflowInstance)
+            "process_refund" -> processRefund(workflowInstance)
+            "notify_customer" -> notifyCustomer(workflowInstance)
+            "update_eta" -> updateETA(workflowInstance)
+            "analyze_delay" -> analyzeDelay(workflowInstance)
+            "process_return" -> processReturn(workflowInstance)
+            "update_inventory" -> updateInventory(workflowInstance)
+            "reschedule_delivery" -> rescheduleDelivery(workflowInstance)
+            "update_status" -> updateStatus(workflowInstance)
+            "priority_assignment" -> priorityAssignment(workflowInstance)
+            "assign_express_driver" -> assignExpressDriver(workflowInstance)
+            "assign_priority_vehicle" -> assignPriorityVehicle(workflowInstance)
+            "immediate_pickup" -> immediatePickup(workflowInstance)
+            "start_express_tracking" -> startExpressTracking(workflowInstance)
+            "expedited_route" -> expeditedRoute(workflowInstance)
+            "priority_notifications" -> priorityNotifications(workflowInstance)
+            "priority_delivery" -> priorityDelivery(workflowInstance)
+            "real_time_updates" -> realTimeUpdates(workflowInstance)
+            "delivery_confirmation" -> deliveryConfirmation(workflowInstance)
+            "express_completion" -> expressCompletion(workflowInstance)
+            "priority_report" -> priorityReport(workflowInstance)
+            "immediate_feedback" -> immediateFeedback(workflowInstance)
+            "express_archive" -> expressArchive(workflowInstance)
+            "priority_feedback" -> priorityFeedback(workflowInstance)
+            "quality_review" -> qualityReview(workflowInstance)
+            "express_cancellation" -> expressCancellation(workflowInstance)
+            "priority_refund" -> priorityRefund(workflowInstance)
+            "immediate_notification" -> immediateNotification(workflowInstance)
+            "priority_alert" -> priorityAlert(workflowInstance)
+            "escalation" -> escalation(workflowInstance)
+            "alternative_routing" -> alternativeRouting(workflowInstance)
+            "immediate_reschedule" -> immediateReschedule(workflowInstance)
+            "validate_cold_chain" -> validateColdChain(workflowInstance)
+            "setup_temperature_monitoring" -> setupTemperatureMonitoring(workflowInstance)
+            "prepare_cold_chain_docs" -> prepareColdChainDocs(workflowInstance)
+            "assign_cold_chain_driver" -> assignColdChainDriver(workflowInstance)
+            "assign_refrigerated_vehicle" -> assignRefrigeratedVehicle(workflowInstance)
+            "setup_monitoring" -> setupMonitoring(workflowInstance)
+            "optimize_cold_chain_route" -> optimizeColdChainRoute(workflowInstance)
+            "pre_cool_vehicle" -> preCoolVehicle(workflowInstance)
+            "validate_temperature" -> validateTemperature(workflowInstance)
+            "start_temperature_monitoring" -> startTemperatureMonitoring(workflowInstance)
+            "validate_pickup_temp" -> validatePickupTemp(workflowInstance)
+            "continuous_monitoring" -> continuousMonitoring(workflowInstance)
+            "temperature_alerts" -> temperatureAlerts(workflowInstance)
+            "compliance_tracking" -> complianceTracking(workflowInstance)
+            "final_temperature_check" -> finalTemperatureCheck(workflowInstance)
+            "delivery_preparation" -> deliveryPreparation(workflowInstance)
+            "customer_notification" -> customerNotification(workflowInstance)
+            "generate_temp_report" -> generateTempReport(workflowInstance)
+            "compliance_certificate" -> complianceCertificate(workflowInstance)
+            "archive_data" -> archiveData(workflowInstance)
+            "compliance_audit" -> complianceAudit(workflowInstance)
+            "quality_report" -> qualityReport(workflowInstance)
+            "data_retention" -> dataRetention(workflowInstance)
+            "violation_alert" -> violationAlert(workflowInstance)
+            "corrective_action" -> correctiveAction(workflowInstance)
+            "compliance_review" -> complianceReview(workflowInstance)
+            "stop_monitoring" -> stopMonitoring(workflowInstance)
+            "violation_report" -> violationReport(workflowInstance)
+            "quarantine_procedure" -> quarantineProcedure(workflowInstance)
+            else -> {
+                // Handle unknown action
+            }
+        }
+    }
+    
+    /**
+     * Get workflow analytics
+     */
+    suspend fun getWorkflowAnalytics(): WorkflowAnalytics {
+        return withContext(Dispatchers.IO) {
+            // val allTransitions = database.workflowTransitionDao().getAllTransitions()
+            val allInstances = activeWorkflowInstances.values.toList()
+            
+            val totalWorkflows = allInstances.size
+            val completedWorkflows = allInstances.count { it.currentStep.id == "completed" }
+            val averageCompletionTime = calculateAverageCompletionTime(allInstances)
+            val stepCompletionRates = calculateStepCompletionRates(listOf())
+            val stepCompletionRates = calculateStepCompletionRates(allTransitions)
+            val workflowTypeDistribution = calculateWorkflowTypeDistribution(allInstances)
+            val commonBottlenecks = identifyBottlenecks(allTransitions)
+            val automationRate = calculateAutomationRate(allTransitions)
+            
+            WorkflowAnalytics(
+                totalWorkflows = totalWorkflows,
+                completedWorkflows = completedWorkflows,
+                completionRate = if (totalWorkflows > 0) completedWorkflows.toFloat() / totalWorkflows else 1f,
+                averageCompletionTime = averageCompletionTime,
+                stepCompletionRates = stepCompletionRates,
+                workflowTypeDistribution = workflowTypeDistribution,
+                commonBottlenecks = commonBottlenecks,
+                automationRate = automationRate
+            )
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private fun determineWorkflowType(shipment: ShipmentEntity): String {
+        return when {
+            shipment.priority == Priority.CRITICAL -> EXPRESS_WORKFLOW
+            shipment.isColdChain -> COLD_CHAIN_WORKFLOW
+            // Add other workflow type logic
+            else -> STANDARD_WORKFLOW
+        }
+    }
+    
+    private fun findNextStep(workflowInstance: WorkflowInstance, newStatus: ShipmentStatus): WorkflowStep? {
+        val workflowDefinition = workflowDefinitions[workflowInstance.workflowType]
+            ?: return null
+        
+        return workflowDefinition.steps.find { it.status == newStatus }
+    }
+    
+    private fun handleInvalidTransition(workflowInstance: WorkflowInstance, newStatus: ShipmentStatus, changedBy: String) {
+        // Handle invalid transition - create alert or log
+        _workflowState.value = WorkflowState.Error("Invalid transition from ${workflowInstance.currentStep.status} to $newStatus")
+    }
+    
+    private fun checkConditions(workflowInstance: WorkflowInstance, conditions: List<String>): Boolean {
+        return conditions.all { condition ->
+            checkCondition(workflowInstance, condition)
+        }
+    }
+    
+    private fun checkCondition(workflowInstance: WorkflowInstance, condition: String): Boolean {
+        // Implementation would check specific conditions
+        return true // Placeholder
+    }
+    
+    private fun handleFailedConditions(workflowInstance: WorkflowInstance, step: WorkflowStep) {
+        workflowInstance.failedConditions.addAll(step.conditions)
+        _workflowState.value = WorkflowState.Error("Failed conditions for step: ${step.id}")
+    }
+    
+    private fun updateActiveWorkflows() {
+        val activeWorkflows = activeWorkflowInstances.values.map { instance ->
+            ActiveWorkflow(
+                shipmentId = instance.shipmentId,
+                workflowType = instance.workflowType,
+                currentStep = instance.currentStep,
+                startTime = instance.startTime,
+                lastUpdateTime = instance.lastUpdateTime,
+                completedSteps = instance.completedSteps.size,
+                totalSteps = workflowDefinitions[instance.workflowType]?.steps?.size ?: 0,
+                progress = instance.completedSteps.size.toFloat() / (workflowDefinitions[instance.workflowType]?.steps?.size ?: 1)
+            )
+        }
+        
+        _activeWorkflows.value = activeWorkflows
+    }
+    
+    // Action implementations (simplified)
+    private fun validateShipment(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun generateBarcode(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun notifyCustomer(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun assignDriver(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun assignVehicle(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun schedulePickup(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun optimizeRoute(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun sendNotifications(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun prepareDocuments(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun startTracking(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun updateStatus(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun monitorProgress(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun updateETA(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun handleExceptions(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun stopTracking(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun generateReport(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun processPayment(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun archiveShipment(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun sendFeedback(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun cleanupData(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun processRefund(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun analyzeDelay(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun processReturn(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun updateInventory(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun rescheduleDelivery(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    
+    // Express workflow actions
+    private fun priorityAssignment(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun assignExpressDriver(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun assignPriorityVehicle(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun immediatePickup(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun startExpressTracking(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun expeditedRoute(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun priorityNotifications(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun priorityDelivery(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun realTimeUpdates(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun deliveryConfirmation(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun expressCompletion(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun priorityReport(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun immediateFeedback(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun expressArchive(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun priorityFeedback(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun qualityReview(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun expressCancellation(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun priorityRefund(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun immediateNotification(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun priorityAlert(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun escalation(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun alternativeRouting(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun immediateReschedule(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    
+    // Cold chain workflow actions
+    private fun validateColdChain(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun setupTemperatureMonitoring(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun prepareColdChainDocs(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun assignColdChainDriver(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun assignRefrigeratedVehicle(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun setupMonitoring(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun optimizeColdChainRoute(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun preCoolVehicle(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun validateTemperature(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun startTemperatureMonitoring(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun validatePickupTemp(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun continuousMonitoring(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun temperatureAlerts(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun complianceTracking(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun finalTemperatureCheck(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun deliveryPreparation(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun generateTempReport(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun complianceCertificate(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun archiveData(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun complianceAudit(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun qualityReport(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun dataRetention(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun violationAlert(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun correctiveAction(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun complianceReview(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun stopMonitoring(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun violationReport(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    private fun quarantineProcedure(workflowInstance: WorkflowInstance) { /* Implementation */ }
+    
+    // Analytics calculations
+    private fun calculateAverageCompletionTime(instances: List<WorkflowInstance>): Double {
+        val completedInstances = instances.filter { 
+            it.currentStep.id == "completed" 
+        }
+        
+        if (completedInstances.isEmpty()) return 0.0
+        
+        val totalTime = completedInstances.sumOf { instance ->
+            instance.lastUpdateTime.time - instance.startTime.time
+        }
+        
+        return totalTime / completedInstances.size / (1000 * 60) // Convert to minutes
+    }
+    
+    private fun calculateStepCompletionRates(transitions: List<WorkflowTransitionEntity>): Map<String, Float> {
+        // Implementation would calculate completion rates for each step
+        return mapOf(
+            "created" to 0.98f,
+            "assigned" to 0.95f,
+            "scheduled" to 0.92f,
+            "pickup_confirmed" to 0.90f,
+            "in_transit" to 0.88f,
+            "delivered" to 0.95f
+        )
+    }
+    
+    private fun calculateWorkflowTypeDistribution(instances: List<WorkflowInstance>): Map<String, Int> {
+        return instances.groupBy { it.workflowType }.mapValues { it.value.size }
+    }
+    
+    private fun identifyBottlenecks(transitions: List<WorkflowTransitionEntity>): List<String> {
+        // Implementation would identify workflow bottlenecks
+        return listOf("assigned", "scheduled")
+    }
+    
+    // private fun calculateAutomationRate(transitions: List<WorkflowTransitionEntity>): Float {
+        val automatedTransitions = transitions.count { it.triggeredBy == "system" }
+        return if (transitions.isNotEmpty()) {
+            automatedTransitions.toFloat() / transitions.size
+        } else 0f
+    }
+    
+    /**
+     * Get workflow state
+     */
+    fun getWorkflowState(): WorkflowState = _workflowState.value
+}
+
+/**
+ * Data classes
+ */
+data class WorkflowDefinition(
+    val name: String,
+    val description: String,
+    val steps: List<WorkflowStep>
+)
+
+data class WorkflowStep(
+    val id: String,
+    val name: String,
+    val status: ShipmentStatus,
+    val actions: List<String>,
+    val conditions: List<String>,
+    val timeout: Long,
+    val nextSteps: List<String>
+)
+
+data class WorkflowInstance(
+    val shipmentId: Long,
+    val workflowType: String,
+    var currentStep: WorkflowStep,
+    val startTime: Date,
+    var lastUpdateTime: Date,
+    val completedSteps: MutableList<WorkflowStep>,
+    val failedConditions: MutableList<String>,
+    val metadata: MutableMap<String, Any>
+)
+
+data class ActiveWorkflow(
+    val shipmentId: Long,
+    val workflowType: String,
+    val currentStep: WorkflowStep,
+    val startTime: Date,
+    val lastUpdateTime: Date,
+    val completedSteps: Int,
+    val totalSteps: Int,
+    val progress: Float
+)
+
+data class WorkflowAnalytics(
+    val totalWorkflows: Int,
+    val completedWorkflows: Int,
+    val completionRate: Float,
+    val averageCompletionTime: Double,
+    val stepCompletionRates: Map<String, Float>,
+    val workflowTypeDistribution: Map<String, Int>,
+    val commonBottlenecks: List<String>,
+    val automationRate: Float
+)
+
+/**
+ * Enums
+ */
+enum class WorkflowState {
+    Idle,
+    Initializing,
+    Initialized,
+    Processing,
+    Completed,
+    Error
+}

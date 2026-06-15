@@ -1,0 +1,751 @@
+package com.edham.logistics.shipment
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.local.entity.AuditLogEntity
+import com.edham.logistics.data.remote.api.ShipmentApi
+import com.edham.logistics.tracking.LiveTrackingManager
+import com.edham.logistics.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Audit Logger - Comprehensive audit logging system for shipments
+ * 
+ * Features:
+ * - Action logging
+ * - User activity tracking
+ * - System event logging
+ * - Compliance reporting
+ * - Security monitoring
+ * - Data retention policies
+ */
+@Singleton
+class AuditLogger @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val shipmentApi: ShipmentApi,
+    private val liveTrackingManager: LiveTrackingManager,
+    private val networkUtils: NetworkUtils
+) {
+    
+    private val _auditState = MutableStateFlow<AuditState>(AuditState.Idle)
+    val auditState: StateFlow<AuditState> = _auditState.asStateFlow()
+    
+    private val _auditLogs = MutableStateFlow<List<AuditLogEntity>>(emptyList())
+    val auditLogs: StateFlow<List<AuditLogEntity>> = _auditLogs.asStateFlow()
+    
+    private val _complianceReports = MutableStateFlow<List<ComplianceReport>>(emptyList())
+    val complianceReports: StateFlow<List<ComplianceReport>> = _complianceReports.asStateFlow()
+    
+    private val _securityAlerts = MutableStateFlow<List<SecurityAlert>>(emptyList())
+    val securityAlerts: StateFlow<List<SecurityAlert>> = _securityAlerts.asStateFlow()
+    
+    private val _auditAnalytics = MutableStateFlow<AuditAnalytics?>(null)
+    val auditAnalytics: StateFlow<AuditAnalytics?> = _auditAnalytics.asStateFlow()
+    
+    private var isLogging = false
+    private val maxLogEntries = 10000
+    private val logRetentionDays = 365
+    private val securityThreshold = 10 // Number of suspicious actions before alert
+    
+    companion object {
+        private const val TAG = "AuditLogger"
+        private const val LOG_BATCH_SIZE = 100
+        private const val SYNC_INTERVAL = 300000L // 5 minutes
+    }
+    
+    init {
+        startLogging()
+    }
+    
+    /**
+     * Start audit logging
+     */
+    private fun startLogging() {
+        if (isLogging) return
+        
+        try {
+            _auditState.value = AuditState.Starting
+            isLogging = true
+            
+            // Start periodic cleanup
+            startPeriodicCleanup()
+            
+            // Start periodic sync
+            startPeriodicSync()
+            
+            // Start security monitoring
+            startSecurityMonitoring()
+            
+            _auditState.value = AuditState.Logging
+            
+        } catch (e: Exception) {
+            _auditState.value = AuditState.Error("Failed to start logging: ${e.message}")
+        }
+    }
+    
+    /**
+     * Stop audit logging
+     */
+    fun stopLogging() {
+        isLogging = false
+        _auditState.value = AuditState.Stopped
+    }
+    
+    /**
+     * Log shipment action
+     */
+    suspend fun logShipmentAction(
+        shipmentId: Long,
+        action: String,
+        userId: String,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String? = null,
+        userAgent: String? = null
+    ) {
+        try {
+            val auditLog = AuditLogEntity(
+                id = 0,
+                shipmentId = shipmentId,
+                entityType = EntityType.SHIPMENT,
+                entityId = shipmentId.toString(),
+                action = action,
+                userId = userId,
+                timestamp = Date(),
+                details = serializeDetails(details),
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                severity = determineSeverity(action, details),
+                category = determineCategory(action),
+                complianceFlag = isComplianceAction(action),
+                securityFlag = isSecurityAction(action),
+                createdAt = Date()
+            )
+            
+            // Save log entry
+            val logId = database.auditLogDao().insertLog(auditLog)
+            val savedLog = auditLog.copy(id = logId)
+            
+            // Update logs list
+            updateAuditLogs()
+            
+            // Check for security alerts
+            checkSecurityAlerts(savedLog)
+            
+            // Sync with server if available
+            if (networkUtils.isNetworkAvailable()) {
+                syncLogWithServer(savedLog)
+            }
+            
+        } catch (e: Exception) {
+            _auditState.value = AuditState.Error("Failed to log action: ${e.message}")
+        }
+    }
+    
+    /**
+     * Log user action
+     */
+    suspend fun logUserAction(
+        action: String,
+        userId: String,
+        details: Map<String, Any> = emptyMap(),
+        ipAddress: String? = null,
+        userAgent: String? = null
+    ) {
+        try {
+            val auditLog = AuditLogEntity(
+                id = 0,
+                shipmentId = null,
+                entityType = EntityType.USER,
+                entityId = userId,
+                action = action,
+                userId = userId,
+                timestamp = Date(),
+                details = serializeDetails(details),
+                ipAddress = ipAddress,
+                userAgent = userAgent,
+                severity = determineSeverity(action, details),
+                category = determineCategory(action),
+                complianceFlag = isComplianceAction(action),
+                securityFlag = isSecurityAction(action),
+                createdAt = Date()
+            )
+            
+            // Save log entry
+            val logId = database.auditLogDao().insertLog(auditLog)
+            val savedLog = auditLog.copy(id = logId)
+            
+            // Update logs list
+            updateAuditLogs()
+            
+            // Check for security alerts
+            checkSecurityAlerts(savedLog)
+            
+            // Sync with server if available
+            if (networkUtils.isNetworkAvailable()) {
+                syncLogWithServer(savedLog)
+            }
+            
+        } catch (e: Exception) {
+            _auditState.value = AuditState.Error("Failed to log user action: ${e.message}")
+        }
+    }
+    
+    /**
+     * Log system event
+     */
+    suspend fun logSystemEvent(
+        event: String,
+        details: Map<String, Any> = emptyMap(),
+        severity: AuditSeverity = AuditSeverity.INFO
+    ) {
+        try {
+            val auditLog = AuditLogEntity(
+                id = 0,
+                shipmentId = null,
+                entityType = EntityType.SYSTEM,
+                entityId = "system",
+                action = event,
+                userId = "system",
+                timestamp = Date(),
+                details = serializeDetails(details),
+                ipAddress = null,
+                userAgent = null,
+                severity = severity,
+                category = AuditCategory.SYSTEM,
+                complianceFlag = false,
+                securityFlag = isSecurityEvent(event),
+                createdAt = Date()
+            )
+            
+            // Save log entry
+            val logId = database.auditLogDao().insertLog(auditLog)
+            val savedLog = auditLog.copy(id = logId)
+            
+            // Update logs list
+            updateAuditLogs()
+            
+            // Check for security alerts
+            checkSecurityAlerts(savedLog)
+            
+            // Sync with server if available
+            if (networkUtils.isNetworkAvailable()) {
+                syncLogWithServer(savedLog)
+            }
+            
+        } catch (e: Exception) {
+            _auditState.value = AuditState.Error("Failed to log system event: ${e.message}")
+        }
+    }
+    
+    /**
+     * Get audit logs for shipment
+     */
+    suspend fun getShipmentAuditLogs(shipmentId: Long): List<AuditLogEntity> {
+        return withContext(Dispatchers.IO) {
+            database.auditLogDao().getLogsByShipment(shipmentId)
+        }
+    }
+    
+    /**
+     * Get audit logs for user
+     */
+    suspend fun getUserAuditLogs(userId: String): List<AuditLogEntity> {
+        return withContext(Dispatchers.IO) {
+            database.auditLogDao().getLogsByUser(userId)
+        }
+    }
+    
+    /**
+     * Get audit logs by date range
+     */
+    suspend fun getAuditLogsByDateRange(startDate: Date, endDate: Date): List<AuditLogEntity> {
+        return withContext(Dispatchers.IO) {
+            database.auditLogDao().getLogsByDateRange(startDate, endDate)
+        }
+    }
+    
+    /**
+     * Generate compliance report
+     */
+    suspend fun generateComplianceReport(
+        reportType: ComplianceReportType,
+        startDate: Date,
+        endDate: Date
+    ): ComplianceReport {
+        return withContext(Dispatchers.IO) {
+            try {
+                val logs = database.auditLogDao().getLogsByDateRange(startDate, endDate)
+                val complianceLogs = logs.filter { it.complianceFlag }
+                
+                val report = ComplianceReport(
+                    id = 0,
+                    reportType = reportType,
+                    startDate = startDate,
+                    endDate = endDate,
+                    totalActions = logs.size,
+                    complianceActions = complianceLogs.size,
+                    complianceRate = if (logs.isNotEmpty()) {
+                        complianceLogs.size.toFloat() / logs.size
+                    } else 1f,
+                    violations = identifyViolations(complianceLogs),
+                    recommendations = generateRecommendations(complianceLogs),
+                    generatedAt = Date(),
+                    generatedBy = "system"
+                )
+                
+                // Save report
+                val reportId = database.complianceReportDao().insertReport(report)
+                val savedReport = report.copy(id = reportId)
+                
+                // Update compliance reports
+                updateComplianceReports()
+                
+                savedReport
+                
+            } catch (e: Exception) {
+                throw Exception("Failed to generate compliance report: ${e.message}")
+            }
+        }
+    }
+    
+    /**
+     * Get audit analytics
+     */
+    suspend fun getAuditAnalytics(): AuditAnalytics {
+        return withContext(Dispatchers.IO) {
+            val allLogs = database.auditLogDao().getAllLogs()
+            val today = Calendar.getInstance()
+            val weekAgo = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -7) }
+            val monthAgo = Calendar.getInstance().apply { add(Calendar.MONTH, -1) }
+            
+            val totalLogs = allLogs.size
+            val todayLogs = allLogs.count { isToday(it.timestamp) }
+            val weekLogs = allLogs.count { it.timestamp.after(weekAgo.time) }
+            val monthLogs = allLogs.count { it.timestamp.after(monthAgo.time) }
+            
+            val actionDistribution = calculateActionDistribution(allLogs)
+            val userActivity = calculateUserActivity(allLogs)
+            val securityEvents = allLogs.filter { it.securityFlag }
+            val complianceEvents = allLogs.filter { it.complianceFlag }
+            
+            AuditAnalytics(
+                totalLogs = totalLogs,
+                todayLogs = todayLogs,
+                weekLogs = weekLogs,
+                monthLogs = monthLogs,
+                actionDistribution = actionDistribution,
+                userActivity = userActivity,
+                securityEvents = securityEvents.size,
+                complianceEvents = complianceEvents.size,
+                securityAlerts = _securityAlerts.value.size,
+                complianceRate = if (totalLogs > 0) complianceEvents.size.toFloat() / totalLogs else 1f,
+                averageLogsPerDay = calculateAverageLogsPerDay(allLogs),
+                peakActivityHours = calculatePeakActivityHours(allLogs)
+            )
+        }
+    }
+    
+    /**
+     * Export audit logs
+     */
+    suspend fun exportAuditLogs(
+        format: ExportFormat,
+        startDate: Date? = null,
+        endDate: Date? = null,
+        filters: Map<String, Any> = emptyMap()
+    ): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val logs = getFilteredLogs(startDate, endDate, filters)
+                
+                val exportedData = when (format) {
+                    ExportFormat.JSON -> exportToJSON(logs)
+                    ExportFormat.CSV -> exportToCSV(logs)
+                    ExportFormat.PDF -> exportToPDF(logs)
+                    ExportFormat.EXCEL -> exportToExcel(logs)
+                }
+                
+                Result.success(exportedData)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private fun updateAuditLogs() {
+        val logs = database.auditLogDao().getAllLogs().take(maxLogEntries)
+        _auditLogs.value = logs
+    }
+    
+    private fun updateComplianceReports() {
+        val reports = database.complianceReportDao().getAllReports()
+        _complianceReports.value = reports
+    }
+    
+    private fun checkSecurityAlerts(log: AuditLogEntity) {
+        if (!log.securityFlag) return
+        
+        // Check for suspicious patterns
+        val recentLogs = _auditLogs.value.filter { 
+            it.userId == log.userId && 
+            it.timestamp.after(Date(System.currentTimeMillis() - 3600000L)) // Last hour
+        }
+        
+        if (recentLogs.size >= securityThreshold) {
+            val alert = SecurityAlert(
+                id = 0,
+                alertType = SecurityAlertType.SUSPICIOUS_ACTIVITY,
+                userId = log.userId,
+                description = "High frequency of actions detected",
+                severity = SecurityAlertSeverity.HIGH,
+                timestamp = Date(),
+                details = mapOf(
+                    "action_count" to recentLogs.size,
+                    "time_window" to "1 hour",
+                    "actions" to recentLogs.map { it.action }
+                ),
+                resolved = false,
+                createdAt = Date()
+            )
+            
+            // Save alert
+            val alertId = database.securityAlertDao().insertAlert(alert)
+            val savedAlert = alert.copy(id = alertId)
+            
+            // Update security alerts
+            val currentAlerts = _securityAlerts.value.toMutableList()
+            currentAlerts.add(savedAlert)
+            _securityAlerts.value = currentAlerts
+        }
+    }
+    
+    private suspend fun syncLogWithServer(log: AuditLogEntity) {
+        // Implementation would sync log with server
+    }
+    
+    private fun startPeriodicCleanup() {
+        // Implementation would start periodic cleanup of old logs
+    }
+    
+    private fun startPeriodicSync() {
+        // Implementation would start periodic sync with server
+    }
+    
+    private fun startSecurityMonitoring() {
+        // Implementation would start security monitoring
+    }
+    
+    private fun getFilteredLogs(
+        startDate: Date?,
+        endDate: Date?,
+        filters: Map<String, Any>
+    ): List<AuditLogEntity> {
+        var logs = database.auditLogDao().getAllLogs()
+        
+        // Apply date range filter
+        startDate?.let { start ->
+            logs = logs.filter { it.timestamp.after(start) }
+        }
+        
+        endDate?.let { end ->
+            logs = logs.filter { it.timestamp.before(end) }
+        }
+        
+        // Apply other filters
+        filters["userId"]?.let { userId ->
+            logs = logs.filter { it.userId == userId.toString() }
+        }
+        
+        filters["action"]?.let { action ->
+            logs = logs.filter { it.action == action.toString() }
+        }
+        
+        filters["severity"]?.let { severity ->
+            logs = logs.filter { it.severity == AuditSeverity.valueOf(severity.toString()) }
+        }
+        
+        return logs
+    }
+    
+    private fun determineSeverity(action: String, details: Map<String, Any>): AuditSeverity {
+        return when {
+            action.contains("DELETE") || action.contains("CANCEL") -> AuditSeverity.HIGH
+            action.contains("MODIFY") || action.contains("UPDATE") -> AuditSeverity.MEDIUM
+            action.contains("CREATE") || action.contains("ADD") -> AuditSeverity.LOW
+            else -> AuditSeverity.INFO
+        }
+    }
+    
+    private fun determineCategory(action: String): AuditCategory {
+        return when {
+            action.contains("SHIPMENT") -> AuditCategory.SHIPMENT
+            action.contains("USER") || action.contains("LOGIN") -> AuditCategory.USER
+            action.contains("DRIVER") -> AuditCategory.DRIVER
+            action.contains("VEHICLE") -> AuditCategory.VEHICLE
+            action.contains("SYSTEM") -> AuditCategory.SYSTEM
+            else -> AuditCategory.GENERAL
+        }
+    }
+    
+    private fun isComplianceAction(action: String): Boolean {
+        val complianceActions = listOf(
+            "CREATE_SHIPMENT",
+            "UPDATE_SHIPMENT",
+            "DELETE_SHIPMENT",
+            "ASSIGN_DRIVER",
+            "ASSIGN_VEHICLE",
+            "CONFIRM_PICKUP",
+            "CONFIRM_DELIVERY",
+            "CANCEL_SHIPMENT"
+        )
+        return complianceActions.any { action.contains(it) }
+    }
+    
+    private fun isSecurityAction(action: String): Boolean {
+        val securityActions = listOf(
+            "LOGIN",
+            "LOGOUT",
+            "CHANGE_PASSWORD",
+            "RESET_PASSWORD",
+            "DELETE_USER",
+            "MODIFY_PERMISSIONS",
+            "ACCESS_DENIED"
+        )
+        return securityActions.any { action.contains(it) }
+    }
+    
+    private fun isSecurityEvent(event: String): Boolean {
+        val securityEvents = listOf(
+            "SECURITY_BREACH",
+            "UNAUTHORIZED_ACCESS",
+            "SUSPICIOUS_ACTIVITY",
+            "FAILED_LOGIN",
+            "ACCOUNT_LOCKED"
+        )
+        return securityEvents.any { event.contains(it) }
+    }
+    
+    private fun serializeDetails(details: Map<String, Any>): String {
+        // Implementation would serialize details to JSON
+        return details.toString()
+    }
+    
+    private fun identifyViolations(logs: List<AuditLogEntity>): List<ComplianceViolation> {
+        // Implementation would identify compliance violations
+        return emptyList() // Placeholder
+    }
+    
+    private fun generateRecommendations(logs: List<AuditLogEntity>): List<String> {
+        // Implementation would generate compliance recommendations
+        return emptyList() // Placeholder
+    }
+    
+    private fun calculateActionDistribution(logs: List<AuditLogEntity>): Map<String, Int> {
+        return logs.groupBy { it.action }.mapValues { it.value.size }
+    }
+    
+    private fun calculateUserActivity(logs: List<AuditLogEntity>): Map<String, Int> {
+        return logs.filter { it.userId != "system" }
+            .groupBy { it.userId }
+            .mapValues { it.value.size }
+    }
+    
+    private fun calculateAverageLogsPerDay(logs: List<AuditLogEntity>): Double {
+        if (logs.isEmpty()) return 0.0
+        
+        val dateRange = logs.maxOfOrNull { it.timestamp.time }?.let { maxTime ->
+            val minTime = logs.minOfOrNull { it.timestamp.time } ?: maxTime
+            (maxTime - minTime) / (1000 * 60 * 60 * 24) // Convert to days
+        } ?: 1.0
+        
+        return logs.size / dateRange
+    }
+    
+    private fun calculatePeakActivityHours(logs: List<AuditLogEntity>): Map<Int, Int> {
+        return logs.groupBy { 
+            Calendar.getInstance().apply { time = it.timestamp }.get(Calendar.HOUR_OF_DAY)
+        }.mapValues { it.value.size }
+    }
+    
+    private fun isToday(date: Date): Boolean {
+        val today = Calendar.getInstance()
+        val checkDate = Calendar.getInstance()
+        checkDate.time = date
+        
+        return today.get(Calendar.YEAR) == checkDate.get(Calendar.YEAR) &&
+                today.get(Calendar.DAY_OF_YEAR) == checkDate.get(Calendar.DAY_OF_YEAR)
+    }
+    
+    private fun exportToJSON(logs: List<AuditLogEntity>): String {
+        // Implementation would export logs to JSON format
+        return "JSON export data"
+    }
+    
+    private fun exportToCSV(logs: List<AuditLogEntity>): String {
+        // Implementation would export logs to CSV format
+        return "CSV export data"
+    }
+    
+    private fun exportToPDF(logs: List<AuditLogEntity>): String {
+        // Implementation would export logs to PDF format
+        return "PDF export data"
+    }
+    
+    private fun exportToExcel(logs: List<AuditLogEntity>): String {
+        // Implementation would export logs to Excel format
+        return "Excel export data"
+    }
+    
+    /**
+     * Get logging status
+     */
+    fun isLogging(): Boolean = isLogging
+}
+
+/**
+ * Data classes
+ */
+data class ComplianceReport(
+    val id: Long,
+    val reportType: ComplianceReportType,
+    val startDate: Date,
+    val endDate: Date,
+    val totalActions: Int,
+    val complianceActions: Int,
+    val complianceRate: Float,
+    val violations: List<ComplianceViolation>,
+    val recommendations: List<String>,
+    val generatedAt: Date,
+    val generatedBy: String
+)
+
+data class ComplianceViolation(
+    val type: ViolationType,
+    val description: String,
+    val severity: ViolationSeverity,
+    val timestamp: Date,
+    val userId: String,
+    val action: String
+)
+
+data class SecurityAlert(
+    val id: Long,
+    val alertType: SecurityAlertType,
+    val userId: String,
+    val description: String,
+    val severity: SecurityAlertSeverity,
+    val timestamp: Date,
+    val details: Map<String, Any>,
+    val resolved: Boolean,
+    val createdAt: Date
+)
+
+data class AuditAnalytics(
+    val totalLogs: Int,
+    val todayLogs: Int,
+    val weekLogs: Int,
+    val monthLogs: Int,
+    val actionDistribution: Map<String, Int>,
+    val userActivity: Map<String, Int>,
+    val securityEvents: Int,
+    val complianceEvents: Int,
+    val securityAlerts: Int,
+    val complianceRate: Float,
+    val averageLogsPerDay: Double,
+    val peakActivityHours: Map<Int, Int>
+)
+
+/**
+ * Enums
+ */
+enum class AuditState {
+    Idle,
+    Starting,
+    Logging,
+    Stopped,
+    Error
+}
+
+enum class EntityType {
+    SHIPMENT,
+    USER,
+    DRIVER,
+    VEHICLE,
+    SYSTEM,
+    GENERAL
+}
+
+enum class AuditSeverity {
+    INFO,
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class AuditCategory {
+    SHIPMENT,
+    USER,
+    DRIVER,
+    VEHICLE,
+    SYSTEM,
+    GENERAL
+}
+
+enum class ComplianceReportType {
+    DAILY,
+    WEEKLY,
+    MONTHLY,
+    QUARTERLY,
+    YEARLY,
+    CUSTOM
+}
+
+enum class ViolationType {
+    UNAUTHORIZED_ACCESS,
+    DATA_MODIFICATION,
+    MISSING_DOCUMENTATION,
+    POLICY_VIOLATION,
+    SECURITY_BREACH
+}
+
+enum class ViolationSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class SecurityAlertType {
+    SUSPICIOUS_ACTIVITY,
+    UNAUTHORIZED_ACCESS,
+    FAILED_LOGIN_ATTEMPTS,
+    DATA_BREACH,
+    POLICY_VIOLATION
+}
+
+enum class SecurityAlertSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class ExportFormat {
+    JSON,
+    CSV,
+    PDF,
+    EXCEL
+}

@@ -1,0 +1,752 @@
+package com.edham.logistics.feature.coldchain
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import com.edham.logistics.data.local.database.ColdChainDatabase
+import com.edham.logistics.data.local.entity.TemperatureReading
+import com.edham.logistics.data.local.entity.SensorStatus
+import com.edham.logistics.data.remote.api.ColdChainApi
+import kotlinx.coroutines.*
+import timber.log.Timber
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Cold Chain Monitoring Service
+ * Professional temperature and humidity monitoring with real-time alerts
+ */
+class ColdChainMonitoringService(
+    private val context: Context,
+    private val api: ColdChainApi,
+    private val database: ColdChainDatabase
+) {
+    
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val handler = Handler(Looper.getMainLooper())
+    
+    // LiveData for real-time updates
+    private val _currentTemperature = MutableLiveData<Double>()
+    val currentTemperature: LiveData<Double> = _currentTemperature
+    
+    private val _currentHumidity = MutableLiveData<Double>()
+    val currentHumidity: LiveData<Double> = _currentHumidity
+    
+    private val _sensorStatus = MutableLiveData<Map<String, SensorStatus>>()
+    val sensorStatus: LiveData<Map<String, SensorStatus>> = _sensorStatus
+    
+    private val _activeAlerts = MutableLiveData<List<ColdChainAlert>>()
+    val activeAlerts: LiveData<List<ColdChainAlert>> = _activeAlerts
+    
+    private val _complianceStatus = MutableLiveData<ComplianceStatus>()
+    val complianceStatus: LiveData<ComplianceStatus> = _complianceStatus
+    
+    // Monitoring state
+    private var isMonitoring = false
+    private var monitoringInterval = 30000L // 30 seconds
+    private val activeSensors = ConcurrentHashMap<String, SensorInfo>()
+    private val temperatureHistory = mutableListOf<TemperatureReading>()
+    private val alertHistory = mutableListOf<ColdChainAlert>()
+    
+    // Threshold configurations
+    private var currentStandard = ColdChainStandard.FOOD
+    private var temperatureThreshold = TemperatureThreshold()
+    private var humidityThreshold = HumidityThreshold()
+    
+    companion object {
+        private const val MAX_HISTORY_SIZE = 1000
+        private const val MAX_ALERT_HISTORY = 500
+        private const val DATA_RETENTION_DAYS = 90
+    }
+    
+    /**
+     * Start cold chain monitoring
+     */
+    fun startMonitoring(shipmentId: String, standard: ColdChainStandard) {
+        if (isMonitoring) {
+            Timber.w("Monitoring already active")
+            return
+        }
+        
+        currentStandard = standard
+        setupThresholds(standard)
+        isMonitoring = true
+        
+        serviceScope.launch {
+            try {
+                // Initialize sensors
+                initializeSensors(shipmentId)
+                
+                // Start monitoring loop
+                startMonitoringLoop()
+                
+                // Start data streaming
+                startDataStreaming(shipmentId)
+                
+                Timber.d("Cold chain monitoring started for shipment: $shipmentId")
+                
+            } catch (e: Exception) {
+                Timber.e(e, "Error starting cold chain monitoring")
+                isMonitoring = false
+            }
+        }
+    }
+    
+    /**
+     * Stop cold chain monitoring
+     */
+    fun stopMonitoring() {
+        if (!isMonitoring) return
+        
+        isMonitoring = false
+        serviceScope.cancel()
+        
+        // Disconnect sensors
+        activeSensors.values.forEach { sensor ->
+            disconnectSensor(sensor.id)
+        }
+        activeSensors.clear()
+        
+        Timber.d("Cold chain monitoring stopped")
+    }
+    
+    /**
+     * Initialize sensors for monitoring
+     */
+    private suspend fun initializeSensors(shipmentId: String) {
+        try {
+            // Get available sensors from API
+            val sensors = api.getAvailableSensors(shipmentId)
+            
+            sensors.forEach { sensor ->
+                val sensorInfo = SensorInfo(
+                    id = sensor.id,
+                    type = sensor.type,
+                    location = sensor.location,
+                    isActive = true,
+                    lastReading = null,
+                    batteryLevel = sensor.batteryLevel
+                )
+                
+                activeSensors[sensor.id] = sensorInfo
+                
+                // Connect to sensor
+                connectToSensor(sensorInfo)
+            }
+            
+            updateSensorStatus()
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error initializing sensors")
+        }
+    }
+    
+    /**
+     * Connect to individual sensor
+     */
+    private suspend fun connectToSensor(sensor: SensorInfo) {
+        try {
+            // Simulate sensor connection
+            delay(1000)
+            
+            // Update sensor status
+            activeSensors[sensor.id]?.let {
+                it.isActive = true
+                it.lastConnected = System.currentTimeMillis()
+            }
+            
+            Timber.d("Connected to sensor: ${sensor.id}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error connecting to sensor: ${sensor.id}")
+            
+            // Mark sensor as inactive
+            activeSensors[sensor.id]?.isActive = false
+        }
+    }
+    
+    /**
+     * Disconnect from sensor
+     */
+    private suspend fun disconnectSensor(sensorId: String) {
+        try {
+            // Simulate sensor disconnection
+            delay(500)
+            
+            activeSensors.remove(sensorId)
+            Timber.d("Disconnected from sensor: $sensorId")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error disconnecting from sensor: $sensorId")
+        }
+    }
+    
+    /**
+     * Start monitoring loop
+     */
+    private fun startMonitoringLoop() {
+        serviceScope.launch {
+            while (isMonitoring) {
+                try {
+                    // Collect sensor data
+                    collectSensorData()
+                    
+                    // Process readings
+                    processReadings()
+                    
+                    // Check thresholds
+                    checkThresholds()
+                    
+                    // Update compliance status
+                    updateComplianceStatus()
+                    
+                    // Wait for next interval
+                    delay(monitoringInterval)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in monitoring loop")
+                    delay(5000) // Wait before retrying
+                }
+            }
+        }
+    }
+    
+    /**
+     * Collect data from all active sensors
+     */
+    private suspend fun collectSensorData() {
+        activeSensors.values.forEach { sensor ->
+            if (sensor.isActive) {
+                try {
+                    // Simulate sensor reading
+                    val temperature = 20.0 + (Math.random() * 10.0 - 5.0) // 15-25°C range
+                    val humidity = 40.0 + (Math.random() * 20.0) // 40-60% range
+                    val timestamp = System.currentTimeMillis()
+                    
+                    // Create temperature reading
+                    val reading = TemperatureReading(
+                        id = UUID.randomUUID().toString(),
+                        sensorId = sensor.id,
+                        temperature = temperature,
+                        humidity = humidity,
+                        timestamp = timestamp,
+                        isValid = true
+                    )
+                    
+                    // Update sensor info
+                    sensor.lastReading = reading
+                    sensor.batteryLevel = maxOf(0, sensor.batteryLevel - 0.1)
+                    
+                    // Add to history
+                    addToHistory(reading)
+                    
+                    // Update LiveData
+                    updateLiveData(reading)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error collecting data from sensor: ${sensor.id}")
+                    sensor.isActive = false
+                }
+            }
+        }
+    }
+    
+    /**
+     * Process collected readings
+     */
+    private suspend fun processReadings() {
+        // Save readings to database
+        val recentReadings = temperatureHistory.takeLast(10)
+        
+        try {
+            database.temperatureReadingDao().insertAll(recentReadings)
+        } catch (e: Exception) {
+            Timber.e(e, "Error saving readings to database")
+        }
+        
+        // Check for sensor anomalies
+        checkSensorAnomalies()
+    }
+    
+    /**
+     * Check temperature and humidity thresholds
+     */
+    private suspend fun checkThresholds() {
+        val latestReadings = temperatureHistory.takeLast(5)
+        
+        latestReadings.forEach { reading ->
+            // Check temperature thresholds
+            if (reading.temperature < temperatureThreshold.minSafe) {
+                createAlert(
+                    type = AlertType.TEMPERATURE_LOW,
+                    severity = AlertSeverity.CRITICAL,
+                    sensorId = reading.sensorId,
+                    value = reading.temperature,
+                    threshold = temperatureThreshold.minSafe
+                )
+            } else if (reading.temperature < temperatureThreshold.minWarning) {
+                createAlert(
+                    type = AlertType.TEMPERATURE_LOW_WARNING,
+                    severity = AlertSeverity.WARNING,
+                    sensorId = reading.sensorId,
+                    value = reading.temperature,
+                    threshold = temperatureThreshold.minWarning
+                )
+            } else if (reading.temperature > temperatureThreshold.maxWarning) {
+                createAlert(
+                    type = AlertType.TEMPERATURE_HIGH_WARNING,
+                    severity = AlertSeverity.WARNING,
+                    sensorId = reading.sensorId,
+                    value = reading.temperature,
+                    threshold = temperatureThreshold.maxWarning
+                )
+            } else if (reading.temperature > temperatureThreshold.maxSafe) {
+                createAlert(
+                    type = AlertType.TEMPERATURE_HIGH,
+                    severity = AlertSeverity.CRITICAL,
+                    sensorId = reading.sensorId,
+                    value = reading.temperature,
+                    threshold = temperatureThreshold.maxSafe
+                )
+            }
+            
+            // Check humidity thresholds
+            if (reading.humidity < humidityThreshold.minSafe) {
+                createAlert(
+                    type = AlertType.HUMIDITY_LOW,
+                    severity = AlertSeverity.WARNING,
+                    sensorId = reading.sensorId,
+                    value = reading.humidity,
+                    threshold = humidityThreshold.minSafe
+                )
+            } else if (reading.humidity > humidityThreshold.maxSafe) {
+                createAlert(
+                    type = AlertType.HUMIDITY_HIGH,
+                    severity = AlertSeverity.WARNING,
+                    sensorId = reading.sensorId,
+                    value = reading.humidity,
+                    threshold = humidityThreshold.maxSafe
+                )
+            }
+        }
+    }
+    
+    /**
+     * Create and manage alerts
+     */
+    private suspend fun createAlert(
+        type: AlertType,
+        severity: AlertSeverity,
+        sensorId: String,
+        value: Double,
+        threshold: Double
+    ) {
+        val alert = ColdChainAlert(
+            id = UUID.randomUUID().toString(),
+            type = type,
+            severity = severity,
+            sensorId = sensorId,
+            value = value,
+            threshold = threshold,
+            timestamp = System.currentTimeMillis(),
+            acknowledged = false,
+            resolved = false
+        )
+        
+        // Check for duplicate alerts
+        val existingAlert = activeAlerts.value?.find { 
+            it.type == type && it.sensorId == sensorId && !it.resolved 
+        }
+        
+        if (existingAlert == null) {
+            alertHistory.add(alert)
+            updateActiveAlerts()
+            
+            // Send notification
+            sendAlertNotification(alert)
+            
+            Timber.w("Cold chain alert created: ${type.name} for sensor: $sensorId")
+        }
+    }
+    
+    /**
+     * Check for sensor anomalies
+     */
+    private suspend fun checkSensorAnomalies() {
+        activeSensors.values.forEach { sensor ->
+            // Check battery level
+            if (sensor.batteryLevel < 20.0) {
+                createAlert(
+                    type = AlertType.SENSOR_BATTERY_LOW,
+                    severity = AlertSeverity.WARNING,
+                    sensorId = sensor.id,
+                    value = sensor.batteryLevel,
+                    threshold = 20.0
+                )
+            }
+            
+            // Check connection status
+            if (!sensor.isActive) {
+                createAlert(
+                    type = AlertType.SENSOR_DISCONNECTED,
+                    severity = AlertSeverity.CRITICAL,
+                    sensorId = sensor.id,
+                    value = 0.0,
+                    threshold = 1.0
+                )
+            }
+            
+            // Check for stale data
+            sensor.lastReading?.let { reading ->
+                val age = System.currentTimeMillis() - reading.timestamp
+                if (age > 300000) { // 5 minutes
+                    createAlert(
+                        type = AlertType.SENSOR_STALE_DATA,
+                        severity = AlertSeverity.WARNING,
+                        sensorId = sensor.id,
+                        value = age / 1000.0, // age in seconds
+                        threshold = 300.0 // 5 minutes
+                    )
+                }
+            }
+        }
+    }
+    
+    /**
+     * Update compliance status
+     */
+    private suspend fun updateComplianceStatus() {
+        val criticalAlerts = activeAlerts.value?.filter { it.severity == AlertSeverity.CRITICAL } ?: emptyList()
+        val warningAlerts = activeAlerts.value?.filter { it.severity == AlertSeverity.WARNING } ?: emptyList()
+        
+        val status = when {
+            criticalAlerts.isNotEmpty() -> ComplianceStatus.NON_COMPLIANT
+            warningAlerts.isNotEmpty() -> ComplianceStatus.WARNING
+            else -> ComplianceStatus.COMPLIANT
+        }
+        
+        _complianceStatus.postValue(status)
+    }
+    
+    /**
+     * Setup thresholds based on standard
+     */
+    private fun setupThresholds(standard: ColdChainStandard) {
+        temperatureThreshold = when (standard) {
+            ColdChainStandard.FOOD -> TemperatureThreshold(
+                minSafe = 0.0,
+                minWarning = 2.0,
+                maxWarning = 8.0,
+                maxSafe = 10.0
+            )
+            ColdChainStandard.PHARMA -> TemperatureThreshold(
+                minSafe = 2.0,
+                minWarning = 4.0,
+                maxWarning = 8.0,
+                maxSafe = 10.0
+            )
+            ColdChainStandard.FROZEN -> TemperatureThreshold(
+                minSafe = -25.0,
+                minWarning = -20.0,
+                maxWarning = -15.0,
+                maxSafe = -10.0
+            )
+        }
+        
+        humidityThreshold = HumidityThreshold(
+            minSafe = 30.0,
+            minWarning = 35.0,
+            maxWarning = 70.0,
+            maxSafe = 75.0
+        )
+    }
+    
+    /**
+     * Start data streaming to server
+     */
+    private suspend fun startDataStreaming(shipmentId: String) {
+        serviceScope.launch {
+            while (isMonitoring) {
+                try {
+                    val recentReadings = temperatureHistory.takeLast(10)
+                    
+                    if (recentReadings.isNotEmpty()) {
+                        // Stream data to server
+                        api.streamSensorData(shipmentId, recentReadings)
+                    }
+                    
+                    delay(60000) // Stream every minute
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error streaming data")
+                    delay(30000) // Wait before retrying
+                }
+            }
+        }
+    }
+    
+    /**
+     * Add reading to history with size limit
+     */
+    private fun addToHistory(reading: TemperatureReading) {
+        temperatureHistory.add(reading)
+        
+        // Maintain history size limit
+        if (temperatureHistory.size > MAX_HISTORY_SIZE) {
+            temperatureHistory.removeAt(0)
+        }
+    }
+    
+    /**
+     * Update LiveData with latest readings
+     */
+    private fun updateLiveData(reading: TemperatureReading) {
+        _currentTemperature.postValue(reading.temperature)
+        _currentHumidity.postValue(reading.humidity)
+    }
+    
+    /**
+     * Update sensor status LiveData
+     */
+    private fun updateSensorStatus() {
+        val statusMap = activeSensors.mapValues { (_, sensor) ->
+            SensorStatus(
+                id = sensor.id,
+                isActive = sensor.isActive,
+                batteryLevel = sensor.batteryLevel,
+                lastReading = sensor.lastReading,
+                lastConnected = sensor.lastConnected
+            )
+        }
+        
+        _sensorStatus.postValue(statusMap)
+    }
+    
+    /**
+     * Update active alerts LiveData
+     */
+    private fun updateActiveAlerts() {
+        val active = alertHistory.filter { !it.resolved }
+        _activeAlerts.postValue(active)
+    }
+    
+    /**
+     * Send alert notification
+     */
+    private suspend fun sendAlertNotification(alert: ColdChainAlert) {
+        try {
+            // Send to API
+            api.sendAlert(alert)
+            
+            // Send local notification
+            sendLocalNotification(alert)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending alert notification")
+        }
+    }
+    
+    /**
+     * Send local notification
+     */
+    private fun sendLocalNotification(alert: ColdChainAlert) {
+        // Implementation would use Android NotificationManager
+        Timber.d("Local notification sent for alert: ${alert.type.name}")
+    }
+    
+    /**
+     * Acknowledge alert
+     */
+    fun acknowledgeAlert(alertId: String) {
+        serviceScope.launch {
+            val alert = alertHistory.find { it.id == alertId }
+            alert?.let {
+                it.acknowledged = true
+                updateActiveAlerts()
+                
+                // Update on server
+                try {
+                    api.acknowledgeAlert(alertId)
+                } catch (e: Exception) {
+                    Timber.e(e, "Error acknowledging alert")
+                }
+            }
+        }
+    }
+    
+    /**
+     * Resolve alert
+     */
+    fun resolveAlert(alertId: String) {
+        serviceScope.launch {
+            val alert = alertHistory.find { it.id == alertId }
+            alert?.let {
+                it.resolved = true
+                it.resolvedAt = System.currentTimeMillis()
+                updateActiveAlerts()
+                updateComplianceStatus()
+                
+                // Update on server
+                try {
+                    api.resolveAlert(alertId)
+                } catch (e: Exception) {
+                    Timber.e(e, "Error resolving alert")
+                }
+            }
+        }
+    }
+    
+    /**
+     * Get historical data for date range
+     */
+    suspend fun getHistoricalData(startDate: Long, endDate: Long): List<TemperatureReading> {
+        return try {
+            database.temperatureReadingDao().getReadingsByDateRange(startDate, endDate)
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting historical data")
+            emptyList()
+        }
+    }
+    
+    /**
+     * Generate compliance report
+     */
+    suspend fun generateComplianceReport(startDate: Long, endDate: Long): ComplianceReport {
+        val readings = getHistoricalData(startDate, endDate)
+        val alerts = alertHistory.filter { 
+            it.timestamp in startDate..endDate 
+        }
+        
+        return ComplianceReport(
+            id = UUID.randomUUID().toString(),
+            startDate = startDate,
+            endDate = endDate,
+            standard = currentStandard,
+            totalReadings = readings.size,
+            compliancePercentage = calculateCompliancePercentage(readings),
+            alertCount = alerts.size,
+            criticalAlerts = alerts.count { it.severity == AlertSeverity.CRITICAL },
+            averageTemperature = readings.map { it.temperature }.average(),
+            averageHumidity = readings.map { it.humidity }.average(),
+            minTemperature = readings.minOfOrNull { it.temperature } ?: 0.0,
+            maxTemperature = readings.maxOfOrNull { it.temperature } ?: 0.0,
+            generatedAt = System.currentTimeMillis()
+        )
+    }
+    
+    /**
+     * Calculate compliance percentage
+     */
+    private fun calculateCompliancePercentage(readings: List<TemperatureReading>): Double {
+        if (readings.isEmpty()) return 0.0
+        
+        val compliantReadings = readings.count { reading ->
+            reading.temperature >= temperatureThreshold.minSafe &&
+            reading.temperature <= temperatureThreshold.maxSafe &&
+            reading.humidity >= humidityThreshold.minSafe &&
+            reading.humidity <= humidityThreshold.maxSafe
+        }
+        
+        return (compliantReadings.toDouble() / readings.size) * 100
+    }
+    
+    /**
+     * Cleanup old data
+     */
+    suspend fun cleanupOldData() {
+        try {
+            val cutoffDate = System.currentTimeMillis() - (DATA_RETENTION_DAYS * 24 * 60 * 60 * 1000L)
+            
+            // Clean old readings
+            database.temperatureReadingDao().deleteOldReadings(cutoffDate)
+            
+            // Clean old alerts
+            alertHistory.removeAll { it.timestamp < cutoffDate }
+            
+            Timber.d("Cleaned up old data older than ${DATA_RETENTION_DAYS} days")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error cleaning up old data")
+        }
+    }
+}
+
+// Data classes
+data class SensorInfo(
+    val id: String,
+    val type: SensorType,
+    val location: String,
+    var isActive: Boolean,
+    var lastReading: TemperatureReading?,
+    var batteryLevel: Double,
+    var lastConnected: Long = System.currentTimeMillis()
+)
+
+data class TemperatureThreshold(
+    val minSafe: Double,
+    val minWarning: Double,
+    val maxWarning: Double,
+    val maxSafe: Double
+)
+
+data class HumidityThreshold(
+    val minSafe: Double,
+    val minWarning: Double,
+    val maxWarning: Double,
+    val maxSafe: Double
+)
+
+data class ColdChainAlert(
+    val id: String,
+    val type: AlertType,
+    val severity: AlertSeverity,
+    val sensorId: String,
+    val value: Double,
+    val threshold: Double,
+    val timestamp: Long,
+    var acknowledged: Boolean,
+    var resolved: Boolean,
+    var resolvedAt: Long? = null
+)
+
+data class ComplianceReport(
+    val id: String,
+    val startDate: Long,
+    val endDate: Long,
+    val standard: ColdChainStandard,
+    val totalReadings: Int,
+    val compliancePercentage: Double,
+    val alertCount: Int,
+    val criticalAlerts: Int,
+    val averageTemperature: Double,
+    val averageHumidity: Double,
+    val minTemperature: Double,
+    val maxTemperature: Double,
+    val generatedAt: Long
+)
+
+// Enums
+enum class ColdChainStandard {
+    FOOD, PHARMA, FROZEN
+}
+
+enum class SensorType {
+    TEMPERATURE, HUMIDITY, COMBINED
+}
+
+enum class AlertType {
+    TEMPERATURE_LOW, TEMPERATURE_HIGH, TEMPERATURE_LOW_WARNING, TEMPERATURE_HIGH_WARNING,
+    HUMIDITY_LOW, HUMIDITY_HIGH,
+    SENSOR_BATTERY_LOW, SENSOR_DISCONNECTED, SENSOR_STALE_DATA,
+    COOLING_FAILURE
+}
+
+enum class AlertSeverity {
+    INFO, WARNING, CRITICAL
+}
+
+enum class ComplianceStatus {
+    COMPLIANT, WARNING, NON_COMPLIANT
+}

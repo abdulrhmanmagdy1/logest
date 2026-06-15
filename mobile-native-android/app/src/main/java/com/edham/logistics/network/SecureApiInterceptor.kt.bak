@@ -1,0 +1,297 @@
+package com.edham.logistics.network
+
+import android.content.Context
+import com.edham.logistics.auth.AuthenticationManager
+import com.edham.logistics.auth.TokenManager
+import com.edham.logistics.security.SSLPinningManager
+import com.edham.logistics.utils.NetworkUtils
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.runBlocking
+import okhttp3.Interceptor
+import okhttp3.Request
+import okhttp3.Response
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Secure API Interceptor - Handles authentication, token refresh, and security
+ * 
+ * Features:
+ * - Automatic token injection
+ * - Token refresh on 401
+ * - Rate limiting
+ * - Request signing
+ * - Security headers
+ */
+@Singleton
+class SecureApiInterceptor @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val authenticationManager: AuthenticationManager,
+    private val tokenManager: TokenManager,
+    private val networkUtils: NetworkUtils,
+    private val sslPinningManager: SSLPinningManager
+) : Interceptor {
+
+    companion object {
+        private const val TAG = "SecureApiInterceptor"
+        private const val AUTH_HEADER = "Authorization"
+        private const val BEARER_PREFIX = "Bearer "
+        private const val USER_AGENT_HEADER = "User-Agent"
+        private const val API_VERSION_HEADER = "API-Version"
+        private const val DEVICE_ID_HEADER = "Device-ID"
+        private const val SESSION_ID_HEADER = "Session-ID"
+        private const val TIMESTAMP_HEADER = "X-Timestamp"
+        private const val SIGNATURE_HEADER = "X-Signature"
+        private const val RATE_LIMIT_HEADER = "X-Rate-Limit"
+        private const val RATE_LIMIT_REMAINING_HEADER = "X-Rate-Limit-Remaining"
+        private const val RATE_LIMIT_RESET_HEADER = "X-Rate-Limit-Reset"
+    }
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val originalRequest = chain.request()
+        
+        // Check network connectivity
+        if (!networkUtils.isNetworkAvailable()) {
+            throw NetworkUnavailableException("No internet connection")
+        }
+        
+        // Build secure request
+        val secureRequest = buildSecureRequest(originalRequest)
+        
+        // Execute request
+        var response = chain.proceed(secureRequest)
+        
+        // Handle authentication errors
+        if (response.code == 401) {
+            response.close()
+            response = handleAuthenticationError(chain, originalRequest)
+        }
+        
+        // Handle rate limiting
+        handleRateLimiting(response)
+        
+        return response
+    }
+
+    /**
+     * Build secure request with authentication and security headers
+     */
+    private fun buildSecureRequest(originalRequest: Request): Request {
+        val requestBuilder = originalRequest.newBuilder()
+        
+        // Add authentication header
+        addAuthenticationHeader(requestBuilder)
+        
+        // Add security headers
+        addSecurityHeaders(requestBuilder)
+        
+        // Add device and session headers
+        addDeviceHeaders(requestBuilder)
+        
+        // Add API version header
+        requestBuilder.addHeader(API_VERSION_HEADER, "1.0")
+        
+        // Add user agent
+        requestBuilder.addHeader(USER_AGENT_HEADER, getUserAgent())
+        
+        // Add timestamp for request signing
+        val timestamp = System.currentTimeMillis().toString()
+        requestBuilder.addHeader(TIMESTAMP_HEADER, timestamp)
+        
+        // Add signature if enabled
+        if (isRequestSigningEnabled()) {
+            addRequestSignature(requestBuilder, originalRequest, timestamp)
+        }
+        
+        return requestBuilder.build()
+    }
+
+    /**
+     * Add authentication header with JWT token
+     */
+    private fun addAuthenticationHeader(requestBuilder: Request.Builder) {
+        val token = authenticationManager.getAccessToken()
+        if (token != null) {
+            requestBuilder.addHeader(AUTH_HEADER, BEARER_PREFIX + token)
+        }
+    }
+
+    /**
+     * Add security headers
+     */
+    private fun addSecurityHeaders(requestBuilder: Request.Builder) {
+        // Add content security policy header
+        requestBuilder.addHeader("X-Content-Type-Options", "nosniff")
+        requestBuilder.addHeader("X-Frame-Options", "DENY")
+        requestBuilder.addHeader("X-XSS-Protection", "1; mode=block")
+        requestBuilder.addHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        
+        // Add CORS headers
+        requestBuilder.addHeader("Access-Control-Allow-Origin", "*")
+        requestBuilder.addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        requestBuilder.addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    }
+
+    /**
+     * Add device and session headers
+     */
+    private fun addDeviceHeaders(requestBuilder: Request.Builder) {
+        // Add device ID
+        val deviceId = getDeviceId()
+        requestBuilder.addHeader(DEVICE_ID_HEADER, deviceId)
+        
+        // Add session ID if available
+        val sessionId = authenticationManager.sessionId
+        if (sessionId != null) {
+            requestBuilder.addHeader(SESSION_ID_HEADER, sessionId)
+        }
+    }
+
+    /**
+     * Handle authentication errors (401)
+     */
+    private fun handleAuthenticationError(
+        chain: Interceptor.Chain,
+        originalRequest: Request
+    ): Response {
+        // Try to refresh token
+        val refreshResult = runBlocking {
+            tokenManager.refreshToken()
+        }
+        
+        return if (refreshResult.isSuccess) {
+            // Token refreshed successfully, retry request
+            val newRequest = buildSecureRequest(originalRequest)
+            chain.proceed(newRequest)
+        } else {
+            // Token refresh failed, logout user
+            runBlocking {
+                authenticationManager.logout()
+            }
+            throw AuthenticationException("Authentication failed")
+        }
+    }
+
+    /**
+     * Handle rate limiting from response headers
+     */
+    private fun handleRateLimiting(response: Response) {
+        try {
+            val rateLimit = response.header(RATE_LIMIT_HEADER)
+            val rateLimitRemaining = response.header(RATE_LIMIT_REMAINING_HEADER)
+            val rateLimitReset = response.header(RATE_LIMIT_RESET_HEADER)
+            
+            if (rateLimit != null && rateLimitRemaining != null) {
+                val remaining = rateLimitRemaining.toInt()
+                if (remaining <= 5) {
+                    // Rate limit approaching, log warning
+                    logRateLimitWarning(rateLimit, remaining, rateLimitReset)
+                }
+            }
+        } catch (e: Exception) {
+            // Log error but don't fail the request
+            android.util.Log.e(TAG, "Error handling rate limiting", e)
+        }
+    }
+
+    /**
+     * Add request signature for additional security
+     */
+    private fun addRequestSignature(
+        requestBuilder: Request.Builder,
+        originalRequest: Request,
+        timestamp: String
+    ) {
+        try {
+            val signature = generateRequestSignature(originalRequest, timestamp)
+            requestBuilder.addHeader(SIGNATURE_HEADER, signature)
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Error generating request signature", e)
+        }
+    }
+
+    /**
+     * Generate request signature
+     */
+    private fun generateRequestSignature(request: Request, timestamp: String): String {
+        // This is a simplified example - in production, use proper HMAC
+        val method = request.method
+        val url = request.url.toString()
+        val body = request.body?.toString() ?: ""
+        
+        val dataToSign = "$method$url$body$timestamp"
+        val signature = android.util.Base64.encodeToString(
+            dataToSign.toByteArray(),
+            android.util.Base64.NO_WRAP
+        )
+        
+        return "sha256=$signature"
+    }
+
+    /**
+     * Get user agent string
+     */
+    private fun getUserAgent(): String {
+        val appVersion = getAppVersion()
+        val osVersion = android.os.Build.VERSION.RELEASE
+        val deviceModel = android.os.Build.MODEL
+        val manufacturer = android.os.Build.MANUFACTURER
+        
+        return "EdhamLogistics/$appVersion (Android $osVersion; $manufacturer $deviceModel)"
+    }
+
+    /**
+     * Get app version
+     */
+    private fun getAppVersion(): String {
+        return try {
+            val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            packageInfo.versionName ?: "1.0.0"
+        } catch (e: Exception) {
+            "1.0.0"
+        }
+    }
+
+    /**
+     * Get device ID
+     */
+    private fun getDeviceId(): String {
+        return try {
+            android.provider.Settings.Secure.getString(
+                context.contentResolver,
+                android.provider.Settings.Secure.ANDROID_ID
+            ) ?: "unknown"
+        } catch (e: Exception) {
+            "unknown"
+        }
+    }
+
+    /**
+     * Check if request signing is enabled
+     */
+    private fun isRequestSigningEnabled(): Boolean {
+        return try {
+            val prefs = context.getSharedPreferences("security_prefs", Context.MODE_PRIVATE)
+            prefs.getBoolean("request_signing_enabled", true)
+        } catch (e: Exception) {
+            true // Default to enabled
+        }
+    }
+
+    /**
+     * Log rate limit warning
+     */
+    private fun logRateLimitWarning(rateLimit: String?, remaining: Int, resetTime: String?) {
+        android.util.Log.w(
+            TAG,
+            "Rate limit warning: $remaining/$rateLimit requests remaining. Reset: $resetTime"
+        )
+    }
+}
+
+/**
+ * Custom exceptions
+ */
+class NetworkUnavailableException(message: String) : Exception(message)
+class AuthenticationException(message: String) : Exception(message)
+class RateLimitExceededException(message: String) : Exception(message)

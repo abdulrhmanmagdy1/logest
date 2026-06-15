@@ -1,0 +1,687 @@
+package com.edham.logistics.monitoring.anr
+
+import android.content.Context
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * ANR Monitor Manager - Application Not Responding detection and monitoring
+ * Implements real-time ANR detection, stack trace analysis, and prevention strategies
+ */
+
+@Singleton
+class ANRMonitorManager @Inject constructor(
+    private val context: Context
+) {
+
+    private val anrScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val anrListeners = mutableListOf<ANRListener>()
+    private val anrEvents = ConcurrentHashMap<String, ANREvent>()
+    private val threadMonitor = ThreadMonitor()
+    
+    // Performance metrics
+    private val totalANREvents = AtomicLong(0)
+    private val totalMainThreadBlocks = AtomicLong(0)
+    private val averageANRDuration = AtomicLong(0)
+    private val totalANRDuration = AtomicLong(0)
+    
+    // Configuration
+    private val anrThreshold = 5000L // 5 seconds
+    private val monitoringInterval = 1000L // 1 second
+    private val enableANRMonitoring = true
+    private val maxStackTraceDepth = 50
+    
+    // ANR monitoring state
+    private val _anrState = MutableStateFlow<ANRState>(ANRState.MONITORING)
+    val anrState: StateFlow<ANRState> = _anrState.asStateFlow()
+    
+    init {
+        initializeANRMonitoring()
+    }
+    
+    /**
+     * Start ANR monitoring
+     */
+    fun startANRMonitoring() {
+        if (!enableANRMonitoring) return
+        
+        try {
+            _anrState.value = ANRState.MONITORING
+            
+            // Start thread monitoring
+            threadMonitor.startMonitoring()
+            
+            // Start ANR detection
+            startANRDetection()
+            
+            // Notify listeners
+            anrListeners.forEach { listener ->
+                listener.onANRMonitoringStarted()
+            }
+            
+            Timber.d("ANR monitoring started")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error starting ANR monitoring")
+        }
+    }
+    
+    /**
+     * Stop ANR monitoring
+     */
+    fun stopANRMonitoring() {
+        try {
+            _anrState.value = ANRState.STOPPED
+            
+            // Stop thread monitoring
+            threadMonitor.stopMonitoring()
+            
+            // Stop ANR detection
+            anrScope.cancel()
+            
+            // Notify listeners
+            anrListeners.forEach { listener ->
+                listener.onANRMonitoringStopped()
+            }
+            
+            Timber.d("ANR monitoring stopped")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error stopping ANR monitoring")
+        }
+    }
+    
+    /**
+     * Report ANR event
+     */
+    fun reportANR(stackTrace: String, context: Map<String, Any> = emptyMap()) {
+        if (!enableANRMonitoring) return
+        
+        try {
+            totalANREvents.incrementAndGet()
+            
+            val anrEvent = ANREvent(
+                id = generateANREventId(),
+                timestamp = System.currentTimeMillis(),
+                stackTrace = stackTrace,
+                threadName = "main",
+                duration = anrThreshold,
+                context = context,
+                severity = determineANRSeverity(stackTrace, context)
+            )
+            
+            anrEvents[anrEvent.id] = anrEvent
+            
+            // Update metrics
+            totalANRDuration.addAndGet(anrEvent.duration)
+            updateAverageANRDuration(anrEvent.duration)
+            
+            // Notify listeners
+            anrListeners.forEach { listener ->
+                listener.onANRDetected(anrEvent)
+            }
+            
+            Timber.w("ANR detected and reported: ${anrEvent.id}")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error reporting ANR event")
+        }
+    }
+    
+    /**
+     * Monitor main thread blockage
+     */
+    suspend fun monitorMainThreadBlockage() {
+        try {
+            val startTime = System.currentTimeMillis()
+            val mainThread = Thread.currentThread()
+            
+            // Simulate main thread monitoring
+            delay(anrThreshold + 1000) // Wait longer than ANR threshold
+            
+            val duration = System.currentTimeMillis() - startTime
+            
+            if (duration > anrThreshold) {
+                totalMainThreadBlocks.incrementAndGet()
+                
+                val stackTrace = generateStackTrace(mainThread)
+                reportANR(stackTrace, mapOf(
+                    "block_duration" to duration,
+                    "thread_name" to mainThread.name,
+                    "thread_id" to mainThread.id
+                ))
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error monitoring main thread blockage")
+        }
+    }
+    
+    /**
+     * Get ANR statistics
+     */
+    fun getANRStats(): ANRStats {
+        return ANRStats(
+            totalANREvents = totalANREvents.get(),
+            totalMainThreadBlocks = totalMainThreadBlocks.get(),
+            averageANRDuration = averageANRDuration.get(),
+            totalANRDuration = totalANRDuration.get(),
+            activeANREvents = anrEvents.size,
+            anrMonitoringEnabled = enableANRMonitoring,
+            anrState = _anrState.value
+        )
+    }
+    
+    /**
+     * Get ANR events
+     */
+    fun getANREvents(): List<ANREvent> {
+        return anrEvents.values.toList().sortedByDescending { it.timestamp }
+    }
+    
+    /**
+     * Get ANR events by severity
+     */
+    fun getANREventsBySeverity(severity: ANRSeverity): List<ANREvent> {
+        return anrEvents.values.filter { it.severity == severity }
+            .sortedByDescending { it.timestamp }
+    }
+    
+    /**
+     * Add ANR listener
+     */
+    fun addANRListener(listener: ANRListener) {
+        anrListeners.add(listener)
+    }
+    
+    /**
+     * Remove ANR listener
+     */
+    fun removeANRListener(listener: ANRListener) {
+        anrListeners.remove(listener)
+    }
+    
+    /**
+     * Get ANR prevention recommendations
+     */
+    fun getANRPreventionRecommendations(): List<ANRPreventionRecommendation> {
+        val recommendations = mutableListOf<ANRPreventionRecommendation>()
+        val stats = getANRStats()
+        
+        when {
+            stats.totalANREvents > 10 -> {
+                recommendations.add(
+                    ANRPreventionRecommendation(
+                        priority = RecommendationPriority.CRITICAL,
+                        action = "OPTIMIZE_MAIN_THREAD",
+                        description = "High number of ANR events. Move heavy operations off main thread.",
+                        estimatedImpact = "80-90% ANR reduction"
+                    )
+                )
+            }
+            stats.averageANRDuration > 8000 -> {
+                recommendations.add(
+                    ANRPreventionRecommendation(
+                        priority = RecommendationPriority.HIGH,
+                        action = "REDUCE_OPERATION_TIME",
+                        description = "Long ANR duration. Break down operations into smaller chunks.",
+                        estimatedImpact = "50-70% duration reduction"
+                    )
+                )
+            }
+            stats.totalMainThreadBlocks > 5 -> {
+                recommendations.add(
+                    ANRPreventionRecommendation(
+                        priority = RecommendationPriority.MEDIUM,
+                        action = "IMPLEMENT_ASYNC_OPERATIONS",
+                        description = "Main thread blocks detected. Implement async operations.",
+                        estimatedImpact = "60-80% block reduction"
+                    )
+                )
+            }
+        }
+        
+        // Analyze stack traces for common patterns
+        val commonPatterns = analyzeCommonANRPatterns()
+        commonPatterns.forEach { pattern ->
+            recommendations.add(
+                ANRPreventionRecommendation(
+                    priority = RecommendationPriority.MEDIUM,
+                    action = "FIX_PATTERN_${pattern.patternType}",
+                    description = "Common ANR pattern detected: ${pattern.description}",
+                    estimatedImpact = "30-50% pattern reduction"
+                )
+            )
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Generate ANR report
+     */
+    fun generateANRReport(): ANRReport {
+        val stats = getANRStats()
+        val events = getANREvents()
+        val recommendations = getANRPreventionRecommendations()
+        val patterns = analyzeCommonANRPatterns()
+        
+        return ANRReport(
+            generatedAt = System.currentTimeMillis(),
+            stats = stats,
+            events = events,
+            recommendations = recommendations,
+            commonPatterns = patterns,
+            stabilityScore = calculateStabilityScore(stats)
+        )
+    }
+    
+    // Private methods
+    
+    private fun initializeANRMonitoring() {
+        try {
+            // Set up default ANR detection
+            startANRMonitoring()
+            
+            Timber.d("ANR monitoring initialized")
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error initializing ANR monitoring")
+        }
+    }
+    
+    private fun startANRDetection() {
+        anrScope.launch {
+            while (isActive) {
+                try {
+                    // Monitor for ANR conditions
+                    checkForANRConditions()
+                    
+                    delay(monitoringInterval)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in ANR detection loop")
+                    delay(monitoringInterval * 2) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    private suspend fun checkForANRConditions() {
+        try {
+            // Check main thread responsiveness
+            val mainThreadResponse = checkMainThreadResponsiveness()
+            
+            if (!mainThreadResponse) {
+                val stackTrace = generateMainThreadStackTrace()
+                reportANR(stackTrace, mapOf(
+                    "detection_type" to "responsiveness_check",
+                    "timestamp" to System.currentTimeMillis()
+                ))
+            }
+            
+            // Check for long-running operations
+            checkLongRunningOperations()
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking ANR conditions")
+        }
+    }
+    
+    private suspend fun checkMainThreadResponsiveness(): Boolean {
+        return try {
+            // Simulate main thread responsiveness check
+            withTimeoutOrNull(1000) {
+                // This would check if main thread responds
+                delay(100) // Simulate quick check
+                true
+            } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    private suspend fun checkLongRunningOperations() {
+        try {
+            // Monitor for long-running operations
+            val operations = threadMonitor.getLongRunningOperations()
+            
+            operations.forEach { operation ->
+                if (operation.duration > anrThreshold) {
+                    val stackTrace = generateStackTrace(operation.thread)
+                    reportANR(stackTrace, mapOf(
+                        "operation_name" to operation.name,
+                        "operation_duration" to operation.duration,
+                        "thread_name" to operation.thread.name
+                    ))
+                }
+            }
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error checking long-running operations")
+        }
+    }
+    
+    private fun generateStackTrace(thread: Thread): String {
+        return try {
+            val stackTrace = thread.stackTrace
+            stackTrace.take(maxStackTraceDepth).joinToString("\n") { 
+                "at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})"
+            }
+        } catch (e: Exception) {
+            "Unable to generate stack trace: ${e.message}"
+        }
+    }
+    
+    private fun generateMainThreadStackTrace(): String {
+        return try {
+            val mainThread = getMainThread()
+            generateStackTrace(mainThread)
+        } catch (e: Exception) {
+            "Unable to generate main thread stack trace: ${e.message}"
+        }
+    }
+    
+    private fun getMainThread(): Thread {
+        return Thread.getAllThreads().find { it.name == "main" } ?: Thread.currentThread()
+    }
+    
+    private fun determineANRSeverity(stackTrace: String, context: Map<String, Any>): ANRSeverity {
+        return when {
+            stackTrace.contains("NetworkOnMainThreadException") -> ANRSeverity.CRITICAL
+            stackTrace.contains("SQLite") -> ANRSeverity.HIGH
+            stackTrace.contains("IO") -> ANRSeverity.MEDIUM
+            stackTrace.contains("computation") -> ANRSeverity.LOW
+            else -> ANRSeverity.MEDIUM
+        }
+    }
+    
+    private fun analyzeCommonANRPatterns(): List<ANRPattern> {
+        val patterns = mutableListOf<ANRPattern>()
+        val events = getANREvents()
+        
+        // Analyze stack traces for common patterns
+        val stackTraces = events.map { it.stackTrace }
+        
+        // Network operations on main thread
+        val networkCount = stackTraces.count { it.contains("Network") || it.contains("HTTP") }
+        if (networkCount > 0) {
+            patterns.add(
+                ANRPattern(
+                    patternType = "NETWORK_ON_MAIN_THREAD",
+                    frequency = networkCount,
+                    description = "Network operations performed on main thread",
+                    severity = ANRSeverity.HIGH
+                )
+            )
+        }
+        
+        // Database operations on main thread
+        val databaseCount = stackTraces.count { it.contains("SQLite") || it.contains("Database") }
+        if (databaseCount > 0) {
+            patterns.add(
+                ANRPattern(
+                    patternType = "DATABASE_ON_MAIN_THREAD",
+                    frequency = databaseCount,
+                    description = "Database operations performed on main thread",
+                    severity = ANRSeverity.HIGH
+                )
+            )
+        }
+        
+        // File I/O operations on main thread
+        val ioCount = stackTraces.count { it.contains("File") || it.contains("IO") }
+        if (ioCount > 0) {
+            patterns.add(
+                ANRPattern(
+                    patternType = "IO_ON_MAIN_THREAD",
+                    frequency = ioCount,
+                    description = "File I/O operations performed on main thread",
+                    severity = ANRSeverity.MEDIUM
+                )
+            )
+        }
+        
+        return patterns
+    }
+    
+    private fun calculateStabilityScore(stats: ANRStats): Double {
+        var score = 100.0
+        
+        // Deduct points for ANR events
+        score -= stats.totalANREvents * 5
+        
+        // Deduct points for long duration
+        if (stats.averageANRDuration > 5000) {
+            score -= 10
+        }
+        
+        // Deduct points for main thread blocks
+        score -= stats.totalMainThreadBlocks * 3
+        
+        return score.coerceIn(0.0, 100.0)
+    }
+    
+    private fun updateAverageANRDuration(duration: Long) {
+        val current = averageANRDuration.get()
+        val newAverage = (current + duration) / 2
+        averageANRDuration.set(newAverage)
+    }
+    
+    private fun generateANREventId(): String {
+        return "anr_${System.currentTimeMillis()}_${(1000..9999).random()}"
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): ANRPerformanceMetrics {
+        val stats = getANRStats()
+        
+        return ANRPerformanceMetrics(
+            totalANREvents = stats.totalANREvents,
+            totalMainThreadBlocks = stats.totalMainThreadBlocks,
+            averageANRDuration = stats.averageANRDuration,
+            totalANRDuration = stats.totalANRDuration,
+            activeANREvents = stats.activeANREvents,
+            stabilityScore = calculateStabilityScore(stats),
+            monitoringActive = stats.anrMonitoringEnabled
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalANREvents.set(0)
+        totalMainThreadBlocks.set(0)
+        averageANRDuration.set(0)
+        totalANRDuration.set(0)
+        anrEvents.clear()
+    }
+    
+    /**
+     * Stop ANR monitor manager
+     */
+    fun stop() {
+        stopANRMonitoring()
+        anrListeners.clear()
+        anrEvents.clear()
+    }
+}
+
+/**
+ * ANR Event
+ */
+data class ANREvent(
+    val id: String,
+    val timestamp: Long,
+    val stackTrace: String,
+    val threadName: String,
+    val duration: Long,
+    val context: Map<String, Any>,
+    val severity: ANRSeverity
+)
+
+/**
+ * ANR Statistics
+ */
+data class ANRStats(
+    val totalANREvents: Long,
+    val totalMainThreadBlocks: Long,
+    val averageANRDuration: Long,
+    val totalANRDuration: Long,
+    val activeANREvents: Int,
+    val anrMonitoringEnabled: Boolean,
+    val anrState: ANRState
+)
+
+/**
+ * ANR Prevention Recommendation
+ */
+data class ANRPreventionRecommendation(
+    val priority: RecommendationPriority,
+    val action: String,
+    val description: String,
+    val estimatedImpact: String
+)
+
+/**
+ * ANR Report
+ */
+data class ANRReport(
+    val generatedAt: Long,
+    val stats: ANRStats,
+    val events: List<ANREvent>,
+    val recommendations: List<ANRPreventionRecommendation>,
+    val commonPatterns: List<ANRPattern>,
+    val stabilityScore: Double
+)
+
+/**
+ * ANR Pattern
+ */
+data class ANRPattern(
+    val patternType: String,
+    val frequency: Int,
+    val description: String,
+    val severity: ANRSeverity
+)
+
+/**
+ * ANR Performance Metrics
+ */
+data class ANRPerformanceMetrics(
+    val totalANREvents: Long,
+    val totalMainThreadBlocks: Long,
+    val averageANRDuration: Long,
+    val totalANRDuration: Long,
+    val activeANREvents: Int,
+    val stabilityScore: Double,
+    val monitoringActive: Boolean
+) {
+    val averageANRDurationMs: Double get() = averageANRDuration.toDouble()
+    val stabilityPercentage: Double get() = stabilityScore
+}
+
+/**
+ * ANR State
+ */
+enum class ANRState {
+    MONITORING,
+    DETECTED,
+    STOPPED
+}
+
+/**
+ * ANR Severity
+ */
+enum class ANRSeverity {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+/**
+ * ANR Listener Interface
+ */
+interface ANRListener {
+    fun onANRMonitoringStarted() {}
+    fun onANRMonitoringStopped() {}
+    fun onANRDetected(anrEvent: ANREvent) {}
+    fun onANRResolved(anrEvent: ANREvent) {}
+}
+
+/**
+ * Thread Monitor
+ */
+class ThreadMonitor {
+    
+    private val monitoringScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val longRunningOperations = ConcurrentHashMap<String, ThreadOperation>()
+    private var isMonitoring = false
+    
+    fun startMonitoring() {
+        if (isMonitoring) return
+        
+        isMonitoring = true
+        
+        monitoringScope.launch {
+            while (isActive) {
+                try {
+                    monitorThreads()
+                    delay(1000) // Check every second
+                } catch (e: Exception) {
+                    delay(5000) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    fun stopMonitoring() {
+        isMonitoring = false
+        monitoringScope.cancel()
+        longRunningOperations.clear()
+    }
+    
+    fun getLongRunningOperations(): List<ThreadOperation> {
+        return longRunningOperations.values.toList()
+            .filter { it.duration > 5000 } // Longer than 5 seconds
+            .sortedByDescending { it.duration }
+    }
+    
+    private fun monitorThreads() {
+        try {
+            val threads = Thread.getAllThreads()
+            
+            threads.forEach { thread ->
+                if (thread.isAlive && thread.state == Thread.State.RUNNABLE) {
+                    val operation = ThreadOperation(
+                        name = thread.name,
+                        thread = thread,
+                        startTime = System.currentTimeMillis(),
+                        duration = System.currentTimeMillis() - (System.currentTimeMillis() - 1000) // Simplified
+                    )
+                    
+                    longRunningOperations[thread.id.toString()] = operation
+                }
+            }
+            
+        } catch (e: Exception) {
+            // Handle exception
+        }
+    }
+}
+
+/**
+ * Thread Operation
+ */
+data class ThreadOperation(
+    val name: String,
+    val thread: Thread,
+    val startTime: Long,
+    val duration: Long
+)

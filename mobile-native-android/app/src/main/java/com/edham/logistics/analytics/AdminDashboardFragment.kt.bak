@@ -1,0 +1,527 @@
+package com.edham.logistics.analytics
+
+import android.graphics.Color
+import android.os.Bundle
+import android.view.*
+import android.widget.*
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.analytics.adapters.*
+import com.edham.logistics.analytics.AdminDashboardService.*
+import com.github.mikephil.charting.charts.LineChart
+import com.github.mikephil.charting.data.*
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.*
+
+/**
+ * Admin dashboard fragment
+ * Provides comprehensive analytics with filters for total shipments, active drivers, revenue charts, delayed shipments, and temperature violations
+ */
+class AdminDashboardFragment : Fragment() {
+
+    private lateinit var adminDashboardService: AdminDashboardService
+    private lateinit var filterSpinner: Spinner
+    private lateinit var refreshButton: Button
+    private lateinit var loadingProgressBar: ProgressBar
+    private lateinit var errorTextView: TextView
+
+    // Filter options
+    private val filterOptions = arrayOf("Daily", "Weekly", "Monthly", "Custom")
+    private var currentFilter = DateFilter.WEEKLY
+
+    // Analytics data
+    private var dashboardAnalytics: DashboardAnalytics? = null
+    private var isLoading = false
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View? {
+        return inflater.inflate(R.layout.fragment_admin_dashboard, container, false)
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        adminDashboardService = AdminDashboardService(requireContext())
+        
+        setupViews(view)
+        setupFilters()
+        setupRefreshButton()
+        loadDashboardData()
+    }
+
+    private fun setupViews(view: View) {
+        filterSpinner = view.findViewById(R.id.filterSpinner)
+        refreshButton = view.findViewById(R.id.refreshButton)
+        loadingProgressBar = view.findViewById(R.id.loadingProgressBar)
+        errorTextView = view.findViewById(R.id.errorTextView)
+        
+        // Setup summary cards
+        setupSummaryCards(view)
+        
+        // Setup charts
+        setupCharts(view)
+        
+        // Setup analytics sections
+        setupAnalyticsSections(view)
+    }
+
+    private fun setupFilters() {
+        val adapter = ArrayAdapter(requireContext(), android.R.layout.simple_spinner_item, filterOptions)
+        filterSpinner.adapter = adapter
+        
+        filterSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                currentFilter = when (position) {
+                    0 -> DateFilter.DAILY
+                    1 -> DateFilter.WEEKLY
+                    2 -> DateFilter.MONTHLY
+                    else -> DateFilter.CUSTOM
+                }
+                loadDashboardData()
+            }
+            
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+    }
+
+    private fun setupRefreshButton() {
+        refreshButton.setOnClickListener {
+            loadDashboardData()
+        }
+    }
+
+    private fun setupSummaryCards(view: View) {
+        // Total shipments card
+        val totalShipmentsCard = view.findViewById<LinearLayout>(R.id.totalShipmentsCard)
+        totalShipmentsCard.setOnClickListener {
+            showShipmentsDetails()
+        }
+        
+        // Active drivers card
+        val activeDriversCard = view.findViewById<LinearLayout>(R.id.activeDriversCard)
+        activeDriversCard.setOnClickListener {
+            showDriversDetails()
+        }
+        
+        // Revenue card
+        val revenueCard = view.findViewById<LinearLayout>(R.id.revenueCard)
+        revenueCard.setOnClickListener {
+            showRevenueDetails()
+        }
+        
+        // Delayed shipments card
+        val delayedShipmentsCard = view.findViewById<LinearLayout>(R.id.delayedShipmentsCard)
+        delayedShipmentsCard.setOnClickListener {
+            showDelayedShipmentsDetails()
+        }
+        
+        // Temperature violations card
+        val temperatureViolationsCard = view.findViewById<LinearLayout>(R.id.temperatureViolationsCard)
+        temperatureViolationsCard.setOnClickListener {
+            showTemperatureViolationsDetails()
+        }
+    }
+
+    private fun setupCharts(view: View) {
+        // Revenue chart
+        val revenueChart = view.findViewById<LineChart>(R.id.revenueChart)
+        setupRevenueChart(revenueChart)
+        
+        // Shipments trend chart
+        val shipmentsTrendChart = view.findViewById<LineChart>(R.id.shipmentsTrendChart)
+        setupShipmentsTrendChart(shipmentsTrendChart)
+        
+        // Temperature violations chart
+        val temperatureViolationsChart = view.findViewById<LineChart>(R.id.temperatureViolationsChart)
+        setupTemperatureViolationsChart(temperatureViolationsChart)
+    }
+
+    private fun setupAnalyticsSections(view: View) {
+        // Shipments analytics section
+        val shipmentsRecyclerView = view.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.shipmentsRecyclerView)
+        shipmentsRecyclerView.layoutManager = LinearLayoutManager(requireContext())
+        shipmentsRecyclerView.adapter = ShipmentsAnalyticsAdapter(emptyList())
+        
+        // Drivers analytics section
+        val driversRecyclerView = view.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.driversRecyclerView)
+        driversRecyclerView.layoutManager = LinearLayoutManager(requireContext())
+        driversRecyclerView.adapter = DriversAnalyticsAdapter(emptyList())
+        
+        // Delayed shipments section
+        val delayedShipmentsRecyclerView = view.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.delayedShipmentsRecyclerView)
+        delayedShipmentsRecyclerView.layoutManager = LinearLayoutManager(requireContext())
+        delayedShipmentsRecyclerView.adapter = DelayedShipmentsAnalyticsAdapter(emptyList())
+        
+        // Temperature violations section
+        val temperatureViolationsRecyclerView = view.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.temperatureViolationsRecyclerView)
+        temperatureViolationsRecyclerView.layoutManager = LinearLayoutManager(requireContext())
+        temperatureViolationsRecyclerView.adapter = TemperatureViolationsAnalyticsAdapter(emptyList())
+    }
+
+    private fun loadDashboardData() {
+        if (isLoading) return
+        
+        isLoading = true
+        showLoading(true)
+        hideError()
+        
+        lifecycleScope.launch {
+            try {
+                val result = adminDashboardService.getDashboardAnalytics(currentFilter)
+                
+                if (result.isSuccess) {
+                    dashboardAnalytics = result.getOrNull()
+                    updateUI()
+                } else {
+                    showError("Failed to load dashboard data: ${result.exceptionOrNull()?.message}")
+                }
+            } catch (e: Exception) {
+                showError("Error loading dashboard: ${e.message}")
+            } finally {
+                isLoading = false
+                showLoading(false)
+            }
+        }
+    }
+
+    private fun updateUI() {
+        dashboardAnalytics?.let { analytics ->
+            // Update summary cards
+            updateSummaryCards(analytics)
+            
+            // Update charts
+            updateCharts(analytics)
+            
+            // Update analytics sections
+            updateAnalyticsSections(analytics)
+        }
+    }
+
+    private fun updateSummaryCards(analytics: DashboardAnalytics) {
+        // Update total shipments
+        val totalShipmentsText = view?.findViewById<TextView>(R.id.totalShipmentsText)
+        totalShipmentsText?.text = analytics.shipmentsAnalytics.totalShipments.toString()
+        
+        // Update active drivers
+        val activeDriversText = view?.findViewById<TextView>(R.id.activeDriversText)
+        activeDriversText?.text = analytics.driversAnalytics.activeDrivers.toString()
+        
+        // Update revenue
+        val totalRevenueText = view?.findViewById<TextView>(R.id.totalRevenueText)
+        totalRevenueText?.text = "${analytics.revenueAnalytics.currency} ${analytics.revenueAnalytics.totalRevenue}"
+        
+        // Update delayed shipments
+        val delayedShipmentsText = view?.findViewById<TextView>(R.id.delayedShipmentsText)
+        delayedShipmentsText?.text = analytics.delayedShipmentsAnalytics.totalDelayedShipments.toString()
+        
+        // Update temperature violations
+        val temperatureViolationsText = view?.findViewById<TextView>(R.id.temperatureViolationsText)
+        temperatureViolationsText?.text = analytics.temperatureViolationsAnalytics.totalViolations.toString()
+        
+        // Update trend indicators
+        updateTrendIndicators(analytics)
+    }
+
+    private fun updateTrendIndicators(analytics: DashboardAnalytics) {
+        // Revenue trend
+        val revenueTrend = view?.findViewById<ImageView>(R.id.revenueTrend)
+        val revenueGrowth = analytics.revenueAnalytics.revenueGrowth.toDoubleOrNull() ?: 0.0
+        revenueTrend?.setImageResource(
+            if (revenueGrowth > 0) R.drawable.ic_trending_up
+            else if (revenueGrowth < 0) R.drawable.ic_trending_down
+            else R.drawable.ic_trending_flat
+        )
+        
+        // Delivery performance trend
+        val deliveryTrend = view?.findViewById<ImageView>(R.id.deliveryTrend)
+        val onTimeRate = analytics.delayedShipmentsAnalytics.onTimeDeliveryRate
+        deliveryTrend?.setImageResource(
+            if (onTimeRate > 95.0) R.drawable.ic_trending_up
+            else if (onTimeRate < 85.0) R.drawable.ic_trending_down
+            else R.drawable.ic_trending_flat
+        )
+        
+        // Temperature violations trend
+        val violationsTrend = view?.findViewById<ImageView>(R.id.violationsTrend)
+        val resolutionRate = analytics.temperatureViolationsAnalytics.resolutionRate
+        violationsTrend?.setImageResource(
+            if (resolutionRate > 95.0) R.drawable.ic_trending_up
+            else if (resolutionRate < 85.0) R.drawable.ic_trending_down
+            else R.drawable.ic_trending_flat
+        )
+    }
+
+    private fun updateCharts(analytics: DashboardAnalytics) {
+        // Update revenue chart
+        updateRevenueChart(analytics.revenueAnalytics)
+        
+        // Update shipments trend chart
+        updateShipmentsTrendChart(analytics.shipmentsAnalytics)
+        
+        // Update temperature violations chart
+        updateTemperatureViolationsChart(analytics.temperatureViolationsAnalytics)
+    }
+
+    private fun updateRevenueChart(revenueAnalytics: RevenueAnalytics) {
+        val revenueChart = view?.findViewById<LineChart>(R.id.revenueChart)
+        revenueChart?.let { chart ->
+            val entries = mutableListOf<Entry>()
+            val labels = mutableListOf<String>()
+            
+            revenueAnalytics.revenueByTime.forEach { (time, amount) ->
+                val index = entries.size.toFloat()
+                entries.add(Entry(index, amount.toFloat()))
+                labels.add(time)
+            }
+            
+            val dataSet = LineDataSet(entries, "Revenue").apply {
+                color = Color.parseColor("#10B981")
+                setDrawValues(true)
+                setDrawCircles(true)
+                setDrawFilled(true)
+                lineWidth = 3f
+                circleRadius = 5f
+                setDrawCircleHole(false)
+                valueTextSize = 12f
+                valueTextColor = Color.BLACK
+            }
+            
+            val lineData = LineData(dataSet)
+            chart.data = lineData
+            chart.description = "Revenue Trend"
+            chart.setNoDataText("No revenue data available")
+            chart.invalidate()
+        }
+    }
+
+    private fun updateShipmentsTrendChart(shipmentsAnalytics: ShipmentsAnalytics) {
+        val shipmentsChart = view?.findViewById<LineChart>(R.id.shipmentsTrendChart)
+        shipmentsChart?.let { chart ->
+            val entries = mutableListOf<Entry>()
+            
+            shipmentsAnalytics.shipmentsByTime.forEach { (time, count) ->
+                val index = entries.size.toFloat()
+                entries.add(Entry(index, count.toFloat()))
+            }
+            
+            val dataSet = LineDataSet(entries, "Shipments").apply {
+                color = Color.parseColor("#3B82F6")
+                setDrawValues(true)
+                setDrawCircles(true)
+                lineWidth = 3f
+                circleRadius = 5f
+                valueTextSize = 12f
+                valueTextColor = Color.BLACK
+            }
+            
+            val lineData = LineData(dataSet)
+            chart.data = lineData
+            chart.description = "Shipments Trend"
+            chart.setNoDataText("No shipment data available")
+            chart.invalidate()
+        }
+    }
+
+    private fun updateTemperatureViolationsChart(temperatureViolationsAnalytics: TemperatureViolationsAnalytics) {
+        val violationsChart = view?.findViewById<LineChart>(R.id.temperatureViolationsChart)
+        violationsChart?.let { chart ->
+            val entries = mutableListOf<Entry>()
+            
+            temperatureViolationsAnalytics.violationsByTime.forEach { (time, count) ->
+                val index = entries.size.toFloat()
+                entries.add(Entry(index, count.toFloat()))
+            }
+            
+            val dataSet = LineDataSet(entries, "Violations").apply {
+                color = Color.parseColor("#EF4444")
+                setDrawValues(true)
+                setDrawCircles(true)
+                lineWidth = 3f
+                circleRadius = 5f
+                valueTextSize = 12f
+                valueTextColor = Color.BLACK
+            }
+            
+            val lineData = LineData(dataSet)
+            chart.data = lineData
+            chart.description = "Temperature Violations"
+            chart.setNoDataText("No violation data available")
+            chart.invalidate()
+        }
+    }
+
+    private fun updateAnalyticsSections(analytics: DashboardAnalytics) {
+        // Update shipments analytics
+        val shipmentsRecyclerView = view?.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.shipmentsRecyclerView)
+        shipmentsRecyclerView?.adapter = ShipmentsAnalyticsAdapter(analytics.shipmentsAnalytics.topRoutes)
+        
+        // Update drivers analytics
+        val driversRecyclerView = view?.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.driversRecyclerView)
+        driversRecyclerView?.adapter = DriversAnalyticsAdapter(analytics.driversAnalytics.driverPerformance)
+        
+        // Update delayed shipments analytics
+        val delayedShipmentsRecyclerView = view?.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.delayedShipmentsRecyclerView)
+        delayedShipmentsRecyclerView?.adapter = DelayedShipmentsAnalyticsAdapter(
+                analytics.delayedShipmentsAnalytics.delayedByReason.entries.map { 
+                    DelayReasonAnalytics(it.key, it.value) 
+                }
+        )
+        
+        // Update temperature violations analytics
+        val temperatureViolationsRecyclerView = view?.findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.temperatureViolationsRecyclerView)
+        temperatureViolationsRecyclerView?.adapter = TemperatureViolationsAnalyticsAdapter(
+                analytics.temperatureViolationsAnalytics.topProblematicShipments
+        )
+    }
+
+    private fun showLoading(show: Boolean) {
+        loadingProgressBar.visibility = if (show) View.VISIBLE else View.GONE
+        refreshButton.isEnabled = !show
+    }
+
+    private fun showError(message: String) {
+        errorTextView.text = message
+        errorTextView.visibility = View.VISIBLE
+    }
+
+    private fun hideError() {
+        errorTextView.visibility = View.GONE
+    }
+
+    // Detail dialog methods
+    private fun showShipmentsDetails() {
+        dashboardAnalytics?.let { analytics ->
+            showDetailDialog(
+                "Shipments Analytics",
+                createShipmentsDetailsContent(analytics.shipmentsAnalytics)
+            )
+        }
+    }
+
+    private fun showDriversDetails() {
+        dashboardAnalytics?.let { analytics ->
+            showDetailDialog(
+                "Drivers Analytics",
+                createDriversDetailsContent(analytics.driversAnalytics)
+            )
+        }
+    }
+
+    private fun showRevenueDetails() {
+        dashboardAnalytics?.let { analytics ->
+            showDetailDialog(
+                "Revenue Analytics",
+                createRevenueDetailsContent(analytics.revenueAnalytics)
+            )
+        }
+    }
+
+    private fun showDelayedShipmentsDetails() {
+        dashboardAnalytics?.let { analytics ->
+            showDetailDialog(
+                "Delayed Shipments Analytics",
+                createDelayedShipmentsDetailsContent(analytics.delayedShipmentsAnalytics)
+            )
+        }
+    }
+
+    private fun showTemperatureViolationsDetails() {
+        dashboardAnalytics?.let { analytics ->
+            showDetailDialog(
+                "Temperature Violations Analytics",
+                createTemperatureViolationsDetailsContent(analytics.temperatureViolationsAnalytics)
+            )
+        }
+    }
+
+    private fun showDetailDialog(title: String, content: String) {
+        androidx.appcompat.app.AlertDialog.Builder(requireContext())
+            .setTitle(title)
+            .setMessage(content)
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun createShipmentsDetailsContent(analytics: ShipmentsAnalytics): String {
+        return buildString {
+            appendLine("Total Shipments: ${analytics.totalShipments}")
+            appendLine("On-Time Delivery Rate: ${analytics.deliveryPerformance.onTimeDeliveryRate}%")
+            appendLine("Average Delivery Time: ${analytics.deliveryPerformance.averageDeliveryHours} hours")
+            appendLine("\nShipments by Status:")
+            analytics.shipmentsByStatus.forEach { (status, count) ->
+                appendLine("$status: $count")
+            }
+        }
+    }
+
+    private fun createDriversDetailsContent(analytics: DriversAnalytics): String {
+        return buildString {
+            appendLine("Total Drivers: ${analytics.totalDrivers}")
+            appendLine("Active Drivers: ${analytics.activeDrivers}")
+            appendLine("Average Deliveries per Driver: ${analytics.averageDeliveriesPerDriver}")
+            appendLine("\nTop Performing Drivers:")
+            analytics.driverPerformance.take(5).forEach { driver ->
+                appendLine("${driver.driverName}: ${driver.onTimeDeliveryRate}% on-time")
+            }
+        }
+    }
+
+    private fun createRevenueDetailsContent(analytics: RevenueAnalytics): String {
+        return buildString {
+            appendLine("Total Revenue: ${analytics.currency} ${analytics.totalRevenue}")
+            appendLine("Paid Revenue: ${analytics.currency} ${analytics.paidRevenue}")
+            appendLine("Outstanding Revenue: ${analytics.currency} ${analytics.outstandingRevenue}")
+            appendLine("Collection Rate: ${analytics.collectionRate}%")
+            appendLine("Revenue Growth: ${analytics.revenueGrowth}%")
+            appendLine("\nRevenue by Service:")
+            analytics.revenueByService.forEach { (service, amount) ->
+                appendLine("$service: ${analytics.currency} $amount")
+            }
+        }
+    }
+
+    private fun createDelayedShipmentsDetailsContent(analytics: DelayedShipmentsAnalytics): String {
+        return buildString {
+            appendLine("Total Delayed Shipments: ${analytics.totalDelayedShipments}")
+            appendLine("On-Time Delivery Rate: ${analytics.onTimeDeliveryRate}%")
+            appendLine("Average Delay: ${analytics.averageDelayHours} hours")
+            appendLine("\nDelay Reasons:")
+            analytics.delayedByReason.forEach { (reason, count) ->
+                appendLine("$reason: $count")
+            }
+        }
+    }
+
+    private fun createTemperatureViolationsDetailsContent(analytics: TemperatureViolationsAnalytics): String {
+        return buildString {
+            appendLine("Total Violations: ${analytics.totalViolations}")
+            appendLine("Resolution Rate: ${analytics.resolutionRate}%")
+            appendLine("\nViolations by Severity:")
+            analytics.violationsBySeverity.forEach { (severity, count) ->
+                appendLine("$severity: $count")
+            }
+            appendLine("\nTop Problematic Shipments:")
+            analytics.topProblematicShipments.take(5).forEach { shipment ->
+                appendLine("${shipment.trackingNumber}: ${shipment.violationCount} violations")
+            }
+        }
+    }
+
+    companion object {
+        fun newInstance(): AdminDashboardFragment {
+            return AdminDashboardFragment()
+        }
+    }
+}
+
+// Data classes for adapters
+data class DelayReasonAnalytics(
+    val reason: String,
+    val count: Long
+)

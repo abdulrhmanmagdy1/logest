@@ -1,0 +1,275 @@
+package com.edham.logistics.core.auth
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.edham.logistics.auth.AuthenticationManager
+import com.edham.logistics.core.model.UserRole
+import com.edham.logistics.core.navigation.RoleDashboardFactory
+import com.edham.logistics.data.local.database.UserEntity
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Centralized Authentication State Manager
+ * Separates authentication logic from navigation logic
+ * Provides single source of truth for auth state
+ */
+@Singleton
+class AuthStateManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val authenticationManager: AuthenticationManager,
+    private val roleDashboardFactory: RoleDashboardFactory
+) {
+    
+    private val coroutineScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    
+    private val _authState = MutableStateFlow<AuthUiState>(AuthUiState.Initial)
+    val authState: StateFlow<AuthUiState> = _authState.asStateFlow()
+    
+    private val _navigationState = MutableStateFlow<NavigationState>(NavigationState.Idle)
+    val navigationState: StateFlow<NavigationState> = _navigationState.asStateFlow()
+    
+    private val _sessionState = MutableStateFlow<com.edham.logistics.core.auth.SessionState>(com.edham.logistics.core.auth.SessionState.Unknown)
+    val sessionState: StateFlow<com.edham.logistics.core.auth.SessionState> = _sessionState.asStateFlow()
+    
+    init {
+        Timber.d("AuthStateManager initialized")
+        observeAuthenticationChanges()
+        observeSessionValidity()
+    }
+    
+    /**
+     * Observe authentication state changes from AuthenticationManager
+     */
+    private fun observeAuthenticationChanges() {
+        authenticationManager.authState
+            .onEach { authState ->
+                when (authState) {
+                    is com.edham.logistics.auth.AuthState.Authenticated -> {
+                        _authState.value = AuthUiState.Authenticated
+                        Timber.d("User authenticated, preparing navigation")
+                    }
+                    is com.edham.logistics.auth.AuthState.Unauthenticated -> {
+                        _authState.value = AuthUiState.Unauthenticated
+                        _navigationState.value = NavigationState.NavigateToLogin
+                        Timber.d("User unauthenticated, navigating to login")
+                    }
+                    is com.edham.logistics.auth.AuthState.Loading -> {
+                        _authState.value = AuthUiState.Loading
+                        Timber.d("Authentication in progress")
+                    }
+                    is com.edham.logistics.auth.AuthState.Error -> {
+                        _authState.value = AuthUiState.Error(authState.message)
+                        Timber.e("Authentication error: ${authState.message}")
+                    }
+                    else -> {
+                        _authState.value = AuthUiState.Initial
+                        Timber.d("Authentication state initialized")
+                    }
+                }
+            }
+            .catch { e ->
+                _authState.value = AuthUiState.Error("Authentication state error: ${e.message}")
+                Timber.e(e, "Error observing authentication state")
+            }
+            .launchIn(coroutineScope)
+    }
+    
+    /**
+     * Observe session validity and handle token refresh
+     */
+    private fun observeSessionValidity() {
+        authenticationManager.authState
+            .filter { it is com.edham.logistics.auth.AuthState.Authenticated }
+            .flatMapLatest { 
+                flow {
+                    while (true) {
+                        emit(authenticationManager.isSessionValid())
+                        kotlinx.coroutines.delay(30000) // Check every 30 seconds
+                    }
+                }
+            }
+            .onEach { isValid ->
+                _sessionState.value = if (isValid) {
+                    com.edham.logistics.core.auth.SessionState.Active
+                } else {
+                    com.edham.logistics.core.auth.SessionState.Expired("Session expired")
+                }
+                Timber.d("Session validity: $isValid")
+            }
+            .catch { e ->
+                _sessionState.value = com.edham.logistics.core.auth.SessionState.Error(e.message ?: "Session check error")
+                Timber.e(e, "Error checking session validity")
+            }
+            .launchIn(coroutineScope)
+    }
+    
+    /**
+     * Handle successful login and prepare navigation
+     */
+    fun handleLoginSuccess(user: UserEntity) {
+        coroutineScope.launch {
+            _authState.value = AuthUiState.Authenticated
+            
+            // Determine navigation destination based on user role
+            val destination = when (user.role) {
+                UserRole.ADMIN -> com.edham.logistics.core.auth.NavigationDestination.AdminDashboard
+                UserRole.SUPERVISOR -> com.edham.logistics.core.auth.NavigationDestination.SupervisorDashboard
+                UserRole.DRIVER -> com.edham.logistics.core.auth.NavigationDestination.DriverDashboard
+                UserRole.ACCOUNTANT -> com.edham.logistics.core.auth.NavigationDestination.AccountantDashboard
+                UserRole.FLEET_MANAGER -> com.edham.logistics.core.auth.NavigationDestination.FleetManagerDashboard
+                UserRole.CUSTOMER -> com.edham.logistics.core.auth.NavigationDestination.CustomerDashboard
+                UserRole.WORKSHOP -> com.edham.logistics.core.auth.NavigationDestination.WorkshopDashboard
+            }
+            
+            _navigationState.value = NavigationState.NavigateToDashboard(destination)
+            Timber.d("Login successful, navigating to ${user.role.displayName} dashboard")
+        }
+    }
+    
+    /**
+     * Handle session expiration
+     */
+    fun handleSessionExpired() {
+        coroutineScope.launch {
+            _sessionState.value = com.edham.logistics.core.auth.SessionState.Expired("Session expired")
+            _authState.value = AuthUiState.SessionExpired
+
+            // Attempt token refresh
+            val refreshResult = authenticationManager.refreshToken()
+            refreshResult.onSuccess { success ->
+                if (success) {
+                    _sessionState.value = com.edham.logistics.core.auth.SessionState.Active
+                    _authState.value = AuthUiState.Authenticated
+                    Timber.d("Token refreshed successfully")
+                } else {
+                    _navigationState.value = NavigationState.NavigateToLogin
+                    Timber.d("Token refresh failed, navigating to login")
+                }
+            }
+
+            refreshResult.onFailure { error ->
+                _authState.value = AuthUiState.Error("Session refresh failed: ${error.message}")
+                _navigationState.value = NavigationState.NavigateToLogin
+                Timber.e(error, "Session refresh failed")
+            }
+        }
+    }
+    
+    /**
+     * Handle logout
+     */
+    fun handleLogout() {
+        coroutineScope.launch {
+            try {
+                authenticationManager.logout()
+                _authState.value = AuthUiState.Unauthenticated
+                _navigationState.value = NavigationState.NavigateToLogin
+                _sessionState.value = com.edham.logistics.core.auth.SessionState.Inactive
+                Timber.d("Logout successful, navigating to login")
+            } catch (e: Exception) {
+                _authState.value = AuthUiState.Error("Logout failed: ${e.message}")
+                Timber.e(e, "Logout failed")
+            }
+        }
+    }
+    
+    /**
+     * Get current navigation destination
+     */
+    fun getCurrentNavigationDestination(): com.edham.logistics.core.auth.NavigationDestination? {
+        val navState = _navigationState.value
+        return if (navState is NavigationState.NavigateToDashboard) {
+            navState.destination
+        } else null
+    }
+    
+    /**
+     * Clear navigation state after navigation
+     */
+    fun clearNavigationState() {
+        _navigationState.value = NavigationState.Idle
+        Timber.d("Navigation state cleared")
+    }
+    
+    /**
+     * Force refresh authentication state
+     */
+    fun refreshAuthState() {
+        val currentAuthState = authenticationManager.authState.value
+        when (currentAuthState) {
+            is com.edham.logistics.auth.AuthState.Authenticated -> {
+                _authState.value = AuthUiState.Authenticated
+            }
+            is com.edham.logistics.auth.AuthState.Unauthenticated -> {
+                _authState.value = AuthUiState.Unauthenticated
+            }
+            else -> {
+                _authState.value = AuthUiState.Initial
+            }
+        }
+    }
+}
+
+/**
+ * Authentication UI State
+ */
+sealed class AuthUiState {
+    object Initial : AuthUiState()
+    object Loading : AuthUiState()
+    object Authenticated : AuthUiState()
+    object Unauthenticated : AuthUiState()
+    object SessionExpired : AuthUiState()
+    data class Error(val message: String) : AuthUiState()
+}
+
+/**
+ * Navigation State
+ */
+sealed class NavigationState {
+    object Idle : NavigationState()
+    object NavigateToLogin : NavigationState()
+    data class NavigateToDashboard(val destination: com.edham.logistics.core.auth.NavigationDestination) : NavigationState()
+}
+
+/**
+ * ViewModel for UI components that need auth state
+ */
+@HiltViewModel
+class AuthViewModel @Inject constructor(
+    private val authStateManager: AuthStateManager
+) : ViewModel() {
+    
+    val authState = authStateManager.authState
+    val navigationState = authStateManager.navigationState
+    val sessionState = authStateManager.sessionState
+    
+    fun handleLoginSuccess(user: UserEntity) {
+        authStateManager.handleLoginSuccess(user)
+    }
+    
+    fun handleSessionExpired() {
+        authStateManager.handleSessionExpired()
+    }
+    
+    fun handleLogout() {
+        authStateManager.handleLogout()
+    }
+    
+    fun clearNavigationState() {
+        authStateManager.clearNavigationState()
+    }
+    
+    fun refreshAuthState() {
+        authStateManager.refreshAuthState()
+    }
+}

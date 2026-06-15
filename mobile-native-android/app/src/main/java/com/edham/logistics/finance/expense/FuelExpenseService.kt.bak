@@ -1,0 +1,780 @@
+package com.edham.logistics.finance.expense
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.FuelExpenseApi
+import com.edham.logistics.data.remote.api.VehicleApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Fuel Expense Service - Manages fuel expense tracking and analysis
+ * 
+ * Features:
+ * - Fuel expense creation and management
+ * - Fuel consumption tracking
+ * - Fuel efficiency analysis
+ * - Vehicle fuel performance
+ * - Fuel price tracking
+ * - Fuel expense categorization
+ * - Fuel expense reporting
+ * - Fuel cost optimization
+ */
+@Singleton
+class FuelExpenseService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val fuelExpenseApi: FuelExpenseApi,
+    private val vehicleApi: VehicleApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _fuelExpenseState = MutableStateFlow<FuelExpenseState>(FuelExpenseState.Idle)
+    val fuelExpenseState: StateFlow<FuelExpenseState> = _fuelExpenseState.asStateFlow()
+    
+    private val _fuelExpenses = MutableStateFlow<List<FuelExpense>>(emptyList())
+    val fuelExpenses: StateFlow<List<FuelExpense>> = _fuelExpenses.asStateFlow()
+    
+    private val _fuelExpenseStats = MutableStateFlow<FuelExpenseStats>(FuelExpenseStats())
+    val fuelExpenseStats: StateFlow<FuelExpenseStats> = _fuelExpenseStats.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "FuelExpenseService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val FUEL_PRICE_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000L // 24 hours
+        private const val FUEL_EFFICIENCY_THRESHOLD = 8.0f // km/liter
+        private const val MAX_FUEL_AMOUNT = 1000f // liters
+    }
+    
+    /**
+     * Initialize fuel expense service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _fuelExpenseState.value = FuelExpenseState.Initializing
+                
+                // Load fuel expense configuration
+                loadFuelExpenseConfiguration()
+                
+                // Load recent fuel expenses
+                loadRecentFuelExpenses()
+                
+                // Load fuel prices
+                loadFuelPrices()
+                
+                isInitialized = true
+                _fuelExpenseState.value = FuelExpenseState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _fuelExpenseState.value = FuelExpenseState.Error("Failed to initialize fuel expense service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create fuel expense
+     */
+    suspend fun createFuelExpense(
+        fuelExpenseRequest: FuelExpenseRequest
+    ): Result<FuelExpense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Fuel expense service not initialized")
+                }
+                
+                _fuelExpenseState.value = FuelExpenseState.Processing
+                
+                // Validate fuel expense request
+                validateFuelExpenseRequest(fuelExpenseRequest)
+                
+                // Get vehicle information
+                val vehicle = vehicleApi.getVehicleById(fuelExpenseRequest.vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Calculate fuel efficiency if odometer reading is provided
+                val fuelEfficiency = calculateFuelEfficiency(
+                    fuelExpenseRequest,
+                    vehicle
+                )
+                
+                // Create fuel expense
+                val fuelExpense = FuelExpense(
+                    id = UUID.randomUUID().toString(),
+                    vehicleId = fuelExpenseRequest.vehicleId,
+                    fuelType = fuelExpenseRequest.fuelType,
+                    amount = fuelExpenseRequest.amount,
+                    pricePerLiter = fuelExpenseRequest.pricePerLiter,
+                    totalCost = fuelExpenseRequest.amount * fuelExpenseRequest.pricePerLiter,
+                    currency = fuelExpenseRequest.currency ?: DEFAULT_CURRENCY,
+                    date = fuelExpenseRequest.date,
+                    odometerReading = fuelExpenseRequest.odometerReading,
+                    fuelEfficiency = fuelEfficiency,
+                    location = fuelExpenseRequest.location,
+                    fuelStation = fuelExpenseRequest.fuelStation,
+                    receiptUrl = fuelExpenseRequest.receiptUrl,
+                    status = FuelExpenseStatus.PENDING,
+                    metadata = fuelExpenseRequest.metadata,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save to database
+                val savedFuelExpense = database.fuelExpenseDao().insertFuelExpense(fuelExpense.toEntity())
+                    .let { id -> fuelExpense.copy(id = id.toString()) }
+                
+                // Add to fuel expenses list
+                addToFuelExpenses(savedFuelExpense)
+                
+                // Update vehicle fuel information
+                updateVehicleFuelInfo(vehicle, savedFuelExpense)
+                
+                // Update stats
+                updateFuelExpenseStats()
+                
+                _fuelExpenseState.value = FuelExpenseState.Ready
+                Result.success(savedFuelExpense)
+                
+            } catch (e: Exception) {
+                _fuelExpenseState.value = FuelExpenseState.Error("Fuel expense creation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update fuel expense
+     */
+    suspend fun updateFuelExpense(
+        fuelExpense: FuelExpense
+    ): Result<FuelExpense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Fuel expense service not initialized")
+                }
+                
+                _fuelExpenseState.value = FuelExpenseState.Processing
+                
+                // Validate fuel expense
+                validateFuelExpense(fuelExpense)
+                
+                // Recalculate total cost
+                val updatedFuelExpense = fuelExpense.copy(
+                    totalCost = fuelExpense.amount * fuelExpense.pricePerLiter,
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.fuelExpenseDao().updateFuelExpense(updatedFuelExpense.toEntity())
+                
+                // Update in list
+                updateFuelExpenseInList(updatedFuelExpense)
+                
+                // Update stats
+                updateFuelExpenseStats()
+                
+                _fuelExpenseState.value = FuelExpenseState.Ready
+                Result.success(updatedFuelExpense)
+                
+            } catch (e: Exception) {
+                _fuelExpenseState.value = FuelExpenseState.Error("Fuel expense update failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fuel expense by ID
+     */
+    suspend fun getFuelExpense(fuelExpenseId: String): FuelExpense? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _fuelExpenses.value.find { it.id == fuelExpenseId }
+                    ?: database.fuelExpenseDao().getFuelExpenseById(fuelExpenseId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get fuel expense history
+     */
+    suspend fun getFuelExpenseHistory(
+        vehicleId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        fuelType: FuelType? = null
+    ): Result<List<FuelExpense>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val fuelExpenses = database.fuelExpenseDao().getFuelExpenseHistory(
+                    vehicleId = vehicleId?.toLong(),
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    fuelType = fuelType
+                ).map { it.toDomainModel() }
+                
+                Result.success(fuelExpenses)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fuel expense analytics
+     */
+    suspend fun getFuelExpenseAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<FuelExpenseAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val fuelExpenses = getFuelExpenseHistory(null, dateRange).getOrThrow()
+                
+                val analytics = FuelExpenseAnalytics(
+                    totalExpenses = fuelExpenses.size,
+                    totalFuelAmount = fuelExpenses.sumOf { it.amount.toDouble() }.toFloat(),
+                    totalCost = fuelExpenses.sumOf { it.totalCost.toDouble() }.toFloat(),
+                    averageCostPerLiter = if (fuelExpenses.isNotEmpty()) {
+                        (fuelExpenses.sumOf { it.totalCost.toDouble() } / fuelExpenses.sumOf { it.amount.toDouble() }).toFloat()
+                    } else 0f,
+                    averageFuelEfficiency = calculateAverageFuelEfficiency(fuelExpenses),
+                    fuelTypeStats = fuelExpenses.groupBy { it.fuelType }.mapValues { it.value.size },
+                    vehicleStats = fuelExpenses.groupBy { it.vehicleId }.mapValues { it.value.size },
+                    monthlyStats = calculateMonthlyFuelStats(fuelExpenses),
+                    fuelPriceTrend = calculateFuelPriceTrend(fuelExpenses),
+                    fuelEfficiencyTrend = calculateFuelEfficiencyTrend(fuelExpenses),
+                    topFuelingStations = getTopFuelingStations(fuelExpenses),
+                    costOptimization = calculateCostOptimization(fuelExpenses)
+                )
+                
+                Result.success(analytics)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get vehicle fuel efficiency
+     */
+    suspend fun getVehicleFuelEfficiency(
+        vehicleId: String,
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<VehicleFuelEfficiency> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val fuelExpenses = getFuelExpenseHistory(vehicleId, dateRange).getOrThrow()
+                
+                if (fuelExpenses.isEmpty()) {
+                    return@withContext Result.success(
+                        VehicleFuelEfficiency(
+                            vehicleId = vehicleId,
+                            averageEfficiency = 0f,
+                            totalDistance = 0f,
+                            totalFuel = 0f,
+                            totalCost = 0f,
+                            efficiencyRating = EfficiencyRating.UNKNOWN
+                        )
+                    )
+                }
+                
+                val totalFuel = fuelExpenses.sumOf { it.amount.toDouble() }.toFloat()
+                val totalCost = fuelExpenses.sumOf { it.totalCost.toDouble() }.toFloat()
+                val averageEfficiency = calculateAverageFuelEfficiency(fuelExpenses)
+                val efficiencyRating = calculateEfficiencyRating(averageEfficiency)
+                val totalDistance = calculateTotalDistance(fuelExpenses)
+                
+                val efficiency = VehicleFuelEfficiency(
+                    vehicleId = vehicleId,
+                    averageEfficiency = averageEfficiency,
+                    totalDistance = totalDistance,
+                    totalFuel = totalFuel,
+                    totalCost = totalCost,
+                    efficiencyRating = efficiencyRating,
+                    costPerKilometer = if (totalDistance > 0) totalCost / totalDistance else 0f,
+                    fuelConsumptionPer100km = if (totalDistance > 0) (totalFuel / totalDistance) * 100f else 0f
+                )
+                
+                Result.success(efficiency)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fuel prices
+     */
+    suspend fun getFuelPrices(): Result<Map<FuelType, Float>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val prices = fuelExpenseApi.getCurrentFuelPrices()
+                if (prices.success) {
+                    Result.success(prices.data ?: emptyMap())
+                } else {
+                    Result.failure(Exception(prices.message ?: "Failed to fetch fuel prices"))
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get fueling stations
+     */
+    suspend fun getFuelingStations(
+        location: String? = null,
+        radius: Float = 50f // km
+    ): Result<List<FuelingStation>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val stations = fuelExpenseApi.getNearbyFuelingStations(location, radius)
+                if (stations.success) {
+                    Result.success(stations.data ?: emptyList())
+                } else {
+                    Result.failure(Exception(stations.message ?: "Failed to fetch fueling stations"))
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadFuelExpenseConfiguration() {
+        // Load fuel expense configuration from API or local storage
+    }
+    
+    private suspend fun loadRecentFuelExpenses() {
+        try {
+            val fuelExpenses = database.fuelExpenseDao().getRecentFuelExpenses(50)
+                .map { it.toDomainModel() }
+            
+            _fuelExpenses.value = fuelExpenses
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun loadFuelPrices() {
+        try {
+            // Load current fuel prices from API
+            val prices = getFuelPrices().getOrThrow()
+            // Store in cache for quick access
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun validateFuelExpenseRequest(request: FuelExpenseRequest) {
+        if (request.vehicleId.isBlank()) throw Exception("Vehicle ID is required")
+        if (request.amount <= 0) throw Exception("Fuel amount must be positive")
+        if (request.amount > MAX_FUEL_AMOUNT) throw Exception("Fuel amount exceeds maximum limit")
+        if (request.pricePerLiter <= 0) throw Exception("Price per liter must be positive")
+        if (request.date == null) throw Exception("Fuel expense date is required")
+        if (request.fuelType == null) throw Exception("Fuel type is required")
+    }
+    
+    private fun validateFuelExpense(fuelExpense: FuelExpense) {
+        if (fuelExpense.vehicleId.isBlank()) throw Exception("Vehicle ID is required")
+        if (fuelExpense.amount <= 0) throw Exception("Fuel amount must be positive")
+        if (fuelExpense.amount > MAX_FUEL_AMOUNT) throw Exception("Fuel amount exceeds maximum limit")
+        if (fuelExpense.pricePerLiter <= 0) throw Exception("Price per liter must be positive")
+        if (fuelExpense.date == null) throw Exception("Fuel expense date is required")
+        if (fuelExpense.fuelType == null) throw Exception("Fuel type is required")
+    }
+    
+    private fun calculateFuelEfficiency(
+        request: FuelExpenseRequest,
+        vehicle: Vehicle
+    ): Float? {
+        val currentOdometer = vehicle.currentOdometer ?: return null
+        val newOdometer = request.odometerReading ?: return null
+        
+        if (newOdometer <= currentOdometer) return null
+        
+        val distance = newOdometer - currentOdometer // km
+        val fuel = request.amount // liters
+        
+        return if (fuel > 0) distance / fuel else null
+    }
+    
+    private fun calculateAverageFuelEfficiency(fuelExpenses: List<FuelExpense>): Float {
+        val validExpenses = fuelExpenses.filter { it.fuelEfficiency != null && it.fuelEfficiency!! > 0 }
+        return if (validExpenses.isNotEmpty()) {
+            validExpenses.map { it.fuelEfficiency!! }.average().toFloat()
+        } else 0f
+    }
+    
+    private fun calculateEfficiencyRating(efficiency: Float): EfficiencyRating {
+        return when {
+            efficiency >= FUEL_EFFICIENCY_THRESHOLD * 1.2f -> EfficiencyRating.EXCELLENT
+            efficiency >= FUEL_EFFICIENCY_THRESHOLD * 1.0f -> EfficiencyRating.GOOD
+            efficiency >= FUEL_EFFICIENCY_THRESHOLD * 0.8f -> EfficiencyRating.AVERAGE
+            efficiency >= FUEL_EFFICIENCY_THRESHOLD * 0.6f -> EfficiencyRating.POOR
+            else -> EfficiencyRating.VERY_POOR
+        }
+    }
+    
+    private fun calculateTotalDistance(fuelExpenses: List<FuelExpense>): Float {
+        return fuelExpenses.mapNotNull { expense ->
+            val nextExpense = fuelExpenses.find { 
+                it.vehicleId == expense.vehicleId && 
+                it.date.after(expense.date) &&
+                it.odometerReading != null &&
+                expense.odometerReading != null
+            }
+            if (nextExpense != null && expense.odometerReading != null && nextExpense.odometerReading != null) {
+                nextExpense.odometerReading!! - expense.odometerReading!!
+            } else 0f
+        }.sum()
+    }
+    
+    private fun calculateMonthlyFuelStats(fuelExpenses: List<FuelExpense>): Map<String, MonthlyFuelStats> {
+        return fuelExpenses.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.date
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { (_, monthExpenses) ->
+            MonthlyFuelStats(
+                expenseCount = monthExpenses.size,
+                totalFuel = monthExpenses.sumOf { it.amount.toDouble() }.toFloat(),
+                totalCost = monthExpenses.sumOf { it.totalCost.toDouble() }.toFloat(),
+                averageEfficiency = calculateAverageFuelEfficiency(monthExpenses),
+                averageCostPerLiter = if (monthExpenses.isNotEmpty()) {
+                    (monthExpenses.sumOf { it.totalCost.toDouble() } / monthExpenses.sumOf { it.amount.toDouble() }).toFloat()
+                } else 0f
+            )
+        }
+    }
+    
+    private fun calculateFuelPriceTrend(fuelExpenses: List<FuelExpense>): List<FuelPricePoint> {
+        return fuelExpenses
+            .sortedBy { it.date }
+            .groupBy { it.fuelType }
+            .flatMap { (fuelType, expenses) ->
+                expenses.map { expense ->
+                    FuelPricePoint(
+                        date = expense.date,
+                        fuelType = fuelType,
+                        price = expense.pricePerLiter
+                    )
+                }
+            }
+            .sortedBy { it.date }
+    }
+    
+    private fun calculateFuelEfficiencyTrend(fuelExpenses: List<FuelExpense>): List<FuelEfficiencyPoint> {
+        return fuelExpenses
+            .filter { it.fuelEfficiency != null }
+            .sortedBy { it.date }
+            .map { expense ->
+                FuelEfficiencyPoint(
+                    date = expense.date,
+                    vehicleId = expense.vehicleId,
+                    efficiency = expense.fuelEfficiency!!
+                )
+            }
+    }
+    
+    private fun getTopFuelingStations(fuelExpenses: List<FuelExpense>): List<FuelingStationStats> {
+        return fuelExpenses
+            .groupBy { it.fuelStation }
+            .mapValues { (_, stationExpenses) ->
+                FuelingStationStats(
+                    stationName = stationExpenses.first().fuelStation ?: "Unknown",
+                    visitCount = stationExpenses.size,
+                    totalFuel = stationExpenses.sumOf { it.amount.toDouble() }.toFloat(),
+                    totalCost = stationExpenses.sumOf { it.totalCost.toDouble() }.toFloat(),
+                    averagePrice = if (stationExpenses.isNotEmpty()) {
+                        stationExpenses.map { it.pricePerLiter }.average().toFloat()
+                    } else 0f
+                )
+            }
+            .values
+            .sortedByDescending { it.totalCost }
+            .take(10)
+    }
+    
+    private fun calculateCostOptimization(fuelExpenses: List<FuelExpense>): CostOptimization {
+        val averagePrice = if (fuelExpenses.isNotEmpty()) {
+            fuelExpenses.map { it.pricePerLiter }.average().toFloat()
+        } else 0f
+        
+        val lowestPrice = fuelExpenses.minOfOrNull { it.pricePerLiter } ?: 0f
+        val highestPrice = fuelExpenses.maxOfOrNull { it.pricePerLiter } ?: 0f
+        
+        val potentialSavings = if (fuelExpenses.isNotEmpty()) {
+            val totalFuel = fuelExpenses.sumOf { it.amount.toDouble() }.toFloat()
+            (averagePrice - lowestPrice) * totalFuel
+        } else 0f
+        
+        return CostOptimization(
+            averagePrice = averagePrice,
+            lowestPrice = lowestPrice,
+            highestPrice = highestPrice,
+            priceVariation = if (lowestPrice > 0) ((highestPrice - lowestPrice) / lowestPrice) * 100f else 0f,
+            potentialSavings = potentialSavings,
+            recommendedStations = getRecommendedStations(fuelExpenses)
+        )
+    }
+    
+    private fun getRecommendedStations(fuelExpenses: List<FuelExpense>): List<String> {
+        return fuelExpenses
+            .groupBy { it.fuelStation }
+            .filterValues { it.size >= 3 } // Stations with at least 3 visits
+            .mapValues { (_, stationExpenses) ->
+                stationExpenses.map { it.pricePerLiter }.average().toFloat()
+            }
+            .minByOrNull { it.value }?.key
+            ?.let { listOf(it) }
+            ?: emptyList()
+    }
+    
+    private suspend fun updateVehicleFuelInfo(vehicle: Vehicle, fuelExpense: FuelExpense) {
+        try {
+            val updatedVehicle = vehicle.copy(
+                currentOdometer = fuelExpense.odometerReading,
+                lastFuelDate = fuelExpense.date,
+                lastFuelAmount = fuelExpense.amount,
+                lastFuelCost = fuelExpense.totalCost,
+                updatedAt = Date()
+            )
+            
+            vehicleApi.updateVehicle(updatedVehicle)
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun addToFuelExpenses(fuelExpense: FuelExpense) {
+        val currentFuelExpenses = _fuelExpenses.value.toMutableList()
+        currentFuelExpenses.add(0, fuelExpense) // Add to beginning
+        
+        // Keep only last 100 fuel expenses in cache
+        if (currentFuelExpenses.size > 100) {
+            currentFuelExpenses.removeAt(currentFuelExpenses.size - 1)
+        }
+        
+        _fuelExpenses.value = currentFuelExpenses
+    }
+    
+    private fun updateFuelExpenseInList(fuelExpense: FuelExpense) {
+        val currentFuelExpenses = _fuelExpenses.value.toMutableList()
+        val index = currentFuelExpenses.indexOfFirst { it.id == fuelExpense.id }
+        
+        if (index != -1) {
+            currentFuelExpenses[index] = fuelExpense
+            _fuelExpenses.value = currentFuelExpenses
+        }
+    }
+    
+    private suspend fun updateFuelExpenseStats() {
+        try {
+            val fuelExpenses = _fuelExpenses.value
+            val stats = FuelExpenseStats(
+                totalExpenses = fuelExpenses.size,
+                pendingExpenses = fuelExpenses.count { it.status == FuelExpenseStatus.PENDING },
+                approvedExpenses = fuelExpenses.count { it.status == FuelExpenseStatus.APPROVED },
+                totalFuelAmount = fuelExpenses.sumOf { it.amount.toDouble() }.toFloat(),
+                totalCost = fuelExpenses.sumOf { it.totalCost.toDouble() }.toFloat(),
+                averageCostPerLiter = if (fuelExpenses.isNotEmpty()) {
+                    (fuelExpenses.sumOf { it.totalCost.toDouble() } / fuelExpenses.sumOf { it.amount.toDouble() }).toFloat()
+                } else 0f,
+                fuelTypeStats = fuelExpenses.groupBy { it.fuelType }.mapValues { it.value.size }
+            )
+            
+            _fuelExpenseStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class FuelExpenseRequest(
+    val vehicleId: String,
+    val fuelType: FuelType,
+    val amount: Float,
+    val pricePerLiter: Float,
+    val currency: String? = null,
+    val date: Date,
+    val odometerReading: Float? = null,
+    val location: String? = null,
+    val fuelStation: String? = null,
+    val receiptUrl: String? = null,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class FuelExpense(
+    val id: String = "",
+    val vehicleId: String,
+    val fuelType: FuelType,
+    val amount: Float,
+    val pricePerLiter: Float,
+    val totalCost: Float,
+    val currency: String,
+    val date: Date,
+    val odometerReading: Float? = null,
+    val fuelEfficiency: Float? = null,
+    val location: String? = null,
+    val fuelStation: String? = null,
+    val receiptUrl: String? = null,
+    val status: FuelExpenseStatus,
+    val metadata: Map<String, String> = emptyMap(),
+    val createdAt: Date = Date(),
+    val updatedAt: Date = Date()
+)
+
+data class FuelExpenseAnalytics(
+    val totalExpenses: Int,
+    val totalFuelAmount: Float,
+    val totalCost: Float,
+    val averageCostPerLiter: Float,
+    val averageFuelEfficiency: Float,
+    val fuelTypeStats: Map<FuelType, Int>,
+    val vehicleStats: Map<String, Int>,
+    val monthlyStats: Map<String, MonthlyFuelStats>,
+    val fuelPriceTrend: List<FuelPricePoint>,
+    val fuelEfficiencyTrend: List<FuelEfficiencyPoint>,
+    val topFuelingStations: List<FuelingStationStats>,
+    val costOptimization: CostOptimization
+)
+
+data class VehicleFuelEfficiency(
+    val vehicleId: String,
+    val averageEfficiency: Float,
+    val totalDistance: Float,
+    val totalFuel: Float,
+    val totalCost: Float,
+    val efficiencyRating: EfficiencyRating,
+    val costPerKilometer: Float,
+    val fuelConsumptionPer100km: Float
+)
+
+data class FuelExpenseStats(
+    val totalExpenses: Int = 0,
+    val pendingExpenses: Int = 0,
+    val approvedExpenses: Int = 0,
+    val totalFuelAmount: Float = 0f,
+    val totalCost: Float = 0f,
+    val averageCostPerLiter: Float = 0f,
+    val fuelTypeStats: Map<FuelType, Int> = emptyMap()
+)
+
+data class MonthlyFuelStats(
+    val expenseCount: Int,
+    val totalFuel: Float,
+    val totalCost: Float,
+    val averageEfficiency: Float,
+    val averageCostPerLiter: Float
+)
+
+data class FuelPricePoint(
+    val date: Date,
+    val fuelType: FuelType,
+    val price: Float
+)
+
+data class FuelEfficiencyPoint(
+    val date: Date,
+    val vehicleId: String,
+    val efficiency: Float
+)
+
+data class FuelingStationStats(
+    val stationName: String,
+    val visitCount: Int,
+    val totalFuel: Float,
+    val totalCost: Float,
+    val averagePrice: Float
+)
+
+data class CostOptimization(
+    val averagePrice: Float,
+    val lowestPrice: Float,
+    val highestPrice: Float,
+    val priceVariation: Float,
+    val potentialSavings: Float,
+    val recommendedStations: List<String>
+)
+
+data class FuelingStation(
+    val id: String,
+    val name: String,
+    val address: String,
+    val latitude: Double,
+    val longitude: Double,
+    val fuelPrices: Map<FuelType, Float>,
+    val amenities: List<String>,
+    val rating: Float,
+    val distance: Float
+)
+
+/**
+ * Enums
+ */
+enum class FuelExpenseState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class FuelType {
+    GASOLINE_95,
+    GASOLINE_91,
+    DIESEL,
+    PREMIUM_DIESEL,
+    NATURAL_GAS,
+    ELECTRIC
+}
+
+enum class FuelExpenseStatus {
+    PENDING,
+    APPROVED,
+    REJECTED,
+    CANCELLED
+}
+
+enum class EfficiencyRating {
+    EXCELLENT,
+    GOOD,
+    AVERAGE,
+    POOR,
+    VERY_POOR,
+    UNKNOWN
+}

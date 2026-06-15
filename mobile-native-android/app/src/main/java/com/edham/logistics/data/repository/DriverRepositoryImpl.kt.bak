@@ -1,0 +1,215 @@
+package com.edham.logistics.data.repository
+
+import com.edham.logistics.core.utils.Result
+import com.edham.logistics.core.utils.safeCall
+import com.edham.logistics.data.local.dao.DriverDao
+import com.edham.logistics.data.local.entity.DriverEntity
+import com.edham.logistics.data.remote.dto.DriverDto
+import com.edham.logistics.data.remote.mapper.DriverMapper
+import com.edham.logistics.domain.model.Driver
+import com.edham.logistics.domain.repository.DriverRepository
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class DriverRepositoryImpl @Inject constructor(
+    private val driverDao: DriverDao,
+    private val apiService: com.edham.logistics.core.network.ApiService
+) : DriverRepository {
+
+    override suspend fun getDrivers(page: Int, pageSize: Int): Result<List<Driver>> {
+        return safeCall {
+            try {
+                // Try to get from remote first
+                val response = apiService.getDrivers()
+                if (response.isSuccessful) {
+                    response.body()?.let { driverDtos ->
+                        val drivers = driverDtos.map { DriverMapper.toDomain(it) }
+                        val entities = drivers.map { DriverEntity.fromDomain(it) }
+                        driverDao.insertDrivers(entities)
+                        drivers
+                    } ?: emptyList()
+                } else {
+                    // Fallback to local
+                    getLocalDrivers(page, pageSize)
+                }
+            } catch (e: Exception) {
+                // Fallback to local on network error
+                getLocalDrivers(page, pageSize)
+            }
+        }
+    }
+
+    private suspend fun getLocalDrivers(page: Int, pageSize: Int): List<Driver> {
+        val offset = (page - 1) * pageSize
+        return driverDao.getDriversPaged(pageSize, offset).map { it.toDomain() }
+    }
+
+    override suspend fun getDriverById(id: String): Result<Driver> {
+        return safeCall {
+            try {
+                // Try remote first
+                val response = apiService.getDriver(id)
+                if (response.isSuccessful) {
+                    response.body()?.let { driverDto ->
+                        val driver = DriverMapper.toDomain(driverDto)
+                        val entity = DriverEntity.fromDomain(driver)
+                        driverDao.insertDriver(entity)
+                        driver
+                    } ?: throw Exception("Driver not found")
+                } else {
+                    // Fallback to local
+                    driverDao.getDriverById(id)?.toDomain()
+                        ?: throw Exception("Driver not found locally")
+                }
+            } catch (e: Exception) {
+                // Fallback to local on network error
+                driverDao.getDriverById(id)?.toDomain()
+                    ?: throw Exception("Driver not found locally")
+            }
+        }
+    }
+
+    override suspend fun createDriver(driver: Driver): Result<Driver> {
+        return safeCall {
+            val driverDto = DriverMapper.fromDomain(driver)
+            val response = apiService.createDriver(driverDto)
+            if (response.isSuccessful) {
+                response.body()?.let { createdDto ->
+                    val createdDriver = DriverMapper.toDomain(createdDto)
+                    val entity = DriverEntity.fromDomain(createdDriver)
+                    driverDao.insertDriver(entity)
+                    createdDriver
+                } ?: throw Exception("Failed to create driver")
+            } else {
+                throw Exception("Failed to create driver: ${response.code()}")
+            }
+        }
+    }
+
+    override suspend fun updateDriver(driver: Driver): Result<Driver> {
+        return safeCall {
+            val driverDto = DriverMapper.fromDomain(driver)
+            val response = apiService.updateDriver(driver.id, driverDto)
+            if (response.isSuccessful) {
+                response.body()?.let { updatedDto ->
+                    val updatedDriver = DriverMapper.toDomain(updatedDto)
+                    val entity = DriverEntity.fromDomain(updatedDriver)
+                    driverDao.updateDriver(entity)
+                    updatedDriver
+                } ?: throw Exception("Failed to update driver")
+            } else {
+                throw Exception("Failed to update driver: ${response.code()}")
+            }
+        }
+    }
+
+    override suspend fun deleteDriver(id: String): Result<Unit> {
+        return safeCall {
+            val response = apiService.deleteDriver(id)
+            if (response.isSuccessful) {
+                driverDao.deleteDriverById(id)
+                Unit
+            } else {
+                throw Exception("Failed to delete driver: ${response.code()}")
+            }
+        }
+    }
+
+    override suspend fun getDriversByStatus(status: String): Result<List<Driver>> {
+        return safeCall {
+            driverDao.getDriversByStatus(status).map { it.toDomain() }
+        }
+    }
+
+    override suspend fun getAvailableDrivers(): Result<List<Driver>> {
+        return safeCall {
+            driverDao.getAvailableDrivers().map { it.toDomain() }
+        }
+    }
+
+    override suspend fun getDriversOnTrip(): Result<List<Driver>> {
+        return safeCall {
+            driverDao.getDriversOnTrip().map { it.toDomain() }
+        }
+    }
+
+    override suspend fun updateDriverStatus(id: String, status: String): Result<Unit> {
+        return safeCall {
+            driverDao.updateDriverStatus(id, status)
+            // Also update on remote if possible
+            try {
+                val currentDriver = driverDao.getDriverById(id)?.toDomain()
+                currentDriver?.let { driver ->
+                    val updatedDriver = driver.copy(status = status)
+                    val driverDto = DriverMapper.fromDomain(updatedDriver)
+                    apiService.updateDriver(id, driverDto)
+                }
+            } catch (e: Exception) {
+                // Continue even if remote update fails
+            }
+            Unit
+        }
+    }
+
+    override suspend fun updateDriverLocation(
+        id: String,
+        latitude: Double,
+        longitude: Double,
+        address: String
+    ): Result<Unit> {
+        return safeCall {
+            driverDao.updateDriverLocation(id, latitude, longitude, address)
+            Unit
+        }
+    }
+
+    override suspend fun updateDriverRating(id: String, rating: Float): Result<Unit> {
+        return safeCall {
+            driverDao.updateDriverRating(id, rating)
+            Unit
+        }
+    }
+
+    override suspend fun searchDrivers(query: String): Result<List<Driver>> {
+        return safeCall {
+            driverDao.searchDrivers(query).map { it.toDomain() }
+        }
+    }
+
+    override fun observeDrivers(): Flow<List<Driver>> {
+        return driverDao.getAllDrivers().map { entities ->
+            entities.map { it.toDomain() }
+        }
+    }
+
+    override fun observeDriverById(id: String): Flow<Driver?> {
+        return driverDao.getDriverById(id)?.let { entity ->
+            kotlinx.coroutines.flow.flow { emit(entity.toDomain()) }
+        } ?: kotlinx.coroutines.flow.flow { emit(null) }
+    }
+
+    override suspend fun assignDriverToVehicle(driverId: String, vehicleId: String): Result<Unit> {
+        return safeCall {
+            driverDao.assignDriverToVehicle(driverId, vehicleId)
+            Unit
+        }
+    }
+
+    override suspend fun unassignDriverFromVehicle(driverId: String): Result<Unit> {
+        return safeCall {
+            driverDao.unassignDriverFromVehicle(driverId)
+            Unit
+        }
+    }
+
+    override suspend fun getDriverPerformance(id: String): Result<com.edham.logistics.domain.model.DriverPerformance> {
+        return safeCall {
+            val driver = driverDao.getDriverById(id)?.toDomain()
+                ?: throw Exception("Driver not found")
+            driver.performanceMetrics
+        }
+    }
+}

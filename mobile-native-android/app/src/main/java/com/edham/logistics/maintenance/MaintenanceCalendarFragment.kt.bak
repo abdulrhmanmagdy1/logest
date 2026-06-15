@@ -1,0 +1,357 @@
+package com.edham.logistics.maintenance
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.GridLayoutManager
+import com.edham.logistics.R
+import com.edham.logistics.databinding.FragmentMaintenanceCalendarBinding
+import com.edham.logistics.maintenance.adapters.CalendarDayAdapter
+import com.edham.logistics.maintenance.adapters.UpcomingMaintenanceAdapter
+import com.edham.logistics.maintenance.viewmodels.MaintenanceCalendarViewModel
+import com.google.android.material.datepicker.MaterialDatePicker
+import kotlinx.coroutines.launch
+import java.util.*
+import javax.inject.Inject
+
+/**
+ * Maintenance Calendar Fragment - Interactive calendar for maintenance scheduling and viewing
+ * 
+ * Features:
+ * - Monthly calendar view with maintenance indicators
+ * - Day-wise maintenance details
+ * - Navigation between months
+ * - Filter by maintenance type and priority
+ * - Upcoming maintenance list
+ * - Quick maintenance scheduling
+ * - Maintenance statistics
+ */
+class MaintenanceCalendarFragment @Inject constructor(
+    private val calendarDayAdapter: CalendarDayAdapter,
+    private val upcomingMaintenanceAdapter: UpcomingMaintenanceAdapter
+) : Fragment() {
+
+    private var _binding: FragmentMaintenanceCalendarBinding? = null
+    private val binding get() = _binding!!
+    
+    private lateinit var viewModel: MaintenanceCalendarViewModel
+    private var currentCalendar = Calendar.getInstance()
+    
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentMaintenanceCalendarBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        setupViewModel()
+        setupRecyclerViews()
+        setupClickListeners()
+        observeViewModel()
+        
+        // Load initial data
+        loadCalendarData()
+    }
+
+    private fun setupViewModel() {
+        viewModel = ViewModelProvider(this)[MaintenanceCalendarViewModel::class.java]
+    }
+
+    private fun setupRecyclerViews() {
+        // Setup calendar grid
+        binding.rvCalendarGrid.apply {
+            layoutManager = GridLayoutManager(context, 7)
+            adapter = calendarDayAdapter
+            isNestedScrollingEnabled = false
+        }
+        
+        // Setup upcoming maintenance list
+        binding.rvUpcomingMaintenance.apply {
+            layoutManager = androidx.recyclerview.widget.LinearLayoutManager(context)
+            adapter = upcomingMaintenanceAdapter
+            isNestedScrollingEnabled = false
+        }
+    }
+
+    private fun setupClickListeners() {
+        // Month navigation
+        binding.btnPreviousMonth.setOnClickListener {
+            navigateToPreviousMonth()
+        }
+        
+        binding.btnNextMonth.setOnClickListener {
+            navigateToNextMonth()
+        }
+        
+        // View all upcoming maintenance
+        binding.btnViewAllUpcoming.setOnClickListener {
+            navigateToAllUpcomingMaintenance()
+        }
+        
+        // Add maintenance
+        binding.fabAddMaintenance.setOnClickListener {
+            showAddMaintenanceDialog()
+        }
+        
+        // Toolbar menu
+        binding.toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_today -> {
+                    navigateToToday()
+                    true
+                }
+                R.id.action_date_picker -> {
+                    showDatePicker()
+                    true
+                }
+                R.id.action_refresh -> {
+                    refreshCalendarData()
+                    true
+                }
+                else -> false
+            }
+        }
+        
+        // Filter chips
+        setupFilterListeners()
+    }
+
+    private fun setupFilterListeners() {
+        // Maintenance type filter
+        binding.chipGroupMaintenanceType.setOnCheckedStateChangeListener { group, checkedIds ->
+            val selectedTypes = mutableListOf<String>()
+            
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as com.google.android.material.chip.Chip
+                if (chip.isChecked) {
+                    selectedTypes.add(chip.text.toString())
+                }
+            }
+            
+            viewModel.applyMaintenanceTypeFilter(selectedTypes)
+        }
+        
+        // Priority filter
+        binding.chipGroupPriority.setOnCheckedStateChangeListener { group, checkedIds ->
+            val selectedPriorities = mutableListOf<String>()
+            
+            for (i in 0 until group.childCount) {
+                val chip = group.getChildAt(i) as com.google.android.material.chip.Chip
+                if (chip.isChecked) {
+                    selectedPriorities.add(chip.text.toString())
+                }
+            }
+            
+            viewModel.applyPriorityFilter(selectedPriorities)
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.calendarState.collect { state ->
+                when (state) {
+                    is MaintenanceCalendarState.Loading -> {
+                        showLoadingState()
+                    }
+                    is MaintenanceCalendarState.Success -> {
+                        hideLoadingState()
+                        updateCalendarView(state.calendarData)
+                        updateMaintenanceSummary(state.summary)
+                        updateUpcomingMaintenance(state.upcomingMaintenance)
+                    }
+                    is MaintenanceCalendarState.Error -> {
+                        hideLoadingState()
+                        showError(state.message)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.currentMonth.collect { month ->
+                updateMonthDisplay(month)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.maintenanceEvents.collect { events ->
+                calendarDayAdapter.updateEvents(events)
+            }
+        }
+    }
+
+    private fun loadCalendarData() {
+        val year = currentCalendar.get(Calendar.YEAR)
+        val month = currentCalendar.get(Calendar.MONTH)
+        viewModel.loadCalendarData(year, month)
+    }
+
+    private fun updateCalendarView(calendarData: CalendarData) {
+        // Update calendar grid
+        calendarDayAdapter.submitList(calendarData.days)
+        
+        // Update month display
+        updateMonthDisplay(calendarData.month)
+    }
+
+    private fun updateMonthDisplay(month: String) {
+        binding.tvCurrentMonth.text = month
+    }
+
+    private fun updateMaintenanceSummary(summary: MaintenanceSummary) {
+        binding.tvScheduledCount.text = summary.scheduledCount.toString()
+        binding.tvInProgressCount.text = summary.inProgressCount.toString()
+        binding.tvCompletedCount.text = summary.completedCount.toString()
+    }
+
+    private fun updateUpcomingMaintenance(upcoming: List<UpcomingMaintenance>) {
+        upcomingMaintenanceAdapter.submitList(upcoming)
+    }
+
+    private fun navigateToPreviousMonth() {
+        currentCalendar.add(Calendar.MONTH, -1)
+        loadCalendarData()
+    }
+
+    private fun navigateToNextMonth() {
+        currentCalendar.add(Calendar.MONTH, 1)
+        loadCalendarData()
+    }
+
+    private fun navigateToToday() {
+        currentCalendar = Calendar.getInstance()
+        loadCalendarData()
+    }
+
+    private fun showDatePicker() {
+        val datePicker = MaterialDatePicker.Builder.datePicker()
+            .setTitleText("اختر التاريخ")
+            .setSelection(currentCalendar.timeInMillis)
+            .build()
+        
+        datePicker.addOnPositiveButtonClickListener { selection ->
+            selection?.let {
+                val selectedCalendar = Calendar.getInstance()
+                selectedCalendar.timeInMillis = it
+                currentCalendar = selectedCalendar
+                loadCalendarData()
+            }
+        }
+        
+        datePicker.show(childFragmentManager, "date_picker")
+    }
+
+    private fun refreshCalendarData() {
+        loadCalendarData()
+    }
+
+    private fun navigateToAllUpcomingMaintenance() {
+        // Navigate to all upcoming maintenance screen
+    }
+
+    private fun showAddMaintenanceDialog() {
+        // Show add maintenance dialog
+        val dialog = AddMaintenanceDialogFragment()
+        dialog.show(childFragmentManager, "add_maintenance_dialog")
+        
+        // Listen for maintenance creation
+        dialog.setOnMaintenanceCreated { maintenance ->
+            viewModel.addMaintenance(maintenance)
+        }
+    }
+
+    private fun showLoadingState() {
+        binding.layoutLoading.visibility = View.VISIBLE
+        binding.contentGroup.visibility = View.GONE
+    }
+
+    private fun hideLoadingState() {
+        binding.layoutLoading.visibility = View.GONE
+        binding.contentGroup.visibility = View.VISIBLE
+    }
+
+    private fun showError(message: String) {
+        com.google.android.material.snackbar.Snackbar.make(
+            binding.root,
+            message,
+            com.google.android.material.snackbar.Snackbar.LENGTH_LONG
+        ).show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Refresh calendar data when fragment becomes visible
+        loadCalendarData()
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+
+/**
+ * Data classes
+ */
+data class CalendarData(
+    val month: String,
+    val year: Int,
+    val days: List<CalendarDay>,
+    val maintenanceEvents: Map<String, List<MaintenanceEvent>>
+)
+
+data class CalendarDay(
+    val date: Int,
+    val month: Int,
+    val year: Int,
+    val isCurrentMonth: Boolean,
+    val isToday: Boolean,
+    val maintenanceEvents: List<MaintenanceEvent>,
+    val isSelected: Boolean = false
+)
+
+data class MaintenanceEvent(
+    val id: String,
+    val vehicleId: String,
+    val vehicleName: String,
+    val maintenanceType: String,
+    val priority: String,
+    val time: String,
+    val status: String
+)
+
+data class MaintenanceSummary(
+    val scheduledCount: Int,
+    val inProgressCount: Int,
+    val completedCount: Int
+)
+
+data class UpcomingMaintenance(
+    val id: String,
+    val vehicleId: String,
+    val vehicleName: String,
+    val maintenanceType: String,
+    val scheduledDate: String,
+    val scheduledTime: String,
+    val priority: String,
+    val technician: String,
+    val estimatedDuration: String
+)
+
+/**
+ * Enums
+ */
+enum class MaintenanceCalendarState {
+    Loading,
+    Success,
+    Error
+}

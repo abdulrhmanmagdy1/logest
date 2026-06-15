@@ -1,0 +1,889 @@
+package com.edham.logistics.finance.expense
+
+import android.content.Context
+import com.edham.logistics.data.local.database.EdhamDatabase
+import com.edham.logistics.data.remote.api.MaintenanceExpenseApi
+import com.edham.logistics.data.remote.api.VehicleApi
+import com.edham.logistics.data.remote.api.WorkshopApi
+import com.edham.logistics.utils.NetworkUtils
+import com.edham.logistics.utils.SecurityUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.util.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Maintenance Expense Service - Manages maintenance expense tracking and analysis
+ * 
+ * Features:
+ * - Maintenance expense creation and management
+ * - Maintenance type categorization
+ * - Maintenance scheduling and tracking
+ * - Workshop management
+ * - Parts inventory integration
+ * - Maintenance cost analysis
+ * - Maintenance history tracking
+ * - Predictive maintenance analytics
+ */
+@Singleton
+class MaintenanceExpenseService @Inject constructor(
+    private val context: Context,
+    private val database: EdhamDatabase,
+    private val maintenanceExpenseApi: MaintenanceExpenseApi,
+    private val vehicleApi: VehicleApi,
+    private val workshopApi: WorkshopApi,
+    private val networkUtils: NetworkUtils,
+    private val securityUtils: SecurityUtils
+) {
+    
+    private val _maintenanceExpenseState = MutableStateFlow<MaintenanceExpenseState>(MaintenanceExpenseState.Idle)
+    val maintenanceExpenseState: StateFlow<MaintenanceExpenseState> = _maintenanceExpenseState.asStateFlow()
+    
+    private val _maintenanceExpenses = MutableStateFlow<List<MaintenanceExpense>>(emptyList())
+    val maintenanceExpenses: StateFlow<List<MaintenanceExpense>> = _maintenanceExpenses.asStateFlow()
+    
+    private val _maintenanceExpenseStats = MutableStateFlow<MaintenanceExpenseStats>(MaintenanceExpenseStats())
+    val maintenanceExpenseStats: StateFlow<MaintenanceExpenseStats> = _maintenanceExpenseStats.asStateFlow()
+    
+    private var isInitialized = false
+    
+    companion object {
+        private const val TAG = "MaintenanceExpenseService"
+        private const val DEFAULT_CURRENCY = "SAR"
+        private const val MAINTENANCE_COST_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000L // 24 hours
+        private const val PREVENTIVE_MAINTENANCE_INTERVAL_KM = 10000f // km
+        private const val MAX_MAINTENANCE_COST = 50000f
+    }
+    
+    /**
+     * Initialize maintenance expense service
+     */
+    suspend fun initialize(): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            try {
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Initializing
+                
+                // Load maintenance expense configuration
+                loadMaintenanceExpenseConfiguration()
+                
+                // Load recent maintenance expenses
+                loadRecentMaintenanceExpenses()
+                
+                // Load maintenance types
+                loadMaintenanceTypes()
+                
+                isInitialized = true
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Ready
+                Result.success(true)
+                
+            } catch (e: Exception) {
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Error("Failed to initialize maintenance expense service: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Create maintenance expense
+     */
+    suspend fun createMaintenanceExpense(
+        maintenanceExpenseRequest: MaintenanceExpenseRequest
+    ): Result<MaintenanceExpense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Maintenance expense service not initialized")
+                }
+                
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Processing
+                
+                // Validate maintenance expense request
+                validateMaintenanceExpenseRequest(maintenanceExpenseRequest)
+                
+                // Get vehicle information
+                val vehicle = vehicleApi.getVehicleById(maintenanceExpenseRequest.vehicleId)
+                    ?: throw Exception("Vehicle not found")
+                
+                // Get workshop information
+                val workshop = maintenanceExpenseRequest.workshopId?.let { workshopId ->
+                    workshopApi.getWorkshopById(workshopId)
+                }
+                
+                // Create maintenance expense
+                val maintenanceExpense = MaintenanceExpense(
+                    id = UUID.randomUUID().toString(),
+                    vehicleId = maintenanceExpenseRequest.vehicleId,
+                    maintenanceType = maintenanceExpenseRequest.maintenanceType,
+                    description = maintenanceExpenseRequest.description,
+                    date = maintenanceExpenseRequest.date,
+                    odometerReading = maintenanceExpenseRequest.odometerReading,
+                    workshopId = maintenanceExpenseRequest.workshopId,
+                    workshopName = workshop?.name,
+                    laborCost = maintenanceExpenseRequest.laborCost,
+                    partsCost = maintenanceExpenseRequest.partsCost,
+                    totalCost = (maintenanceExpenseRequest.laborCost ?: 0f) + (maintenanceExpenseRequest.partsCost ?: 0f),
+                    currency = maintenanceExpenseRequest.currency ?: DEFAULT_CURRENCY,
+                    parts = maintenanceExpenseRequest.parts,
+                    receiptUrl = maintenanceExpenseRequest.receiptUrl,
+                    status = MaintenanceExpenseStatus.PENDING,
+                    metadata = maintenanceExpenseRequest.metadata,
+                    createdAt = Date(),
+                    updatedAt = Date()
+                )
+                
+                // Save to database
+                val savedMaintenanceExpense = database.maintenanceExpenseDao().insertMaintenanceExpense(maintenanceExpense.toEntity())
+                    .let { id -> maintenanceExpense.copy(id = id.toString()) }
+                
+                // Add to maintenance expenses list
+                addToMaintenanceExpenses(savedMaintenanceExpense)
+                
+                // Update vehicle maintenance information
+                updateVehicleMaintenanceInfo(vehicle, savedMaintenanceExpense)
+                
+                // Check for auto-approval
+                if (shouldAutoApprove(maintenanceExpenseRequest)) {
+                    processAutoApproval(savedMaintenanceExpense)
+                } else {
+                    // Submit for approval
+                    submitForApproval(savedMaintenanceExpense)
+                }
+                
+                // Update stats
+                updateMaintenanceExpenseStats()
+                
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Ready
+                Result.success(savedMaintenanceExpense)
+                
+            } catch (e: Exception) {
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Error("Maintenance expense creation failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Update maintenance expense
+     */
+    suspend fun updateMaintenanceExpense(
+        maintenanceExpense: MaintenanceExpense
+    ): Result<MaintenanceExpense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!isInitialized) {
+                    throw Exception("Maintenance expense service not initialized")
+                }
+                
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Processing
+                
+                // Validate maintenance expense
+                validateMaintenanceExpense(maintenanceExpense)
+                
+                // Recalculate total cost
+                val updatedMaintenanceExpense = maintenanceExpense.copy(
+                    totalCost = (maintenanceExpense.laborCost ?: 0f) + (maintenanceExpense.partsCost ?: 0f),
+                    updatedAt = Date()
+                )
+                
+                // Update in database
+                database.maintenanceExpenseDao().updateMaintenanceExpense(updatedMaintenanceExpense.toEntity())
+                
+                // Update in list
+                updateMaintenanceExpenseInList(updatedMaintenanceExpense)
+                
+                // Update stats
+                updateMaintenanceExpenseStats()
+                
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Ready
+                Result.success(updatedMaintenanceExpense)
+                
+            } catch (e: Exception) {
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Error("Maintenance expense update failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Process maintenance approval
+     */
+    suspend fun processMaintenanceApproval(
+        maintenanceExpenseId: String,
+        approved: Boolean,
+        approverId: String,
+        notes: String? = null
+    ): Result<MaintenanceExpense> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val maintenanceExpense = _maintenanceExpenses.value.find { it.id == maintenanceExpenseId }
+                    ?: throw Exception("Maintenance expense not found")
+                
+                if (maintenanceExpense.status != MaintenanceExpenseStatus.PENDING) {
+                    throw Exception("Maintenance expense is not pending approval")
+                }
+                
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Processing
+                
+                val updatedMaintenanceExpense = if (approved) {
+                    maintenanceExpense.copy(
+                        status = MaintenanceExpenseStatus.APPROVED,
+                        approvedBy = approverId,
+                        approvalNotes = notes,
+                        approvedAt = Date(),
+                        updatedAt = Date()
+                    )
+                } else {
+                    maintenanceExpense.copy(
+                        status = MaintenanceExpenseStatus.REJECTED,
+                        rejectedBy = approverId,
+                        rejectionReason = notes,
+                        rejectedAt = Date(),
+                        updatedAt = Date()
+                    )
+                }
+                
+                // Update in database
+                database.maintenanceExpenseDao().updateMaintenanceExpense(updatedMaintenanceExpense.toEntity())
+                
+                // Update in list
+                updateMaintenanceExpenseInList(updatedMaintenanceExpense)
+                
+                // Update stats
+                updateMaintenanceExpenseStats()
+                
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Ready
+                Result.success(updatedMaintenanceExpense)
+                
+            } catch (e: Exception) {
+                _maintenanceExpenseState.value = MaintenanceExpenseState.Error("Maintenance approval processing failed: ${e.message}")
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get maintenance expense by ID
+     */
+    suspend fun getMaintenanceExpense(maintenanceExpenseId: String): MaintenanceExpense? {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Try cache first
+                _maintenanceExpenses.value.find { it.id == maintenanceExpenseId }
+                    ?: database.maintenanceExpenseDao().getMaintenanceExpenseById(maintenanceExpenseId.toLong())?.toDomainModel()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+    
+    /**
+     * Get maintenance expense history
+     */
+    suspend fun getMaintenanceExpenseHistory(
+        vehicleId: String? = null,
+        dateRange: DateRange = DateRange.last30Days(),
+        maintenanceType: MaintenanceType? = null
+    ): Result<List<MaintenanceExpense>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val maintenanceExpenses = database.maintenanceExpenseDao().getMaintenanceExpenseHistory(
+                    vehicleId = vehicleId?.toLong(),
+                    startDate = dateRange.startDate,
+                    endDate = dateRange.endDate,
+                    maintenanceType = maintenanceType
+                ).map { it.toDomainModel() }
+                
+                Result.success(maintenanceExpenses)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get maintenance expense analytics
+     */
+    suspend fun getMaintenanceExpenseAnalytics(
+        dateRange: DateRange = DateRange.last30Days()
+    ): Result<MaintenanceExpenseAnalytics> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val maintenanceExpenses = getMaintenanceExpenseHistory(null, dateRange).getOrThrow()
+                
+                val analytics = MaintenanceExpenseAnalytics(
+                    totalExpenses = maintenanceExpenses.size,
+                    totalCost = maintenanceExpenses.sumOf { it.totalCost.toDouble() }.toFloat(),
+                    approvedExpenses = maintenanceExpenses.count { it.status == MaintenanceExpenseStatus.APPROVED },
+                    pendingExpenses = maintenanceExpenses.count { it.status == MaintenanceExpenseStatus.PENDING },
+                    rejectedExpenses = maintenanceExpenses.count { it.status == MaintenanceExpenseStatus.REJECTED },
+                    averageCost = if (maintenanceExpenses.isNotEmpty()) maintenanceExpenses.map { it.totalCost }.average().toFloat() else 0f,
+                    maintenanceTypeStats = maintenanceExpenses.groupBy { it.maintenanceType }.mapValues { it.value.size },
+                    vehicleStats = maintenanceExpenses.groupBy { it.vehicleId }.mapValues { it.value.size },
+                    workshopStats = maintenanceExpenses.groupBy { it.workshopId }.mapValues { it.value.size },
+                    monthlyStats = calculateMonthlyMaintenanceStats(maintenanceExpenses),
+                    costTrend = calculateCostTrend(maintenanceExpenses),
+                    predictiveMaintenance = calculatePredictiveMaintenance(maintenanceExpenses)
+                )
+                
+                Result.success(analytics)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get vehicle maintenance history
+     */
+    suspend fun getVehicleMaintenanceHistory(
+        vehicleId: String,
+        dateRange: DateRange = DateRange.last90Days()
+    ): Result<VehicleMaintenanceHistory> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val maintenanceExpenses = getMaintenanceExpenseHistory(vehicleId, dateRange).getOrThrow()
+                val vehicle = vehicleApi.getVehicleById(vehicleId) ?: throw Exception("Vehicle not found")
+                
+                val history = VehicleMaintenanceHistory(
+                    vehicleId = vehicleId,
+                    totalMaintenanceCost = maintenanceExpenses.sumOf { it.totalCost.toDouble() }.toFloat(),
+                    maintenanceCount = maintenanceExpenses.size,
+                    averageCost = if (maintenanceExpenses.isNotEmpty()) maintenanceExpenses.map { it.totalCost }.average().toFloat() else 0f,
+                    lastMaintenanceDate = maintenanceExpenses.maxOfOrNull { it.date },
+                    nextMaintenanceDate = calculateNextMaintenanceDate(vehicle, maintenanceExpenses),
+                    maintenanceTypeStats = maintenanceExpenses.groupBy { it.maintenanceType }.mapValues { it.value.size },
+                    costTrend = calculateCostTrend(maintenanceExpenses),
+                    maintenanceEfficiency = calculateMaintenanceEfficiency(vehicle, maintenanceExpenses)
+                )
+                
+                Result.success(history)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Get maintenance recommendations
+     */
+    suspend fun getMaintenanceRecommendations(
+        vehicleId: String
+    ): Result<List<MaintenanceRecommendation>> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val vehicle = vehicleApi.getVehicleById(vehicleId) ?: throw Exception("Vehicle not found")
+                val maintenanceExpenses = getMaintenanceExpenseHistory(vehicleId, DateRange.last90Days()).getOrThrow()
+                
+                val recommendations = mutableListOf<MaintenanceRecommendation>()
+                
+                // Check for preventive maintenance
+                val lastMaintenance = maintenanceExpenses.maxByOrNull { it.date }
+                val currentOdometer = vehicle.currentOdometer ?: 0f
+                
+                if (lastMaintenance != null && lastMaintenance.odometerReading != null) {
+                    val kmSinceLastMaintenance = currentOdometer - lastMaintenance.odometerReading
+                    if (kmSinceLastMaintenance >= PREVENTIVE_MAINTENANCE_INTERVAL_KM) {
+                        recommendations.add(
+                            MaintenanceRecommendation(
+                                type = MaintenanceType.PREVENTIVE,
+                                priority = RecommendationPriority.HIGH,
+                                description = "Preventive maintenance recommended based on mileage",
+                                estimatedCost = calculateEstimatedMaintenanceCost(MaintenanceType.PREVENTIVE, vehicle),
+                                dueDate = Date(),
+                                vehicleId = vehicleId
+                            )
+                        )
+                    }
+                }
+                
+                // Check for oil change
+                val oilChangeExpenses = maintenanceExpenses.filter { it.maintenanceType == MaintenanceType.OIL_CHANGE }
+                val lastOilChange = oilChangeExpenses.maxByOrNull { it.date }
+                
+                if (lastOilChange != null && lastOilChange.odometerReading != null) {
+                    val kmSinceLastOilChange = currentOdometer - lastOilChange.odometerReading
+                    if (kmSinceLastOilChange >= 5000f) { // Oil change every 5000km
+                        recommendations.add(
+                            MaintenanceRecommendation(
+                                type = MaintenanceType.OIL_CHANGE,
+                                priority = RecommendationPriority.MEDIUM,
+                                description = "Oil change recommended based on mileage",
+                                estimatedCost = calculateEstimatedMaintenanceCost(MaintenanceType.OIL_CHANGE, vehicle),
+                                dueDate = Date(),
+                                vehicleId = vehicleId
+                            )
+                        )
+                    }
+                }
+                
+                // Check for tire replacement
+                val tireExpenses = maintenanceExpenses.filter { it.maintenanceType == MaintenanceType.TIRE_REPLACEMENT }
+                val lastTireReplacement = tireExpenses.maxByOrNull { it.date }
+                
+                if (lastTireReplacement != null) {
+                    val monthsSinceLastTireReplacement = ((Date().time - lastTireReplacement.date.time) / (1000 * 60 * 60 * 24 * 30f)).toInt()
+                    if (monthsSinceLastTireReplacement >= 24) { // Replace tires every 2 years
+                        recommendations.add(
+                            MaintenanceRecommendation(
+                                type = MaintenanceType.TIRE_REPLACEMENT,
+                                priority = RecommendationPriority.LOW,
+                                description = "Tire replacement recommended based on time",
+                                estimatedCost = calculateEstimatedMaintenanceCost(MaintenanceType.TIRE_REPLACEMENT, vehicle),
+                                dueDate = Date(),
+                                vehicleId = vehicleId
+                            )
+                        )
+                    }
+                }
+                
+                Result.success(recommendations)
+                
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+    
+    /**
+     * Helper functions
+     */
+    private suspend fun loadMaintenanceExpenseConfiguration() {
+        // Load maintenance expense configuration from API or local storage
+    }
+    
+    private suspend fun loadRecentMaintenanceExpenses() {
+        try {
+            val maintenanceExpenses = database.maintenanceExpenseDao().getRecentMaintenanceExpenses(50)
+                .map { it.toDomainModel() }
+            
+            _maintenanceExpenses.value = maintenanceExpenses
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun loadMaintenanceTypes() {
+        // Load maintenance types from API or local storage
+    }
+    
+    private fun validateMaintenanceExpenseRequest(request: MaintenanceExpenseRequest) {
+        if (request.vehicleId.isBlank()) throw Exception("Vehicle ID is required")
+        if (request.maintenanceType == null) throw Exception("Maintenance type is required")
+        if (request.description.isBlank()) throw Exception("Description is required")
+        if (request.date == null) throw Exception("Maintenance date is required")
+        
+        val totalCost = (request.laborCost ?: 0f) + (request.partsCost ?: 0f)
+        if (totalCost <= 0) throw Exception("Total cost must be positive")
+        if (totalCost > MAX_MAINTENANCE_COST) throw Exception("Total cost exceeds maximum limit")
+    }
+    
+    private fun validateMaintenanceExpense(maintenanceExpense: MaintenanceExpense) {
+        if (maintenanceExpense.vehicleId.isBlank()) throw Exception("Vehicle ID is required")
+        if (maintenanceExpense.maintenanceType == null) throw Exception("Maintenance type is required")
+        if (maintenanceExpense.description.isBlank()) throw Exception("Description is required")
+        if (maintenanceExpense.date == null) throw Exception("Maintenance date is required")
+        if (maintenanceExpense.totalCost <= 0) throw Exception("Total cost must be positive")
+        if (maintenanceExpense.totalCost > MAX_MAINTENANCE_COST) throw Exception("Total cost exceeds maximum limit")
+    }
+    
+    private fun shouldAutoApprove(request: MaintenanceExpenseRequest): Boolean {
+        // Auto-approve if cost is below threshold and type allows it
+        val totalCost = (request.laborCost ?: 0f) + (request.partsCost ?: 0f)
+        return totalCost <= 1000f && request.maintenanceType in listOf(
+            MaintenanceType.OIL_CHANGE,
+            MaintenanceType.TIRE_ROTATION,
+            MaintenanceType.BATTERY_REPLACEMENT
+        )
+    }
+    
+    private suspend fun processAutoApproval(maintenanceExpense: MaintenanceExpense) {
+        try {
+            val approvedMaintenanceExpense = maintenanceExpense.copy(
+                status = MaintenanceExpenseStatus.APPROVED,
+                approvedBy = "SYSTEM",
+                approvalNotes = "Auto-approved",
+                approvedAt = Date(),
+                updatedAt = Date()
+            )
+            
+            // Update in database
+            database.maintenanceExpenseDao().updateMaintenanceExpense(approvedMaintenanceExpense.toEntity())
+            
+            // Update in list
+            updateMaintenanceExpenseInList(approvedMaintenanceExpense)
+            
+            // Update stats
+            updateMaintenanceExpenseStats()
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun submitForApproval(maintenanceExpense: MaintenanceExpense) {
+        try {
+            // Send notification to approvers
+            // This would integrate with notification system
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private suspend fun updateVehicleMaintenanceInfo(vehicle: Vehicle, maintenanceExpense: MaintenanceExpense) {
+        try {
+            val updatedVehicle = vehicle.copy(
+                lastMaintenanceDate = maintenanceExpense.date,
+                lastMaintenanceOdometer = maintenanceExpense.odometerReading,
+                lastMaintenanceCost = maintenanceExpense.totalCost,
+                updatedAt = Date()
+            )
+            
+            vehicleApi.updateVehicle(updatedVehicle)
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun addToMaintenanceExpenses(maintenanceExpense: MaintenanceExpense) {
+        val currentMaintenanceExpenses = _maintenanceExpenses.value.toMutableList()
+        currentMaintenanceExpenses.add(0, maintenanceExpense) // Add to beginning
+        
+        // Keep only last 100 maintenance expenses in cache
+        if (currentMaintenanceExpenses.size > 100) {
+            currentMaintenanceExpenses.removeAt(currentMaintenanceExpenses.size - 1)
+        }
+        
+        _maintenanceExpenses.value = currentMaintenanceExpenses
+    }
+    
+    private fun updateMaintenanceExpenseInList(maintenanceExpense: MaintenanceExpense) {
+        val currentMaintenanceExpenses = _maintenanceExpenses.value.toMutableList()
+        val index = currentMaintenanceExpenses.indexOfFirst { it.id == maintenanceExpense.id }
+        
+        if (index != -1) {
+            currentMaintenanceExpenses[index] = maintenanceExpense
+            _maintenanceExpenses.value = currentMaintenanceExpenses
+        }
+    }
+    
+    private suspend fun updateMaintenanceExpenseStats() {
+        try {
+            val maintenanceExpenses = _maintenanceExpenses.value
+            val stats = MaintenanceExpenseStats(
+                totalExpenses = maintenanceExpenses.size,
+                pendingExpenses = maintenanceExpenses.count { it.status == MaintenanceExpenseStatus.PENDING },
+                approvedExpenses = maintenanceExpenses.count { it.status == MaintenanceExpenseStatus.APPROVED },
+                rejectedExpenses = maintenanceExpenses.count { it.status == MaintenanceExpenseStatus.REJECTED },
+                totalCost = maintenanceExpenses.sumOf { it.totalCost.toDouble() }.toFloat(),
+                averageCost = if (maintenanceExpenses.isNotEmpty()) maintenanceExpenses.map { it.totalCost }.average().toFloat() else 0f,
+                maintenanceTypeStats = maintenanceExpenses.groupBy { it.maintenanceType }.mapValues { it.value.size }
+            )
+            
+            _maintenanceExpenseStats.value = stats
+            
+        } catch (e: Exception) {
+            // Handle error
+        }
+    }
+    
+    private fun calculateMonthlyMaintenanceStats(maintenanceExpenses: List<MaintenanceExpense>): Map<String, MonthlyMaintenanceStats> {
+        return maintenanceExpenses.groupBy { 
+            val calendar = Calendar.getInstance()
+            calendar.time = it.date
+            "${calendar.get(Calendar.YEAR)}-${String.format("%02d", calendar.get(Calendar.MONTH) + 1)}"
+        }.mapValues { (_, monthExpenses) ->
+            MonthlyMaintenanceStats(
+                expenseCount = monthExpenses.size,
+                totalCost = monthExpenses.sumOf { it.totalCost.toDouble() }.toFloat(),
+                averageCost = if (monthExpenses.isNotEmpty()) monthExpenses.map { it.totalCost }.average().toFloat() else 0f,
+                approvedExpenses = monthExpenses.count { it.status == MaintenanceExpenseStatus.APPROVED }
+            )
+        }
+    }
+    
+    private fun calculateCostTrend(maintenanceExpenses: List<MaintenanceExpense>): List<CostTrendPoint> {
+        return maintenanceExpenses
+            .sortedBy { it.date }
+            .map { expense ->
+                CostTrendPoint(
+                    date = expense.date,
+                    maintenanceType = expense.maintenanceType,
+                    cost = expense.totalCost
+                )
+            }
+    }
+    
+    private fun calculatePredictiveMaintenance(maintenanceExpenses: List<MaintenanceExpense>): PredictiveMaintenance {
+        val typeFrequency = maintenanceExpenses.groupBy { it.maintenanceType }
+            .mapValues { (_, expenses) ->
+                val intervals = expenses.sortedBy { it.date }.zipWithNext { a, b ->
+                    (b.date.time - a.date.time) / (1000 * 60 * 60 * 24f) // days
+                }
+                if (intervals.isNotEmpty()) intervals.average().toFloat() else 0f
+            }
+        
+        return PredictiveMaintenance(
+            maintenanceTypeFrequency = typeFrequency,
+            averageInterval = typeFrequency.values.average().toFloat(),
+            nextPredictiveMaintenance = calculateNextPredictiveMaintenance(maintenanceExpenses, typeFrequency)
+        )
+    }
+    
+    private fun calculateNextMaintenanceDate(vehicle: Vehicle, maintenanceExpenses: List<MaintenanceExpense>): Date? {
+        val lastMaintenance = maintenanceExpenses.maxByOrNull { it.date } ?: return null
+        val calendar = Calendar.getInstance()
+        calendar.time = lastMaintenance.date
+        calendar.add(Calendar.DAY_OF_MONTH, 90) // Next maintenance in 90 days
+        return calendar.time
+    }
+    
+    private fun calculateMaintenanceEfficiency(vehicle: Vehicle, maintenanceExpenses: List<MaintenanceExpense>): MaintenanceEfficiency {
+        val totalCost = maintenanceExpenses.sumOf { it.totalCost.toDouble() }.toFloat()
+        val daysSinceFirstMaintenance = if (maintenanceExpenses.isNotEmpty()) {
+            ((Date().time - maintenanceExpenses.minByOrNull { it.date }!!.date.time) / (1000 * 60 * 60 * 24f))
+        } else 0f
+        
+        return MaintenanceEfficiency(
+            costPerDay = if (daysSinceFirstMaintenance > 0) totalCost / daysSinceFirstMaintenance else 0f,
+            maintenanceFrequency = if (daysSinceFirstMaintenance > 0) maintenanceExpenses.size / (daysSinceFirstMaintenance / 30f) else 0f,
+            efficiencyRating = calculateEfficiencyRating(totalCost, daysSinceFirstMaintenance, maintenanceExpenses.size)
+        )
+    }
+    
+    private fun calculateEfficiencyRating(totalCost: Float, days: Float, count: Int): EfficiencyRating {
+        val costPerDay = if (days > 0) totalCost / days else 0f
+        return when {
+            costPerDay <= 10f -> EfficiencyRating.EXCELLENT
+            costPerDay <= 20f -> EfficiencyRating.GOOD
+            costPerDay <= 30f -> EfficiencyRating.AVERAGE
+            costPerDay <= 50f -> EfficiencyRating.POOR
+            else -> EfficiencyRating.VERY_POOR
+        }
+    }
+    
+    private fun calculateEstimatedMaintenanceCost(maintenanceType: MaintenanceType, vehicle: Vehicle): Float {
+        return when (maintenanceType) {
+            MaintenanceType.OIL_CHANGE -> 150f
+            MaintenanceType.TIRE_ROTATION -> 100f
+            MaintenanceType.TIRE_REPLACEMENT -> 800f
+            MaintenanceType.BATTERY_REPLACEMENT -> 300f
+            MaintenanceType.BRAKE_SERVICE -> 400f
+            MaintenanceType.PREVENTIVE -> 500f
+            MaintenanceType.MAJOR -> 2000f
+            MaintenanceType.MINOR -> 300f
+            MaintenanceType.EMERGENCY -> 1500f
+        }
+    }
+    
+    private fun calculateNextPredictiveMaintenance(
+        maintenanceExpenses: List<MaintenanceExpense>,
+        typeFrequency: Map<MaintenanceType, Float>
+    ): NextPredictiveMaintenance? {
+        val mostFrequentType = typeFrequency.maxByOrNull { it.value }?.key ?: return null
+        val lastMaintenanceOfType = maintenanceExpenses
+            .filter { it.maintenanceType == mostFrequentType }
+            .maxByOrNull { it.date } ?: return null
+        
+        val calendar = Calendar.getInstance()
+        calendar.time = lastMaintenanceOfType.date
+        calendar.add(Calendar.DAY_OF_MONTH, typeFrequency[mostFrequentType]?.toInt() ?: 90)
+        
+        return NextPredictiveMaintenance(
+            maintenanceType = mostFrequentType,
+            predictedDate = calendar.time,
+            confidence = 0.8f,
+            estimatedCost = calculateEstimatedMaintenanceCost(mostFrequentType, Vehicle())
+        )
+    }
+    
+    /**
+     * Get initialization status
+     */
+    fun isInitialized(): Boolean = isInitialized
+}
+
+/**
+ * Data classes
+ */
+data class MaintenanceExpenseRequest(
+    val vehicleId: String,
+    val maintenanceType: MaintenanceType,
+    val description: String,
+    val date: Date,
+    val odometerReading: Float? = null,
+    val workshopId: String? = null,
+    val laborCost: Float? = null,
+    val partsCost: Float? = null,
+    val currency: String? = null,
+    val parts: List<Part> = emptyList(),
+    val receiptUrl: String? = null,
+    val metadata: Map<String, String> = emptyMap()
+)
+
+data class MaintenanceExpense(
+    val id: String = "",
+    val vehicleId: String,
+    val maintenanceType: MaintenanceType,
+    val description: String,
+    val date: Date,
+    val odometerReading: Float? = null,
+    val workshopId: String? = null,
+    val workshopName: String? = null,
+    val laborCost: Float? = null,
+    val partsCost: Float? = null,
+    val totalCost: Float,
+    val currency: String,
+    val parts: List<Part> = emptyList(),
+    val receiptUrl: String? = null,
+    val status: MaintenanceExpenseStatus,
+    val approvedBy: String? = null,
+    val approvalNotes: String? = null,
+    val rejectedBy: String? = null,
+    val rejectionReason: String? = null,
+    val approvedAt: Date? = null,
+    val rejectedAt: Date? = null,
+    val metadata: Map<String, String> = emptyMap(),
+    val createdAt: Date = Date(),
+    val updatedAt: Date = Date()
+)
+
+data class MaintenanceExpenseAnalytics(
+    val totalExpenses: Int,
+    val totalCost: Float,
+    val approvedExpenses: Int,
+    val pendingExpenses: Int,
+    val rejectedExpenses: Int,
+    val averageCost: Float,
+    val maintenanceTypeStats: Map<MaintenanceType, Int>,
+    val vehicleStats: Map<String, Int>,
+    val workshopStats: Map<String, Int>,
+    val monthlyStats: Map<String, MonthlyMaintenanceStats>,
+    val costTrend: List<CostTrendPoint>,
+    val predictiveMaintenance: PredictiveMaintenance
+)
+
+data class MaintenanceExpenseStats(
+    val totalExpenses: Int = 0,
+    val pendingExpenses: Int = 0,
+    val approvedExpenses: Int = 0,
+    val rejectedExpenses: Int = 0,
+    val totalCost: Float = 0f,
+    val averageCost: Float = 0f,
+    val maintenanceTypeStats: Map<MaintenanceType, Int> = emptyMap()
+)
+
+data class VehicleMaintenanceHistory(
+    val vehicleId: String,
+    val totalMaintenanceCost: Float,
+    val maintenanceCount: Int,
+    val averageCost: Float,
+    val lastMaintenanceDate: Date?,
+    val nextMaintenanceDate: Date?,
+    val maintenanceTypeStats: Map<MaintenanceType, Int>,
+    val costTrend: List<CostTrendPoint>,
+    val maintenanceEfficiency: MaintenanceEfficiency
+)
+
+data class MaintenanceRecommendation(
+    val type: MaintenanceType,
+    val priority: RecommendationPriority,
+    val description: String,
+    val estimatedCost: Float,
+    val dueDate: Date,
+    val vehicleId: String
+)
+
+data class MonthlyMaintenanceStats(
+    val expenseCount: Int,
+    val totalCost: Float,
+    val averageCost: Float,
+    val approvedExpenses: Int
+)
+
+data class CostTrendPoint(
+    val date: Date,
+    val maintenanceType: MaintenanceType,
+    val cost: Float
+)
+
+data class PredictiveMaintenance(
+    val maintenanceTypeFrequency: Map<MaintenanceType, Float>,
+    val averageInterval: Float,
+    val nextPredictiveMaintenance: NextPredictiveMaintenance?
+)
+
+data class NextPredictiveMaintenance(
+    val maintenanceType: MaintenanceType,
+    val predictedDate: Date,
+    val confidence: Float,
+    val estimatedCost: Float
+)
+
+data class MaintenanceEfficiency(
+    val costPerDay: Float,
+    val maintenanceFrequency: Float,
+    val efficiencyRating: EfficiencyRating
+)
+
+data class Part(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val quantity: Int,
+    val unitPrice: Float,
+    val totalPrice: Float = quantity * unitPrice,
+    val partNumber: String? = null,
+    val manufacturer: String? = null
+)
+
+/**
+ * Enums
+ */
+enum class MaintenanceExpenseState {
+    Idle,
+    Initializing,
+    Ready,
+    Processing,
+    Error
+}
+
+enum class MaintenanceType {
+    OIL_CHANGE,
+    TIRE_ROTATION,
+    TIRE_REPLACEMENT,
+    BATTERY_REPLACEMENT,
+    BRAKE_SERVICE,
+    PREVENTIVE,
+    MAJOR,
+    MINOR,
+    EMERGENCY
+}
+
+enum class MaintenanceExpenseStatus {
+    PENDING,
+    APPROVED,
+    REJECTED,
+    CANCELLED
+}
+
+enum class RecommendationPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+enum class EfficiencyRating {
+    EXCELLENT,
+    GOOD,
+    AVERAGE,
+    POOR,
+    VERY_POOR
+}

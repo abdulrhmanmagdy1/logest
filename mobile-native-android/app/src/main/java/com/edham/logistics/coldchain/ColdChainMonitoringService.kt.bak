@@ -1,0 +1,723 @@
+package com.edham.logistics.coldchain
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.os.*
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.edham.logistics.R
+import com.edham.logistics.network.RetrofitClient
+import com.edham.logistics.network.api.ColdChainApi
+import com.edham.logistics.utils.BluetoothUtils
+import com.edham.logistics.utils.SensorUtils
+import kotlinx.coroutines.*
+import org.json.JSONObject
+import java.util.concurrent.ConcurrentLinkedQueue
+
+/**
+ * Cold-chain monitoring service for Android
+ * Provides real-time temperature tracking with visual indicators
+ */
+class ColdChainMonitoringService : Service() {
+
+    companion object {
+        private const val TAG = "ColdChainMonitoringService"
+        private const val NOTIFICATION_ID = 2001
+        private const val TEMPERATURE_CHECK_INTERVAL = 30000L // 30 seconds
+        private const val BLUETOOTH_SCAN_INTERVAL = 60000L // 1 minute
+        private const val OFFLINE_QUEUE_MAX_SIZE = 50
+        private const val CRITICAL_ALERT_VIBRATION_PATTERN = longArrayOf(0, 500, 200, 500, 200, 500)
+        private const val WARNING_ALERT_VIBRATION_PATTERN = longArrayOf(0, 300, 200, 300)
+        
+        // Temperature thresholds
+        private const val SAFE_MIN_TEMP = 2.0
+        private const val SAFE_MAX_TEMP = 8.0
+        private const val CRITICAL_MIN_TEMP = 0.0
+        private const val CRITICAL_MAX_TEMP = 10.0
+    }
+
+    private lateinit var coldChainApi: ColdChainApi
+    private lateinit var notificationManager: NotificationManager
+    private lateinit var bluetoothUtils: BluetoothUtils
+    private lateinit var sensorUtils: SensorUtils
+
+    // Service components
+    private var serviceJob: Job? = null
+    private var temperatureCheckJob: Job? = null
+    private var bluetoothScanJob: Job? = null
+    private var alertProcessingJob: Job? = null
+
+    // Monitoring state
+    private var activeShipmentId: Long? = null
+    private var currentTemperature: Double? = null
+    private var currentStatus: TemperatureStatus = TemperatureStatus.NO_DATA
+    private var lastAlertTime: Long = 0
+    private var offlineQueue = ConcurrentLinkedQueue<TemperatureReading>()
+    private var connectedSensors = mutableListOf<BluetoothSensor>()
+
+    // Performance tracking
+    private var totalReadings = 0
+    private var successfulUploads = 0
+    private var failedUploads = 0
+    private var sessionStartTime = 0L
+
+    enum class TemperatureStatus {
+        SAFE, WARNING, CRITICAL, NO_DATA
+    }
+
+    enum class AlertType {
+        TEMPERATURE_WARNING, TEMPERATURE_CRITICAL, TEMPERATURE_NORMALIZED, SENSOR_DISCONNECTED, SENSOR_CONNECTED
+    }
+
+    data class TemperatureReading(
+        val temperature: Double,
+        val humidity: Double?,
+        val sensorId: String,
+        val location: String?,
+        val timestamp: Long,
+        val batteryLevel: Int?,
+        val signalStrength: Int?
+    )
+
+    data class BluetoothSensor(
+        val id: String,
+        val name: String,
+        val address: String,
+        val isConnected: Boolean,
+        val lastReading: TemperatureReading?,
+        val batteryLevel: Int?
+    )
+
+    data class ColdChainAlert(
+        val type: AlertType,
+        val temperature: Double?,
+        val message: String,
+        val timestamp: Long,
+        val severity: AlertSeverity
+    )
+
+    enum class AlertSeverity {
+        INFO, WARNING, CRITICAL
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        Log.d(TAG, "Cold-chain monitoring service starting")
+
+        initializeComponents()
+        startForegroundService()
+        startTemperatureMonitoring()
+        startBluetoothScanning()
+        startAlertProcessing()
+
+        sessionStartTime = System.currentTimeMillis()
+        Log.i(TAG, "Cold-chain monitoring service initialized successfully")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            "START_MONITORING" -> {
+                val shipmentId = intent.getLongExtra("shipment_id", -1L)
+                val productType = intent.getStringExtra("product_type") ?: "REFRIGERATED"
+                startMonitoring(shipmentId, productType)
+            }
+            "STOP_MONITORING" -> {
+                stopMonitoring()
+            }
+            "TEMPERATURE_UPDATE" -> {
+                val temperature = intent.getDoubleExtra("temperature", 0.0)
+                val humidity = intent.getDoubleExtra("humidity", 0.0)
+                val sensorId = intent.getStringExtra("sensor_id") ?: ""
+                processTemperatureUpdate(temperature, humidity, sensorId)
+            }
+        }
+
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Log.d(TAG, "Cold-chain monitoring service stopping")
+
+        stopTemperatureMonitoring()
+        stopBluetoothScanning()
+        stopAlertProcessing()
+
+        // Upload remaining offline data
+        if (offlineQueue.isNotEmpty()) {
+            uploadOfflineData()
+        }
+
+        Log.i(TAG, "Cold-chain monitoring service stopped. Stats: Readings: $totalReadings, Success: $successfulUploads, Failed: $failedUploads")
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun initializeComponents() {
+        coldChainApi = RetrofitClient.getInstance().create(ColdChainApi::class.java)
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        bluetoothUtils = BluetoothUtils(this)
+        sensorUtils = SensorUtils(this)
+    }
+
+    private fun startForegroundService() {
+        val notification = createNotification()
+        startForeground(NOTIFICATION_ID, notification)
+        Log.d(TAG, "Foreground service started")
+    }
+
+    private fun createNotification(): Notification {
+        val channelId = "cold_chain_monitoring_channel"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Cold-Chain Monitoring",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Monitors temperature for cold-chain shipments"
+                setShowBadge(true)
+                enableVibration(true)
+                setVibrationPattern(CRITICAL_ALERT_VIBRATION_PATTERN)
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Cold-Chain Monitoring")
+            .setContentText("Temperature monitoring active")
+            .setSmallIcon(R.drawable.ic_thermometer)
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVibrate(CRITICAL_ALERT_VIBRATION_PATTERN)
+            .build()
+    }
+
+    private fun startTemperatureMonitoring() {
+        temperatureCheckJob = CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                try {
+                    checkTemperatureSensors()
+                    delay(TEMPERATURE_CHECK_INTERVAL)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in temperature monitoring", e)
+                }
+            }
+        }
+    }
+
+    private fun startBluetoothScanning() {
+        bluetoothScanJob = CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                try {
+                    scanForSensors()
+                    delay(BLUETOOTH_SCAN_INTERVAL)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in Bluetooth scanning", e)
+                }
+            }
+        }
+    }
+
+    private fun startAlertProcessing() {
+        alertProcessingJob = CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                try {
+                    processAlertQueue()
+                    delay(5000) // Process every 5 seconds
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in alert processing", e)
+                }
+            }
+        }
+    }
+
+    private fun checkTemperatureSensors() {
+        try {
+            // Check connected Bluetooth sensors
+            val connectedSensors = bluetoothUtils.getConnectedSensors()
+            updateConnectedSensors(connectedSensors)
+
+            // Check built-in sensors
+            val deviceTemperature = sensorUtils.getDeviceTemperature()
+            val ambientTemperature = sensorUtils.getAmbientTemperature()
+
+            // Process readings from all sensors
+            connectedSensors.forEach { sensor ->
+                val reading = sensorUtils.getSensorReading(sensor.id)
+                if (reading != null) {
+                    processTemperatureReading(reading)
+                }
+            }
+
+            // Use device sensors as fallback
+            if (connectedSensors.isEmpty()) {
+                if (deviceTemperature != null) {
+                    val fallbackReading = TemperatureReading(
+                        temperature = deviceTemperature,
+                        humidity = null,
+                        sensorId = "device_sensor",
+                        location = null,
+                        timestamp = System.currentTimeMillis(),
+                        batteryLevel = null,
+                        signalStrength = null
+                    )
+                    processTemperatureReading(fallbackReading)
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking temperature sensors", e)
+        }
+    }
+
+    private fun scanForSensors() {
+        try {
+            val discoveredSensors = bluetoothUtils.scanForSensors()
+            
+            discoveredSensors.forEach { sensor ->
+                if (!connectedSensors.any { it.id == sensor.id }) {
+                    // Try to connect to new sensor
+                    val connected = bluetoothUtils.connectToSensor(sensor.address)
+                    if (connected) {
+                        val bluetoothSensor = BluetoothSensor(
+                            id = sensor.id,
+                            name = sensor.name,
+                            address = sensor.address,
+                            isConnected = true,
+                            lastReading = null,
+                            batteryLevel = null
+                        )
+                        connectedSensors.add(bluetoothSensor)
+                        
+                        val alert = ColdChainAlert(
+                            type = AlertType.SENSOR_CONNECTED,
+                            temperature = null,
+                            message = "Sensor connected: ${sensor.name}",
+                            timestamp = System.currentTimeMillis(),
+                            severity = AlertSeverity.INFO
+                        )
+                        handleAlert(alert)
+                    }
+                }
+            }
+
+            // Check for disconnected sensors
+            connectedSensors.removeAll { sensor ->
+                val stillConnected = discoveredSensors.any { it.id == sensor.id }
+                if (!stillConnected && sensor.isConnected) {
+                    val alert = ColdChainAlert(
+                        type = AlertType.SENSOR_DISCONNECTED,
+                        temperature = null,
+                        message = "Sensor disconnected: ${sensor.name}",
+                        timestamp = System.currentTimeMillis(),
+                        severity = AlertSeverity.WARNING
+                    )
+                    handleAlert(alert)
+                    true // Remove from list
+                } else {
+                    false // Keep in list
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error scanning for sensors", e)
+        }
+    }
+
+    private fun processTemperatureReading(reading: TemperatureReading) {
+        totalReadings++
+        currentTemperature = reading.temperature
+        currentStatus = determineTemperatureStatus(reading.temperature)
+
+        // Add to offline queue if needed
+        if (!isNetworkAvailable()) {
+            offlineQueue.offer(reading)
+            if (offlineQueue.size > OFFLINE_QUEUE_MAX_SIZE) {
+                offlineQueue.poll() // Remove oldest
+            }
+            Log.d(TAG, "Stored temperature reading offline. Queue size: ${offlineQueue.size}")
+        }
+
+        // Update notification with visual indicator
+        updateNotification(reading.temperature, currentStatus)
+
+        // Check for threshold violations
+        checkThresholdViolations(reading)
+
+        // Upload to server
+        uploadTemperatureReading(reading)
+
+        Log.d(TAG, "Temperature reading processed: ${reading.temperature}°C, Status: $currentStatus")
+    }
+
+    private fun processTemperatureUpdate(temperature: Double, humidity: Double, sensorId: String) {
+        val reading = TemperatureReading(
+            temperature = temperature,
+            humidity = humidity,
+            sensorId = sensorId,
+            location = null,
+            timestamp = System.currentTimeMillis(),
+            batteryLevel = null,
+            signalStrength = null
+        )
+        processTemperatureReading(reading)
+    }
+
+    private fun determineTemperatureStatus(temperature: Double): TemperatureStatus {
+        return when {
+            temperature < CRITICAL_MIN_TEMP || temperature > CRITICAL_MAX_TEMP -> TemperatureStatus.CRITICAL
+            temperature < SAFE_MIN_TEMP || temperature > SAFE_MAX_TEMP -> TemperatureStatus.WARNING
+            else -> TemperatureStatus.SAFE
+        }
+    }
+
+    private fun checkThresholdViolations(reading: TemperatureReading) {
+        val currentTime = System.currentTimeMillis()
+        
+        // Prevent alert spam
+        if (currentTime - lastAlertTime < 30000) return // 30 seconds between alerts
+        
+        val status = determineTemperatureStatus(reading.temperature)
+        val previousStatus = currentStatus
+        
+        if (status != previousStatus) {
+            val alertType = when (status) {
+                TemperatureStatus.CRITICAL -> AlertType.TEMPERATURE_CRITICAL
+                TemperatureStatus.WARNING -> AlertType.TEMPERATURE_WARNING
+                TemperatureStatus.SAFE -> AlertType.TEMPERATURE_NORMALIZED
+                else -> return
+            }
+
+            val severity = when (status) {
+                TemperatureStatus.CRITICAL -> AlertSeverity.CRITICAL
+                TemperatureStatus.WARNING -> AlertSeverity.WARNING
+                TemperatureStatus.SAFE -> AlertSeverity.INFO
+                else -> AlertSeverity.INFO
+            }
+
+            val message = generateAlertMessage(status, reading.temperature)
+
+            val alert = ColdChainAlert(
+                type = alertType,
+                temperature = reading.temperature,
+                message = message,
+                timestamp = currentTime,
+                severity = severity
+            )
+
+            handleAlert(alert)
+            lastAlertTime = currentTime
+        }
+    }
+
+    private fun generateAlertMessage(status: TemperatureStatus, temperature: Double): String {
+        return when (status) {
+            TemperatureStatus.CRITICAL -> String.format("CRITICAL: Temperature %.1f°C is outside critical range (%.1f°C to %.1f°C)", temperature, CRITICAL_MIN_TEMP, CRITICAL_MAX_TEMP)
+            TemperatureStatus.WARNING -> String.format("WARNING: Temperature %.1f°C is outside safe range (%.1f°C to %.1f°C)", temperature, SAFE_MIN_TEMP, SAFE_MAX_TEMP)
+            TemperatureStatus.SAFE -> String.format("INFO: Temperature %.1f°C is within safe range (%.1f°C to %.1f°C)", temperature, SAFE_MIN_TEMP, SAFE_MAX_TEMP)
+            else -> "Temperature status unknown"
+        }
+    }
+
+    private fun handleAlert(alert: ColdChainAlert) {
+        try {
+            // Show notification with visual indicators
+            showAlertNotification(alert)
+
+            // Play sound and vibration based on severity
+            when (alert.severity) {
+                AlertSeverity.CRITICAL -> {
+                    playCriticalAlertSound()
+                    vibrateDevice(CRITICAL_ALERT_VIBRATION_PATTERN)
+                }
+                AlertSeverity.WARNING -> {
+                    playWarningAlertSound()
+                    vibrateDevice(WARNING_ALERT_VIBRATION_PATTERN)
+                }
+                AlertSeverity.INFO -> {
+                    // Just notification, no sound/vibration
+                }
+            }
+
+            // Update visual indicators
+            updateVisualIndicators(alert)
+
+            // Broadcast to UI
+            broadcastAlert(alert)
+
+            Log.i(TAG, "Alert handled: ${alert.type}, Message: ${alert.message}")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling alert", e)
+        }
+    }
+
+    private fun showAlertNotification(alert: ColdChainAlert) {
+        val channelId = "cold_chain_alerts_channel"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Cold-Chain Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Temperature alerts for cold-chain monitoring"
+                setShowBadge(true)
+                enableVibration(true)
+                when (alert.severity) {
+                    AlertSeverity.CRITICAL -> {
+                        setVibrationPattern(CRITICAL_ALERT_VIBRATION_PATTERN)
+                        enableLights(true)
+                        setLightColor(android.graphics.Color.RED)
+                    }
+                    AlertSeverity.WARNING -> {
+                        setVibrationPattern(WARNING_ALERT_VIBRATION_PATTERN)
+                        enableLights(true)
+                        setLightColor(android.graphics.Color.YELLOW)
+                    }
+                    else -> {
+                        setVibrationPattern(longArrayOf(0))
+                        enableLights(false)
+                    }
+                }
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Cold-Chain Alert")
+            .setContentText(alert.message)
+            .setSmallIcon(getStatusIcon(alert.severity))
+            .setColor(getStatusColor(alert.severity))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setAutoCancel(true)
+            .setDefaults(0) // We handle sound and vibration manually
+            .build()
+
+        notificationManager.notify(System.currentTimeMillis().toInt(), notification)
+    }
+
+    private fun updateNotification(temperature: Double, status: TemperatureStatus) {
+        val channelId = "cold_chain_monitoring_channel"
+        
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Cold-Chain Monitoring")
+            .setContentText("Current: ${temperature}°C - ${status.name}")
+            .setSmallIcon(R.drawable.ic_thermometer)
+            .setColor(getStatusColor(status))
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun updateVisualIndicators(alert: ColdChainAlert) {
+        // Update UI components with visual indicators
+        val intent = Intent("com.edham.logistics.COLD_CHAIN_ALERT")
+        intent.putExtra("alert_type", alert.type.name)
+        intent.putExtra("temperature", alert.temperature)
+        intent.putExtra("message", alert.message)
+        intent.putExtra("severity", alert.severity.name)
+        intent.putExtra("color", getStatusColor(alert.severity))
+        intent.putExtra("icon", getStatusIcon(alert.severity))
+        
+        sendBroadcast(intent)
+    }
+
+    private fun broadcastAlert(alert: ColdChainAlert) {
+        val intent = Intent("com.edham.logistics.COLD_CHAIN_UPDATE")
+        intent.putExtra("alert", alert)
+        sendBroadcast(intent)
+    }
+
+    private fun uploadTemperatureReading(reading: TemperatureReading) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val request = mapOf(
+                    "shipmentId" to (activeShipmentId ?: -1L),
+                    "temperature" to reading.temperature,
+                    "humidity" to reading.humidity,
+                    "sensorId" to reading.sensorId,
+                    "location" to reading.location,
+                    "deviceId" to android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID),
+                    "batteryLevel" to reading.batteryLevel,
+                    "signalStrength" to reading.signalStrength
+                )
+
+                val response = coldChainApi.recordTemperature(request)
+                
+                if (response.isSuccessful) {
+                    successfulUploads++
+                    
+                    // Process offline queue if successful
+                    if (offlineQueue.isNotEmpty()) {
+                        uploadOfflineData()
+                    }
+                } else {
+                    failedUploads++
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error uploading temperature reading", e)
+                failedUploads++
+            }
+        }
+    }
+
+    private fun uploadOfflineData() {
+        if (offlineQueue.isEmpty()) return
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val offlineData = offlineQueue.toList()
+                offlineQueue.clear()
+
+                offlineData.forEach { reading ->
+                    val request = mapOf(
+                        "shipmentId" to (activeShipmentId ?: -1L),
+                        "temperature" to reading.temperature,
+                        "humidity" to reading.humidity,
+                        "sensorId" to reading.sensorId,
+                        "location" to reading.location,
+                        "deviceId" to android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID),
+                        "batteryLevel" to reading.batteryLevel,
+                        "signalStrength" to reading.signalStrength
+                    )
+
+                    val response = coldChainApi.recordTemperature(request)
+                    if (response.isSuccessful) {
+                        successfulUploads++
+                    } else {
+                        // Re-add to queue if failed
+                        offlineQueue.offer(reading)
+                        failedUploads++
+                    }
+                }
+
+                Log.i(TAG, "Uploaded ${offlineData.size} offline temperature readings")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error uploading offline data", e)
+                // Re-add all to queue if failed
+                offlineQueue.addAll(offlineData)
+            }
+        }
+    }
+
+    private fun processAlertQueue() {
+        // Process any pending alerts
+        // Implementation would depend on alert queue system
+    }
+
+    private fun updateConnectedSensors(sensors: List<BluetoothSensor>) {
+        connectedSensors.clear()
+        connectedSensors.addAll(sensors)
+        Log.d(TAG, "Connected sensors updated: ${sensors.size}")
+    }
+
+    private fun startMonitoring(shipmentId: Long, productType: String) {
+        activeShipmentId = shipmentId
+        Log.i(TAG, "Started cold-chain monitoring for shipment: $shipmentId, product: $productType")
+    }
+
+    private fun stopMonitoring() {
+        activeShipmentId = null
+        currentTemperature = null
+        currentStatus = TemperatureStatus.NO_DATA
+        Log.i(TAG, "Stopped cold-chain monitoring")
+    }
+
+    private fun stopTemperatureMonitoring() {
+        temperatureCheckJob?.cancel()
+    }
+
+    private fun stopBluetoothScanning() {
+        bluetoothScanJob?.cancel()
+    }
+
+    private fun stopAlertProcessing() {
+        alertProcessingJob?.cancel()
+    }
+
+    // Helper methods
+    private fun isNetworkAvailable(): Boolean {
+        // Implementation to check network availability
+        return true // Placeholder
+    }
+
+    private fun playCriticalAlertSound() {
+        // Play critical alert sound
+        Log.d(TAG, "Playing critical alert sound")
+    }
+
+    private fun playWarningAlertSound() {
+        // Play warning alert sound
+        Log.d(TAG, "Playing warning alert sound")
+    }
+
+    private fun vibrateDevice(pattern: LongArray) {
+        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(pattern, -1)
+        }
+    }
+
+    private fun getStatusColor(status: TemperatureStatus): Int {
+        return when (status) {
+            TemperatureStatus.SAFE -> android.graphics.Color.parseColor("#10B981") // Green
+            TemperatureStatus.WARNING -> android.graphics.Color.parseColor("#F59E0B") // Yellow
+            TemperatureStatus.CRITICAL -> android.graphics.Color.parseColor("#EF4444") // Red
+            TemperatureStatus.NO_DATA -> android.graphics.Color.parseColor("#9CA3AF") // Gray
+        }
+    }
+
+    private fun getStatusColor(severity: AlertSeverity): Int {
+        return when (severity) {
+            AlertSeverity.INFO -> android.graphics.Color.parseColor("#10B981") // Green
+            AlertSeverity.WARNING -> android.graphics.Color.parseColor("#F59E0B") // Yellow
+            AlertSeverity.CRITICAL -> android.graphics.Color.parseColor("#EF4444") // Red
+        }
+    }
+
+    private fun getStatusIcon(severity: AlertSeverity): Int {
+        return when (severity) {
+            AlertSeverity.INFO -> R.drawable.ic_thermometer_safe
+            AlertSeverity.WARNING -> R.drawable.ic_thermometer_warning
+            AlertSeverity.CRITICAL -> R.drawable.ic_thermometer_critical
+        }
+    }
+
+    private fun getStatusIcon(status: TemperatureStatus): Int {
+        return when (status) {
+            TemperatureStatus.SAFE -> R.drawable.ic_thermometer_safe
+            TemperatureStatus.WARNING -> R.drawable.ic_thermometer_warning
+            TemperatureStatus.CRITICAL -> R.drawable.ic_thermometer_critical
+            TemperatureStatus.NO_DATA -> R.drawable.ic_thermometer_off
+        }
+    }
+
+    fun getMonitoringStatus(): Map<String, Any> {
+        return mapOf(
+            "isActive" to (activeShipmentId != null),
+            "shipmentId" to (activeShipmentId ?: "none"),
+            "currentTemperature" to (currentTemperature ?: "no data"),
+            "currentStatus" to currentStatus.name,
+            "connectedSensors" to connectedSensors.size,
+            "totalReadings" to totalReadings,
+            "successfulUploads" to successfulUploads,
+            "failedUploads" to failedUploads,
+            "offlineQueueSize" to offlineQueue.size,
+            "sessionDuration" to (if (sessionStartTime > 0) System.currentTimeMillis() - sessionStartTime else 0)
+        )
+    }
+}

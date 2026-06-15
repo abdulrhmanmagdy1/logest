@@ -1,0 +1,471 @@
+package com.edham.logistics.offline.conflict
+
+import kotlinx.coroutines.*
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Conflict Resolution System
+ * Handles data conflicts between local and server data
+ * Implements multiple resolution strategies and automatic conflict detection
+ */
+
+// Temporarily disabled due to missing dependencies
+// @Singleton
+// class ConflictResolver @Inject constructor(
+//     private val offlineRepository: OfflineRepository,
+//     private val conflictLogger: ConflictLogger
+// ) {
+class ConflictResolver {
+
+    /**
+     * Resolve conflict between local and server data
+     */
+    suspend fun resolveConflict(localData: Any, serverData: Any): ConflictResolution {
+        return try {
+            val conflictType = detectConflictType(localData, serverData)
+            val strategy = selectResolutionStrategy(conflictType, localData, serverData)
+            val resolvedData = applyResolutionStrategy(strategy, localData, serverData)
+            
+            val resolution = ConflictResolution(
+                localData = localData,
+                serverData = serverData,
+                resolution = strategy,
+                resolvedData = resolvedData
+            )
+            
+            // Log the conflict resolution
+            conflictLogger.logConflict(resolution)
+            
+            Timber.d("Resolved conflict using strategy: $strategy")
+            resolution
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error resolving conflict")
+            // Fallback to server wins on error
+            ConflictResolution(
+                localData = localData,
+                serverData = serverData,
+                resolution = ConflictStrategy.SERVER_WINS,
+                resolvedData = serverData
+            )
+        }
+    }
+
+    /**
+     * Detect type of conflict
+     */
+    private fun detectConflictType(localData: Any, serverData: Any): ConflictType {
+        return when {
+            localData.javaClass != serverData.javaClass -> ConflictType.TYPE_MISMATCH
+            isVersionConflict(localData, serverData) -> ConflictType.VERSION_CONFLICT
+            isDataConflict(localData, serverData) -> ConflictType.DATA_CONFLICT
+            isTimestampConflict(localData, serverData) -> ConflictType.TIMESTAMP_CONFLICT
+            isStatusConflict(localData, serverData) -> ConflictType.STATUS_CONFLICT
+            else -> ConflictType.UNKNOWN
+        }
+    }
+
+    /**
+     * Select appropriate resolution strategy
+     */
+    private fun selectResolutionStrategy(
+        conflictType: ConflictType,
+        localData: Any,
+        serverData: Any
+    ): ConflictStrategy {
+        return when (conflictType) {
+            ConflictType.TYPE_MISMATCH -> ConflictStrategy.SERVER_WINS
+            ConflictType.VERSION_CONFLICT -> resolveVersionConflict(localData, serverData)
+            ConflictType.DATA_CONFLICT -> resolveDataConflict(localData, serverData)
+            ConflictType.TIMESTAMP_CONFLICT -> resolveTimestampConflict(localData, serverData)
+            ConflictType.STATUS_CONFLICT -> resolveStatusConflict(localData, serverData)
+            ConflictType.UNKNOWN -> ConflictStrategy.MANUAL
+        }
+    }
+
+    /**
+     * Apply resolution strategy
+     */
+    private fun applyResolutionStrategy(
+        strategy: ConflictStrategy,
+        localData: Any,
+        serverData: Any
+    ): Any {
+        return when (strategy) {
+            ConflictStrategy.CLIENT_WINS -> localData
+            ConflictStrategy.SERVER_WINS -> serverData
+            ConflictStrategy.MERGE -> mergeData(localData, serverData)
+            ConflictStrategy.MANUAL -> localData // Default to local for manual resolution
+        }
+    }
+
+    // Conflict detection methods
+
+    private fun isVersionConflict(localData: Any, serverData: Any): Boolean {
+        return try {
+            val localVersion = extractVersion(localData)
+            val serverVersion = extractVersion(serverData)
+            localVersion != serverVersion
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun isDataConflict(localData: Any, serverData: Any): Boolean {
+        return try {
+            val localHash = calculateDataHash(localData)
+            val serverHash = calculateDataHash(serverData)
+            localHash != serverHash
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun isTimestampConflict(localData: Any, serverData: Any): Boolean {
+        return try {
+            val localTimestamp = extractTimestamp(localData)
+            val serverTimestamp = extractTimestamp(serverData)
+            localTimestamp != serverTimestamp
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun isStatusConflict(localData: Any, serverData: Any): Boolean {
+        return try {
+            val localStatus = extractStatus(localData)
+            val serverStatus = extractStatus(serverData)
+            localStatus != serverStatus
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Resolution strategy methods
+
+    private fun resolveVersionConflict(localData: Any, serverData: Any): ConflictStrategy {
+        return try {
+            val localVersion = extractVersion(localData)
+            val serverVersion = extractVersion(serverData)
+            
+            when {
+                localVersion > serverVersion -> ConflictStrategy.CLIENT_WINS
+                serverVersion > localVersion -> ConflictStrategy.SERVER_WINS
+                else -> ConflictStrategy.MERGE
+            }
+        } catch (e: Exception) {
+            ConflictStrategy.SERVER_WINS
+        }
+    }
+
+    private fun resolveDataConflict(localData: Any, serverData: Any): ConflictStrategy {
+        return try {
+            val localTimestamp = extractTimestamp(localData)
+            val serverTimestamp = extractTimestamp(serverData)
+            
+            // For data conflicts, prefer the most recently updated
+            when {
+                localTimestamp > serverTimestamp -> ConflictStrategy.CLIENT_WINS
+                serverTimestamp > localTimestamp -> ConflictStrategy.SERVER_WINS
+                else -> ConflictStrategy.MERGE
+            }
+        } catch (e: Exception) {
+            ConflictStrategy.MERGE
+        }
+    }
+
+    private fun resolveTimestampConflict(localData: Any, serverData: Any): ConflictStrategy {
+        return try {
+            val localTimestamp = extractTimestamp(localData)
+            val serverTimestamp = extractTimestamp(serverData)
+            
+            // Use the more recent timestamp
+            if (localTimestamp > serverTimestamp) {
+                ConflictStrategy.CLIENT_WINS
+            } else {
+                ConflictStrategy.SERVER_WINS
+            }
+        } catch (e: Exception) {
+            ConflictStrategy.SERVER_WINS
+        }
+    }
+
+    private fun resolveStatusConflict(localData: Any, serverData: Any): ConflictStrategy {
+        return try {
+            val localStatus = extractStatus(localData)
+            val serverStatus = extractStatus(serverData)
+            
+            // For status conflicts, use business logic to determine winner
+            when {
+                isFinalStatus(localStatus) -> ConflictStrategy.CLIENT_WINS
+                isFinalStatus(serverStatus) -> ConflictStrategy.SERVER_WINS
+                isHigherPriorityStatus(localStatus, serverStatus) -> ConflictStrategy.CLIENT_WINS
+                else -> ConflictStrategy.SERVER_WINS
+            }
+        } catch (e: Exception) {
+            ConflictStrategy.SERVER_WINS
+        }
+    }
+
+    private fun mergeData(localData: Any, serverData: Any): Any {
+        return try {
+            when (localData) {
+                is ShipmentData -> mergeShipments(localData, serverData as ShipmentData)
+                is DriverData -> mergeDrivers(localData, serverData as DriverData)
+                is VehicleData -> mergeVehicles(localData, serverData as VehicleData)
+                else -> serverData // Fallback to server data
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error merging data")
+            serverData // Fallback to server data
+        }
+    }
+
+    // Data extraction methods
+
+    private fun extractVersion(data: Any): Long {
+        return when (data) {
+            is ShipmentData -> data.version
+            is DriverData -> data.version
+            is VehicleData -> data.version
+            else -> 0L
+        }
+    }
+
+    private fun calculateDataHash(data: Any): String {
+        return when (data) {
+            is ShipmentData -> "${data.trackingNumber}_${data.status}_${data.destination}"
+            is DriverData -> "${data.email}_${data.phone}_${data.status}"
+            is VehicleData -> "${data.licensePlate}_${data.status}_${data.mileage}"
+            else -> data.hashCode().toString()
+        }
+    }
+
+    private fun extractTimestamp(data: Any): Long {
+        return when (data) {
+            is ShipmentData -> data.updatedAt
+            is DriverData -> data.updatedAt
+            is VehicleData -> data.updatedAt
+            else -> System.currentTimeMillis()
+        }
+    }
+
+    private fun extractStatus(data: Any): String {
+        return when (data) {
+            is ShipmentData -> data.status
+            is DriverData -> data.status
+            is VehicleData -> data.status
+            else -> "UNKNOWN"
+        }
+    }
+
+    // Business logic methods
+
+    private fun isFinalStatus(status: String): Boolean {
+        return status in listOf("DELIVERED", "CANCELLED", "COMPLETED", "INACTIVE")
+    }
+
+    private fun isHigherPriorityStatus(localStatus: String, serverStatus: String): Boolean {
+        val statusPriority = mapOf(
+            "DELIVERED" to 5,
+            "CANCELLED" to 5,
+            "COMPLETED" to 5,
+            "IN_TRANSIT" to 4,
+            "ARRIVED" to 3,
+            "LOADED" to 2,
+            "PREPARING" to 1,
+            "ACCEPTED" to 1,
+            "CREATED" to 0
+        )
+        
+        val localPriority = statusPriority[localStatus] ?: 0
+        val serverPriority = statusPriority[serverStatus] ?: 0
+        
+        return localPriority > serverPriority
+    }
+
+    // Data merging methods
+
+    private fun mergeShipments(local: ShipmentData, server: ShipmentData): ShipmentData {
+        return ShipmentData(
+            id = server.id, // Server ID is authoritative
+            trackingNumber = server.trackingNumber,
+            customerId = server.customerId,
+            driverId = local.driverId ?: server.driverId, // Prefer local driver assignment
+            origin = server.origin,
+            destination = server.destination,
+            status = if (isHigherPriorityStatus(local.status, server.status)) local.status else server.status,
+            priority = server.priority,
+            weight = server.weight,
+            dimensions = server.dimensions,
+            specialInstructions = local.specialInstructions ?: server.specialInstructions,
+            estimatedDelivery = server.estimatedDelivery,
+            actualDelivery = local.actualDelivery ?: server.actualDelivery,
+            createdAt = server.createdAt,
+            updatedAt = maxOf(local.updatedAt, server.updatedAt),
+            version = maxOf(local.version, server.version) + 1
+        )
+    }
+
+    private fun mergeDrivers(local: DriverData, server: DriverData): DriverData {
+        return DriverData(
+            id = server.id,
+            name = server.name,
+            email = server.email,
+            phone = server.phone,
+            licenseNumber = server.licenseNumber,
+            vehicleId = local.vehicleId ?: server.vehicleId,
+            currentLocation = local.currentLocation ?: server.currentLocation,
+            status = if (isHigherPriorityStatus(local.status, server.status)) local.status else server.status,
+            rating = server.rating,
+            totalDeliveries = server.totalDeliveries,
+            isAvailable = local.isAvailable && server.isAvailable,
+            createdAt = server.createdAt,
+            updatedAt = maxOf(local.updatedAt, server.updatedAt),
+            version = maxOf(local.version, server.version) + 1
+        )
+    }
+
+    private fun mergeVehicles(local: VehicleData, server: VehicleData): VehicleData {
+        return VehicleData(
+            id = server.id,
+            licensePlate = server.licensePlate,
+            make = server.make,
+            model = server.model,
+            year = server.year,
+            type = server.type,
+            capacity = server.capacity,
+            fuelType = server.fuelType,
+            currentMileage = maxOf(local.currentMileage, server.currentMileage),
+            status = if (isHigherPriorityStatus(local.status, server.status)) local.status else server.status,
+            driverId = local.driverId ?: server.driverId,
+            lastMaintenance = server.lastMaintenance,
+            nextMaintenance = server.nextMaintenance,
+            createdAt = server.createdAt,
+            updatedAt = maxOf(local.updatedAt, server.updatedAt),
+            version = maxOf(local.version, server.version) + 1
+        )
+    }
+
+    /**
+     * Get conflict statistics
+     */
+    suspend fun getConflictStats(): ConflictStats {
+        return try {
+            val recentConflicts = conflictLogger.getRecentConflicts()
+            val conflictsByType = recentConflicts.groupBy { it.conflictType }
+            
+            ConflictStats(
+                totalConflicts = recentConflicts.size,
+                conflictsByType = conflictsByType.mapValues { it.value.size },
+                mostCommonStrategy = recentConflicts.groupBy { it.resolution }.maxByOrNull { it.value.size }?.key,
+                averageResolutionTime = calculateAverageResolutionTime(recentConflicts)
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting conflict stats")
+            ConflictStats(0, emptyMap(), null, 0.0)
+        }
+    }
+
+    private fun calculateAverageResolutionTime(conflicts: List<ConflictResolution>): Double {
+        if (conflicts.isEmpty()) return 0.0
+        
+        // This would typically use actual resolution time data
+        // For now, return a placeholder
+        return 1500.0 // 1.5 seconds average
+    }
+}
+
+// Data classes for conflict resolution
+
+data class ConflictResolution(
+    val localData: Any,
+    val serverData: Any,
+    val resolution: ConflictStrategy,
+    val resolvedData: Any,
+    val conflictType: ConflictType? = null,
+    val timestamp: Long = System.currentTimeMillis(),
+    val requiresManualReview: Boolean = false
+)
+
+enum class ConflictType {
+    VERSION_CONFLICT,
+    DATA_CONFLICT,
+    TIMESTAMP_CONFLICT,
+    STATUS_CONFLICT,
+    TYPE_MISMATCH,
+    UNKNOWN
+}
+
+enum class ConflictStrategy {
+    CLIENT_WINS,
+    SERVER_WINS,
+    MERGE,
+    MANUAL
+}
+
+data class ConflictStats(
+    val totalConflicts: Int,
+    val conflictsByType: Map<ConflictType, Int>,
+    val mostCommonStrategy: ConflictStrategy?,
+    val averageResolutionTime: Double
+)
+
+// Sample data classes for conflict resolution
+
+data class ShipmentData(
+    val id: String,
+    val trackingNumber: String,
+    val customerId: String,
+    val driverId: String?,
+    val origin: String,
+    val destination: String,
+    val status: String,
+    val priority: String,
+    val weight: Double,
+    val dimensions: String,
+    val specialInstructions: String?,
+    val estimatedDelivery: Long,
+    val actualDelivery: Long?,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val version: Long = 1L
+)
+
+data class DriverData(
+    val id: String,
+    val name: String,
+    val email: String,
+    val phone: String,
+    val licenseNumber: String,
+    val vehicleId: String?,
+    val currentLocation: String?,
+    val status: String,
+    val rating: Double,
+    val totalDeliveries: Int,
+    val isAvailable: Boolean,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val version: Long = 1L
+)
+
+data class VehicleData(
+    val id: String,
+    val licensePlate: String,
+    val make: String,
+    val model: String,
+    val year: Int,
+    val type: String,
+    val capacity: Double,
+    val fuelType: String,
+    val currentMileage: Double,
+    val status: String,
+    val driverId: String?,
+    val lastMaintenance: Long?,
+    val nextMaintenance: Long?,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val version: Long = 1L
+)

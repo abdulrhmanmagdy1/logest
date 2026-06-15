@@ -1,0 +1,705 @@
+package com.edham.logistics.performance.memory
+
+import android.app.ActivityManager
+import android.content.Context
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import timber.log.Timber
+import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Memory Optimizer - Advanced memory management and optimization
+ * Implements intelligent memory monitoring, cleanup, and optimization strategies
+ */
+
+@Singleton
+class MemoryOptimizer @Inject constructor(
+    private val context: Context
+) {
+
+    private val memoryScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val memoryListeners = mutableListOf<MemoryListener>()
+    private val weakReferences = ConcurrentHashMap<String, WeakReference<Any>>()
+    
+    // Performance metrics
+    private val totalCleanups = AtomicLong(0)
+    private val totalMemoryFreed = AtomicLong(0)
+    private val averageCleanupTime = AtomicLong(0)
+    
+    // Configuration
+    private val memoryThreshold = 0.8 // 80% memory usage threshold
+    private val criticalMemoryThreshold = 0.9 // 90% critical threshold
+    private val cleanupInterval = 30000L // 30 seconds
+    private val maxWeakReferences = 1000
+    
+    // Memory monitoring
+    private val _memoryState = MutableStateFlow<MemoryState>(MemoryState.NORMAL)
+    val memoryState: StateFlow<MemoryState> = _memoryState.asStateFlow()
+    
+    init {
+        startMemoryMonitoring()
+    }
+    
+    /**
+     * Get current memory usage
+     */
+    fun getMemoryUsage(): MemoryUsage {
+        return try {
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val memoryInfo = ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(memoryInfo)
+            
+            val runtime = Runtime.getRuntime()
+            val totalMemory = runtime.totalMemory()
+            val freeMemory = runtime.freeMemory()
+            val usedMemory = totalMemory - freeMemory
+            val maxMemory = runtime.maxMemory()
+            
+            MemoryUsage(
+                totalMemory = totalMemory,
+                usedMemory = usedMemory,
+                freeMemory = freeMemory,
+                maxMemory = maxMemory,
+                usagePercentage = (usedMemory.toDouble() / maxMemory) * 100,
+                availableMemory = memoryInfo.availMem,
+                threshold = (maxMemory * memoryThreshold).toLong(),
+                isLowMemory = memoryInfo.lowMemory
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting memory usage")
+            MemoryUsage(0, 0, 0, 0, 0.0, 0, 0, false)
+        }
+    }
+    
+    /**
+     * Optimize memory usage
+     */
+    suspend fun optimizeMemory(): Result<MemoryOptimizationResult> {
+        val startTime = System.currentTimeMillis()
+        
+        return try {
+            val beforeUsage = getMemoryUsage()
+            val memoryFreed = performMemoryCleanup()
+            val afterUsage = getMemoryUsage()
+            
+            val optimizationTime = System.currentTimeMillis() - startTime
+            val actualMemoryFreed = beforeUsage.usedMemory - afterUsage.usedMemory
+            
+            totalCleanups.incrementAndGet()
+            totalMemoryFreed.addAndGet(actualMemoryFreed)
+            updateAverageCleanupTime(optimizationTime)
+            
+            val result = MemoryOptimizationResult(
+                success = true,
+                memoryFreed = actualMemoryFreed,
+                optimizationTime = optimizationTime,
+                strategies = getAppliedStrategies(),
+                beforeUsage = beforeUsage,
+                afterUsage = afterUsage
+            )
+            
+            // Notify listeners
+            memoryListeners.forEach { listener ->
+                listener.onMemoryOptimized(result)
+            }
+            
+            Result.success(result)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error optimizing memory")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Perform aggressive memory cleanup
+     */
+    suspend fun aggressiveMemoryCleanup(): Result<MemoryOptimizationResult> {
+        return try {
+            val beforeUsage = getMemoryUsage()
+            
+            // Force garbage collection
+            System.gc()
+            delay(1000) // Wait for GC to complete
+            
+            // Clear weak references
+            clearWeakReferences()
+            
+            // Clear caches
+            clearCaches()
+            
+            // Release bitmaps
+            releaseBitmaps()
+            
+            val afterUsage = getMemoryUsage()
+            val memoryFreed = beforeUsage.usedMemory - afterUsage.usedMemory
+            
+            val result = MemoryOptimizationResult(
+                success = true,
+                memoryFreed = memoryFreed,
+                optimizationTime = 1000L,
+                strategies = listOf("AGGRESSIVE_GC", "WEAK_REFERENCES", "CACHES", "BITMAPS"),
+                beforeUsage = beforeUsage,
+                afterUsage = afterUsage
+            )
+            
+            Result.success(result)
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error in aggressive memory cleanup")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Add weak reference for object
+     */
+    fun addWeakReference(key: String, obj: Any) {
+        if (weakReferences.size >= maxWeakReferences) {
+            // Remove oldest entries
+            val keysToRemove = weakReferences.keys.take(100)
+            keysToRemove.forEach { key ->
+                weakReferences.remove(key)
+            }
+        }
+        
+        weakReferences[key] = WeakReference(obj)
+    }
+    
+    /**
+     * Remove weak reference
+     */
+    fun removeWeakReference(key: String) {
+        weakReferences.remove(key)
+    }
+    
+    /**
+     * Get object from weak reference
+     */
+    fun <T> getFromWeakReference(key: String): T? {
+        val weakRef = weakReferences[key] as? WeakReference<T>
+        return weakRef?.get()
+    }
+    
+    /**
+     * Clear weak references
+     */
+    fun clearWeakReferences() {
+        val iterator = weakReferences.entries.iterator()
+        var removedCount = 0
+        
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.value.get() == null) {
+                iterator.remove()
+                removedCount++
+            }
+        }
+        
+        if (removedCount > 0) {
+            Timber.d("Cleared $removedCount weak references")
+        }
+    }
+    
+    /**
+     * Set memory limit
+     */
+    fun setMemoryLimit(limit: Long) {
+        // This would configure memory limits for various components
+        Timber.d("Memory limit set to: ${limit / 1024 / 1024}MB")
+    }
+    
+    /**
+     * Add memory listener
+     */
+    fun addMemoryListener(listener: MemoryListener) {
+        memoryListeners.add(listener)
+    }
+    
+    /**
+     * Remove memory listener
+     */
+    fun removeMemoryListener(listener: MemoryListener) {
+        memoryListeners.remove(listener)
+    }
+    
+    /**
+     * Get memory statistics
+     */
+    fun getMemoryStats(): MemoryStats {
+        val usage = getMemoryUsage()
+        
+        return MemoryStats(
+            totalCleanups = totalCleanups.get(),
+            totalMemoryFreed = totalMemoryFreed.get(),
+            averageCleanupTime = averageCleanupTime.get(),
+            currentUsage = usage,
+            weakReferencesCount = weakReferences.size,
+            memoryState = _memoryState.value
+        )
+    }
+    
+    /**
+     * Check if memory optimization is needed
+     */
+    fun isOptimizationNeeded(): Boolean {
+        val usage = getMemoryUsage()
+        return usage.usagePercentage > (memoryThreshold * 100)
+    }
+    
+    /**
+     * Check if memory is critical
+     */
+    fun isMemoryCritical(): Boolean {
+        val usage = getMemoryUsage()
+        return usage.usagePercentage > (criticalMemoryThreshold * 100)
+    }
+    
+    // Private methods
+    
+    private fun startMemoryMonitoring() {
+        memoryScope.launch {
+            while (isActive) {
+                try {
+                    val usage = getMemoryUsage()
+                    val currentState = determineMemoryState(usage)
+                    
+                    // Update memory state
+                    val previousState = _memoryState.value
+                    _memoryState.value = currentState
+                    
+                    // Check for state changes
+                    if (previousState != currentState) {
+                        handleMemoryStateChange(previousState, currentState, usage)
+                    }
+                    
+                    // Auto-optimize if needed
+                    if (currentState == MemoryState.CRITICAL) {
+                        optimizeMemory()
+                    } else if (currentState == MemoryState.WARNING && isOptimizationNeeded()) {
+                        optimizeMemory()
+                    }
+                    
+                    delay(cleanupInterval)
+                    
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in memory monitoring")
+                    delay(cleanupInterval * 2) // Wait longer on error
+                }
+            }
+        }
+    }
+    
+    private fun determineMemoryState(usage: MemoryUsage): MemoryState {
+        return when {
+            usage.usagePercentage > 90 -> MemoryState.CRITICAL
+            usage.usagePercentage > 80 -> MemoryState.WARNING
+            usage.usagePercentage > 60 -> MemoryState.MODERATE
+            else -> MemoryState.NORMAL
+        }
+    }
+    
+    private fun handleMemoryStateChange(
+        previousState: MemoryState,
+        currentState: MemoryState,
+        usage: MemoryUsage
+    ) {
+        when (currentState) {
+            MemoryState.CRITICAL -> {
+                Timber.w("CRITICAL memory usage: ${usage.usagePercentage}%")
+                memoryListeners.forEach { listener ->
+                    listener.onMemoryCritical(usage)
+                }
+            }
+            MemoryState.WARNING -> {
+                Timber.w("WARNING memory usage: ${usage.usagePercentage}%")
+                memoryListeners.forEach { listener ->
+                    listener.onMemoryWarning(usage)
+                }
+            }
+            MemoryState.MODERATE -> {
+                Timber.d("MODERATE memory usage: ${usage.usagePercentage}%")
+            }
+            MemoryState.NORMAL -> {
+                Timber.d("NORMAL memory usage: ${usage.usagePercentage}%")
+                memoryListeners.forEach { listener ->
+                    listener.onMemoryOptimized(MemoryOptimizationResult(
+                        success = true,
+                        memoryFreed = 0,
+                        optimizationTime = 0,
+                        strategies = emptyList(),
+                        beforeUsage = usage,
+                        afterUsage = usage
+                    ))
+                }
+            }
+        }
+    }
+    
+    private suspend fun performMemoryCleanup(): Long {
+        var memoryFreed = 0L
+        
+        try {
+            // Clear weak references
+            val beforeWeakRefs = weakReferences.size
+            clearWeakReferences()
+            val afterWeakRefs = weakReferences.size
+            memoryFreed += (beforeWeakRefs - afterWeakRefs) * 1024L // Estimate
+            
+            // Clear caches (placeholder - would integrate with actual cache managers)
+            memoryFreed += clearCaches()
+            
+            // Release bitmaps (placeholder - would integrate with bitmap management)
+            memoryFreed += releaseBitmaps()
+            
+            // Suggest garbage collection
+            System.gc()
+            
+        } catch (e: Exception) {
+            Timber.e(e, "Error during memory cleanup")
+        }
+        
+        return memoryFreed
+    }
+    
+    private suspend fun clearCaches(): Long {
+        // This would integrate with actual cache managers
+        // For now, return estimated memory freed
+        return 5 * 1024 * 1024L // 5MB estimate
+    }
+    
+    private suspend fun releaseBitmaps(): Long {
+        // This would integrate with actual bitmap management
+        // For now, return estimated memory freed
+        return 10 * 1024 * 1024L // 10MB estimate
+    }
+    
+    private fun getAppliedStrategies(): List<String> {
+        return listOf(
+            "WEAK_REFERENCE_CLEANUP",
+            "CACHE_CLEARING",
+            "BITMAP_RELEASE",
+            "GARBAGE_COLLECTION"
+        )
+    }
+    
+    private fun updateAverageCleanupTime(cleanupTime: Long) {
+        val current = averageCleanupTime.get()
+        val newAverage = (current + cleanupTime) / 2
+        averageCleanupTime.set(newAverage)
+    }
+    
+    /**
+     * Get memory optimization recommendations
+     */
+    fun getOptimizationRecommendations(): List<MemoryOptimizationRecommendation> {
+        val usage = getMemoryUsage()
+        val recommendations = mutableListOf<MemoryOptimizationRecommendation>()
+        
+        when {
+            usage.usagePercentage > 90 -> {
+                recommendations.add(
+                    MemoryOptimizationRecommendation(
+                        priority = RecommendationPriority.CRITICAL,
+                        action = "AGGRESSIVE_CLEANUP",
+                        description = "Memory usage is critical. Perform aggressive cleanup immediately.",
+                        estimatedSavings = "20-40MB"
+                    )
+                )
+            }
+            usage.usagePercentage > 80 -> {
+                recommendations.add(
+                    MemoryOptimizationRecommendation(
+                        priority = RecommendationPriority.HIGH,
+                        action = "STANDARD_CLEANUP",
+                        description = "Memory usage is high. Perform standard cleanup.",
+                        estimatedSavings = "10-20MB"
+                    )
+                )
+            }
+            usage.usagePercentage > 60 -> {
+                recommendations.add(
+                    MemoryOptimizationRecommendation(
+                        priority = RecommendationPriority.MEDIUM,
+                        action = "LIGHT_CLEANUP",
+                        description = "Memory usage is moderate. Consider light cleanup.",
+                        estimatedSavings = "5-10MB"
+                    )
+                )
+            }
+        }
+        
+        // Add general recommendations
+        if (weakReferences.size > 500) {
+            recommendations.add(
+                MemoryOptimizationRecommendation(
+                    priority = RecommendationPriority.LOW,
+                    action = "WEAK_REFERENCE_CLEANUP",
+                    description = "Too many weak references. Consider cleanup.",
+                    estimatedSavings = "1-5MB"
+                )
+            )
+        }
+        
+        return recommendations
+    }
+    
+    /**
+     * Schedule automatic memory optimization
+     */
+    fun scheduleAutomaticOptimization(interval: Long = cleanupInterval) {
+        memoryScope.launch {
+            while (isActive) {
+                delay(interval)
+                
+                if (isOptimizationNeeded()) {
+                    optimizeMemory()
+                }
+            }
+        }
+    }
+    
+    /**
+     * Get performance metrics
+     */
+    fun getPerformanceMetrics(): MemoryPerformanceMetrics {
+        val stats = getMemoryStats()
+        
+        return MemoryPerformanceMetrics(
+            totalCleanups = stats.totalCleanups,
+            totalMemoryFreed = stats.totalMemoryFreed,
+            averageCleanupTime = stats.averageCleanupTime,
+            currentMemoryUsage = stats.currentUsage.usagePercentage,
+            memoryState = stats.memoryState,
+            weakReferencesCount = stats.weakReferencesCount,
+            cleanupEfficiency = if (stats.totalCleanups > 0) {
+                stats.totalMemoryFreed.toDouble() / stats.totalCleanups
+            } else 0.0
+        )
+    }
+    
+    /**
+     * Reset metrics
+     */
+    fun resetMetrics() {
+        totalCleanups.set(0)
+        totalMemoryFreed.set(0)
+        averageCleanupTime.set(0)
+    }
+    
+    /**
+     * Stop memory optimizer
+     */
+    fun stop() {
+        memoryScope.cancel()
+        memoryListeners.clear()
+        weakReferences.clear()
+    }
+}
+
+/**
+ * Memory Usage Information
+ */
+data class MemoryUsage(
+    val totalMemory: Long,
+    val usedMemory: Long,
+    val freeMemory: Long,
+    val maxMemory: Long,
+    val usagePercentage: Double,
+    val availableMemory: Long,
+    val threshold: Long,
+    val isLowMemory: Boolean
+) {
+    val usedMemoryMB: Double get() = usedMemory / (1024.0 * 1024.0)
+    val totalMemoryMB: Double get() = totalMemory / (1024.0 * 1024.0)
+    val maxMemoryMB: Double get() = maxMemory / (1024.0 * 1024.0)
+}
+
+/**
+ * Memory Optimization Result
+ */
+data class MemoryOptimizationResult(
+    val success: Boolean,
+    val memoryFreed: Long,
+    val optimizationTime: Long,
+    val strategies: List<String>,
+    val beforeUsage: MemoryUsage,
+    val afterUsage: MemoryUsage
+) {
+    val memoryFreedMB: Double get() = memoryFreed / (1024.0 * 1024.0)
+    val improvementPercentage: Double get() = 
+        if (beforeUsage.usedMemory > 0) {
+            ((beforeUsage.usedMemory - afterUsage.usedMemory).toDouble() / beforeUsage.usedMemory) * 100
+        } else 0.0
+}
+
+/**
+ * Memory State
+ */
+enum class MemoryState {
+    NORMAL,      // < 60% usage
+    MODERATE,    // 60-80% usage
+    WARNING,     // 80-90% usage
+    CRITICAL     // > 90% usage
+}
+
+/**
+ * Memory Statistics
+ */
+data class MemoryStats(
+    val totalCleanups: Long,
+    val totalMemoryFreed: Long,
+    val averageCleanupTime: Long,
+    val currentUsage: MemoryUsage,
+    val weakReferencesCount: Int,
+    val memoryState: MemoryState
+)
+
+/**
+ * Memory Optimization Recommendation
+ */
+data class MemoryOptimizationRecommendation(
+    val priority: RecommendationPriority,
+    val action: String,
+    val description: String,
+    val estimatedSavings: String
+)
+
+/**
+ * Recommendation Priority
+ */
+enum class RecommendationPriority {
+    LOW, MEDIUM, HIGH, CRITICAL
+}
+
+/**
+ * Memory Performance Metrics
+ */
+data class MemoryPerformanceMetrics(
+    val totalCleanups: Long,
+    val totalMemoryFreed: Long,
+    val averageCleanupTime: Long,
+    val currentMemoryUsage: Double,
+    val memoryState: MemoryState,
+    val weakReferencesCount: Int,
+    val cleanupEfficiency: Double
+) {
+    val memoryFreedMB: Double get() = totalMemoryFreed / (1024.0 * 1024.0)
+    val averageCleanupTimeMs: Double get() = averageCleanupTime.toDouble()
+}
+
+/**
+ * Memory Listener Interface
+ */
+interface MemoryListener {
+    fun onMemoryWarning(usage: MemoryUsage) {}
+    fun onMemoryCritical(usage: MemoryUsage) {}
+    fun onMemoryOptimized(result: MemoryOptimizationResult) {}
+}
+
+/**
+ * Memory Manager for specific components
+ */
+class ComponentMemoryManager @Inject constructor(
+    private val memoryOptimizer: MemoryOptimizer
+) {
+    
+    private val componentCaches = ConcurrentHashMap<String, ComponentCache>()
+    
+    /**
+     * Register component for memory management
+     */
+    fun registerComponent(
+        componentName: String,
+        maxMemoryUsage: Long,
+        cleanupCallback: suspend () -> Long
+    ) {
+        componentCaches[componentName] = ComponentCache(
+            name = componentName,
+            maxMemoryUsage = maxMemoryUsage,
+            cleanupCallback = cleanupCallback,
+            currentUsage = 0L,
+            lastCleanup = System.currentTimeMillis()
+        )
+    }
+    
+    /**
+     * Update component memory usage
+     */
+    fun updateComponentUsage(componentName: String, usage: Long) {
+        componentCaches[componentName]?.let { cache ->
+            cache.currentUsage = usage
+            
+            // Check if component exceeds its limit
+            if (usage > cache.maxMemoryUsage) {
+                memoryScope.launch {
+                    val freed = cache.cleanupCallback()
+                    cache.currentUsage = maxOf(0, cache.currentUsage - freed)
+                    cache.lastCleanup = System.currentTimeMillis()
+                    
+                    Timber.d("Component $componentName freed ${freed / 1024}KB")
+                }
+            }
+        }
+    }
+    
+    /**
+     * Cleanup all components
+     */
+    suspend fun cleanupAllComponents(): Long {
+        var totalFreed = 0L
+        
+        componentCaches.values.forEach { cache ->
+            val freed = cache.cleanupCallback()
+            cache.currentUsage = maxOf(0, cache.currentUsage - freed)
+            cache.lastCleanup = System.currentTimeMillis()
+            totalFreed += freed
+        }
+        
+        return totalFreed
+    }
+    
+    /**
+     * Get component statistics
+     */
+    fun getComponentStats(): Map<String, ComponentStats> {
+        return componentCaches.mapValues { (name, cache) ->
+            ComponentStats(
+                name = name,
+                currentUsage = cache.currentUsage,
+                maxUsage = cache.maxMemoryUsage,
+                usagePercentage = (cache.currentUsage.toDouble() / cache.maxMemoryUsage) * 100,
+                lastCleanup = cache.lastCleanup
+            )
+        }
+    }
+}
+
+/**
+ * Component Cache
+ */
+data class ComponentCache(
+    val name: String,
+    val maxMemoryUsage: Long,
+    val cleanupCallback: suspend () -> Long,
+    var currentUsage: Long,
+    var lastCleanup: Long
+)
+
+/**
+ * Component Statistics
+ */
+data class ComponentStats(
+    val name: String,
+    val currentUsage: Long,
+    val maxUsage: Long,
+    val usagePercentage: Double,
+    val lastCleanup: Long
+) {
+    val currentUsageMB: Double get() = currentUsage / (1024.0 * 1024.0)
+    val maxUsageMB: Double get() = maxUsage / (1024.0 * 1024.0)
+}
