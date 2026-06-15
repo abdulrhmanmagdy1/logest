@@ -303,7 +303,7 @@ ProjectSchema.methods.checkHealth = function() {
   return 'green';
 };
 
-module.exports.Project = mongoose.model('Project', ProjectSchema);
+module.exports.Project = mongoose.models.Project || mongoose.model('Project', ProjectSchema);
 
 // Timesheet Schema
 const TimesheetSchema = new mongoose.Schema({

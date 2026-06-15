@@ -395,8 +395,8 @@ const DataSourceSchema = new mongoose.Schema({
 });
 
 module.exports = {
-  Dashboard: mongoose.model('Dashboard', DashboardSchema),
-  Report: mongoose.model('Report', ReportSchema),
-  KPI: mongoose.model('KPI', KPISchema),
-  DataSource: mongoose.model('DataSource', DataSourceSchema)
+  Dashboard: mongoose.models.Dashboard || mongoose.model('Dashboard', DashboardSchema),
+  Report: mongoose.models.Report || mongoose.model('Report', ReportSchema),
+  KPI: mongoose.models.KPI || mongoose.model('KPI', KPISchema),
+  DataSource: mongoose.models.DataSource || mongoose.model('DataSource', DataSourceSchema)
 };

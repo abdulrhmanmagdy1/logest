@@ -362,9 +362,9 @@ const RecommendationSchema = new mongoose.Schema({
 });
 
 module.exports = {
-  MLModel: mongoose.model('MLModel', MLModelSchema),
-  Prediction: mongoose.model('Prediction', PredictionSchema),
-  Anomaly: mongoose.model('Anomaly', AnomalySchema),
-  DemandForecast: mongoose.model('DemandForecast', DemandForecastSchema),
-  Recommendation: mongoose.model('Recommendation', RecommendationSchema)
+  MLModel: mongoose.models.MLModel || mongoose.model('MLModel', MLModelSchema),
+  Prediction: mongoose.models.Prediction || mongoose.model('Prediction', PredictionSchema),
+  Anomaly: mongoose.models.Anomaly || mongoose.model('Anomaly', AnomalySchema),
+  DemandForecast: mongoose.models.DemandForecast || mongoose.model('DemandForecast', DemandForecastSchema),
+  Recommendation: mongoose.models.Recommendation || mongoose.model('Recommendation', RecommendationSchema)
 };

@@ -117,7 +117,7 @@ router.get('/audits', protect, authorize(['quality', 'admin']), async (req, res)
     if (standard) query.standard = standard;
 
     const audits = await Audit.find(query)
-      .sort({ dates.planned: 1 });
+      .sort({ 'dates.planned': 1 });
 
     res.json({
       success: true,

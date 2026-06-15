@@ -248,7 +248,7 @@ const TimeEntrySchema = new mongoose.Schema({
 });
 
 module.exports = {
-  Task: mongoose.model('Task', TaskSchema),
-  Project: mongoose.model('Project', ProjectSchema),
-  TimeEntry: mongoose.model('TimeEntry', TimeEntrySchema)
+  Task: mongoose.models.Task || mongoose.model('Task', TaskSchema),
+  Project: mongoose.models.Project || mongoose.model('Project', ProjectSchema),
+  TimeEntry: mongoose.models.TimeEntry || mongoose.model('TimeEntry', TimeEntrySchema)
 };

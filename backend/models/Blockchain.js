@@ -327,8 +327,8 @@ SupplyChainEventSchema.index({ shipment: 1, timestamp: -1 });
 SupplyChainEventSchema.index({ blockchain: 1 });
 
 module.exports = {
-  BlockchainTransaction: mongoose.model('BlockchainTransaction', BlockchainTransactionSchema),
-  SmartContract: mongoose.model('SmartContract', SmartContractSchema),
-  BlockchainWallet: mongoose.model('BlockchainWallet', BlockchainWalletSchema),
-  SupplyChainEvent: mongoose.model('SupplyChainEvent', SupplyChainEventSchema)
+  BlockchainTransaction: mongoose.models.BlockchainTransaction || mongoose.model('BlockchainTransaction', BlockchainTransactionSchema),
+  SmartContract: mongoose.models.SmartContract || mongoose.model('SmartContract', SmartContractSchema),
+  BlockchainWallet: mongoose.models.BlockchainWallet || mongoose.model('BlockchainWallet', BlockchainWalletSchema),
+  SupplyChainEvent: mongoose.models.SupplyChainEvent || mongoose.model('SupplyChainEvent', SupplyChainEventSchema)
 };

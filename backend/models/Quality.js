@@ -308,8 +308,8 @@ const SOPSchema = new mongoose.Schema({
 });
 
 module.exports = {
-  QualityIncident: mongoose.model('QualityIncident', QualityIncidentSchema),
-  Audit: mongoose.model('Audit', AuditSchema),
-  KPI: mongoose.model('KPI', KPISchema),
-  SOP: mongoose.model('SOP', SOPSchema)
+  QualityIncident: mongoose.models.QualityIncident || mongoose.model('QualityIncident', QualityIncidentSchema),
+  Audit: mongoose.models.Audit || mongoose.model('Audit', AuditSchema),
+  KPI: mongoose.models.KPI || mongoose.model('KPI', KPISchema),
+  SOP: mongoose.models.SOP || mongoose.model('SOP', SOPSchema)
 };

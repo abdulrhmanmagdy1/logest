@@ -340,8 +340,8 @@ const WebhookSchema = new mongoose.Schema({
 });
 
 module.exports = {
-  APIEndpoint: mongoose.model('APIEndpoint', APIEndpointSchema),
-  APIKey: mongoose.model('APIKey', APIKeySchema),
-  APIUsageLog: mongoose.model('APIUsageLog', APIUsageLogSchema),
-  Webhook: mongoose.model('Webhook', WebhookSchema)
+  APIEndpoint: mongoose.models.APIEndpoint || mongoose.model('APIEndpoint', APIEndpointSchema),
+  APIKey: mongoose.models.APIKey || mongoose.model('APIKey', APIKeySchema),
+  APIUsageLog: mongoose.models.APIUsageLog || mongoose.model('APIUsageLog', APIUsageLogSchema),
+  Webhook: mongoose.models.Webhook || mongoose.model('Webhook', WebhookSchema)
 };

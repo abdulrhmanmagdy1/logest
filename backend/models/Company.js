@@ -314,7 +314,7 @@ const DepartmentSchema = new mongoose.Schema({
 DepartmentSchema.index({ company: 1, code: 1 });
 
 module.exports = {
-  Company: mongoose.model('Company', CompanySchema),
-  Branch: mongoose.model('Branch', BranchSchema),
-  Department: mongoose.model('Department', DepartmentSchema)
+  Company: mongoose.models.Company || mongoose.model('Company', CompanySchema),
+  Branch: mongoose.models.Branch || mongoose.model('Branch', BranchSchema),
+  Department: mongoose.models.Department || mongoose.model('Department', DepartmentSchema)
 };

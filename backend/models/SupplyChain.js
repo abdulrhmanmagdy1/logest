@@ -310,9 +310,9 @@ const DistributionPlanSchema = new mongoose.Schema({
 });
 
 module.exports = {
-  Supplier: mongoose.model('Supplier', SupplierSchema),
-  DemandForecast: mongoose.model('DemandForecast', DemandForecastSchema),
-  InventoryPlan: mongoose.model('InventoryPlan', InventoryPlanSchema),
-  SupplyChainEvent: mongoose.model('SupplyChainEvent', SupplyChainEventSchema),
-  DistributionPlan: mongoose.model('DistributionPlan', DistributionPlanSchema)
+  Supplier: mongoose.models.Supplier || mongoose.model('Supplier', SupplierSchema),
+  DemandForecast: mongoose.models.DemandForecast || mongoose.model('DemandForecast', DemandForecastSchema),
+  InventoryPlan: mongoose.models.InventoryPlan || mongoose.model('InventoryPlan', InventoryPlanSchema),
+  SupplyChainEvent: mongoose.models.SupplyChainEvent || mongoose.model('SupplyChainEvent', SupplyChainEventSchema),
+  DistributionPlan: mongoose.models.DistributionPlan || mongoose.model('DistributionPlan', DistributionPlanSchema)
 };

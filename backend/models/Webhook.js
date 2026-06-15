@@ -186,6 +186,6 @@ WebhookSchema.methods.verifySignature = function(payload, signature) {
 };
 
 module.exports = {
-  Webhook: mongoose.model('Webhook', WebhookSchema),
-  WebhookDelivery: mongoose.model('WebhookDelivery', WebhookDeliverySchema)
+  Webhook: mongoose.models.Webhook || mongoose.model('Webhook', WebhookSchema),
+  WebhookDelivery: mongoose.models.WebhookDelivery || mongoose.model('WebhookDelivery', WebhookDeliverySchema)
 };
