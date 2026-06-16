@@ -1,13 +1,33 @@
+'use client';
+
+import { useRouter } from 'next/navigation';
 import { Card } from '@/components/ui/Card';
 import { DashboardShell } from '@/components/layout/DashboardShell';
 
 const reports = [
-  { title: 'تقرير الإيرادات', subtitle: 'ملف PDF جاهز للتصدير', status: 'جاهز' },
-  { title: 'كفاءة الأسطول', subtitle: 'تقرير حالة المركبات والاستهلاك', status: 'قيد المعالجة' },
-  { title: 'أداء السائقين', subtitle: 'تحليل تقييم الرحلات والمخالفات', status: 'جاهز' },
+  {
+    title: 'تقرير الإيرادات',
+    subtitle: 'ملف PDF جاهز للتصدير',
+    status: 'جاهز',
+    href: '/shipments',
+  },
+  {
+    title: 'كفاءة الأسطول',
+    subtitle: 'تقرير حالة المركبات والاستهلاك',
+    status: 'قيد المعالجة',
+    href: '/fleet',
+  },
+  {
+    title: 'أداء السائقين',
+    subtitle: 'تحليل تقييم الرحلات والمخالفات',
+    status: 'جاهز',
+    href: '/drivers',
+  },
 ];
 
 export default function ReportsPage() {
+  const router = useRouter();
+
   return (
     <DashboardShell title="التقارير" description="مركز التقارير والتحليلات الذكية.">
       <div className="grid gap-5">
@@ -23,8 +43,18 @@ export default function ReportsPage() {
               </span>
             </div>
             <div className="mt-5 flex flex-wrap gap-3">
-              <button className="rounded-full bg-cyan-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300">تنزيل PDF</button>
-              <button className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10">عرض</button>
+              <button
+                onClick={() => window.print()}
+                className="rounded-full bg-cyan-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300"
+              >
+                تنزيل PDF
+              </button>
+              <button
+                onClick={() => router.push(report.href)}
+                className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10"
+              >
+                عرض
+              </button>
             </div>
           </Card>
         ))}

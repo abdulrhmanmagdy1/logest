@@ -52,7 +52,10 @@ export const trucksApi = {
 };
 
 export const usersApi = {
-  list: (params?: Record<string, string>) => api.get('/users', { params }),
+  list:   (params?: Record<string, string>) => api.get('/users', { params }),
+  create: (data: Record<string, unknown>) => api.post('/users', data),
+  update: (id: string, data: Record<string, unknown>) => api.put(`/users/${id}`, data),
+  me:     () => api.get('/auth/me'),
 };
 
 export default api;

@@ -1,11 +1,23 @@
 import { create } from 'zustand';
 
+export interface AuthUser {
+  id: string;
+  _id?: string;
+  name: string;
+  firstName?: string;
+  lastName?: string;
+  email: string;
+  phone?: string;
+  role: string;
+  companyName?: string;
+}
+
 interface AuthState {
   token: string | null;
-  user: { id: string; name: string; email: string; role: string } | null;
+  user: AuthUser | null;
   loading: boolean;
   error: string | null;
-  setUser: (user: AuthState['user']) => void;
+  setUser: (user: AuthUser | null) => void;
   setToken: (token: string | null) => void;
   setLoading: (value: boolean) => void;
   setError: (message: string | null) => void;

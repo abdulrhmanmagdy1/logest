@@ -1,23 +1,120 @@
+'use client';
+
+import { useState, useEffect } from 'react';
 import { Card } from '@/components/ui/Card';
 import { DashboardShell } from '@/components/layout/DashboardShell';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
+import { usersApi } from '@/lib/api';
+import { useAuthStore } from '@/store/useAuthStore';
+
+function normalizePhone(raw: string): string {
+  const d = raw.replace(/\s+/g, '');
+  if (d.startsWith('00966')) return '0' + d.slice(5);
+  if (d.startsWith('+966'))  return '0' + d.slice(4);
+  if (d.startsWith('966'))   return '0' + d.slice(3);
+  return d;
+}
 
 export default function SettingsPage() {
+  const user    = useAuthStore((s) => s.user);
+  const setUser = useAuthStore((s) => s.setUser);
+
+  const initial = {
+    companyName: user?.companyName ?? '',
+    email: user?.email ?? '',
+    phone: user?.phone ?? '',
+  };
+
+  const [form, setForm]       = useState(initial);
+  const [saving, setSaving]   = useState(false);
+  const [saved, setSaved]     = useState(false);
+  const [saveError, setSaveError] = useState('');
+
+  useEffect(() => {
+    setForm({
+      companyName: user?.companyName ?? '',
+      email: user?.email ?? '',
+      phone: user?.phone ?? '',
+    });
+  }, [user]);
+
+  function set(field: string, value: string) {
+    setForm((prev) => ({ ...prev, [field]: value }));
+    setSaved(false);
+    setSaveError('');
+  }
+
+  function handleCancel() {
+    setForm(initial);
+    setSaved(false);
+    setSaveError('');
+  }
+
+  async function handleSave(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setSaveError('');
+    setSaving(true);
+    try {
+      const id = user?._id ?? user?.id;
+      if (!id) { setSaveError('لم يتم التعرف على المستخدم'); setSaving(false); return; }
+      const payload: Record<string, unknown> = { email: form.email.trim() };
+      if (form.companyName.trim()) payload.companyName = form.companyName.trim();
+      if (form.phone.trim())       payload.phone = normalizePhone(form.phone);
+      const res = await usersApi.update(id, payload);
+      const body = res.data as { success: boolean; data: import('@/store/useAuthStore').AuthUser };
+      if (body.success && body.data) setUser(body.data);
+      setSaved(true);
+    } catch (err: unknown) {
+      const apiErr = err as { response?: { data?: { message?: string; errors?: { msg: string }[] } } };
+      setSaveError(
+        apiErr?.response?.data?.errors?.[0]?.msg ??
+        apiErr?.response?.data?.message ??
+        'فشل حفظ الإعدادات'
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <DashboardShell title="الإعدادات" description="ضبط الشركة والصلاحيات وسياسات الأمان.">
       <div className="grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">
         <Card className="glass p-6">
           <h2 className="text-xl font-semibold text-white">إعدادات الشركة</h2>
-          <div className="mt-6 grid gap-4">
-            <Input label="اسم الشركة" placeholder="شركة ادهام للنقل" />
-            <Input label="البريد الإلكتروني للشركة" placeholder="contact@edhamlogistics.com" type="email" />
-            <Input label="رقم الهاتف" placeholder="00966 5X XXX XXXX" type="tel" />
-          </div>
-          <div className="mt-6 flex items-center gap-3">
-            <Button>حفظ التغييرات</Button>
-            <Button variant="secondary">إلغاء</Button>
-          </div>
+          <form onSubmit={handleSave} className="mt-6 grid gap-4">
+            <Input
+              label="اسم الشركة"
+              placeholder="شركة ادهام للنقل"
+              value={form.companyName}
+              onChange={(e) => set('companyName', e.target.value)}
+            />
+            <Input
+              label="البريد الإلكتروني للشركة"
+              placeholder="contact@edhamlogistics.com"
+              type="email"
+              required
+              value={form.email}
+              onChange={(e) => set('email', e.target.value)}
+            />
+            <Input
+              label="رقم الهاتف"
+              placeholder="00966 5X XXX XXXX"
+              type="tel"
+              value={form.phone}
+              onChange={(e) => set('phone', e.target.value)}
+            />
+            {saveError && (
+              <p className="rounded-3xl bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{saveError}</p>
+            )}
+            {saved && (
+              <p className="rounded-3xl bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300">تم حفظ الإعدادات بنجاح</p>
+            )}
+            <div className="flex items-center gap-3">
+              <Button type="submit" disabled={saving}>{saving ? 'جاري الحفظ...' : 'حفظ التغييرات'}</Button>
+              <Button type="button" variant="secondary" onClick={handleCancel}>إلغاء</Button>
+            </div>
+          </form>
         </Card>
         <Card className="glass p-6">
           <h2 className="text-xl font-semibold text-white">صلاحيات المستخدمين</h2>

@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { DashboardShell } from '@/components/layout/DashboardShell';
 import { DashboardSummary } from '@/components/dashboard/DashboardSummary';
 import { LiveMapWidget } from '@/components/dashboard/LiveMapWidget';
@@ -42,6 +43,7 @@ const loadingKpis: KpiCard[] = [
 ];
 
 export default function HomePage() {
+  const router = useRouter();
   const [kpis, setKpis] = useState<KpiCard[]>(loadingKpis);
 
   useEffect(() => {
@@ -63,7 +65,7 @@ export default function HomePage() {
                 <p className="text-sm uppercase tracking-[0.24em] text-cyan-300/80">نظرة عامة</p>
                 <h2 className="text-2xl font-semibold text-white">أحدث مؤشرات الأداء</h2>
               </div>
-              <button className="rounded-full bg-cyan-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300">
+              <button onClick={() => router.push('/shipments')} className="rounded-full bg-cyan-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300">
                 مشاهدة المزيد
               </button>
             </div>
