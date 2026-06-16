@@ -45,6 +45,17 @@ const STATUS_COLORS: Record<string, string> = {
   delayed: 'bg-rose-500/15 text-rose-300',
 };
 
+// Must match Shipment model enum exactly
+const CARGO_TYPES = [
+  { value: 'general',        label: 'بضاعة عامة' },
+  { value: 'frozen',         label: 'مجمدة' },
+  { value: 'chilled',        label: 'مبردة' },
+  { value: 'dry_ice',        label: 'جليد جاف' },
+  { value: 'pharmaceutical', label: 'أدوية وصيدليات' },
+  { value: 'flowers',        label: 'ورود ونباتات' },
+  { value: 'food',           label: 'مواد غذائية' },
+];
+
 interface UserOption { _id: string; firstName: string; lastName: string; companyName?: string; }
 interface TruckOption { _id: string; plateNumber: string; make?: string; model?: string; }
 
@@ -58,11 +69,21 @@ function driverName(d?: Shipment['driver']): string {
   return [d.firstName, d.lastName].filter(Boolean).join(' ') || '—';
 }
 
+const today = new Date().toISOString().split('T')[0];
+
 const BLANK_FORM = {
-  cargoType: '', cargoDesc: '', cargoWeight: '',
-  pickupCity: '', pickupStreet: '',
-  deliveryCity: '', deliveryStreet: '',
-  clientId: '', driverId: '', truckId: '',
+  cargoType: 'general',
+  cargoDesc: '',
+  cargoWeight: '',
+  pickupCity: '',
+  pickupStreet: '',
+  pickupDate: today,
+  deliveryCity: '',
+  deliveryStreet: '',
+  deliveryDate: today,
+  clientId: '',
+  driverId: '',
+  truckId: '',
 };
 
 export default function ShipmentsPage() {
@@ -78,6 +99,9 @@ export default function ShipmentsPage() {
   const [clients, setClients]     = useState<UserOption[]>([]);
   const [drivers, setDrivers]     = useState<UserOption[]>([]);
   const [trucks, setTrucks]       = useState<TruckOption[]>([]);
+
+  // Only admin/supervisor can create (they're the only ones who can list users)
+  const canCreate = user?.role === 'admin' || user?.role === 'supervisor';
 
   function fetchShipments() {
     shipmentsApi.list()
@@ -116,20 +140,40 @@ export default function ShipmentsPage() {
   async function handleAdd(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setFormError('');
+
+    if (!form.clientId) {
+      setFormError('يجب اختيار العميل');
+      return;
+    }
+
     setSubmitting(true);
     try {
       const payload: Record<string, unknown> = {
         cargo: {
-          type: form.cargoType.trim(),
+          type: form.cargoType,
           description: form.cargoDesc.trim(),
           weight: { value: parseFloat(form.cargoWeight), unit: 'kg' },
         },
-        pickup:   { address: { city: form.pickupCity.trim(),   street: form.pickupStreet.trim() } },
-        delivery: { address: { city: form.deliveryCity.trim(), street: form.deliveryStreet.trim() } },
+        pickup: {
+          address: {
+            city:   form.pickupCity.trim(),
+            street: form.pickupStreet.trim(),
+            region: form.pickupCity.trim(),   // region defaults to city
+          },
+          scheduledDate: new Date(form.pickupDate).toISOString(),
+        },
+        delivery: {
+          address: {
+            city:   form.deliveryCity.trim(),
+            street: form.deliveryStreet.trim(),
+            region: form.deliveryCity.trim(),  // region defaults to city
+          },
+          scheduledDate: new Date(form.deliveryDate).toISOString(),
+        },
+        client: form.clientId,
       };
-      if (form.clientId)  payload.client = form.clientId;
-      if (form.driverId)  payload.driver = form.driverId;
-      if (form.truckId)   payload.truck  = form.truckId;
+      if (form.driverId) payload.driver = form.driverId;
+      if (form.truckId)  payload.truck  = form.truckId;
 
       await shipmentsApi.create(payload);
       setShowModal(false);
@@ -148,8 +192,6 @@ export default function ShipmentsPage() {
     }
   }
 
-  const isAdmin = user?.role === 'admin' || user?.role === 'supervisor' || user?.role === 'employee';
-
   const filtered = search
     ? shipments.filter((s) =>
         s.trackingNumber.toLowerCase().includes(search.toLowerCase()) ||
@@ -162,63 +204,75 @@ export default function ShipmentsPage() {
 
       <Modal title="إضافة شحنة جديدة" open={showModal} onClose={() => setShowModal(false)}>
         <form onSubmit={handleAdd} className="grid gap-4">
+          {/* Cargo */}
           <p className="text-sm text-slate-400 -mt-2">بيانات البضاعة</p>
+          <div>
+            <label className="mb-2 block text-sm text-slate-300">نوع البضاعة</label>
+            <select value={form.cargoType} onChange={(e) => set('cargoType', e.target.value)}
+              className="w-full rounded-3xl border border-white/10 bg-slate-900/85 px-4 py-3 text-white outline-none transition focus:border-cyan-400">
+              {CARGO_TYPES.map((t) => (
+                <option key={t.value} value={t.value}>{t.label}</option>
+              ))}
+            </select>
+          </div>
           <div className="grid gap-3 sm:grid-cols-2">
-            <Input label="نوع البضاعة" placeholder="غذائية / إلكترونيات / مبردة" required value={form.cargoType} onChange={(e) => set('cargoType', e.target.value)} />
+            <Input label="وصف البضاعة" placeholder="وصف تفصيلي" required value={form.cargoDesc} onChange={(e) => set('cargoDesc', e.target.value)} />
             <Input label="الوزن (كجم)" type="number" placeholder="500" required value={form.cargoWeight} onChange={(e) => set('cargoWeight', e.target.value)} />
           </div>
-          <Input label="وصف البضاعة" placeholder="وصف تفصيلي للبضاعة" required value={form.cargoDesc} onChange={(e) => set('cargoDesc', e.target.value)} />
 
+          {/* Pickup */}
           <p className="text-sm text-slate-400">عنوان الاستلام</p>
           <div className="grid gap-3 sm:grid-cols-2">
             <Input label="المدينة" placeholder="الرياض" required value={form.pickupCity} onChange={(e) => set('pickupCity', e.target.value)} />
             <Input label="الشارع" placeholder="شارع الملك فهد" required value={form.pickupStreet} onChange={(e) => set('pickupStreet', e.target.value)} />
           </div>
+          <Input label="تاريخ الاستلام" type="date" required value={form.pickupDate} onChange={(e) => set('pickupDate', e.target.value)} />
 
+          {/* Delivery */}
           <p className="text-sm text-slate-400">عنوان التسليم</p>
           <div className="grid gap-3 sm:grid-cols-2">
             <Input label="المدينة" placeholder="جدة" required value={form.deliveryCity} onChange={(e) => set('deliveryCity', e.target.value)} />
             <Input label="الشارع" placeholder="شارع التحلية" required value={form.deliveryStreet} onChange={(e) => set('deliveryStreet', e.target.value)} />
           </div>
+          <Input label="تاريخ التسليم المتوقع" type="date" required value={form.deliveryDate} onChange={(e) => set('deliveryDate', e.target.value)} />
 
-          {isAdmin && (
-            <>
-              <div>
-                <label className="mb-2 block text-sm text-slate-300">العميل</label>
-                <select value={form.clientId} onChange={(e) => set('clientId', e.target.value)}
-                  className="w-full rounded-3xl border border-white/10 bg-slate-900/85 px-4 py-3 text-white outline-none transition focus:border-cyan-400">
-                  <option value="">— اختر العميل —</option>
-                  {clients.map((c) => (
-                    <option key={c._id} value={c._id}>
-                      {c.companyName || `${c.firstName} ${c.lastName}`}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div>
-                  <label className="mb-2 block text-sm text-slate-300">السائق (اختياري)</label>
-                  <select value={form.driverId} onChange={(e) => set('driverId', e.target.value)}
-                    className="w-full rounded-3xl border border-white/10 bg-slate-900/85 px-4 py-3 text-white outline-none transition focus:border-cyan-400">
-                    <option value="">— بدون سائق —</option>
-                    {drivers.map((d) => (
-                      <option key={d._id} value={d._id}>{d.firstName} {d.lastName}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="mb-2 block text-sm text-slate-300">الشاحنة (اختياري)</label>
-                  <select value={form.truckId} onChange={(e) => set('truckId', e.target.value)}
-                    className="w-full rounded-3xl border border-white/10 bg-slate-900/85 px-4 py-3 text-white outline-none transition focus:border-cyan-400">
-                    <option value="">— بدون شاحنة —</option>
-                    {trucks.map((t) => (
-                      <option key={t._id} value={t._id}>{t.plateNumber} — {t.make} {t.model}</option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            </>
-          )}
+          {/* Client (required) */}
+          <div>
+            <label className="mb-2 block text-sm text-slate-300">العميل <span className="text-rose-400">*</span></label>
+            <select value={form.clientId} onChange={(e) => set('clientId', e.target.value)}
+              className="w-full rounded-3xl border border-white/10 bg-slate-900/85 px-4 py-3 text-white outline-none transition focus:border-cyan-400">
+              <option value="">— اختر العميل —</option>
+              {clients.map((c) => (
+                <option key={c._id} value={c._id}>
+                  {c.companyName || `${c.firstName} ${c.lastName}`}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Optional driver + truck */}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="mb-2 block text-sm text-slate-300">السائق (اختياري)</label>
+              <select value={form.driverId} onChange={(e) => set('driverId', e.target.value)}
+                className="w-full rounded-3xl border border-white/10 bg-slate-900/85 px-4 py-3 text-white outline-none transition focus:border-cyan-400">
+                <option value="">— بدون سائق —</option>
+                {drivers.map((d) => (
+                  <option key={d._id} value={d._id}>{d.firstName} {d.lastName}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-2 block text-sm text-slate-300">الشاحنة (اختياري)</label>
+              <select value={form.truckId} onChange={(e) => set('truckId', e.target.value)}
+                className="w-full rounded-3xl border border-white/10 bg-slate-900/85 px-4 py-3 text-white outline-none transition focus:border-cyan-400">
+                <option value="">— بدون شاحنة —</option>
+                {trucks.map((t) => (
+                  <option key={t._id} value={t._id}>{t.plateNumber} — {t.make} {t.model}</option>
+                ))}
+              </select>
+            </div>
+          </div>
 
           {formError && <p className="rounded-3xl bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{formError}</p>}
           <div className="flex gap-3 pt-2">
@@ -243,7 +297,9 @@ export default function ShipmentsPage() {
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
-              <Button variant="secondary" onClick={openModal}>+ إضافة شحنة</Button>
+              {canCreate && (
+                <Button variant="secondary" onClick={openModal}>+ إضافة شحنة</Button>
+              )}
             </div>
           </div>
         </Card>

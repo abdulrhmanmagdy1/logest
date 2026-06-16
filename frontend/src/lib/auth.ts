@@ -1,10 +1,15 @@
-export type UserRole = 'admin' | 'operations' | 'dispatcher' | 'driver' | 'customer' | 'warehouse';
+export type UserRole = 'admin' | 'supervisor' | 'employee' | 'driver' | 'client' | 'accountant';
 
 export interface AuthUser {
   id: string;
-  name: string;
+  firstName: string;
+  lastName: string;
   email: string;
+  phone?: string;
   role: UserRole;
+  status?: string;
+  companyName?: string;
+  driverInfo?: unknown;
 }
 
 export interface LoginPayload {

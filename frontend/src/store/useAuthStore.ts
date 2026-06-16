@@ -3,13 +3,14 @@ import { create } from 'zustand';
 export interface AuthUser {
   id: string;
   _id?: string;
-  name: string;
-  firstName?: string;
-  lastName?: string;
+  firstName: string;
+  lastName: string;
   email: string;
   phone?: string;
   role: string;
+  status?: string;
   companyName?: string;
+  driverInfo?: unknown;
 }
 
 interface AuthState {

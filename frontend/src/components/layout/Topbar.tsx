@@ -41,9 +41,13 @@ export function Topbar() {
           <LogOut size={18} />
         </button>
         <div className="hidden items-center gap-3 rounded-3xl border border-white/10 bg-slate-900/80 px-4 py-3 md:flex">
-          <span className="h-10 w-10 rounded-full bg-cyan-400/15 text-cyan-300 grid place-items-center">{user?.name?.charAt(0).toUpperCase() ?? 'A'}</span>
+          <span className="h-10 w-10 rounded-full bg-cyan-400/15 text-cyan-300 grid place-items-center">
+            {user?.firstName?.charAt(0).toUpperCase() ?? 'A'}
+          </span>
           <div>
-            <p className="text-sm text-slate-200">{user?.name ?? 'مدير النظام'}</p>
+            <p className="text-sm text-slate-200">
+              {user ? `${user.firstName} ${user.lastName}`.trim() || user.email : 'مدير النظام'}
+            </p>
             <p className="text-xs text-slate-500">{user?.role ?? 'Admin'}</p>
           </div>
         </div>

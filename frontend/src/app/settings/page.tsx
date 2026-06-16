@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { usersApi } from '@/lib/api';
 import { useAuthStore } from '@/store/useAuthStore';
+import type { AuthUser } from '@/store/useAuthStore';
 
 function normalizePhone(raw: string): string {
   const d = raw.replace(/\s+/g, '');
@@ -20,24 +21,21 @@ export default function SettingsPage() {
   const user    = useAuthStore((s) => s.user);
   const setUser = useAuthStore((s) => s.setUser);
 
-  const initial = {
-    companyName: user?.companyName ?? '',
-    email: user?.email ?? '',
-    phone: user?.phone ?? '',
-  };
+  function buildInitial(u: AuthUser | null) {
+    return {
+      firstName:   u?.firstName ?? '',
+      lastName:    u?.lastName  ?? '',
+      companyName: u?.companyName ?? '',
+      phone:       u?.phone ?? '',
+    };
+  }
 
-  const [form, setForm]       = useState(initial);
+  const [form, setForm]       = useState(() => buildInitial(user));
   const [saving, setSaving]   = useState(false);
   const [saved, setSaved]     = useState(false);
   const [saveError, setSaveError] = useState('');
 
-  useEffect(() => {
-    setForm({
-      companyName: user?.companyName ?? '',
-      email: user?.email ?? '',
-      phone: user?.phone ?? '',
-    });
-  }, [user]);
+  useEffect(() => { setForm(buildInitial(user)); }, [user]);
 
   function set(field: string, value: string) {
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -46,7 +44,7 @@ export default function SettingsPage() {
   }
 
   function handleCancel() {
-    setForm(initial);
+    setForm(buildInitial(user));
     setSaved(false);
     setSaveError('');
   }
@@ -58,11 +56,15 @@ export default function SettingsPage() {
     try {
       const id = user?._id ?? user?.id;
       if (!id) { setSaveError('لم يتم التعرف على المستخدم'); setSaving(false); return; }
-      const payload: Record<string, unknown> = { email: form.email.trim() };
+
+      const payload: Record<string, unknown> = {};
+      if (form.firstName.trim())   payload.firstName   = form.firstName.trim();
+      if (form.lastName.trim())    payload.lastName    = form.lastName.trim();
       if (form.companyName.trim()) payload.companyName = form.companyName.trim();
-      if (form.phone.trim())       payload.phone = normalizePhone(form.phone);
+      if (form.phone.trim())       payload.phone       = normalizePhone(form.phone);
+
       const res = await usersApi.update(id, payload);
-      const body = res.data as { success: boolean; data: import('@/store/useAuthStore').AuthUser };
+      const body = res.data as { success: boolean; data: AuthUser };
       if (body.success && body.data) setUser(body.data);
       setSaved(true);
     } catch (err: unknown) {
@@ -81,21 +83,28 @@ export default function SettingsPage() {
     <DashboardShell title="الإعدادات" description="ضبط الشركة والصلاحيات وسياسات الأمان.">
       <div className="grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">
         <Card className="glass p-6">
-          <h2 className="text-xl font-semibold text-white">إعدادات الشركة</h2>
+          <h2 className="text-xl font-semibold text-white">إعدادات الحساب</h2>
+          <p className="mt-1 text-sm text-slate-500">البريد الإلكتروني: {user?.email ?? '—'}</p>
           <form onSubmit={handleSave} className="mt-6 grid gap-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Input
+                label="الاسم الأول"
+                placeholder="محمد"
+                value={form.firstName}
+                onChange={(e) => set('firstName', e.target.value)}
+              />
+              <Input
+                label="اسم العائلة"
+                placeholder="العمري"
+                value={form.lastName}
+                onChange={(e) => set('lastName', e.target.value)}
+              />
+            </div>
             <Input
               label="اسم الشركة"
               placeholder="شركة ادهام للنقل"
               value={form.companyName}
               onChange={(e) => set('companyName', e.target.value)}
-            />
-            <Input
-              label="البريد الإلكتروني للشركة"
-              placeholder="contact@edhamlogistics.com"
-              type="email"
-              required
-              value={form.email}
-              onChange={(e) => set('email', e.target.value)}
             />
             <Input
               label="رقم الهاتف"
