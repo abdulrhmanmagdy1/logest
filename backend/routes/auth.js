@@ -332,4 +332,55 @@ router.post('/refresh-token', protect, async (req, res) => {
   }
 });
 
+// @route   GET /api/v1/auth/seed-demo
+// @desc    Create demo users (idempotent — safe to call multiple times)
+// @access  Public
+router.get('/seed-demo', async (req, res) => {
+  const demoUsers = [
+    { firstName: 'مدير',    lastName: 'النظام',   email: 'admin@edham.com',       phone: '0500000001', role: 'admin',       password: 'Supervisor@2026' },
+    { firstName: 'مشرف',    lastName: 'العمليات', email: 'supervisor@edham.com',   phone: '0500000002', role: 'supervisor',  password: 'Supervisor@2026' },
+    { firstName: 'محاسب',   lastName: 'النظام',   email: 'accountant@edham.com',   phone: '0500000003', role: 'accountant',  password: 'Supervisor@2026' },
+    { firstName: 'سائق',    lastName: 'النظام',   email: 'driver@edham.com',       phone: '0500000004', role: 'driver',      password: 'Supervisor@2026' },
+    { firstName: 'فني',     lastName: 'الورشة',   email: 'workshop@edham.com',     phone: '0500000005', role: 'employee',    password: 'Supervisor@2026' },
+    { firstName: 'عميل',    lastName: 'تجريبي',   email: 'customer@edham.com',     phone: '0500000006', role: 'client',      password: 'Supervisor@2026' },
+  ];
+
+  try {
+    const results = [];
+
+    for (const userData of demoUsers) {
+      const existing = await User.findOne({ email: userData.email });
+      if (existing) {
+        results.push({ email: userData.email, status: 'already_exists' });
+        continue;
+      }
+
+      await User.create({
+        firstName:       userData.firstName,
+        lastName:        userData.lastName,
+        email:           userData.email,
+        phone:           userData.phone,
+        password:        userData.password,
+        role:            userData.role,
+        status:          'active',
+        isEmailVerified: true,
+      });
+
+      results.push({ email: userData.email, status: 'created' });
+    }
+
+    const created = results.filter(r => r.status === 'created').length;
+    const skipped = results.filter(r => r.status === 'already_exists').length;
+
+    res.json({
+      success: true,
+      message: `Demo users ready — ${created} created, ${skipped} already existed.`,
+      details: results,
+    });
+  } catch (error) {
+    logger.error('Seed demo error:', error);
+    res.status(500).json({ success: false, message: 'Seed failed: ' + error.message });
+  }
+});
+
 module.exports = router;

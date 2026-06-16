@@ -22,7 +22,7 @@ const mockMiddleware = require('./middleware/mockData');
 const { specs, swaggerUi } = require('./config/swagger');
 
 // Import routes (only if not in mock mode)
-let authRoutes, userRoutes, shipmentRoutes, truckRoutes, driverRoutes, invoiceRoutes, trackingRoutes, notificationRoutes, surveyRoutes, reportRoutes, uploadRoutes;
+let authRoutes, userRoutes, shipmentRoutes, truckRoutes, driverRoutes, invoiceRoutes, trackingRoutes, notificationRoutes, surveyRoutes, reportRoutes, uploadRoutes, dashboardRoutes;
 let accountantRoutes, workshopRoutes, chatRoutes, ticketRoutes, reviewRoutes, documentRoutes, sensorRoutes, ceoRoutes, analyticsRoutes, routeOptimizationRoutes, fuelRoutes, auditLogRoutes, subscriptionRoutes, paymentRoutes, webhookRoutes, apiKeyRoutes, aiRoutes, twoFARoutes, searchRoutes, exportRoutes, scannerRoutes;
 let warehouseRoutes, crmRoutes, hrRoutes, contractRoutes, qualityRoutes, riskRoutes, projectRoutes;
 let fleetRoutes, procurementRoutes, marketingRoutes;
@@ -36,6 +36,7 @@ if (!USE_MOCK_MODE) {
     
     // Import routes
     authRoutes = require('./routes/auth');
+    dashboardRoutes = require('./routes/dashboard');
     userRoutes = require('./routes/users');
     shipmentRoutes = require('./routes/shipments');
     truckRoutes = require('./routes/trucks');
@@ -185,6 +186,7 @@ if (process.env.NODE_ENV !== 'production') {
 // API Routes (only if not in mock mode)
 if (!USE_MOCK_MODE && authRoutes) {
   app.use('/api/v1/auth', authRoutes);
+  app.use('/api/v1/dashboard', dashboardRoutes);
   app.use('/api/v1/users', userRoutes);
   app.use('/api/v1/shipments', shipmentRoutes);
   app.use('/api/v1/trucks', truckRoutes);

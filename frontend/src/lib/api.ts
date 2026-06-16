@@ -16,6 +16,14 @@ const api = axios.create({
 
 export const authApi = {
   login: (payload: { email: string; password: string }) => api.post('/auth/login', payload),
+  register: (payload: {
+    firstName: string;
+    lastName: string;
+    email: string;
+    phone: string;
+    password: string;
+    companyName?: string;
+  }) => api.post('/auth/register', payload),
   refresh: () => api.post('/auth/refresh'),
 };
 
