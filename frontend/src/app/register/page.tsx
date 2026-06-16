@@ -5,13 +5,22 @@ import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Input';
 import { authApi } from '@/lib/api';
+
+function normalizePhone(raw: string): string {
+  const digits = raw.replace(/\s+/g, '');
+  if (digits.startsWith('00966')) return '0' + digits.slice(5);
+  if (digits.startsWith('+966'))  return '0' + digits.slice(4);
+  if (digits.startsWith('966'))   return '0' + digits.slice(3);
+  return digits;
+}
 
 export default function RegisterPage() {
   const router = useRouter();
 
   const [companyName, setCompanyName] = useState('');
-  const [fullName,    setFullName]    = useState('');
+  const [username,    setUsername]    = useState('');
   const [email,       setEmail]       = useState('');
   const [phone,       setPhone]       = useState('');
   const [password,    setPassword]    = useState('');
@@ -34,14 +43,20 @@ export default function RegisterPage() {
       return;
     }
 
-    // split "الاسم الكامل" → firstName + lastName
-    const parts     = fullName.trim().split(/\s+/);
-    const firstName = parts[0] ?? fullName.trim();
+    const parts     = username.trim().split(/\s+/);
+    const firstName = parts[0] ?? username.trim();
     const lastName  = parts.slice(1).join(' ') || firstName;
 
     setLoading(true);
     try {
-      await authApi.register({ firstName, lastName, email, phone, password, companyName });
+      await authApi.register({
+        firstName,
+        lastName,
+        email,
+        phone: normalizePhone(phone),
+        password,
+        companyName,
+      });
       setSuccess('تم إنشاء الحساب بنجاح! سيتم تحويلك لتسجيل الدخول...');
       setTimeout(() => router.push('/login'), 2000);
     } catch (err: unknown) {
@@ -82,76 +97,55 @@ export default function RegisterPage() {
 
         <form onSubmit={handleSubmit} className="mt-8 grid gap-5">
           <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <label className="block text-sm text-slate-300">اسم الشركة</label>
-              <input
-                value={companyName}
-                onChange={(e) => setCompanyName(e.target.value)}
-                placeholder="شركة النقل الذكية"
-                className="w-full rounded-3xl border border-white/10 bg-slate-900/80 px-4 py-3 text-white outline-none transition focus:border-cyan-400"
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="block text-sm text-slate-300">الاسم الكامل</label>
-              <input
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                placeholder="أماني أحمد"
-                required
-                className="w-full rounded-3xl border border-white/10 bg-slate-900/80 px-4 py-3 text-white outline-none transition focus:border-cyan-400"
-              />
-            </div>
+            <Input
+              label="اسم الشركة"
+              placeholder="شركة النقل الذكية"
+              value={companyName}
+              onChange={(e) => setCompanyName(e.target.value)}
+            />
+            <Input
+              label="اسم المستخدم"
+              placeholder="أماني أحمد"
+              required
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
           </div>
-
           <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <label className="block text-sm text-slate-300">البريد الإلكتروني</label>
-              <input
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                type="email"
-                placeholder="example@edham.com"
-                required
-                className="w-full rounded-3xl border border-white/10 bg-slate-900/80 px-4 py-3 text-white outline-none transition focus:border-cyan-400"
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="block text-sm text-slate-300">
-                رقم الهاتف <span className="text-slate-500 text-xs">(05XXXXXXXX)</span>
-              </label>
-              <input
-                value={phone}
-                onChange={(e) => setPhone(e.target.value)}
-                placeholder="0512345678"
-                required
-                className="w-full rounded-3xl border border-white/10 bg-slate-900/80 px-4 py-3 text-white outline-none transition focus:border-cyan-400"
-              />
-            </div>
+            <Input
+              label="البريد الإلكتروني"
+              placeholder="example@edham.com"
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+            <Input
+              label="رقم الهاتف"
+              placeholder="00966 5X XXX XXXX"
+              type="tel"
+              required
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+            />
           </div>
-
           <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <label className="block text-sm text-slate-300">كلمة المرور</label>
-              <input
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                type="password"
-                placeholder="8 أحرف على الأقل"
-                required
-                className="w-full rounded-3xl border border-white/10 bg-slate-900/80 px-4 py-3 text-white outline-none transition focus:border-cyan-400"
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="block text-sm text-slate-300">تأكيد كلمة المرور</label>
-              <input
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-                type="password"
-                placeholder="********"
-                required
-                className="w-full rounded-3xl border border-white/10 bg-slate-900/80 px-4 py-3 text-white outline-none transition focus:border-cyan-400"
-              />
-            </div>
+            <Input
+              label="كلمة المرور"
+              placeholder="********"
+              type="password"
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <Input
+              label="تأكيد كلمة المرور"
+              placeholder="********"
+              type="password"
+              required
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+            />
           </div>
 
           {error && (

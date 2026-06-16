@@ -14,6 +14,16 @@ const api = axios.create({
   withCredentials: true,
 });
 
+api.interceptors.request.use((config) => {
+  if (typeof window !== 'undefined') {
+    const token = localStorage.getItem('edham_token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+  }
+  return config;
+});
+
 export const authApi = {
   login: (payload: { email: string; password: string }) => api.post('/auth/login', payload),
   register: (payload: {
@@ -29,6 +39,20 @@ export const authApi = {
 
 export const dashboardApi = {
   stats: () => api.get('/dashboard/stats'),
+};
+
+export const shipmentsApi = {
+  list: (params?: Record<string, string>) => api.get('/shipments', { params }),
+  create: (data: Record<string, unknown>) => api.post('/shipments', data),
+};
+
+export const trucksApi = {
+  list: (params?: Record<string, string>) => api.get('/trucks', { params }),
+  create: (data: Record<string, unknown>) => api.post('/trucks', data),
+};
+
+export const usersApi = {
+  list: (params?: Record<string, string>) => api.get('/users', { params }),
 };
 
 export default api;
